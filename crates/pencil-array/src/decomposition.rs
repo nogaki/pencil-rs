@@ -1,6 +1,133 @@
 use std::ops::Range;
 
-use crate::{AxisError, GeometryError, SpatialAxis};
+use crate::{AxisError, GeometryError, SpatialAxis, checked::checked_product};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Decomposition<const N: usize, const M: usize> {
+    axes: [SpatialAxis; M],
+}
+
+impl<const N: usize, const M: usize> Decomposition<N, M> {
+    pub fn new(axes: [usize; M]) -> Result<Self, AxisError> {
+        if M == 0 || M > N {
+            return Err(AxisError::InvalidDecompositionRank {
+                spatial_dimensions: N,
+                topology_dimensions: M,
+            });
+        }
+
+        let mut seen = [false; N];
+        for &axis in &axes {
+            if axis >= N {
+                return Err(AxisError::OutOfBounds {
+                    axis,
+                    dimensions: N,
+                });
+            }
+            if seen[axis] {
+                return Err(AxisError::Duplicate { axis });
+            }
+            seen[axis] = true;
+        }
+
+        Ok(Self {
+            axes: std::array::from_fn(|index| {
+                SpatialAxis::new::<N>(axes[index]).expect("axis was validated")
+            }),
+        })
+    }
+
+    pub fn axes(&self) -> &[SpatialAxis; M] {
+        &self.axes
+    }
+
+    pub fn complete_process_grid(&self, process_grid: [usize; M]) -> [usize; N] {
+        complete_dims(self.axes.map(SpatialAxis::index), process_grid)
+    }
+
+    pub fn complete_process_coords(&self, process_coords: [usize; M]) -> [usize; N] {
+        let mut completed = [0; N];
+        for (axis, coordinate) in self.axes.iter().copied().zip(process_coords) {
+            completed[axis.index()] = coordinate;
+        }
+        completed
+    }
+}
+
+pub(crate) fn local_data_range(
+    coordinate: usize,
+    process_count: usize,
+    global_len: usize,
+) -> Result<Range<usize>, GeometryError> {
+    debug_assert!(process_count > 0);
+    debug_assert!(coordinate < process_count);
+
+    let start = global_len
+        .checked_mul(coordinate)
+        .ok_or(GeometryError::SizeOverflow)?
+        / process_count;
+    let next_coordinate = coordinate
+        .checked_add(1)
+        .ok_or(GeometryError::SizeOverflow)?;
+    let end = global_len
+        .checked_mul(next_coordinate)
+        .ok_or(GeometryError::SizeOverflow)?
+        / process_count;
+
+    Ok(start..end)
+}
+
+pub(crate) fn complete_dims<const N: usize, const M: usize>(
+    axes: [usize; M],
+    values: [usize; M],
+) -> [usize; N] {
+    let mut completed = [1; N];
+    for (axis, value) in axes.into_iter().zip(values) {
+        completed[axis] = value;
+    }
+    completed
+}
+
+// Pencil construction uses this in the next task. Keeping it crate-visible
+// lets the geometry tests exercise the exact production implementation.
+#[allow(dead_code)]
+pub(crate) fn generate_axes<const N: usize, const M: usize>(
+    decomposition: &Decomposition<N, M>,
+    process_grid: [usize; M],
+    global_shape: [usize; N],
+) -> Result<Vec<[Range<usize>; N]>, GeometryError> {
+    for (axis, extent) in process_grid.iter().copied().enumerate() {
+        if extent == 0 {
+            return Err(GeometryError::ZeroProcessExtent { axis });
+        }
+    }
+
+    let region_count = checked_product(&process_grid)?;
+    let completed_grid = decomposition.complete_process_grid(process_grid);
+    let mut regions = Vec::with_capacity(region_count);
+
+    for flat_index in 0..region_count {
+        let mut remainder = flat_index;
+        let mut process_coords = [0; M];
+        for axis in (0..M).rev() {
+            process_coords[axis] = remainder % process_grid[axis];
+            remainder /= process_grid[axis];
+        }
+
+        let completed_coords = decomposition.complete_process_coords(process_coords);
+        let mut region = std::array::from_fn(|_| 0..0);
+        for (axis, range) in region.iter_mut().enumerate() {
+            *range = local_data_range(
+                completed_coords[axis],
+                completed_grid[axis],
+                global_shape[axis],
+            )?;
+        }
+        regions.push(region);
+    }
+
+    Ok(regions)
+}
 
 #[cfg(test)]
 mod tests {
@@ -24,7 +151,10 @@ mod tests {
 
     #[test]
     fn complete_dims_respects_topology_axis_order() {
-        assert_eq!(complete_dims::<5, 2>([2, 1], [42, 12]), [1, 12, 42, 1, 1]);
+        assert_eq!(
+            complete_dims::<5, 2>([2, 1], [42, 12]),
+            [1, 12, 42, 1, 1]
+        );
     }
 
     #[test]
