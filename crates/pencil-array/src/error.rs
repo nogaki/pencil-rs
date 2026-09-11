@@ -17,9 +17,7 @@ pub enum GeometryError {
     #[error("value does not fit MPI Count (i32)")]
     CountOverflow,
 
-    #[error(
-        "process coordinate {coordinate} is outside 0..{extent} on topology axis {axis}"
-    )]
+    #[error("process coordinate {coordinate} is outside 0..{extent} on topology axis {axis}")]
     ProcessCoordinateOutOfBounds {
         axis: usize,
         coordinate: usize,
