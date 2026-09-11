@@ -2,3 +2,5 @@
 #![deny(missing_debug_implementations)]
 
 //! MPI-distributed, row-major multidimensional array foundations.
+
+mod checked;
