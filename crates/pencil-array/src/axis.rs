@@ -1,5 +1,86 @@
 use crate::AxisError;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SpatialAxis(usize);
+
+impl SpatialAxis {
+    pub fn new<const N: usize>(index: usize) -> Result<Self, AxisError> {
+        if index < N {
+            Ok(Self(index))
+        } else {
+            Err(AxisError::OutOfBounds {
+                axis: index,
+                dimensions: N,
+            })
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AxisPermutation<const N: usize> {
+    axes_in_memory_order: [SpatialAxis; N],
+    logical_to_memory: [usize; N],
+}
+
+impl<const N: usize> AxisPermutation<N> {
+    pub fn new(axes: [usize; N]) -> Result<Self, AxisError> {
+        let mut seen = [false; N];
+
+        for &axis in &axes {
+            if axis >= N {
+                return Err(AxisError::OutOfBounds {
+                    axis,
+                    dimensions: N,
+                });
+            }
+            if seen[axis] {
+                return Err(AxisError::Duplicate { axis });
+            }
+            seen[axis] = true;
+        }
+
+        let axes_in_memory_order = std::array::from_fn(|position| SpatialAxis(axes[position]));
+        let mut logical_to_memory = [0; N];
+        for (memory_position, axis) in axes_in_memory_order.iter().copied().enumerate() {
+            logical_to_memory[axis.index()] = memory_position;
+        }
+
+        Ok(Self {
+            axes_in_memory_order,
+            logical_to_memory,
+        })
+    }
+
+    pub fn identity() -> Self {
+        Self {
+            axes_in_memory_order: std::array::from_fn(SpatialAxis),
+            logical_to_memory: std::array::from_fn(|index| index),
+        }
+    }
+
+    pub fn axes(&self) -> &[SpatialAxis; N] {
+        &self.axes_in_memory_order
+    }
+
+    pub fn position_of(&self, axis: SpatialAxis) -> usize {
+        self.logical_to_memory[axis.index()]
+    }
+
+    pub fn permute<T: Copy>(&self, logical: [T; N]) -> [T; N] {
+        std::array::from_fn(|memory_position| {
+            logical[self.axes_in_memory_order[memory_position].index()]
+        })
+    }
+
+    pub fn unpermute<T: Copy>(&self, memory: [T; N]) -> [T; N] {
+        std::array::from_fn(|logical_axis| memory[self.logical_to_memory[logical_axis]])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

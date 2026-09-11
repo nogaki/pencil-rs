@@ -7,4 +7,5 @@ mod axis;
 mod checked;
 mod error;
 
+pub use axis::{AxisPermutation, SpatialAxis};
 pub use error::{AxisError, GeometryError};
