@@ -151,10 +151,7 @@ mod tests {
 
     #[test]
     fn complete_dims_respects_topology_axis_order() {
-        assert_eq!(
-            complete_dims::<5, 2>([2, 1], [42, 12]),
-            [1, 12, 42, 1, 1]
-        );
+        assert_eq!(complete_dims::<5, 2>([2, 1], [42, 12]), [1, 12, 42, 1, 1]);
     }
 
     #[test]
