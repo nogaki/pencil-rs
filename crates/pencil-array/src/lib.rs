@@ -9,4 +9,5 @@ mod decomposition;
 mod error;
 
 pub use axis::{AxisPermutation, SpatialAxis};
+pub use decomposition::Decomposition;
 pub use error::{AxisError, GeometryError};
