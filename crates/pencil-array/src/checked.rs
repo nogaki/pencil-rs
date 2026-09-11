@@ -1,3 +1,15 @@
+use crate::GeometryError;
+
+pub(crate) fn checked_product(values: &[usize]) -> Result<usize, GeometryError> {
+    values.iter().try_fold(1usize, |acc, &value| {
+        acc.checked_mul(value).ok_or(GeometryError::SizeOverflow)
+    })
+}
+
+pub(crate) fn usize_to_i32(value: usize) -> Result<i32, GeometryError> {
+    i32::try_from(value).map_err(|_| GeometryError::CountOverflow)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

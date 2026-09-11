@@ -4,3 +4,6 @@
 //! MPI-distributed, row-major multidimensional array foundations.
 
 mod checked;
+mod error;
+
+pub use error::{AxisError, GeometryError};
