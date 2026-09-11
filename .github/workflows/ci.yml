@@ -22,16 +22,15 @@ jobs:
       - name: Install Rust components
         run: rustup component add rustfmt clippy
 
-      - name: Cache Cargo build data
-        uses: actions/cache@v4
+      - name: Restore Cargo build data
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Verify workspace metadata
         run: cargo metadata --no-deps --format-version 1
@@ -40,7 +39,30 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run library tests
+        id: library-tests
+        continue-on-error: true
         run: cargo test -p pencil-array --lib
 
       - name: Run Clippy
+        id: clippy
+        if: steps.library-tests.outcome == 'success'
+        continue-on-error: true
         run: cargo clippy -p pencil-array --all-targets -- -D warnings
+
+      - name: Save Cargo build data
+        if: always() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+      - name: Propagate library test failure
+        if: steps.library-tests.outcome == 'failure'
+        run: exit 1
+
+      - name: Propagate Clippy failure
+        if: steps.clippy.outcome == 'failure'
+        run: exit 1
