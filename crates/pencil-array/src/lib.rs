@@ -3,6 +3,7 @@
 
 //! MPI-distributed, row-major multidimensional array foundations.
 
+mod axis;
 mod checked;
 mod error;
 
