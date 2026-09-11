@@ -1,0 +1,50 @@
+name: Bootstrap repository
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reconstruct repository snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat \
+            .bootstrap/archive.part00a \
+            .bootstrap/archive.part00b \
+            .bootstrap/archive.part01 \
+            .bootstrap/archive.part02 \
+            .bootstrap/archive.part03 \
+            .bootstrap/archive.part04 \
+            | base64 --decode > /tmp/pencil-rs-bootstrap.tar.xz
+
+          echo "6bedb162a8384a561f1039e20786cb4bdb8a5f9ba9904e05e69230001a40f215  /tmp/pencil-rs-bootstrap.tar.xz" \
+            | sha256sum --check --strict
+
+          tar -xJf /tmp/pencil-rs-bootstrap.tar.xz -C .
+          rm -rf .bootstrap
+          rm -f .github/workflows/bootstrap.yml
+          rmdir .github/workflows 2>/dev/null || true
+          rmdir .github 2>/dev/null || true
+
+      - name: Commit repository snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: bootstrap pencil array workspace"
+          git push origin HEAD:main
