@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install MPI toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libopenmpi-dev openmpi-bin pkg-config
+
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+
+      - name: Verify workspace metadata
+        run: cargo metadata --no-deps --format-version 1
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run library tests
+        run: cargo test -p pencil-array --lib
+
+      - name: Run Clippy
+        run: cargo clippy -p pencil-array --all-targets -- -D warnings
