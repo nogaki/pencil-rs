@@ -5,6 +5,7 @@
 
 mod axis;
 mod checked;
+mod decomposition;
 mod error;
 
 pub use axis::{AxisPermutation, SpatialAxis};
