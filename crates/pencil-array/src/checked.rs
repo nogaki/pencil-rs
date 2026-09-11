@@ -1,14 +1,12 @@
 use crate::GeometryError;
 
-// These helpers become live production dependencies when the geometry modules
-// are introduced in the next implementation task.
-#[allow(dead_code)]
 pub(crate) fn checked_product(values: &[usize]) -> Result<usize, GeometryError> {
     values.iter().try_fold(1usize, |acc, &value| {
         acc.checked_mul(value).ok_or(GeometryError::SizeOverflow)
     })
 }
 
+// MPI count conversion becomes live when the topology facade is introduced.
 #[allow(dead_code)]
 pub(crate) fn usize_to_i32(value: usize) -> Result<i32, GeometryError> {
     i32::try_from(value).map_err(|_| GeometryError::CountOverflow)
