@@ -43,10 +43,7 @@ mod tests {
     #[test]
     fn identity_exposes_logical_axes_in_memory_order() {
         let permutation = AxisPermutation::<3>::identity();
-        assert_eq!(
-            permutation.axes().map(SpatialAxis::index),
-            [0, 1, 2],
-        );
+        assert_eq!(permutation.axes().map(SpatialAxis::index), [0, 1, 2],);
     }
 
     #[test]
