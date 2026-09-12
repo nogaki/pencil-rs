@@ -51,9 +51,7 @@ pub enum TopologyError {
     #[error("process-grid extent on axis {axis} must be positive")]
     ZeroExtent { axis: usize },
 
-    #[error(
-        "process-grid size {grid_size} does not equal communicator size {communicator_size}"
-    )]
+    #[error("process-grid size {grid_size} does not equal communicator size {communicator_size}")]
     CommunicatorSizeMismatch {
         grid_size: usize,
         communicator_size: usize,
