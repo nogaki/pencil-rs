@@ -43,9 +43,15 @@ jobs:
         continue-on-error: true
         run: cargo test -p pencil-array --lib
 
+      - name: Run four-rank topology tests
+        id: topology-tests
+        if: steps.library-tests.outcome == 'success'
+        continue-on-error: true
+        run: mpiexec -n 4 cargo test -p pencil-array --test topology -- --nocapture --test-threads=1
+
       - name: Run Clippy
         id: clippy
-        if: steps.library-tests.outcome == 'success'
+        if: steps.library-tests.outcome == 'success' && steps.topology-tests.outcome == 'success'
         continue-on-error: true
         run: cargo clippy -p pencil-array --all-targets -- -D warnings
 
@@ -61,6 +67,10 @@ jobs:
 
       - name: Propagate library test failure
         if: steps.library-tests.outcome == 'failure'
+        run: exit 1
+
+      - name: Propagate topology test failure
+        if: steps.topology-tests.outcome == 'failure'
         run: exit 1
 
       - name: Propagate Clippy failure
