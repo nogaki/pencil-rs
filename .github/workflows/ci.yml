@@ -47,7 +47,7 @@ jobs:
         id: topology-tests
         if: steps.library-tests.outcome == 'success'
         continue-on-error: true
-        run: mpiexec -n 4 cargo test -p pencil-array --test topology -- --nocapture --test-threads=1
+        run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test topology -- --nocapture --test-threads=1
 
       - name: Run Clippy
         id: clippy
