@@ -18,6 +18,10 @@ fn row_major_defaults_and_decomposition_order_define_local_ranges() {
 
     let default = Pencil::<3, 2>::new_default(Arc::clone(&topology), global_shape).unwrap();
     assert_eq!(default.decomposition().map(SpatialAxis::index), [0, 1]);
+    assert_eq!(
+        default.permutation().axes().map(SpatialAxis::index),
+        [0, 1, 2]
+    );
 
     let [c0, c1] = *topology.local_coords();
     assert_eq!(
