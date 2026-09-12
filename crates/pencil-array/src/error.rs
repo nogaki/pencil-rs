@@ -73,9 +73,7 @@ pub enum TopologyError {
     #[error("topology axis {axis} is outside 0..{dimensions}")]
     AxisOutOfBounds { axis: usize, dimensions: usize },
 
-    #[error(
-        "subcommunicator on topology axis {axis} has size {actual}, expected {expected}"
-    )]
+    #[error("subcommunicator on topology axis {axis} has size {actual}, expected {expected}")]
     SubcommunicatorSizeMismatch {
         axis: usize,
         expected: usize,
