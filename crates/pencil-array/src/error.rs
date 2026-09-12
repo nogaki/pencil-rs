@@ -70,6 +70,18 @@ pub enum TopologyError {
         extent: usize,
     },
 
+    #[error("topology axis {axis} is outside 0..{dimensions}")]
+    AxisOutOfBounds { axis: usize, dimensions: usize },
+
+    #[error(
+        "subcommunicator on topology axis {axis} has size {actual}, expected {expected}"
+    )]
+    SubcommunicatorSizeMismatch {
+        axis: usize,
+        expected: usize,
+        actual: usize,
+    },
+
     #[error("MPI topology operation {operation} failed with error code {code}")]
     Mpi { operation: &'static str, code: i32 },
 
