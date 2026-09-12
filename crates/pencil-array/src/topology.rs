@@ -108,10 +108,7 @@ impl<const M: usize> MpiTopology<M> {
 
         // SAFETY: `mpi_coords` has exactly M entries, matching the communicator
         // dimensionality, and every coordinate was checked against its extent.
-        Ok(unsafe {
-            self.cartesian
-                .coordinates_to_rank_unchecked(&mpi_coords)
-        })
+        Ok(unsafe { self.cartesian.coordinates_to_rank_unchecked(&mpi_coords) })
     }
 }
 
