@@ -42,3 +42,39 @@ pub enum GeometryError {
         extent: usize,
     },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum TopologyError {
+    #[error("topology dimension count must be positive")]
+    ZeroDimensions,
+
+    #[error("process-grid extent on axis {axis} must be positive")]
+    ZeroExtent { axis: usize },
+
+    #[error(
+        "process-grid size {grid_size} does not equal communicator size {communicator_size}"
+    )]
+    CommunicatorSizeMismatch {
+        grid_size: usize,
+        communicator_size: usize,
+    },
+
+    #[error("MPI did not create a Cartesian communicator")]
+    CartesianCreationFailed,
+
+    #[error("Cartesian communicator has {actual} dimensions, expected {expected}")]
+    DimensionMismatch { expected: usize, actual: usize },
+
+    #[error("coordinate {coordinate} is outside 0..{extent} on topology axis {axis}")]
+    CoordinateOutOfBounds {
+        axis: usize,
+        coordinate: usize,
+        extent: usize,
+    },
+
+    #[error("MPI topology operation {operation} failed with error code {code}")]
+    Mpi { operation: &'static str, code: i32 },
+
+    #[error(transparent)]
+    Geometry(#[from] GeometryError),
+}
