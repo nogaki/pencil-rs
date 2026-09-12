@@ -86,3 +86,26 @@ pub enum TopologyError {
     #[error(transparent)]
     Geometry(#[from] GeometryError),
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PencilError {
+    #[error(
+        "topology dimension M={topology} must satisfy 1 <= M <= spatial dimension N={spatial}"
+    )]
+    InvalidDimensionRelation { spatial: usize, topology: usize },
+
+    #[error("global extent on spatial axis {axis} must be positive")]
+    ZeroGlobalExtent { axis: usize },
+
+    #[error("invalid decomposition: {0}")]
+    InvalidDecomposition(AxisError),
+
+    #[error("invalid memory-axis permutation: {0}")]
+    InvalidPermutation(AxisError),
+
+    #[error("pencil shape or range calculation overflowed usize")]
+    SizeOverflow,
+
+    #[error(transparent)]
+    Topology(#[from] TopologyError),
+}
