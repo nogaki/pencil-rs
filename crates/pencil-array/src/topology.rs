@@ -1,4 +1,4 @@
-use std::{array, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use mpi::topology::{CartesianCommunicator, Communicator};
 
@@ -30,9 +30,8 @@ impl<const M: usize> MpiTopology<M> {
         }
 
         let grid_size = checked_product(&process_grid)?;
-        let communicator_size = usize::try_from(comm.size()).map_err(|_| {
-            TopologyError::Geometry(GeometryError::CountOverflow)
-        })?;
+        let communicator_size = usize::try_from(comm.size())
+            .map_err(|_| TopologyError::Geometry(GeometryError::CountOverflow))?;
         if grid_size != communicator_size {
             return Err(TopologyError::CommunicatorSizeMismatch {
                 grid_size,
@@ -57,11 +56,11 @@ impl<const M: usize> MpiTopology<M> {
             });
         }
 
-        let local_coords = array::try_from_fn(|axis| {
-            usize::try_from(layout.coords[axis]).map_err(|_| {
-                TopologyError::Geometry(GeometryError::CountOverflow)
-            })
-        })?;
+        let mut local_coords = [0usize; M];
+        for (slot, coordinate) in local_coords.iter_mut().zip(layout.coords) {
+            *slot = usize::try_from(coordinate)
+                .map_err(|_| TopologyError::Geometry(GeometryError::CountOverflow))?;
+        }
 
         Ok(Arc::new(Self {
             cartesian,
@@ -70,22 +69,27 @@ impl<const M: usize> MpiTopology<M> {
         }))
     }
 
+    /// Returns the Cartesian process-grid extents.
     pub fn process_grid(&self) -> &[usize; M] {
         &self.process_grid
     }
 
+    /// Returns the calling rank's Cartesian coordinates.
     pub fn local_coords(&self) -> &[usize; M] {
         &self.local_coords
     }
 
+    /// Returns the calling process's rank in the Cartesian communicator.
     pub fn rank(&self) -> i32 {
         self.cartesian.rank()
     }
 
+    /// Returns the number of processes in the Cartesian communicator.
     pub fn size(&self) -> usize {
         usize::try_from(self.cartesian.size()).expect("MPI communicator size is non-negative")
     }
 
+    /// Maps valid zero-based Cartesian coordinates to a communicator rank.
     pub fn rank_at(&self, coords: [usize; M]) -> Result<i32, TopologyError> {
         let mut mpi_coords = [0i32; M];
         for axis in 0..M {
