@@ -60,9 +60,8 @@ impl<const M: usize> MpiTopology<M> {
         let mut dims = [0i32; M];
         // SAFETY: `dims` contains exactly `dimensions` writable MPI Count values,
         // and `comm.size()` is a valid positive communicator size.
-        let status = unsafe {
-            mpi::ffi::MPI_Dims_create(comm.size(), dimensions, dims.as_mut_ptr())
-        };
+        let status =
+            unsafe { mpi::ffi::MPI_Dims_create(comm.size(), dimensions, dims.as_mut_ptr()) };
         if status != 0 {
             return Err(TopologyError::Mpi {
                 operation: "MPI_Dims_create",
@@ -133,12 +132,13 @@ impl<const M: usize> MpiTopology<M> {
 
     /// Returns the number of processes in the one-dimensional communicator for an axis.
     pub fn subcommunicator_size(&self, topology_axis: usize) -> Result<usize, TopologyError> {
-        let communicator = self.subcommunicators.get(topology_axis).ok_or(
-            TopologyError::AxisOutOfBounds {
-                axis: topology_axis,
-                dimensions: M,
-            },
-        )?;
+        let communicator =
+            self.subcommunicators
+                .get(topology_axis)
+                .ok_or(TopologyError::AxisOutOfBounds {
+                    axis: topology_axis,
+                    dimensions: M,
+                })?;
         usize::try_from(communicator.size()).map_err(|_| GeometryError::CountOverflow.into())
     }
 
@@ -150,9 +150,7 @@ impl<const M: usize> MpiTopology<M> {
         }
     }
 
-    fn from_owned_cartesian(
-        cartesian: CartesianCommunicator,
-    ) -> Result<Arc<Self>, TopologyError> {
+    fn from_owned_cartesian(cartesian: CartesianCommunicator) -> Result<Arc<Self>, TopologyError> {
         Self::validate_dimension_count()?;
 
         let layout = cartesian.get_layout();
