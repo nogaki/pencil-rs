@@ -7,9 +7,11 @@ mod axis;
 mod checked;
 mod decomposition;
 mod error;
+mod pencil;
 mod topology;
 
 pub use axis::{AxisPermutation, SpatialAxis};
 pub use decomposition::Decomposition;
-pub use error::{AxisError, GeometryError, TopologyError};
+pub use error::{AxisError, GeometryError, PencilError, TopologyError};
+pub use pencil::Pencil;
 pub use topology::MpiTopology;
