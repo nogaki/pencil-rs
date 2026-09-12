@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -39,20 +43,15 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run library tests
-        id: library-tests
-        continue-on-error: true
         run: cargo test -p pencil-array --lib
 
+      - name: Run one-rank topology tests
+        run: mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test topology -- --nocapture --test-threads=1
+
       - name: Run four-rank topology tests
-        id: topology-tests
-        if: steps.library-tests.outcome == 'success'
-        continue-on-error: true
         run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test topology -- --nocapture --test-threads=1
 
       - name: Run Clippy
-        id: clippy
-        if: steps.library-tests.outcome == 'success' && steps.topology-tests.outcome == 'success'
-        continue-on-error: true
         run: cargo clippy -p pencil-array --all-targets -- -D warnings
 
       - name: Save Cargo build data
@@ -64,15 +63,3 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
-
-      - name: Propagate library test failure
-        if: steps.library-tests.outcome == 'failure'
-        run: exit 1
-
-      - name: Propagate topology test failure
-        if: steps.topology-tests.outcome == 'failure'
-        run: exit 1
-
-      - name: Propagate Clippy failure
-        if: steps.clippy.outcome == 'failure'
-        run: exit 1
