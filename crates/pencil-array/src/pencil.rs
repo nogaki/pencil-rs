@@ -152,10 +152,7 @@ impl<const N: usize, const M: usize> Pencil<N, M> {
     }
 
     /// Computes logical ranges for arbitrary valid Cartesian process coordinates.
-    pub fn ranges_at(
-        &self,
-        process_coords: [usize; M],
-    ) -> Result<[Range<usize>; N], PencilError> {
+    pub fn ranges_at(&self, process_coords: [usize; M]) -> Result<[Range<usize>; N], PencilError> {
         let decomposition = Decomposition::<N, M>::new(std::array::from_fn(|axis| {
             self.decomposition[axis].index()
         }))
@@ -169,10 +166,7 @@ impl<const N: usize, const M: usize> Pencil<N, M> {
     }
 
     /// Derives a pencil with a different ordered decomposition.
-    pub fn with_decomposition(
-        &self,
-        decomposition: [usize; M],
-    ) -> Result<Arc<Self>, PencilError> {
+    pub fn with_decomposition(&self, decomposition: [usize; M]) -> Result<Arc<Self>, PencilError> {
         self.reconfigured(PencilConfig {
             global_shape: self.global_shape,
             decomposition,
@@ -193,10 +187,7 @@ impl<const N: usize, const M: usize> Pencil<N, M> {
     }
 
     /// Derives a pencil with a different global spatial shape.
-    pub fn with_global_shape(
-        &self,
-        global_shape: [usize; N],
-    ) -> Result<Arc<Self>, PencilError> {
+    pub fn with_global_shape(&self, global_shape: [usize; N]) -> Result<Arc<Self>, PencilError> {
         self.reconfigured(PencilConfig {
             global_shape,
             decomposition: std::array::from_fn(|axis| self.decomposition[axis].index()),
@@ -205,10 +196,7 @@ impl<const N: usize, const M: usize> Pencil<N, M> {
     }
 
     /// Derives a pencil by replacing all configurable layout values at once.
-    pub fn reconfigured(
-        &self,
-        config: PencilConfig<N, M>,
-    ) -> Result<Arc<Self>, PencilError> {
+    pub fn reconfigured(&self, config: PencilConfig<N, M>) -> Result<Arc<Self>, PencilError> {
         Self::new_permuted(
             Arc::clone(&self.topology),
             config.global_shape,
