@@ -89,9 +89,7 @@ pub enum TopologyError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PencilError {
-    #[error(
-        "topology dimension M={topology} must satisfy 1 <= M <= spatial dimension N={spatial}"
-    )]
+    #[error("topology dimension M={topology} must satisfy 1 <= M <= spatial dimension N={spatial}")]
     InvalidDimensionRelation { spatial: usize, topology: usize },
 
     #[error("global extent on spatial axis {axis} must be positive")]
