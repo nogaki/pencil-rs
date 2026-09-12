@@ -58,7 +58,9 @@ fn immutable_pencils_define_and_derive_row_major_layouts() {
     assert!(default.same_topology(&decomposition_changed));
     assert_eq!(decomposition_changed.global_shape(), &global_shape);
     assert_eq!(
-        decomposition_changed.decomposition().map(SpatialAxis::index),
+        decomposition_changed
+            .decomposition()
+            .map(SpatialAxis::index),
         [0, 2]
     );
 
@@ -74,10 +76,7 @@ fn immutable_pencils_define_and_derive_row_major_layouts() {
     let reshaped = default.with_global_shape([12, 16, 8]).unwrap();
     assert!(default.same_topology(&reshaped));
     assert_eq!(reshaped.global_shape(), &[12, 16, 8]);
-    assert_eq!(
-        reshaped.decomposition().map(SpatialAxis::index),
-        [0, 1]
-    );
+    assert_eq!(reshaped.decomposition().map(SpatialAxis::index), [0, 1]);
     assert_eq!(
         reshaped.permutation().axes().map(SpatialAxis::index),
         [0, 1, 2]
@@ -99,23 +98,13 @@ fn immutable_pencils_define_and_derive_row_major_layouts() {
         })
         .unwrap();
     assert_eq!(reconfigured.global_shape(), &[12, 16, 8]);
-    assert_eq!(
-        reconfigured.decomposition().map(SpatialAxis::index),
-        [0, 2]
-    );
+    assert_eq!(reconfigured.decomposition().map(SpatialAxis::index), [0, 2]);
     assert_eq!(reconfigured.permutation(), &permutation);
 
-    let fully_decomposed =
-        Pencil::<2, 2>::new(Arc::clone(&topology), [1, 1], [0, 1]).unwrap();
+    let fully_decomposed = Pencil::<2, 2>::new(Arc::clone(&topology), [1, 1], [0, 1]).unwrap();
     let expected_fully_decomposed = [expected_range(1, c0, 2), expected_range(1, c1, 2)];
-    let expected_local_len = expected_fully_decomposed
-        .iter()
-        .map(Range::len)
-        .product();
-    assert_eq!(
-        fully_decomposed.local_ranges(),
-        &expected_fully_decomposed
-    );
+    let expected_local_len = expected_fully_decomposed.iter().map(Range::len).product();
+    assert_eq!(fully_decomposed.local_ranges(), &expected_fully_decomposed);
     assert_eq!(fully_decomposed.local_len(), expected_local_len);
 
     assert_eq!(
@@ -134,12 +123,7 @@ fn immutable_pencils_define_and_derive_row_major_layouts() {
         })
     );
     assert_eq!(
-        Pencil::<3, 2>::new(
-            Arc::clone(&topology),
-            [usize::MAX, 2, 1],
-            [0, 1],
-        )
-        .unwrap_err(),
+        Pencil::<3, 2>::new(Arc::clone(&topology), [usize::MAX, 2, 1], [0, 1],).unwrap_err(),
         PencilError::SizeOverflow
     );
 
