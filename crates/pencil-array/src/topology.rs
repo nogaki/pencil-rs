@@ -62,11 +62,12 @@ impl<const M: usize> MpiTopology<M> {
                 .map_err(|_| TopologyError::Geometry(GeometryError::CountOverflow))?;
         }
 
-        Ok(Arc::new(Self {
+        Ok(Self {
             cartesian,
             process_grid,
             local_coords,
-        }))
+        }
+        .into_shared())
     }
 
     /// Returns the Cartesian process-grid extents.
@@ -109,6 +110,15 @@ impl<const M: usize> MpiTopology<M> {
         // SAFETY: `mpi_coords` has exactly M entries, matching the communicator
         // dimensionality, and every coordinate was checked against its extent.
         Ok(unsafe { self.cartesian.coordinates_to_rank_unchecked(&mpi_coords) })
+    }
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn into_shared(self) -> Arc<Self> {
+        // rsmpi communicators are intentionally !Send and !Sync unless an MPI
+        // threading contract is established. Arc is used here only for shared
+        // ownership across arrays and plans; it does not make this value
+        // transferable between threads.
+        Arc::new(self)
     }
 }
 
