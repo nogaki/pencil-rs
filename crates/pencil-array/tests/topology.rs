@@ -37,10 +37,7 @@ fn cartesian_topology_owns_and_maps_mpi_resources() {
     );
 
     for (axis, expected_size) in process_grid.into_iter().enumerate() {
-        assert_eq!(
-            topology.subcommunicator_size(axis).unwrap(),
-            expected_size
-        );
+        assert_eq!(topology.subcommunicator_size(axis).unwrap(), expected_size);
     }
 
     let automatic = MpiTopology::<1>::auto(&world).unwrap();
