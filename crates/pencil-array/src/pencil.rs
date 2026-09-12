@@ -57,8 +57,8 @@ impl<const N: usize, const M: usize> Pencil<N, M> {
             }
         }
 
-        let decomposition = Decomposition::<N, M>::new(decomposition)
-            .map_err(PencilError::InvalidDecomposition)?;
+        let decomposition =
+            Decomposition::<N, M>::new(decomposition).map_err(PencilError::InvalidDecomposition)?;
         let local_ranges = ranges_for(
             &topology,
             global_shape,
@@ -118,12 +118,9 @@ fn ranges_for<const N: usize, const M: usize>(
     let mut ranges = std::array::from_fn(|_| 0..0);
 
     for axis in 0..N {
-        ranges[axis] = local_data_range(
-            process_coords[axis],
-            process_grid[axis],
-            global_shape[axis],
-        )
-        .map_err(map_geometry_error)?;
+        ranges[axis] =
+            local_data_range(process_coords[axis], process_grid[axis], global_shape[axis])
+                .map_err(map_geometry_error)?;
     }
 
     Ok(ranges)
