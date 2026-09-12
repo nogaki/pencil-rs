@@ -7,7 +7,9 @@ mod axis;
 mod checked;
 mod decomposition;
 mod error;
+mod topology;
 
 pub use axis::{AxisPermutation, SpatialAxis};
 pub use decomposition::Decomposition;
-pub use error::{AxisError, GeometryError};
+pub use error::{AxisError, GeometryError, TopologyError};
+pub use topology::MpiTopology;
