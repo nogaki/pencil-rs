@@ -51,6 +51,9 @@ jobs:
       - name: Run four-rank topology tests
         run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test topology -- --nocapture --test-threads=1
 
+      - name: Run four-rank pencil tests
+        run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test pencil -- --nocapture --test-threads=1
+
       - name: Run Clippy
         run: cargo clippy -p pencil-array --all-targets -- -D warnings
 
