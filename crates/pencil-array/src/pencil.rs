@@ -81,6 +81,11 @@ impl<const N: usize, const M: usize> Pencil<N, M> {
         &self.decomposition
     }
 
+    /// Returns the logical-to-memory spatial-axis permutation.
+    pub fn permutation(&self) -> &AxisPermutation<N> {
+        &self.permutation
+    }
+
     /// Returns the calling rank's zero-based half-open logical ranges.
     pub fn local_ranges(&self) -> &[Range<usize>; N] {
         &self.local_ranges
