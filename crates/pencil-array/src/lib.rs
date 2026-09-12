@@ -13,5 +13,5 @@ mod topology;
 pub use axis::{AxisPermutation, SpatialAxis};
 pub use decomposition::Decomposition;
 pub use error::{AxisError, GeometryError, PencilError, TopologyError};
-pub use pencil::Pencil;
+pub use pencil::{Pencil, PencilConfig};
 pub use topology::MpiTopology;
