@@ -2,7 +2,8 @@ use std::{ops::Range, sync::Arc};
 
 use crate::{
     AxisPermutation, Decomposition, GeometryError, MpiTopology, PencilError, SpatialAxis,
-    checked::checked_product, decomposition::local_data_range,
+    checked::checked_product,
+    geometry::{local_ranges_for, shape_from_ranges},
 };
 
 /// Configuration values used to derive a new [`Pencil`] from an existing one.
@@ -88,7 +89,7 @@ impl<const N: usize, const M: usize> Pencil<N, M> {
             &decomposition,
             *topology.local_coords(),
         )?;
-        let local_shape_logical = std::array::from_fn(|axis| local_ranges[axis].len());
+        let local_shape_logical = shape_from_ranges(&local_ranges);
         let local_shape_memory = permutation.permute(local_shape_logical);
         let local_len = checked_product(&local_shape_logical).map_err(map_geometry_error)?;
 
@@ -237,17 +238,13 @@ fn ranges_for<const N: usize, const M: usize>(
     process_coords: [usize; M],
 ) -> Result<[Range<usize>; N], PencilError> {
     topology.rank_at(process_coords)?;
-    let process_grid = decomposition.complete_process_grid(*topology.process_grid());
-    let process_coords = decomposition.complete_process_coords(process_coords);
-    let mut ranges = std::array::from_fn(|_| 0..0);
-
-    for axis in 0..N {
-        ranges[axis] =
-            local_data_range(process_coords[axis], process_grid[axis], global_shape[axis])
-                .map_err(map_geometry_error)?;
-    }
-
-    Ok(ranges)
+    local_ranges_for(
+        global_shape,
+        *topology.process_grid(),
+        process_coords,
+        *decomposition.axes(),
+    )
+    .map_err(map_geometry_error)
 }
 
 fn map_geometry_error(error: GeometryError) -> PencilError {

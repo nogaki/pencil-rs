@@ -66,8 +66,22 @@ impl<const N: usize> AxisPermutation<N> {
         &self.axes_in_memory_order
     }
 
-    pub fn position_of(&self, axis: SpatialAxis) -> usize {
-        self.logical_to_memory[axis.index()]
+    /// Returns the memory position of a logical axis.
+    ///
+    /// Axes validated for another dimension are checked against this permutation.
+    pub fn inverse_position(&self, axis: SpatialAxis) -> Result<usize, AxisError> {
+        self.logical_to_memory
+            .get(axis.index())
+            .copied()
+            .ok_or(AxisError::OutOfBounds {
+                axis: axis.index(),
+                dimensions: N,
+            })
+    }
+
+    /// Returns the memory position of a logical axis, as [`Self::inverse_position`] does.
+    pub fn position_of(&self, axis: SpatialAxis) -> Result<usize, AxisError> {
+        self.inverse_position(axis)
     }
 
     pub fn permute<T: Copy>(&self, logical: [T; N]) -> [T; N] {
@@ -128,20 +142,58 @@ mod tests {
     }
 
     #[test]
+    fn inverse_lookup_rejects_axis_from_larger_dimension() {
+        let permutation = AxisPermutation::<3>::identity();
+        let axis = SpatialAxis::new::<4>(3).unwrap();
+        let expected = Err(AxisError::OutOfBounds {
+            axis: 3,
+            dimensions: 3,
+        });
+
+        assert_eq!(permutation.position_of(axis), expected);
+        assert_eq!(permutation.inverse_position(axis), expected);
+    }
+
+    #[test]
+    fn inverse_lookup_rejects_axis_for_zero_dimensions() {
+        let permutation = AxisPermutation::<0>::identity();
+        let axis = SpatialAxis::new::<1>(0).unwrap();
+        let expected = Err(AxisError::OutOfBounds {
+            axis: 0,
+            dimensions: 0,
+        });
+
+        assert_eq!(permutation.position_of(axis), expected);
+        assert_eq!(permutation.inverse_position(axis), expected);
+    }
+
+    #[test]
     fn position_of_returns_memory_position() {
         let permutation = AxisPermutation::<3>::new([2, 0, 1]).unwrap();
         assert_eq!(
             permutation.position_of(SpatialAxis::new::<3>(0).unwrap()),
-            1,
+            Ok(1),
         );
         assert_eq!(
             permutation.position_of(SpatialAxis::new::<3>(1).unwrap()),
-            2,
+            Ok(2),
         );
         assert_eq!(
             permutation.position_of(SpatialAxis::new::<3>(2).unwrap()),
-            0,
+            Ok(0),
         );
+    }
+
+    #[test]
+    fn inverse_position_returns_memory_position() {
+        let permutation = AxisPermutation::<3>::new([2, 0, 1]).unwrap();
+
+        for (logical_axis, memory_position) in [(0, 1), (1, 2), (2, 0)] {
+            assert_eq!(
+                permutation.inverse_position(SpatialAxis::new::<4>(logical_axis).unwrap()),
+                Ok(memory_position),
+            );
+        }
     }
 
     #[test]

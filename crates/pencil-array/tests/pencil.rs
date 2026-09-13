@@ -13,9 +13,12 @@ fn expected_range(global_len: usize, coordinate: usize, process_count: usize) ->
 fn immutable_pencils_define_and_derive_row_major_layouts() {
     let universe = mpi::initialize().expect("MPI initialization failed");
     let world = universe.world();
-    assert_eq!(world.size(), 4, "run this test with mpiexec -n 4");
-
-    let topology = MpiTopology::<2>::new(&world, [2, 2]).unwrap();
+    let grid = match world.size() {
+        1 => [1, 1],
+        4 => [2, 2],
+        other => panic!("run this test with mpiexec -n 1 or -n 4, got {other}"),
+    };
+    let topology = MpiTopology::<2>::new(&world, grid).unwrap();
     let global_shape = [10, 14, 6];
     let [c0, c1] = *topology.local_coords();
 
@@ -29,11 +32,15 @@ fn immutable_pencils_define_and_derive_row_major_layouts() {
     );
     assert_eq!(
         default.local_ranges(),
-        &[expected_range(10, c0, 2), expected_range(14, c1, 2), 0..6,]
+        &[
+            expected_range(10, c0, grid[0]),
+            expected_range(14, c1, grid[1]),
+            0..6,
+        ]
     );
     let logical_shape = [
-        expected_range(10, c0, 2).len(),
-        expected_range(14, c1, 2).len(),
+        expected_range(10, c0, grid[0]).len(),
+        expected_range(14, c1, grid[1]).len(),
         6,
     ];
     assert_eq!(default.local_shape_logical(), logical_shape);
@@ -41,14 +48,22 @@ fn immutable_pencils_define_and_derive_row_major_layouts() {
     assert_eq!(default.local_len(), logical_shape.into_iter().product());
     assert_eq!(default.global_len(), 10 * 14 * 6);
     assert_eq!(
-        default.ranges_at([1, 0]).unwrap(),
-        [expected_range(10, 1, 2), expected_range(14, 0, 2), 0..6,]
+        default.ranges_at([grid[0] - 1, 0]).unwrap(),
+        [
+            expected_range(10, grid[0] - 1, grid[0]),
+            expected_range(14, 0, grid[1]),
+            0..6,
+        ]
     );
 
     let swapped = Pencil::<3, 2>::new(Arc::clone(&topology), global_shape, [1, 0]).unwrap();
     assert_eq!(
         swapped.local_ranges(),
-        &[expected_range(10, c1, 2), expected_range(14, c0, 2), 0..6,]
+        &[
+            expected_range(10, c1, grid[1]),
+            expected_range(14, c0, grid[0]),
+            0..6,
+        ]
     );
     assert!(default.same_topology(&swapped));
     assert!(!default.same_distribution(&swapped));
@@ -102,7 +117,10 @@ fn immutable_pencils_define_and_derive_row_major_layouts() {
     assert_eq!(reconfigured.permutation(), &permutation);
 
     let fully_decomposed = Pencil::<2, 2>::new(Arc::clone(&topology), [1, 1], [0, 1]).unwrap();
-    let expected_fully_decomposed = [expected_range(1, c0, 2), expected_range(1, c1, 2)];
+    let expected_fully_decomposed = [
+        expected_range(1, c0, grid[0]),
+        expected_range(1, c1, grid[1]),
+    ];
     let expected_local_len = expected_fully_decomposed.iter().map(Range::len).product();
     assert_eq!(fully_decomposed.local_ranges(), &expected_fully_decomposed);
     assert_eq!(fully_decomposed.local_len(), expected_local_len);
@@ -127,7 +145,33 @@ fn immutable_pencils_define_and_derive_row_major_layouts() {
         PencilError::SizeOverflow
     );
 
-    let topology_3d = MpiTopology::<3>::new(&world, [2, 2, 1]).unwrap();
+    // Pencil contains metadata only: this checks usize::MAX without allocating data.
+    let maximal = Pencil::<2, 2>::new(Arc::clone(&topology), [usize::MAX, 1], [0, 1]).unwrap();
+    let first_axis = if grid[0] == 1 {
+        0..usize::MAX
+    } else if c0 == 0 {
+        0..usize::MAX / 2
+    } else {
+        usize::MAX / 2..usize::MAX
+    };
+    assert_eq!(maximal.global_len(), usize::MAX);
+    assert_eq!(
+        maximal.local_ranges(),
+        &[first_axis, expected_range(1, c1, grid[1])]
+    );
+    assert_eq!(
+        maximal.ranges_at([grid[0] - 1, grid[1] - 1]).unwrap(),
+        [
+            if grid[0] == 1 {
+                0..usize::MAX
+            } else {
+                usize::MAX / 2..usize::MAX
+            },
+            0..1
+        ],
+    );
+
+    let topology_3d = MpiTopology::<3>::new(&world, [grid[0], grid[1], 1]).unwrap();
     assert_eq!(
         Pencil::<2, 3>::new(topology_3d, [8, 8], [0, 1, 0]).unwrap_err(),
         PencilError::InvalidDimensionRelation {

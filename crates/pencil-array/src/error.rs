@@ -25,6 +25,15 @@ pub enum GeometryError {
     #[error("value does not fit MPI Count (i32)")]
     CountOverflow,
 
+    #[error("partition count must be positive")]
+    ZeroPartitions,
+
+    #[error("shape rank {shape_rank} does not equal index rank {index_rank}")]
+    RankMismatch {
+        shape_rank: usize,
+        index_rank: usize,
+    },
+
     #[error("process grid extent is zero on topology axis {axis}")]
     ZeroProcessExtent { axis: usize },
 
@@ -45,6 +54,18 @@ pub enum GeometryError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TopologyError {
+    #[error("Cartesian topology requires an intracommunicator")]
+    InterCommunicatorUnsupported,
+
+    #[error("topology dimension counts differ between communicator ranks")]
+    InconsistentDimensions,
+
+    #[error("process grids differ between communicator ranks")]
+    InconsistentProcessGrid,
+
+    #[error("another communicator rank failed topology validation")]
+    CollectivePreconditionFailed,
+
     #[error("topology dimension count must be positive")]
     ZeroDimensions,
 

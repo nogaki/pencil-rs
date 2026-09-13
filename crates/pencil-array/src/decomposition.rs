@@ -1,6 +1,8 @@
 use std::ops::Range;
 
-use crate::{AxisError, GeometryError, SpatialAxis, checked::checked_product};
+use crate::{
+    AxisError, GeometryError, SpatialAxis, checked::checked_product, geometry::local_ranges_for,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decomposition<const N: usize, const M: usize> {
@@ -54,29 +56,6 @@ impl<const N: usize, const M: usize> Decomposition<N, M> {
     }
 }
 
-pub(crate) fn local_data_range(
-    coordinate: usize,
-    process_count: usize,
-    global_len: usize,
-) -> Result<Range<usize>, GeometryError> {
-    debug_assert!(process_count > 0);
-    debug_assert!(coordinate < process_count);
-
-    let start = global_len
-        .checked_mul(coordinate)
-        .ok_or(GeometryError::SizeOverflow)?
-        / process_count;
-    let next_coordinate = coordinate
-        .checked_add(1)
-        .ok_or(GeometryError::SizeOverflow)?;
-    let end = global_len
-        .checked_mul(next_coordinate)
-        .ok_or(GeometryError::SizeOverflow)?
-        / process_count;
-
-    Ok(start..end)
-}
-
 pub(crate) fn complete_dims<const N: usize, const M: usize>(
     axes: [usize; M],
     values: [usize; M],
@@ -88,8 +67,7 @@ pub(crate) fn complete_dims<const N: usize, const M: usize>(
     completed
 }
 
-// Pencil construction uses this in the next task. Keeping it crate-visible
-// lets the geometry tests exercise the exact production implementation.
+// Retained for all-rank geometry consumers; Pencil only needs its local range.
 #[allow(dead_code)]
 pub(crate) fn generate_axes<const N: usize, const M: usize>(
     decomposition: &Decomposition<N, M>,
@@ -103,7 +81,6 @@ pub(crate) fn generate_axes<const N: usize, const M: usize>(
     }
 
     let region_count = checked_product(&process_grid)?;
-    let completed_grid = decomposition.complete_process_grid(process_grid);
     let mut regions = Vec::with_capacity(region_count);
 
     for flat_index in 0..region_count {
@@ -114,16 +91,12 @@ pub(crate) fn generate_axes<const N: usize, const M: usize>(
             remainder /= process_grid[axis];
         }
 
-        let completed_coords = decomposition.complete_process_coords(process_coords);
-        let mut region = std::array::from_fn(|_| 0..0);
-        for (axis, range) in region.iter_mut().enumerate() {
-            *range = local_data_range(
-                completed_coords[axis],
-                completed_grid[axis],
-                global_shape[axis],
-            )?;
-        }
-        regions.push(region);
+        regions.push(local_ranges_for(
+            global_shape,
+            process_grid,
+            process_coords,
+            *decomposition.axes(),
+        )?);
     }
 
     Ok(regions)
@@ -132,20 +105,21 @@ pub(crate) fn generate_axes<const N: usize, const M: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition_range;
     use proptest::prelude::*;
 
     #[test]
     fn local_ranges_follow_floor_partitioning() {
-        assert_eq!(local_data_range(0, 3, 10).unwrap(), 0..3);
-        assert_eq!(local_data_range(1, 3, 10).unwrap(), 3..6);
-        assert_eq!(local_data_range(2, 3, 10).unwrap(), 6..10);
+        assert_eq!(partition_range(10, 3, 0).unwrap(), 0..3);
+        assert_eq!(partition_range(10, 3, 1).unwrap(), 3..6);
+        assert_eq!(partition_range(10, 3, 2).unwrap(), 6..10);
     }
 
     #[test]
-    fn local_range_reports_multiplication_overflow() {
+    fn local_range_accepts_representable_boundaries_despite_large_intermediate_product() {
         assert_eq!(
-            local_data_range(1, 2, usize::MAX),
-            Err(GeometryError::SizeOverflow),
+            partition_range(usize::MAX, 2, 1),
+            Ok(usize::MAX / 2..usize::MAX),
         );
     }
 
@@ -232,7 +206,7 @@ mod tests {
             process_count in 1usize..32,
         ) {
             let ranges = (0..process_count)
-                .map(|coordinate| local_data_range(coordinate, process_count, global_len).unwrap())
+                .map(|coordinate| partition_range(global_len, process_count, coordinate).unwrap())
                 .collect::<Vec<Range<usize>>>();
 
             prop_assert_eq!(ranges.first().unwrap().start, 0);
