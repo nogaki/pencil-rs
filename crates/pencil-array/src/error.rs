@@ -53,6 +53,33 @@ pub enum GeometryError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ShapeError {
+    #[error("extra shape element count overflowed usize")]
+    SizeOverflow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ArrayError {
+    #[error("storage length {actual} does not equal required length {required}")]
+    StorageLengthMismatch { required: usize, actual: usize },
+
+    #[error("extra index rank {actual} does not equal required rank {required}")]
+    ExtraIndexRankMismatch { required: usize, actual: usize },
+
+    #[error("array layouts are incompatible")]
+    IncompatiblePencils,
+
+    #[error("active layout index {index} is outside 0..{layout_count}")]
+    InvalidActiveLayout { index: usize, layout_count: usize },
+
+    #[error("array data is poisoned by an incomplete in-place operation")]
+    Poisoned,
+
+    #[error(transparent)]
+    Geometry(#[from] GeometryError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TopologyError {
     #[error("Cartesian topology requires an intracommunicator")]
     InterCommunicatorUnsupported,

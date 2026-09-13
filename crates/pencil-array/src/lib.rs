@@ -7,13 +7,17 @@ mod axis;
 mod checked;
 mod decomposition;
 mod error;
+mod extra_shape;
 mod geometry;
 mod pencil;
 mod topology;
+mod view;
 
 pub use axis::{AxisPermutation, SpatialAxis};
 pub use decomposition::Decomposition;
-pub use error::{AxisError, GeometryError, PencilError, TopologyError};
+pub use error::{ArrayError, AxisError, GeometryError, PencilError, ShapeError, TopologyError};
+pub use extra_shape::ExtraShape;
 pub use geometry::partition_range;
 pub use pencil::{Pencil, PencilConfig};
 pub use topology::MpiTopology;
+pub use view::{PencilArrayView, PencilArrayViewMut};
