@@ -11,4 +11,3 @@ thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-trybuild.workspace = true

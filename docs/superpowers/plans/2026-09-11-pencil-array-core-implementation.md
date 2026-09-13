@@ -6,7 +6,7 @@
 
 **Architecture:** The crate separates pure geometry from MPI-owned topology. `MpiTopology<M>` owns Cartesian and one-axis subcommunicators; immutable `Pencil<N, M>` values share it through `Arc`. `PencilArray` owns one local `Vec<T>`, while `ManyPencilArray` owns one maximum-sized local buffer plus a checked active-layout state and creates temporary borrowed views.
 
-**Tech Stack:** Rust 2024 edition; MSRV 1.85; `mpi = 0.8.2`; `thiserror = 2`; `proptest = 1`; `trybuild = 1`; Open MPI or MPICH for integration tests.
+**Tech Stack:** Rust 2024 edition; MSRV 1.85; `mpi = 0.8.2`; `thiserror = 2`; `proptest = 1`; Rustdoc compile-fail tests; Open MPI or MPICH for integration tests.
 
 **Spec:** `docs/superpowers/specs/2026-09-11-pencil-arrays-rust-port-design.md`
 
@@ -37,7 +37,7 @@ LICENSE                                 MIT licence for this implementation
 NOTICE.md                               Upstream PencilArrays/PencilFFTs attribution
 README.md                               Workspace purpose and build prerequisites
 crates/pencil-array/Cargo.toml          Core crate manifest
-crates/pencil-array/src/lib.rs          Public module/re-export boundary
+crates/pencil-array/src/lib.rs          Public module/re-export boundary and compile-fail doctests
 crates/pencil-array/src/error.rs        Core error types
 crates/pencil-array/src/checked.rs      Checked products and integer conversions
 crates/pencil-array/src/axis.rs         SpatialAxis and AxisPermutation
@@ -50,8 +50,6 @@ crates/pencil-array/src/array.rs        Owning PencilArray
 crates/pencil-array/src/many.rs         ManyPencilArray, layout state, overwrite transaction
 crates/pencil-array/tests/topology.rs   Multi-rank topology integration tests
 crates/pencil-array/tests/pencil.rs     Multi-rank Pencil integration tests
-crates/pencil-array/tests/ui.rs         Compile-fail API tests
-crates/pencil-array/tests/ui/*.rs       Borrowing and visibility compile-fail cases
 ```
 
 ---
@@ -88,7 +86,6 @@ license = "MIT"
 mpi = "0.8.2"
 thiserror = "2"
 proptest = "1"
-trybuild = "1"
 ```
 
 Do not add a `repository` field until the actual hosting URL is known.
@@ -118,7 +115,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-trybuild.workspace = true
 ```
 
 - [ ] **Step 4: Create the initial library root**
@@ -1230,9 +1226,6 @@ git commit -m "feat: add shared-storage pencil arrays"
 ### Task 10: Lock down the public API and write crate-level documentation
 
 **Files:**
-- Create: `crates/pencil-array/tests/ui.rs`
-- Create: `crates/pencil-array/tests/ui/no_arbitrary_many_view.rs`
-- Create: `crates/pencil-array/tests/ui/no_active_layout_setter.rs`
 - Modify: `crates/pencil-array/src/lib.rs`
 - Modify: `crates/pencil-array/src/*.rs`
 - Modify: `README.md`
@@ -1255,32 +1248,25 @@ Memory order is [extra..., permuted spatial...] in row-major storage.
 
 Include a one-rank example that constructs a topology, pencil, extra shape, and array.
 
-- [ ] **Step 2: Add compile-fail tests for forbidden APIs**
+- [ ] **Step 2: Add compile-fail doctests for forbidden APIs**
 
-`tests/ui/no_arbitrary_many_view.rs` must attempt:
+Add these examples to the crate-level documentation in `lib.rs`:
 
 ```rust,compile_fail
+# use pencil_array::ManyPencilArray;
+# fn no_arbitrary_many_view(many: &ManyPencilArray<u32, 3, 2>) {
 let _ = many.view_at(1);
+# }
 ```
-
-`tests/ui/no_active_layout_setter.rs` must attempt:
 
 ```rust,compile_fail
+# use pencil_array::ManyPencilArray;
+# fn no_active_layout_setter(many: &mut ManyPencilArray<u32, 3, 2>) {
 many.set_active_layout(1);
+# }
 ```
 
-Drive both with `trybuild`:
-
-```rust
-#[test]
-fn forbidden_many_array_state_mutations_do_not_compile() {
-    let cases = trybuild::TestCases::new();
-    cases.compile_fail("tests/ui/no_arbitrary_many_view.rs");
-    cases.compile_fail("tests/ui/no_active_layout_setter.rs");
-}
-```
-
-Commit the generated `.stderr` snapshots after inspecting that they fail because the methods do not exist or are private.
+Run `cargo test -p pencil-array --doc -- --show-output` and inspect that each example fails because the method does not exist or is private, not because its setup is invalid. No separate harness or diagnostic snapshots are needed.
 
 - [ ] **Step 3: Audit visibility**
 
@@ -1307,7 +1293,7 @@ local indexing implementation helpers
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --lib
-cargo test -p pencil-array --test ui
+cargo test -p pencil-array --doc
 mpiexec -n 1 cargo test -p pencil-array --test topology -- --nocapture
 mpiexec -n 4 cargo test -p pencil-array --test topology -- --nocapture
 mpiexec -n 1 cargo test -p pencil-array --test pencil -- --nocapture
