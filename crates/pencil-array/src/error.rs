@@ -63,6 +63,9 @@ pub enum ArrayError {
     #[error("storage length {actual} does not equal required length {required}")]
     StorageLengthMismatch { required: usize, actual: usize },
 
+    #[error("failed to allocate storage for {required} elements")]
+    AllocationFailed { required: usize },
+
     #[error("extra index rank {actual} does not equal required rank {required}")]
     ExtraIndexRankMismatch { required: usize, actual: usize },
 

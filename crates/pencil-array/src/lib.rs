@@ -3,6 +3,7 @@
 
 //! MPI-distributed, row-major multidimensional array foundations.
 
+mod array;
 mod axis;
 mod checked;
 mod decomposition;
@@ -13,6 +14,7 @@ mod pencil;
 mod topology;
 mod view;
 
+pub use array::PencilArray;
 pub use axis::{AxisPermutation, SpatialAxis};
 pub use decomposition::Decomposition;
 pub use error::{ArrayError, AxisError, GeometryError, PencilError, ShapeError, TopologyError};

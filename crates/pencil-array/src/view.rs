@@ -61,8 +61,6 @@ pub struct PencilArrayView<'a, T, const N: usize, const M: usize> {
 }
 
 impl<'a, T, const N: usize, const M: usize> PencilArrayView<'a, T, N, M> {
-    // Used by the owning array introduced in the next implementation stage.
-    #[allow(dead_code)]
     pub(crate) fn new(
         pencil: &'a Pencil<N, M>,
         extra_shape: &'a ExtraShape,
@@ -140,8 +138,6 @@ pub struct PencilArrayViewMut<'a, T, const N: usize, const M: usize> {
 }
 
 impl<'a, T, const N: usize, const M: usize> PencilArrayViewMut<'a, T, N, M> {
-    // Used by the owning array introduced in the next implementation stage.
-    #[allow(dead_code)]
     pub(crate) fn new(
         pencil: &'a Pencil<N, M>,
         extra_shape: &'a ExtraShape,
@@ -226,8 +222,6 @@ impl<T, const N: usize, const M: usize> LocalArrayLayout<T, N, M>
     }
 }
 
-// Used through the view constructors once the owning array is introduced.
-#[allow(dead_code)]
 fn validate_storage_len<const N: usize, const M: usize>(
     pencil: &Pencil<N, M>,
     extra_shape: &ExtraShape,

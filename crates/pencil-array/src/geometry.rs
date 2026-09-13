@@ -62,8 +62,6 @@ pub(crate) fn shape_from_ranges<const N: usize>(ranges: &[Range<usize>; N]) -> [
     std::array::from_fn(|axis| ranges[axis].len())
 }
 
-// The array/view milestone will use this crate-private indexing primitive.
-#[allow(dead_code)]
 pub(crate) fn row_major_offset(shape: &[usize], indices: &[usize]) -> Result<usize, GeometryError> {
     if shape.len() != indices.len() {
         return Err(GeometryError::RankMismatch {

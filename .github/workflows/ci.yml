@@ -58,6 +58,12 @@ jobs:
       - name: Run one-rank pencil tests
         run: mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test pencil -- --nocapture --test-threads=1
 
+      - name: Run one-rank array tests
+        run: mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test array -- --nocapture --test-threads=1
+
+      - name: Run four-rank array tests
+        run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test array -- --nocapture --test-threads=1
+
       - name: Run Clippy
         run: cargo clippy -p pencil-array --all-targets -- -D warnings
 
