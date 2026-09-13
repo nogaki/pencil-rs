@@ -73,14 +73,14 @@ pub enum GeometryError {
         extent: usize,
     },
 
-    /// A local logical index was outside its array extent.
-    #[error("local index {index} is outside 0..{extent} on logical axis {axis}")]
+    /// A local index was outside its extent in the supplied shape.
+    #[error("local index {index} is outside 0..{extent} on axis {axis} of the supplied shape")]
     LocalIndexOutOfBounds {
-        /// The logical array axis being indexed.
+        /// The axis position in the supplied shape.
         axis: usize,
         /// The rejected local index.
         index: usize,
-        /// The local axis extent.
+        /// The corresponding extent in the supplied shape.
         extent: usize,
     },
 }
