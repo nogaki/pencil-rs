@@ -6,6 +6,9 @@ use mpi::topology::{CartesianCommunicator, Communicator, IntoTopology};
 use crate::{GeometryError, TopologyError, checked::checked_product};
 
 /// An owned Cartesian MPI topology and its one-dimensional axis communicators.
+///
+/// Constructors accept only intracommunicators and are collective. This value
+/// and every object sharing it must be dropped before MPI is finalized.
 pub struct MpiTopology<const M: usize> {
     cartesian: CartesianCommunicator,
     subcommunicators: Box<[CartesianCommunicator]>,
@@ -16,8 +19,9 @@ pub struct MpiTopology<const M: usize> {
 impl<const M: usize> MpiTopology<M> {
     /// Creates a non-periodic Cartesian topology with the requested process grid.
     ///
-    /// This is collective over `comm`. All ranks must call the same constructor
-    /// in the same order. Invalid or inconsistent inputs are rejected on every rank.
+    /// This is collective over the intracommunicator `comm`. All ranks must call
+    /// the same constructor in the same order. Invalid or inconsistent inputs are
+    /// rejected on every rank.
     pub fn new<C: Communicator>(
         comm: &C,
         process_grid: [usize; M],
@@ -70,7 +74,7 @@ impl<const M: usize> MpiTopology<M> {
 
     /// Creates a balanced non-periodic Cartesian topology using `MPI_Dims_create`.
     ///
-    /// This is collective over `comm`.
+    /// This is collective over the intracommunicator `comm`.
     pub fn auto<C: Communicator>(comm: &C) -> Result<Arc<Self>, TopologyError> {
         Self::validate_dimension_count(comm)?;
 
@@ -108,7 +112,7 @@ impl<const M: usize> MpiTopology<M> {
 
     /// Duplicates an existing Cartesian communicator and owns the duplicate.
     ///
-    /// This is collective over `comm`.
+    /// This is collective over the Cartesian intracommunicator `comm`.
     pub fn from_cartesian(comm: &CartesianCommunicator) -> Result<Arc<Self>, TopologyError> {
         Self::validate_dimension_count(comm)?;
         let duplicated = Self::collective_result(

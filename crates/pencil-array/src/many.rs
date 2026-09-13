@@ -7,10 +7,13 @@ use crate::{
 };
 
 #[derive(Debug, Error)]
+/// An error from a transactional [`ManyPencilArray::overwrite_with`] operation.
 pub enum OverwriteError<E> {
+    /// The target layout or array state was invalid.
     #[error(transparent)]
     Array(#[from] ArrayError),
 
+    /// The writer returned its own error after the array had been poisoned.
     #[error("overwrite closure failed")]
     Writer(E),
 }
@@ -22,6 +25,10 @@ pub(crate) enum LayoutState {
 }
 
 #[derive(Debug)]
+/// One local buffer registered for several compatible pencil layouts.
+///
+/// Only the active layout is observable. A layout changes only after a full,
+/// successful [`Self::overwrite_with`] operation.
 pub struct ManyPencilArray<T, const N: usize, const M: usize> {
     pencils: Box<[Arc<Pencil<N, M>>]>,
     extra_shape: ExtraShape,
@@ -30,6 +37,10 @@ pub struct ManyPencilArray<T, const N: usize, const M: usize> {
 }
 
 impl<T, const N: usize, const M: usize> ManyPencilArray<T, N, M> {
+    /// Takes ownership of a buffer sized for the largest registered local layout.
+    ///
+    /// The registry must be nonempty, contain distinct layouts with the same
+    /// topology and global shape, and contain `active`.
     pub fn from_vec(
         pencils: impl Into<Box<[Arc<Pencil<N, M>>]>>,
         active: usize,
@@ -53,6 +64,7 @@ impl<T, const N: usize, const M: usize> ManyPencilArray<T, N, M> {
         })
     }
 
+    /// Allocates the largest registered local layout and fills it with `value`.
     pub fn from_elem(
         pencils: impl Into<Box<[Arc<Pencil<N, M>>]>>,
         active: usize,
@@ -78,18 +90,22 @@ impl<T, const N: usize, const M: usize> ManyPencilArray<T, N, M> {
         })
     }
 
+    /// Returns every registered pencil in registration order.
     pub fn pencils(&self) -> &[Arc<Pencil<N, M>>] {
         &self.pencils
     }
 
+    /// Returns the active pencil, or [`ArrayError::Poisoned`] after an incomplete write.
     pub fn active_pencil(&self) -> Result<&Pencil<N, M>, ArrayError> {
         Ok(self.pencils[self.active_index()?].as_ref())
     }
 
+    /// Returns the extra shape shared by every registered layout.
     pub fn extra_shape(&self) -> &ExtraShape {
         &self.extra_shape
     }
 
+    /// Returns a read-only view of the active layout's buffer prefix.
     pub fn active_view(&self) -> Result<PencilArrayView<'_, T, N, M>, ArrayError> {
         let index = self.active_index()?;
         let used_len = self.layout_len(index)?;
@@ -100,6 +116,7 @@ impl<T, const N: usize, const M: usize> ManyPencilArray<T, N, M> {
         )
     }
 
+    /// Returns an exclusive view of the active layout's buffer prefix.
     pub fn active_view_mut(&mut self) -> Result<PencilArrayViewMut<'_, T, N, M>, ArrayError> {
         let index = self.active_index()?;
         let used_len = self.layout_len(index)?;
@@ -110,6 +127,17 @@ impl<T, const N: usize, const M: usize> ManyPencilArray<T, N, M> {
         )
     }
 
+    /// Replaces the complete target view and makes its registered layout active.
+    ///
+    /// `target` must match a registered layout. Before `write` runs, the array is
+    /// marked poisoned. The writer must assign meaningful values to **every**
+    /// element of the supplied target view before returning `Ok`. If it returns
+    /// `Err` or unwinds, active access remains poisoned because the buffer may be
+    /// only partly written. A later complete, successful overwrite is the recovery
+    /// path, including when the array was already poisoned.
+    ///
+    /// This operation only controls ownership and validity of the shared buffer;
+    /// it performs no data redistribution or transpose by itself.
     pub fn overwrite_with<F, E>(
         &mut self,
         target: &Pencil<N, M>,

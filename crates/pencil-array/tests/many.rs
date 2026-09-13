@@ -275,4 +275,65 @@ fn many_pencil_array_enforces_registry_views_and_transactions() {
             .iter()
             .all(|&x| x == 29)
     );
+
+    // One layout can have an empty local partition while another registered
+    // layout needs storage on the same rank. ManyPencilArray must expose only
+    // the active prefix, including the zero-length prefix.
+    let zero_base = Pencil::<3, 2>::new(Arc::clone(&topology), [1, 7, 5], [0, 1]).unwrap();
+    let positive_target = zero_base.with_decomposition([1, 2]).unwrap();
+    assert!(positive_target.local_len() > 0);
+    if world.size() == 4 {
+        assert_eq!(
+            zero_base.local_len() == 0,
+            topology.local_coords()[0] == 0,
+            "fixture must assign an empty base partition to one coordinate plane",
+        );
+    }
+
+    let mut zero_active = ManyPencilArray::from_elem(
+        vec![Arc::clone(&zero_base), Arc::clone(&positive_target)],
+        0,
+        ExtraShape::scalar(),
+        37u32,
+    )
+    .unwrap();
+    assert_eq!(
+        zero_active.active_view().unwrap().len(),
+        zero_base.local_len()
+    );
+    assert_eq!(
+        zero_active.active_view_mut().unwrap().is_empty(),
+        zero_base.local_len() == 0,
+    );
+    assert_eq!(zero_active.pencils().len(), 2);
+
+    zero_active
+        .overwrite_with(positive_target.as_ref(), |mut view| {
+            view.as_mut_slice().fill(41);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert_eq!(
+        zero_active.active_view().unwrap().len(),
+        positive_target.local_len(),
+    );
+    assert!(
+        zero_active
+            .active_view()
+            .unwrap()
+            .as_slice()
+            .iter()
+            .all(|&value| value == 41)
+    );
+
+    zero_active
+        .overwrite_with(zero_base.as_ref(), |mut view| {
+            view.as_mut_slice().fill(43);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert_eq!(
+        zero_active.active_view().unwrap().len(),
+        zero_base.local_len()
+    );
 }

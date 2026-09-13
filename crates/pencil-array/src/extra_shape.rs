@@ -1,12 +1,16 @@
 use crate::{ShapeError, checked::checked_product};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// The ordered, undistributed dimensions preceding an array's spatial dimensions.
 pub struct ExtraShape {
     dimensions: Box<[usize]>,
     element_count: usize,
 }
 
 impl ExtraShape {
+    /// Creates an extra shape and checks that its element count fits `usize`.
+    ///
+    /// Zero extents are allowed and make the element count zero.
     pub fn new(dimensions: impl Into<Box<[usize]>>) -> Result<Self, ShapeError> {
         let dimensions = dimensions.into();
         let element_count = checked_product(&dimensions).map_err(|_| ShapeError::SizeOverflow)?;
@@ -16,6 +20,7 @@ impl ExtraShape {
         })
     }
 
+    /// Creates a shape with zero extra dimensions and one element per spatial point.
     pub fn scalar() -> Self {
         Self {
             dimensions: Vec::new().into_boxed_slice(),
@@ -23,10 +28,12 @@ impl ExtraShape {
         }
     }
 
+    /// Returns the extra dimensions in logical and memory order.
     pub fn dimensions(&self) -> &[usize] {
         &self.dimensions
     }
 
+    /// Returns the product of the extra dimensions.
     pub fn element_count(&self) -> usize {
         self.element_count
     }

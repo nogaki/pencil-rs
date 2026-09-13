@@ -9,8 +9,11 @@ use crate::{
 /// Configuration values used to derive a new [`Pencil`] from an existing one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PencilConfig<const N: usize, const M: usize> {
+    /// The global spatial shape in logical-axis order.
     pub global_shape: [usize; N],
+    /// The distributed spatial axes in topology-axis order.
     pub decomposition: [usize; M],
+    /// The spatial axes in row-major memory order.
     pub permutation: AxisPermutation<N>,
 }
 

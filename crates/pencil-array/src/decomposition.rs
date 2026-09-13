@@ -5,11 +5,13 @@ use crate::{
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// An ordered mapping from topology axes to distributed spatial axes.
 pub struct Decomposition<const N: usize, const M: usize> {
     axes: [SpatialAxis; M],
 }
 
 impl<const N: usize, const M: usize> Decomposition<N, M> {
+    /// Validates an ordered set of `M` distinct spatial axes in `0..N`.
     pub fn new(axes: [usize; M]) -> Result<Self, AxisError> {
         if M == 0 || M > N {
             return Err(AxisError::InvalidDecompositionRank {
@@ -39,14 +41,21 @@ impl<const N: usize, const M: usize> Decomposition<N, M> {
         })
     }
 
+    /// Returns the distributed spatial axes in topology-axis order.
     pub fn axes(&self) -> &[SpatialAxis; M] {
         &self.axes
     }
 
+    /// Embeds topology-grid extents into all spatial dimensions.
+    ///
+    /// Undistributed spatial axes receive extent one.
     pub fn complete_process_grid(&self, process_grid: [usize; M]) -> [usize; N] {
         complete_dims(self.axes.map(SpatialAxis::index), process_grid)
     }
 
+    /// Embeds topology coordinates into all spatial dimensions.
+    ///
+    /// Undistributed spatial axes receive coordinate zero.
     pub fn complete_process_coords(&self, process_coords: [usize; M]) -> [usize; N] {
         let mut completed = [0; N];
         for (axis, coordinate) in self.axes.iter().copied().zip(process_coords) {

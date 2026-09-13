@@ -1,0 +1,5 @@
+error[E0599]: no method named `view_at` found for reference `&ManyPencilArray<T, 3, 2>` in the current scope
+ --> tests/ui/no_arbitrary_many_view.rs:4:18
+  |
+4 |     let _ = many.view_at(1);
+  |                  ^^^^^^^ method not found in `&ManyPencilArray<T, 3, 2>`

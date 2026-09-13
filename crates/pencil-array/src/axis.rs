@@ -1,9 +1,14 @@
 use crate::AxisError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// A validated zero-based spatial-axis index.
+///
+/// The dimension used by [`Self::new`] is not part of the value's type, so a
+/// consumer with a different dimension must validate the axis again.
 pub struct SpatialAxis(usize);
 
 impl SpatialAxis {
+    /// Validates `index` against the half-open range `0..N`.
     pub fn new<const N: usize>(index: usize) -> Result<Self, AxisError> {
         if index < N {
             Ok(Self(index))
@@ -15,18 +20,23 @@ impl SpatialAxis {
         }
     }
 
+    /// Returns the zero-based logical-axis index.
     pub const fn index(self) -> usize {
         self.0
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// A bijection from row-major memory positions to logical spatial axes.
 pub struct AxisPermutation<const N: usize> {
     axes_in_memory_order: [SpatialAxis; N],
     logical_to_memory: [usize; N],
 }
 
 impl<const N: usize> AxisPermutation<N> {
+    /// Creates a permutation from logical-axis indices in memory order.
+    ///
+    /// Duplicate indices and indices outside `0..N` are rejected.
     pub fn new(axes: [usize; N]) -> Result<Self, AxisError> {
         let mut seen = [false; N];
 
@@ -55,6 +65,7 @@ impl<const N: usize> AxisPermutation<N> {
         })
     }
 
+    /// Returns the identity permutation.
     pub fn identity() -> Self {
         Self {
             axes_in_memory_order: std::array::from_fn(SpatialAxis),
@@ -62,13 +73,15 @@ impl<const N: usize> AxisPermutation<N> {
         }
     }
 
+    /// Returns the logical spatial axes in memory order.
     pub fn axes(&self) -> &[SpatialAxis; N] {
         &self.axes_in_memory_order
     }
 
     /// Returns the memory position of a logical axis.
     ///
-    /// Axes validated for another dimension are checked against this permutation.
+    /// Axes validated for another dimension are checked against this permutation
+    /// and can return [`AxisError::OutOfBounds`].
     pub fn inverse_position(&self, axis: SpatialAxis) -> Result<usize, AxisError> {
         self.logical_to_memory
             .get(axis.index())
@@ -80,16 +93,21 @@ impl<const N: usize> AxisPermutation<N> {
     }
 
     /// Returns the memory position of a logical axis, as [`Self::inverse_position`] does.
+    ///
+    /// This returns a [`Result`] because a [`SpatialAxis`] validated for a
+    /// different `N` may be out of bounds here.
     pub fn position_of(&self, axis: SpatialAxis) -> Result<usize, AxisError> {
         self.inverse_position(axis)
     }
 
+    /// Reorders logical-axis values into memory-axis order.
     pub fn permute<T: Copy>(&self, logical: [T; N]) -> [T; N] {
         std::array::from_fn(|memory_position| {
             logical[self.axes_in_memory_order[memory_position].index()]
         })
     }
 
+    /// Reorders memory-axis values back into logical-axis order.
     pub fn unpermute<T: Copy>(&self, memory: [T; N]) -> [T; N] {
         std::array::from_fn(|logical_axis| memory[self.logical_to_memory[logical_axis]])
     }

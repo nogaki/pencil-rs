@@ -1,0 +1,12 @@
+error[E0624]: method `begin_in_place_write` is private
+ --> tests/ui/no_internal_layout_write.rs:4:18
+  |
+4 |       let _ = many.begin_in_place_write();
+  |                    ^^^^^^^^^^^^^^^^^^^^ private method
+  |
+ ::: src/many.rs
+  |
+  | /     pub(crate) fn begin_in_place_write(
+  | |         &mut self,
+  | |     ) -> Result<LayoutWriteGuard<'_, T, N, M>, ArrayError> {
+  | |__________________________________________________________- private method defined here

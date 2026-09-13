@@ -54,6 +54,7 @@ pub(crate) trait LocalArrayLayout<T, const N: usize, const M: usize> {
 }
 
 #[derive(Debug)]
+/// A read-only local array view borrowing its layout metadata and storage.
 pub struct PencilArrayView<'a, T, const N: usize, const M: usize> {
     pencil: &'a Pencil<N, M>,
     extra_shape: &'a ExtraShape,
@@ -74,42 +75,52 @@ impl<'a, T, const N: usize, const M: usize> PencilArrayView<'a, T, N, M> {
         })
     }
 
+    /// Returns the view's pencil layout.
     pub fn pencil(&self) -> &Pencil<N, M> {
         LocalArrayLayout::pencil(self)
     }
 
+    /// Returns the view's extra shape.
     pub fn extra_shape(&self) -> &ExtraShape {
         LocalArrayLayout::extra_shape(self)
     }
 
+    /// Returns the local spatial shape in logical-axis order.
     pub fn local_spatial_shape(&self) -> [usize; N] {
         LocalArrayLayout::local_spatial_shape(self)
     }
 
+    /// Returns the local spatial shape in memory-axis order.
     pub fn local_spatial_memory_shape(&self) -> [usize; N] {
         LocalArrayLayout::local_spatial_memory_shape(self)
     }
 
+    /// Returns `[extra..., spatial...]` in logical-axis order.
     pub fn logical_shape(&self) -> Vec<usize> {
         LocalArrayLayout::logical_shape(self)
     }
 
+    /// Returns `[extra..., permuted spatial...]` in row-major memory order.
     pub fn memory_shape(&self) -> Vec<usize> {
         LocalArrayLayout::memory_shape(self)
     }
 
+    /// Returns the number of elements in the borrowed buffer.
     pub fn len(&self) -> usize {
         self.storage.len()
     }
 
+    /// Returns whether the borrowed buffer has no elements.
     pub fn is_empty(&self) -> bool {
         self.storage.is_empty()
     }
 
+    /// Returns the borrowed row-major buffer.
     pub fn as_slice(&self) -> &[T] {
         LocalArrayLayout::as_slice(self)
     }
 
+    /// Returns an element at local logical indices, or `None` if invalid.
     pub fn get_local(&self, extra_indices: &[usize], spatial_indices: [usize; N]) -> Option<&T> {
         let offset = LocalArrayLayout::local_offset(self, extra_indices, spatial_indices).ok()?;
         self.storage.get(offset)
@@ -131,6 +142,7 @@ impl<T, const N: usize, const M: usize> LocalArrayLayout<T, N, M> for PencilArra
 }
 
 #[derive(Debug)]
+/// An exclusive local array view borrowing its layout metadata and storage.
 pub struct PencilArrayViewMut<'a, T, const N: usize, const M: usize> {
     pencil: &'a Pencil<N, M>,
     extra_shape: &'a ExtraShape,
@@ -151,51 +163,63 @@ impl<'a, T, const N: usize, const M: usize> PencilArrayViewMut<'a, T, N, M> {
         })
     }
 
+    /// Returns the view's pencil layout.
     pub fn pencil(&self) -> &Pencil<N, M> {
         LocalArrayLayout::pencil(self)
     }
 
+    /// Returns the view's extra shape.
     pub fn extra_shape(&self) -> &ExtraShape {
         LocalArrayLayout::extra_shape(self)
     }
 
+    /// Returns the local spatial shape in logical-axis order.
     pub fn local_spatial_shape(&self) -> [usize; N] {
         LocalArrayLayout::local_spatial_shape(self)
     }
 
+    /// Returns the local spatial shape in memory-axis order.
     pub fn local_spatial_memory_shape(&self) -> [usize; N] {
         LocalArrayLayout::local_spatial_memory_shape(self)
     }
 
+    /// Returns `[extra..., spatial...]` in logical-axis order.
     pub fn logical_shape(&self) -> Vec<usize> {
         LocalArrayLayout::logical_shape(self)
     }
 
+    /// Returns `[extra..., permuted spatial...]` in row-major memory order.
     pub fn memory_shape(&self) -> Vec<usize> {
         LocalArrayLayout::memory_shape(self)
     }
 
+    /// Returns the number of elements in the borrowed buffer.
     pub fn len(&self) -> usize {
         self.storage.len()
     }
 
+    /// Returns whether the borrowed buffer has no elements.
     pub fn is_empty(&self) -> bool {
         self.storage.is_empty()
     }
 
+    /// Returns a shared borrow of the row-major buffer.
     pub fn as_slice(&self) -> &[T] {
         LocalArrayLayout::as_slice(self)
     }
 
+    /// Returns an exclusive borrow of the row-major buffer.
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         self.storage
     }
 
+    /// Returns an element at local logical indices, or `None` if invalid.
     pub fn get_local(&self, extra_indices: &[usize], spatial_indices: [usize; N]) -> Option<&T> {
         let offset = LocalArrayLayout::local_offset(self, extra_indices, spatial_indices).ok()?;
         self.storage.get(offset)
     }
 
+    /// Returns a mutable element at local logical indices, or `None` if invalid.
     pub fn get_local_mut(
         &mut self,
         extra_indices: &[usize],
