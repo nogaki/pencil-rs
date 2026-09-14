@@ -70,6 +70,12 @@ jobs:
       - name: Run four-rank shared array tests
         run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test many --locked -- --nocapture --test-threads=1
 
+      - name: Run one-rank local transpose tests
+        run: timeout --foreground 120s mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test local_transpose --locked -- --nocapture --test-threads=1
+
+      - name: Run four-rank local transpose tests
+        run: timeout --foreground 120s mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test local_transpose --locked -- --nocapture --test-threads=1
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
