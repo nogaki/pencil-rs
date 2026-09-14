@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install MPI toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libopenmpi-dev openmpi-bin pkg-config libclang-dev
+
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+
+      - name: Restore Cargo build data
+        id: cargo-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Verify workspace metadata
+        run: cargo metadata --no-deps --format-version 1
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run library tests
+        run: cargo test --workspace --lib --locked
+
+      - name: Run one-rank topology tests
+        run: mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test topology --locked -- --nocapture --test-threads=1
+
+      - name: Run four-rank topology tests
+        run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test topology --locked -- --nocapture --test-threads=1
+
+      - name: Run four-rank pencil tests
+        run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test pencil --locked -- --nocapture --test-threads=1
+
+      - name: Run one-rank pencil tests
+        run: mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test pencil --locked -- --nocapture --test-threads=1
+
+      - name: Run one-rank array tests
+        run: mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test array --locked -- --nocapture --test-threads=1
+
+      - name: Run four-rank array tests
+        run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test array --locked -- --nocapture --test-threads=1
+
+      - name: Run one-rank shared array tests
+        run: mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test many --locked -- --nocapture --test-threads=1
+
+      - name: Run four-rank shared array tests
+        run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test many --locked -- --nocapture --test-threads=1
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build API documentation
+        run: cargo doc --workspace --no-deps --locked
+
+      - name: Test documentation examples and public API restrictions
+        run: cargo test --workspace --doc --locked -- --show-output
+
+      - name: Save Cargo build data
+        if: always() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install MPI toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libopenmpi-dev openmpi-bin pkg-config libclang-dev
+      - name: Install minimum supported Rust
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: Check minimum supported Rust
+        run: cargo +1.85.0 check --workspace --all-targets --locked
