@@ -962,6 +962,90 @@ distributed plan構築時には、source/destination global shape、decompositio
 
 初期版の公開実行APIはchecked実行のみとする。crate-privateなunchecked fast pathは初期版には実装せず、性能測定で必要性が確認された後に別途設計する。
 
+### 18.1 Milestone 5最初のPRに対する追補（2026-09-14、Alltoallv out-of-place実装済み）
+
+この追補は、sections 14--18にある将来の総合`TransposePlan`案を変更せず、
+最初の小さな分散転置PRへ適用する範囲だけを定める。PRで公開する型は次の
+`AllToAllv`専用APIだけとする。
+
+```rust
+pub struct AllToAllvTransposePlan<const N: usize, const M: usize>;
+pub struct AllToAllvTransposeWorkspace<T>;
+pub struct AllToAllvTransposeWorkspaceRequirements {
+    pub send_len: usize,
+    pub receive_len: usize,
+}
+pub enum AllToAllvTransposeError { /* checked and collective errors */ }
+```
+
+planの`new(source, destination)`と`execute_views(source, destination,
+workspace)`を提供し、workspaceは初期化済み`Vec<T>`を受け取る
+`from_vecs(send, receive)`で構築する。`T`の実行制約は独自traitではなく、
+`mpi::datatype::Equivalence + Copy`とする。`execute` wrapper、in-place、
+point-to-point、`TransposeMethod`、総合`TransposePlan`、FFTはこのPRでは作らない。
+
+分散planは同じ`MpiTopology`、global shape、ちょうど一つだけ異なる
+ordered decompositionを要求し、permutationは任意とする。decompositionが
+同じ場合は既存`LocalTransposePlan`を使い、AllToAllv planは全rankのpreflight後に
+拒否する。全rankが同じsource topologyのCartesian communicator contextで、
+plan構築・実行を同じcollective順序で呼ぶ。local APIとAllToAllv APIをrank間で
+混在させる呼出しは許可しない。
+
+plan構築・実行とも、payloadやaxis subcommunicatorの通信より先にsource
+topology全体でscalar合意を行う。constructorとexecuteの各固定headerでN、M、
+canonical descriptor長をmin/maxで確認する。extra rank、extent、T descriptorの
+長さはdescriptor内部に明示し、別の可変長collectiveを呼ばない。その後だけcanonical
+`u64` descriptorと同じ長さのmin/max受信配列をfallibleに
+確保し、準備成功をscalarで全rank合意する。続いてnativeな要素別min/max
+`all_reduce`を二回行い、min == maxならword毎のexact一致とする。全rank分の
+巨大配列や独自hashは作らない。global shape、decomposition、permutation、変更軸、
+AllToAllv mode、ordered source-to-destination direction、extra shapeのrankと
+内容、Tのtype identity/size/alignmentを比較する。rank固有のlocal lengthや
+workspace lengthはdescriptorに含めない。既存section 18の独自128-bit
+`PlanFingerprint`はこのPRでは採用せず、nativeなexact descriptor比較を使う。
+必要性は性能測定後に別途判断する。
+
+変更されたtopology軸の1次元subcommunicatorについて、peer rank `p`から
+`rank_to_coordinates_into(p, ...)`で座標を得る。peer rankと座標を同じ値と仮定しない。
+送信regionはsource local boxとpeer destination boxの交差、受信regionはpeer
+source boxとlocal destination boxの交差とする。pack/unpackはpeer rank順、extra
+batch row-major順、logical spatial row-major順を一致させる。
+
+rsmpi 0.8.2では`mpi::Count`は`i32`であり、
+`datatype::Partition::new`/`PartitionMut::new`を有効長sliceへ適用して
+`CommunicatorCollectives::all_to_all_varcount_into`を一回呼ぶ。count、
+displacement、count + displacement、総buffer長を先にchecked検査し、内部assert
+へ不正値を渡さない。workspaceは`len`以内の初期化済み領域だけを使い、capacity
+だけへの書込み、`MaybeUninit`、実行時のbacking storage拡張は行わない。
+
+layout、extra、workspace、count/displacement、offsetなどの一rankのlocal errorは
+全rankでvalidityを合意してから返す。preflight errorではdestinationを書かず、
+sourceは常に保持する。preflight成功後だけpack、Alltoallv、unpackを行う。
+
+このPRのplan内部はpeerごとの交差region、spatial count、displacementなど
+O(peers*N)のmetadataだけを保持する。全要素のsend/receive offset配列は保持しない。
+pack/unpackはregion内をlogical row-major順に走査し、既存のmappingとpermutationを
+使ってoffsetをchecked計算する。newは各ローカル要素を列挙せず、巨大shapeでも
+metadataだけを扱う。offsetの事前検査に必要な追加走査はデータを書かない。
+
+constructorとexecuteはschema/version、operation、N、M、descriptor word数を含む
+共通の固定サイズheaderを先に合意する。headerが不一致なら同じ結果を全rankが見て
+その時点でreturnする。header一致後にdescriptor準備成功をscalarで合意し、二つの
+native min/max reductionでexact比較する。extra/typeの長さがdescriptorに明示される
+場合は長さ専用collectiveを重ねない。どの通常Err経路でもrankを後続collectiveへ
+置き去りにしない。
+
+`type_name`、size、alignおよびEquivalenceの記述比較は、誤ったunsafe
+Equivalence実装や同名異型を証明するものではない。全rankが同じ`T`とMPI表現、
+正しいEquivalence、同一communicator、同一collective順序を使う契約を別途守る。
+型記述比較はu32/u64などのよくある誤用検出であり、MPI datatype handle値をrank間で
+比較しない。
+
+workspaceは初期化済みVecのlenで検証し、execute中にresize/reallocしない。`T`は
+`Equivalence + Copy`、pack/unpackは代入コピーで、Clone/Default callbackを呼ばない。
+小さいmetadata割当は必要なら`try_reserve`で失敗をcollectiveに合意する。MPI実行時
+障害、任意のpanic、プロセス喪失では、既存binding同様にResult回収を保証しない。
+
 ## 19. 便利関数
 
 Julia版の`transpose!`に対応する一回限りのAPIを提供する。
