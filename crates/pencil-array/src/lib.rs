@@ -44,7 +44,120 @@
 //! assert_eq!(array.len(), 24);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
+//!
+//! # Borrowing and API boundaries
+//!
+//! Shared and exclusive views can be borrowed in sequence once the earlier
+//! borrow is no longer used:
+//!
+//! ```
+//! use pencil_array::{ManyPencilArray, PencilArray};
+//!
+//! fn borrow_active<T>(many: &mut ManyPencilArray<T, 3, 2>) {
+//!     let _view = many.active_view().unwrap();
+//!     let _view_mut = many.active_view_mut().unwrap();
+//! }
+//!
+//! fn borrow_owner<T>(array: &mut PencilArray<T, 3, 2>) {
+//!     let _view = array.view();
+//!     let _view_mut = array.view_mut();
+//! }
+//! ```
+//!
+//! Two live mutable views cannot alias the same storage:
+//!
+//! ```compile_fail
+//! # use pencil_array::ManyPencilArray;
+//! # fn alias_mutable_view<T>(many: &mut ManyPencilArray<T, 3, 2>) {
+//! let first = many.active_view_mut().unwrap();
+//! let second = many.active_view_mut().unwrap();
+//! let _ = (first, second);
+//! # }
+//! ```
+//!
+//! A view cannot outlive its owning array:
+//!
+//! ```compile_fail
+//! # use pencil_array::{PencilArray, PencilArrayView};
+//! fn outlive_owner<'a, T>(array: PencilArray<T, 3, 2>) -> PencilArrayView<'a, T, 3, 2> {
+//!     array.view()
+//! }
+//! ```
+//!
+//! Shared-storage arrays expose only the active layout, not an arbitrary view:
+//!
+//! ```compile_fail
+//! # use pencil_array::ManyPencilArray;
+//! # fn arbitrary_view<T>(many: &ManyPencilArray<T, 3, 2>) {
+//! let _ = many.view_at(1);
+//! # }
+//! ```
+//!
+//! The active layout cannot be changed without a complete overwrite:
+//!
+//! ```compile_fail
+//! # use pencil_array::ManyPencilArray;
+//! # fn set_active<T>(many: &mut ManyPencilArray<T, 3, 2>) {
+//! many.set_active_layout(1);
+//! # }
+//! ```
+//!
+//! Internal write transactions are not part of the public API:
+//!
+//! ```compile_fail
+//! # use pencil_array::ManyPencilArray;
+//! # fn start_internal_write<T>(many: &mut ManyPencilArray<T, 3, 2>) {
+//! let _ = many.begin_in_place_write();
+//! # }
+//! ```
+//!
+//! Views must be borrowed through an owning array, not constructed directly:
+//!
+//! ```compile_fail
+//! # use pencil_array::{ExtraShape, Pencil, PencilArrayView};
+//! # fn construct_view<T>(pencil: &Pencil<3, 2>, extra_shape: &ExtraShape, storage: &[T]) {
+//! let _ = PencilArrayView::new(pencil, extra_shape, storage);
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # use pencil_array::{ExtraShape, Pencil, PencilArrayViewMut};
+//! # fn construct_view_mut<T>(pencil: &Pencil<3, 2>, extra_shape: &ExtraShape, storage: &mut [T]) {
+//! let _ = PencilArrayViewMut::new(pencil, extra_shape, storage);
+//! # }
+//! ```
+//!
+//! The topology's owned communicators are private:
+//!
+//! ```compile_fail
+//! # use pencil_array::MpiTopology;
+//! # fn expose_cartesian(topology: &MpiTopology<2>) {
+//! let _ = topology.cartesian();
+//! # }
+//! ```
+//!
+//! ```compile_fail
+//! # use pencil_array::MpiTopology;
+//! # fn expose_subcommunicator(topology: &MpiTopology<2>) {
+//! let _ = topology.subcommunicator(0);
+//! # }
+//! ```
+//!
+//! Internal layout state, write guards, and implementation traits are not exported:
+//!
+//! ```compile_fail
+//! use pencil_array::LayoutState;
+//! ```
+//!
+//! ```compile_fail
+//! use pencil_array::LayoutWriteGuard;
+//! ```
+//!
+//! ```compile_fail
+//! use pencil_array::LocalArrayLayout;
+//! ```
 
+// ponytail: rustdoc checks API restrictions; snapshots only if exact diagnostics become a contract.
 mod array;
 mod axis;
 mod checked;

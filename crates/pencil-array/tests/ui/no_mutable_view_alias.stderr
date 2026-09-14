@@ -1,9 +1,0 @@
-error[E0499]: cannot borrow `*many` as mutable more than once at a time
- --> tests/ui/no_mutable_view_alias.rs:5:18
-  |
-4 |     let first = many.active_view_mut().unwrap();
-  |                 ---- first mutable borrow occurs here
-5 |     let second = many.active_view_mut().unwrap();
-  |                  ^^^^ second mutable borrow occurs here
-6 |     let _ = (first, second);
-  |              ----- first borrow later used here

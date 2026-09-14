@@ -1,8 +1,0 @@
-error[E0432]: unresolved imports `pencil_array::LayoutState`, `pencil_array::LayoutWriteGuard`, `pencil_array::LocalArrayLayout`
- --> tests/ui/no_internal_layout_types.rs:1:20
-  |
-1 | use pencil_array::{LayoutState, LayoutWriteGuard, LocalArrayLayout};
-  |                    ^^^^^^^^^^^  ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^ no `LocalArrayLayout` in the root
-  |                    |            |
-  |                    |            no `LayoutWriteGuard` in the root
-  |                    no `LayoutState` in the root

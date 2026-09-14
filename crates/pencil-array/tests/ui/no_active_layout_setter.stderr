@@ -1,5 +1,0 @@
-error[E0599]: no method named `set_active_layout` found for mutable reference `&mut ManyPencilArray<T, 3, 2>` in the current scope
- --> tests/ui/no_active_layout_setter.rs:4:10
-  |
-4 |     many.set_active_layout(1);
-  |          ^^^^^^^^^^^^^^^^^ method not found in `&mut ManyPencilArray<T, 3, 2>`

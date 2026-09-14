@@ -1,8 +1,0 @@
-error[E0515]: cannot return value referencing function parameter `array`
- --> tests/ui/no_view_outliving_owner.rs:4:5
-  |
-4 |     array.view()
-  |     -----^^^^^^^
-  |     |
-  |     returns a value referencing data owned by the current function
-  |     `array` is borrowed here

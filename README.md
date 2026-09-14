@@ -29,7 +29,6 @@ or transpose data.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --lib --locked
-cargo test -p pencil-array --test ui --locked
 
 mpiexec -n 1 cargo test -p pencil-array --test topology --locked -- --nocapture --test-threads=1
 mpiexec -n 4 cargo test -p pencil-array --test topology --locked -- --nocapture --test-threads=1
@@ -41,8 +40,11 @@ mpiexec -n 1 cargo test -p pencil-array --test many --locked -- --nocapture --te
 mpiexec -n 4 cargo test -p pencil-array --test many --locked -- --nocapture --test-threads=1
 
 cargo doc --workspace --no-deps --locked
-cargo test --workspace --doc --locked
+cargo test --workspace --doc --locked -- --show-output
 ```
+
+Rustdoc tests cover usage examples and compile-time borrowing and visibility
+restrictions.
 
 The topology constructors are collective over an MPI intracommunicator. Run
 each integration-test binary with one MPI initialization per process, and drop

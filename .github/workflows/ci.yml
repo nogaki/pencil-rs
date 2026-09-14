@@ -73,14 +73,11 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Verify public API restrictions
-        run: cargo test -p pencil-array --test ui --locked
-
       - name: Build API documentation
         run: cargo doc --workspace --no-deps --locked
 
-      - name: Test documentation examples
-        run: cargo test --workspace --doc --locked
+      - name: Test documentation examples and public API restrictions
+        run: cargo test --workspace --doc --locked -- --show-output
 
       - name: Save Cargo build data
         if: always() && steps.cargo-cache.outputs.cache-hit != 'true'
