@@ -19,8 +19,9 @@
 //! intracommunicators. Every topology, pencil, array, and borrowed view must be
 //! dropped before MPI is finalized. The owning arrays and their views enforce
 //! storage lengths and borrowing in safe Rust. [`LocalTransposePlan`] provides
-//! process-local memory-axis permutations; data redistribution, distributed
-//! transposition, and FFTs are not yet implemented.
+//! process-local memory-axis permutations, and [`AllToAllvTransposePlan`] provides
+//! checked out-of-place Alltoallv redistribution; in-place distributed transposition
+//! and FFTs are not yet implemented.
 //!
 //! # One-rank example
 //!
@@ -30,7 +31,8 @@
 //! ```
 //! use mpi::traits::*;
 //! use pencil_array::{
-//!     AxisPermutation, ExtraShape, LocalTransposePlan, MpiTopology, Pencil, PencilArray,
+//!     AllToAllvTransposePlan, AllToAllvTransposeWorkspace, AxisPermutation, ExtraShape,
+//!     LocalTransposePlan, MpiTopology, Pencil, PencilArray,
 //! };
 //!
 //! let universe = mpi::initialize().expect("MPI must not already be initialized");
@@ -43,14 +45,31 @@
 //!     source_pencil.with_permutation(AxisPermutation::new([1, 0])?)?;
 //! let plan = LocalTransposePlan::new(source_pencil.clone(), destination_pencil.clone())?;
 //! let extra_shape = ExtraShape::scalar();
-//! let source = PencilArray::from_elem(source_pencil, extra_shape.clone(), 0.0_f64)?;
+//! let source = PencilArray::from_elem(source_pencil.clone(), extra_shape.clone(), 0.0_f64)?;
 //! let mut destination =
-//!     PencilArray::from_elem(destination_pencil, extra_shape, 0.0_f64)?;
+//!     PencilArray::from_elem(destination_pencil, extra_shape.clone(), 0.0_f64)?;
 //! plan.execute_views(source.view(), destination.view_mut())?;
+//!
+//! let distributed_destination_pencil = source_pencil.with_decomposition([1])?;
+//! let distributed_plan =
+//!     AllToAllvTransposePlan::new(source_pencil, distributed_destination_pencil.clone())?;
+//! let requirements = distributed_plan.workspace_requirements(&extra_shape)?;
+//! let mut workspace = AllToAllvTransposeWorkspace::from_vecs(
+//!     vec![0.0_f64; requirements.send_len],
+//!     vec![0.0_f64; requirements.receive_len],
+//! );
+//! let mut distributed_destination =
+//!     PencilArray::from_elem(distributed_destination_pencil, extra_shape, 0.0_f64)?;
+//! distributed_plan.execute_views(
+//!     source.view(),
+//!     distributed_destination.view_mut(),
+//!     &mut workspace,
+//! )?;
 //!
 //! assert_eq!(source.logical_shape(), [4, 6]);
 //! assert_eq!(destination.memory_shape(), [6, 4]);
 //! assert_eq!(destination.len(), 24);
+//! assert_eq!(distributed_destination.len(), 24);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -167,6 +186,7 @@
 //! ```
 
 // ponytail: rustdoc checks API restrictions; snapshots only if exact diagnostics become a contract.
+mod alltoallv_transpose;
 mod array;
 mod axis;
 mod checked;
@@ -180,6 +200,10 @@ mod pencil;
 mod topology;
 mod view;
 
+pub use alltoallv_transpose::{
+    AllToAllvTransposeError, AllToAllvTransposePlan, AllToAllvTransposeWorkspace,
+    AllToAllvTransposeWorkspaceRequirements,
+};
 pub use array::PencilArray;
 pub use axis::{AxisPermutation, SpatialAxis};
 pub use decomposition::Decomposition;
