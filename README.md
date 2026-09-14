@@ -13,7 +13,8 @@ one local buffer. `ManyPencilArray` owns a buffer large enough for several
 registered layouts and exposes only its active layout. Array shapes use
 logical order `[extra..., spatial...]`; their row-major buffers use memory
 order `[extra..., permuted spatial...]`. The core crate does not redistribute
-or transpose data.
+or perform distributed transpose or FFT operations. `LocalTransposePlan`
+provides process-local memory-axis permutations between compatible layouts.
 
 ## Prerequisites
 
@@ -38,6 +39,9 @@ mpiexec -n 1 cargo test -p pencil-array --test array --locked -- --nocapture --t
 mpiexec -n 4 cargo test -p pencil-array --test array --locked -- --nocapture --test-threads=1
 mpiexec -n 1 cargo test -p pencil-array --test many --locked -- --nocapture --test-threads=1
 mpiexec -n 4 cargo test -p pencil-array --test many --locked -- --nocapture --test-threads=1
+# The local operation is noncollective; keep a timeout to catch deadlocks.
+timeout --foreground 120s mpiexec -n 1 cargo test -p pencil-array --test local_transpose --locked -- --nocapture --test-threads=1
+timeout --foreground 120s mpiexec -n 4 cargo test -p pencil-array --test local_transpose --locked -- --nocapture --test-threads=1
 
 cargo doc --workspace --no-deps --locked
 cargo test --workspace --doc --locked -- --show-output
@@ -54,3 +58,4 @@ all topologies and arrays before MPI finalizes.
 
 - `docs/superpowers/specs/2026-09-11-pencil-arrays-rust-port-design.md`
 - `docs/superpowers/plans/2026-09-11-pencil-array-core-implementation.md`
+- `docs/superpowers/plans/2026-09-14-local-transpose-implementation.md`

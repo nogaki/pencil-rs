@@ -176,8 +176,6 @@ impl<T, const N: usize, const M: usize> ManyPencilArray<T, N, M> {
             .position(|registered| registered.same_layout(pencil))
     }
 
-    // ponytail: begin_in_place_write/storage_mut are reserved for Milestone 4.
-    #[allow(dead_code)]
     pub(crate) fn begin_in_place_write(
         &mut self,
     ) -> Result<LayoutWriteGuard<'_, T, N, M>, ArrayError> {
@@ -211,7 +209,6 @@ impl<'a, T, const N: usize, const M: usize> LayoutWriteGuard<'a, T, N, M> {
         Self { array }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn storage_mut(&mut self) -> &mut [T] {
         &mut self.array.storage
     }

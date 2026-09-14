@@ -911,15 +911,50 @@ packと通信は本体storageを変更しないため、poisoningは本体への
 
 panicによる巻き戻しでも`Poisoned`が維持されるよう内部guardを使う。
 
+### 17.3 Milestone 4のlocal path
+
+Milestone 4では、将来のcollectiveな`TransposePlan`とは別に、プロセスローカルな`LocalTransposePlan`を先に実装する。15節の`TransposePlanKind::Local`は将来の構成上の接続点であり、この段階で`TransposePlan`へ暗黙に統合しない。
+
+```rust
+pub struct LocalTransposePlan<const N: usize, const M: usize> { /* private */ }
+
+impl<const N: usize, const M: usize> LocalTransposePlan<N, M> {
+    pub fn new(
+        source: Arc<Pencil<N, M>>,
+        destination: Arc<Pencil<N, M>>,
+    ) -> Result<Self, LocalTransposeError>;
+
+    pub fn execute_views<T: Clone>(
+        &self,
+        source: PencilArrayView<'_, T, N, M>,
+        destination: PencilArrayViewMut<'_, T, N, M>,
+    ) -> Result<(), LocalTransposeError>;
+
+    pub fn execute_in_place<T: Clone>(
+        &self,
+        array: &mut ManyPencilArray<T, N, M>,
+        scratch: &mut Vec<T>,
+    ) -> Result<(), LocalTransposeError>;
+}
+```
+
+`new`は同じ`MpiTopology`、global shape、decompositionの配置だけを受け付け、permutationは同一を含む任意の有効置換とする。local pathはMPI通信、`MpiElement`、通信方式variantを持たない。`execute_views`はexactなextra shapeとlayoutを本体書込み前に検査し、sourceを論理indexごとにcloneしてdestinationのmemory orderへ書く。out-of-placeのclone panicではsourceは不変だが、destinationは部分書込みになり得る。
+
+in-placeはactive sourceと登録済みdestination、checkedな必要要素数、`scratch.capacity()`を先に検査する。scratchへsourceの物理storage順でclone退避が終わるまでarrayを変更せず、退避後の本体書込み直前に`LayoutWriteGuard`で`Poisoned`にする。既存のlogical-index mappingでscratchのsource物理offsetを読み、destination順に本体へ書く。完全な書込み後だけdestinationをcommitし、退避中のclone panicではsource stateを維持し、Poisoned後のclone panicでは`Poisoned`を維持する。
+
+`LocalTransposePlan`の構築・実行はnoncollectiveであり、他rankの呼出しを要求しない。topologyの構築自体がcollectiveである既存契約は変わらない。
+
 ## 18. Collective契約
 
-以下はcollective operationである。
+以下はdistributedな`TransposePlan`および分散FFTのcollective operationである。
 
-- `TransposePlan::new`のうちdistributed planを構築する場合。local plan構築はローカル操作
+- `TransposePlan::new`のうちdistributed planを構築する場合
 - `TransposePlan::execute`
 - `TransposePlan::execute_in_place`
 - 分散FFT plan構築のMPI整合性確認
 - 分散FFT実行
+
+17.3の`LocalTransposePlan`の構築・`execute_views`・`execute_in_place`はこの一覧に含まれない。これらは通信を行わないprocess-localな操作なので、呼出しrankを揃えずに実行でき、section 18のcollective事前合意も適用しない。
 
 通信開始前に、各rankのローカル事前検査結果をcollectiveに集約する。一つでも失敗すれば、全rankが実通信前にエラーを返す。
 

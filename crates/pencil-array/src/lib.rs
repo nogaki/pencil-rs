@@ -18,8 +18,9 @@
 //! Topology construction is collective and accepts only MPI
 //! intracommunicators. Every topology, pencil, array, and borrowed view must be
 //! dropped before MPI is finalized. The owning arrays and their views enforce
-//! storage lengths and borrowing in safe Rust; this crate does not yet perform
-//! redistribution, transposition, or FFTs.
+//! storage lengths and borrowing in safe Rust. [`LocalTransposePlan`] provides
+//! process-local memory-axis permutations; data redistribution, distributed
+//! transposition, and FFTs are not yet implemented.
 //!
 //! # One-rank example
 //!
@@ -28,20 +29,28 @@
 //!
 //! ```
 //! use mpi::traits::*;
-//! use pencil_array::{ExtraShape, MpiTopology, Pencil, PencilArray};
+//! use pencil_array::{
+//!     AxisPermutation, ExtraShape, LocalTransposePlan, MpiTopology, Pencil, PencilArray,
+//! };
 //!
 //! let universe = mpi::initialize().expect("MPI must not already be initialized");
 //! let world = universe.world();
 //! assert_eq!(world.size(), 1, "this example requires exactly one MPI rank");
 //!
 //! let topology = MpiTopology::<1>::new(&world, [1])?;
-//! let pencil = Pencil::<2, 1>::new(topology, [4, 6], [0])?;
+//! let source_pencil = Pencil::<2, 1>::new(topology, [4, 6], [0])?;
+//! let destination_pencil =
+//!     source_pencil.with_permutation(AxisPermutation::new([1, 0])?)?;
+//! let plan = LocalTransposePlan::new(source_pencil.clone(), destination_pencil.clone())?;
 //! let extra_shape = ExtraShape::scalar();
-//! let array = PencilArray::from_elem(pencil, extra_shape, 0.0_f64)?;
+//! let source = PencilArray::from_elem(source_pencil, extra_shape.clone(), 0.0_f64)?;
+//! let mut destination =
+//!     PencilArray::from_elem(destination_pencil, extra_shape, 0.0_f64)?;
+//! plan.execute_views(source.view(), destination.view_mut())?;
 //!
-//! assert_eq!(array.logical_shape(), [4, 6]);
-//! assert_eq!(array.memory_shape(), [4, 6]);
-//! assert_eq!(array.len(), 24);
+//! assert_eq!(source.logical_shape(), [4, 6]);
+//! assert_eq!(destination.memory_shape(), [6, 4]);
+//! assert_eq!(destination.len(), 24);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -165,6 +174,7 @@ mod decomposition;
 mod error;
 mod extra_shape;
 mod geometry;
+mod local_transpose;
 mod many;
 mod pencil;
 mod topology;
@@ -176,6 +186,7 @@ pub use decomposition::Decomposition;
 pub use error::{ArrayError, AxisError, GeometryError, PencilError, ShapeError, TopologyError};
 pub use extra_shape::ExtraShape;
 pub use geometry::partition_range;
+pub use local_transpose::{LocalTransposeError, LocalTransposePlan};
 pub use many::{ManyPencilArray, OverwriteError};
 pub use pencil::{Pencil, PencilConfig};
 pub use topology::MpiTopology;
