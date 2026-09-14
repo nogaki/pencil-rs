@@ -136,6 +136,10 @@ impl<T, const N: usize, const M: usize> ManyPencilArray<T, N, M> {
     /// only partly written. A later complete, successful overwrite is the recovery
     /// path, including when the array was already poisoned.
     ///
+    /// Full coverage is not checked at runtime: `Ok` is the writer's assertion
+    /// that the overwrite is complete. Returning `Ok` after an incomplete write
+    /// still activates the target layout and can expose stale values.
+    ///
     /// This operation only controls ownership and validity of the shared buffer;
     /// it performs no data redistribution or transpose by itself.
     pub fn overwrite_with<F, E>(
@@ -172,6 +176,7 @@ impl<T, const N: usize, const M: usize> ManyPencilArray<T, N, M> {
             .position(|registered| registered.same_layout(pencil))
     }
 
+    // ponytail: begin_in_place_write/storage_mut are reserved for Milestone 4.
     #[allow(dead_code)]
     pub(crate) fn begin_in_place_write(
         &mut self,

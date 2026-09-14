@@ -10,12 +10,6 @@ pub(crate) fn checked_product(values: &[usize]) -> Result<usize, GeometryError> 
     })
 }
 
-// MPI count conversion becomes live when the topology facade is introduced.
-#[allow(dead_code)]
-pub(crate) fn usize_to_i32(value: usize) -> Result<i32, GeometryError> {
-    i32::try_from(value).map_err(|_| GeometryError::CountOverflow)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -37,13 +31,5 @@ mod tests {
     fn zero_extent_makes_product_zero_regardless_of_axis_order() {
         assert_eq!(checked_product(&[usize::MAX, 2, 0]), Ok(0));
         assert_eq!(checked_product(&[0, usize::MAX, 2]), Ok(0));
-    }
-
-    #[test]
-    fn mpi_count_conversion_rejects_large_values() {
-        assert_eq!(
-            usize_to_i32(i32::MAX as usize + 1),
-            Err(GeometryError::CountOverflow),
-        );
     }
 }

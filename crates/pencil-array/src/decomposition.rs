@@ -1,8 +1,4 @@
-use std::ops::Range;
-
-use crate::{
-    AxisError, GeometryError, SpatialAxis, checked::checked_product, geometry::local_ranges_for,
-};
+use crate::{AxisError, SpatialAxis};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// An ordered mapping from topology axes to distributed spatial axes.
@@ -76,43 +72,10 @@ pub(crate) fn complete_dims<const N: usize, const M: usize>(
     completed
 }
 
-// Retained for all-rank geometry consumers; Pencil only needs its local range.
-#[allow(dead_code)]
-pub(crate) fn generate_axes<const N: usize, const M: usize>(
-    decomposition: &Decomposition<N, M>,
-    process_grid: [usize; M],
-    global_shape: [usize; N],
-) -> Result<Vec<[Range<usize>; N]>, GeometryError> {
-    for (axis, extent) in process_grid.iter().copied().enumerate() {
-        if extent == 0 {
-            return Err(GeometryError::ZeroProcessExtent { axis });
-        }
-    }
-
-    let region_count = checked_product(&process_grid)?;
-    let mut regions = Vec::with_capacity(region_count);
-
-    for flat_index in 0..region_count {
-        let mut remainder = flat_index;
-        let mut process_coords = [0; M];
-        for axis in (0..M).rev() {
-            process_coords[axis] = remainder % process_grid[axis];
-            remainder /= process_grid[axis];
-        }
-
-        regions.push(local_ranges_for(
-            global_shape,
-            process_grid,
-            process_coords,
-            *decomposition.axes(),
-        )?);
-    }
-
-    Ok(regions)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+
     use super::*;
     use crate::partition_range;
     use proptest::prelude::*;
@@ -176,36 +139,6 @@ mod tests {
         assert_eq!(decomposition.axes().map(SpatialAxis::index), [0, 2]);
         assert_eq!(decomposition.complete_process_grid([2, 4]), [2, 1, 4]);
         assert_eq!(decomposition.complete_process_coords([1, 3]), [1, 0, 3]);
-    }
-
-    #[test]
-    fn generate_axes_rejects_zero_process_extent() {
-        let decomposition = Decomposition::<3, 2>::new([0, 2]).unwrap();
-        assert_eq!(
-            generate_axes(&decomposition, [2, 0], [5, 4, 7]),
-            Err(GeometryError::ZeroProcessExtent { axis: 1 }),
-        );
-    }
-
-    #[test]
-    fn generated_regions_cover_global_domain_exactly_once() {
-        let decomposition = Decomposition::<3, 2>::new([0, 2]).unwrap();
-        let regions = generate_axes(&decomposition, [2, 3], [5, 4, 7]).unwrap();
-        assert_eq!(regions.len(), 6);
-        assert_eq!(regions[0], [0..2, 0..4, 0..2]);
-        assert_eq!(regions[1], [0..2, 0..4, 2..4]);
-
-        let mut visits = vec![0u8; 5 * 4 * 7];
-        for region in regions {
-            for i in region[0].clone() {
-                for j in region[1].clone() {
-                    for k in region[2].clone() {
-                        visits[(i * 4 + j) * 7 + k] += 1;
-                    }
-                }
-            }
-        }
-        assert!(visits.into_iter().all(|count| count == 1));
     }
 
     proptest! {
