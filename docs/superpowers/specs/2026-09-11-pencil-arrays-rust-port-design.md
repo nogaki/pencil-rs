@@ -1,7 +1,7 @@
 # PencilArrays / PencilFFTs Rust移植 設計仕様
 
 日付: 2026-09-11  
-状態: レビュー用設計仕様  
+状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out-of-placeは実装済み。P2P in-placeとFFTは未実装。
 対象: CPU + MPIによる任意次元分散配列基盤と分散FFT基盤
 
 ## 1. 参照実装
@@ -1092,6 +1092,80 @@ unpackはdestination `Pencil`、mutable slice、receive buffer、extra countを�
 `T: Copy`なのでpack/unpackにClone/Drop callbackはなく、panic時のPoisoned維持は既存
 `LayoutWriteGuard`の構造と既存テストに委ねる。公開panic hookやunsafeな不正状態注入は
 追加しない。MPI障害、任意panic、プロセス欠落後のglobal recoveryは保証しない。
+
+### 18.3 PointToPoint out-of-place追補（2026-09-15、基点 `159a16d`、実装済み）
+
+実装計画: [Point-to-point transpose plan](../plans/2026-09-15-point-to-point-transpose-implementation.md)。
+15.5の将来の汎用`PointToPointPlan`案をこの段階で公開せず、専用のchecked APIだけを
+追加する。P2P in-place、FFT、`WaitAny`によるunpack重畳、性能用fast pathは含めない。
+`TransposeError`、`TransposeWorkspace<T>`、`TransposeWorkspaceRequirements`は
+Alltoallvと共有する通信方式非依存の実体とし、既存の
+`AllToAllvTransposeError`、`AllToAllvTransposeWorkspace<T>`、
+`AllToAllvTransposeWorkspaceRequirements`はそれぞれ同じ型のre-export aliasとして
+維持する。P2P専用workspaceや同型のerror/requirementsは作らない。
+
+```rust
+pub struct PointToPointTransposePlan<const N: usize, const M: usize>;
+
+impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
+    pub fn new(
+        source: Arc<Pencil<N, M>>,
+        destination: Arc<Pencil<N, M>>,
+    ) -> Result<Self, TransposeError>;
+
+    pub fn workspace_requirements(
+        &self,
+        extra_shape: &ExtraShape,
+    ) -> Result<TransposeWorkspaceRequirements, TransposeError>;
+
+    pub fn execute_views<T>(
+        &self,
+        source: PencilArrayView<'_, T, N, M>,
+        destination: PencilArrayViewMut<'_, T, N, M>,
+        workspace: &mut TransposeWorkspace<T>,
+    ) -> Result<(), TransposeError>
+    where
+        T: mpi::datatype::Equivalence + Copy;
+}
+```
+
+`new`と`execute_views`はsource topology全体のCartesian communicatorで、方式と操作を
+組み合わせた5語の固定header
+`[schema, combined_operation, N, M, descriptor_len]`を最初にmin/max比較する。既存
+Alltoallvの`new`、`execute_views`、`execute_in_place`は1、2、3を維持し、P2Pの
+`new`、`execute_views`は4、5を使う。方式と操作は一つのwordで区別するため余分な
+header wordは追加しない。`new`、P2P views、Alltoallv views、Alltoallv in-placeを混在
+させたrankは、このheaderで可変descriptorまたは変更軸subcommunicatorへ進まず拒否する。
+header後は既存と同じfallibleな準備成功の合意とnative `u64` wordごとのmin/max二回で
+exact descriptorを比較する。canonical descriptorにもcombined operation（必要なら
+方式固有の固定tag）を含め、方向、変更軸、topology/grid、
+global shape、ordered decomposition、permutationを持ち、実行時にはexactなextra
+shape（rankとextents）、`T`のtype name/size/alignment、`Equivalence::Out`の型名も
+持つ。local layout、workspace、count、offsetなどの失敗は全Cartesian rankでvalidityを
+合意してから返し、成功rankがpeer通信へ先行しない。
+
+データ通信は変更軸の`MpiTopology`内部subcommunicatorだけで行い、固定予約tag
+`POINT_TO_POINT_RESERVED_TAG = 0x5054`を使う。内部communicator contextは利用者通信
+と隔離する。同一contextで未完了の転置を重ねず、公開呼出しは全request完了後に戻る。
+zero-count peerはsend/receiveを個別にpostしなくてよいが、全体のpreflightは全rankで
+行う。self peerは通常の同じsubcommunicator rankとして処理する。検証の大payloadは
+非zero peerごとに `128 * 512` 個の `u64`、`524,288` bytes（512 KiB）であり、
+大きなメッセージ経路を実行するが、MPI実装ごとのeager/rendezvous選択や閾値は保証
+しない。
+
+Alltoallvと同じ初期化済みworkspaceの`len`だけを使い、backing `Vec`をresize/realloc
+しない。全てのcount、displacement、総量、offsetとrequest capacityの準備をpack前に
+checkedに完了する。初期化済みworkspaceの連続prefixを`split_at_mut`で直接postするため、
+追加のsegment-holder Vecは作らない。15.5の一般案にある受信waitと送信waitの間のunpackはこの段階では
+採用せず、両方のrequestを先に完了させる。`mpi::request::scope`内の`Vec<Request>`は最初のpost前に
+`try_reserve`し、その成功を全Cartesian rankで合意する。成功後の順序は
+「全Irecv、全Isend、全requestのwait、scope終了、unpack」で固定する。requestが借用する
+send/receive segmentとworkspaceはwait完了まで生存させ、requestをplan/workspaceへ
+保存せず、未完了のまま`forget`してreturnしない。利用するのはrsmpi 0.8.2の
+`immediate_receive_into_with_tag`、`immediate_send_with_tag`、`Request::wait_without_status`
+であり、raw FFI、`unsafe`、`MaybeUninit`、実行時の`Default`/`Clone` callbackは追加
+しない。MPI障害、任意panic、プロセス喪失後のglobal recoveryは既存契約と同じく保証
+しない。
 
 ## 19. 便利関数
 
