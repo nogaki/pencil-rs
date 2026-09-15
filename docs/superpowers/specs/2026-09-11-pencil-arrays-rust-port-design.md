@@ -1019,7 +1019,7 @@ displacement、count + displacement、総buffer長を先にchecked検査し、�
 だけへの書込み、`MaybeUninit`、実行時のbacking storage拡張は行わない。
 
 layout、extra、workspace、count/displacement、offsetなどの一rankのlocal errorは
-全rankでvalidityを合意してから返す。preflight errorではdestinationを書かず、
+全rankでvalidityを合意してから返す。out-of-place `execute_views`のpreflight errorではdestinationを書かず、
 sourceは常に保持する。preflight成功後だけpack、Alltoallv、unpackを行う。
 
 このPRのplan内部はpeerごとの交差region、spatial count、displacementなど
@@ -1045,6 +1045,53 @@ workspaceは初期化済みVecのlenで検証し、execute中にresize/realloc�
 `Equivalence + Copy`、pack/unpackは代入コピーで、Clone/Default callbackを呼ばない。
 小さいmetadata割当は必要なら`try_reserve`で失敗をcollectiveに合意する。MPI実行時
 障害、任意のpanic、プロセス喪失では、既存binding同様にResult回収を保証しない。
+
+### 18.2 Alltoallv in-place追補（2026-09-14、基点 `f87bb23`）
+
+18.1の専用Alltoallv APIに、既存workspaceを使う次の後続操作を追加する。
+
+```rust
+impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
+    pub fn execute_in_place<T>(
+        &self,
+        array: &mut ManyPencilArray<T, N, M>,
+        workspace: &mut AllToAllvTransposeWorkspace<T>,
+    ) -> Result<(), AllToAllvTransposeError>
+    where
+        T: mpi::datatype::Equivalence + Copy;
+}
+```
+
+実行の最初に、source topology全体のCartesian communicatorで、schema、
+専用のin-place operation code、`N`、`M`、descriptor長を含む固定headerを
+既存のmin/maxで比較する。`new`、`execute_views`、`execute_in_place`の混在は
+header段階で全rankが拒否し、後続の可変長descriptorやaxis subcommunicatorへ
+進まない。header後も、planの方向・変更軸・topology・shape・decomposition・
+permutation、exactなextra shapeのrank/extent、`T`のtype name/size/alignment、
+`Equivalence::Out`のtype nameを既存のnative word-by-word min/maxで比較する。
+
+その後のlocal preflightはsource topology全体でvalidityを合意してから結果を返す。
+activeがPoisoned、source layout不一致、destination未登録、workspace不足、
+checked length/count/displacement/offset不備など、一rankの失敗でも他rankを後続
+collectiveへ置き去りにしない。Poisonedなarrayからも`extra_shape`とplan metadataは
+header/descriptor用に取得する。sourceとdestinationの必要prefixは別々にchecked計算し、
+`ManyPencilArray`が持つ「最大registered local layout分のstorage」という既存不変条件を
+利用するため、local lengthの一致やstorage拡張を仮定しない。通常のpreflight errorでは
+arrayのstateと内容を変更しない。
+
+全rankのpreflight成功後だけ、Validなactive source prefixをpackし、既存の一回の
+`MPI_Alltoallv`を実行する。zero/片方向empty、`mpi::Count`、Partition境界、初期化済み
+workspaceの`len`だけを使う契約は18.1のまま維持し、resize、再allocation、別workspace、
+別trait、dummy通信方式は追加しない。MPI完了後、本体書込み直前に既存
+`begin_in_place_write`でPoisonedにし、destination必要prefixへunpackを完了してから
+commitする。成功したin-place実行ではactive sourceはdestination内容に置き換わる。
+unpackはdestination `Pencil`、mutable slice、receive buffer、extra countを受け取れる
+共通helperとし、guard配下storageにも使える。local lengthが異なる場合もsource/destination
+それぞれのprefixを使い、prefix外の余剰tailは書き換えない。
+
+`T: Copy`なのでpack/unpackにClone/Drop callbackはなく、panic時のPoisoned維持は既存
+`LayoutWriteGuard`の構造と既存テストに委ねる。公開panic hookやunsafeな不正状態注入は
+追加しない。MPI障害、任意panic、プロセス欠落後のglobal recoveryは保証しない。
 
 ## 19. 便利関数
 

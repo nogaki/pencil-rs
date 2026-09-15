@@ -2,7 +2,7 @@
 
 - Date: 2026-09-14
 - Base: `e192d53`
-- Status: Alltoallv out-of-place実装と検証を完了。P2P、分散in-place、FFTは次段階。
+- Status: Alltoallv out-of-placeと後続の分散in-place実装・検証を完了。P2P、FFTは次段階。
 - Scope: Milestone 5 の最初の小さなPR。`MPI_Alltoallv`を使うout-of-place分散転置だけを実装する。
 
 ## 境界と採用方針

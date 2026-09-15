@@ -20,8 +20,17 @@
 //! dropped before MPI is finalized. The owning arrays and their views enforce
 //! storage lengths and borrowing in safe Rust. [`LocalTransposePlan`] provides
 //! process-local memory-axis permutations, and [`AllToAllvTransposePlan`] provides
-//! checked out-of-place Alltoallv redistribution; in-place distributed transposition
+//! checked Alltoallv redistribution through both out-of-place views and
+//! shared-storage in-place execution. Point-to-point distributed transposition
 //! and FFTs are not yet implemented.
+//!
+//! Alltoallv construction and execution are collective: every rank must use
+//! the same source communicator context, API, order, `T`, and correct
+//! `Equivalence`. `execute_views` preserves its source. `execute_in_place`
+//! leaves the array valid through communication, then performs
+//! `Poisoned` -> destination-prefix unpack -> commit; ordinary descriptor or
+//! preflight errors preserve array state and contents. Recovery from global MPI
+//! failures, arbitrary panics, or process loss is not guaranteed.
 //!
 //! # One-rank example
 //!
@@ -32,7 +41,7 @@
 //! use mpi::traits::*;
 //! use pencil_array::{
 //!     AllToAllvTransposePlan, AllToAllvTransposeWorkspace, AxisPermutation, ExtraShape,
-//!     LocalTransposePlan, MpiTopology, Pencil, PencilArray,
+//!     LocalTransposePlan, ManyPencilArray, MpiTopology, Pencil, PencilArray,
 //! };
 //!
 //! let universe = mpi::initialize().expect("MPI must not already be initialized");
@@ -51,25 +60,43 @@
 //! plan.execute_views(source.view(), destination.view_mut())?;
 //!
 //! let distributed_destination_pencil = source_pencil.with_decomposition([1])?;
-//! let distributed_plan =
-//!     AllToAllvTransposePlan::new(source_pencil, distributed_destination_pencil.clone())?;
+//! let distributed_plan = AllToAllvTransposePlan::new(
+//!     source_pencil.clone(),
+//!     distributed_destination_pencil.clone(),
+//! )?;
 //! let requirements = distributed_plan.workspace_requirements(&extra_shape)?;
 //! let mut workspace = AllToAllvTransposeWorkspace::from_vecs(
 //!     vec![0.0_f64; requirements.send_len],
 //!     vec![0.0_f64; requirements.receive_len],
 //! );
-//! let mut distributed_destination =
-//!     PencilArray::from_elem(distributed_destination_pencil, extra_shape, 0.0_f64)?;
+//! let mut distributed_destination = PencilArray::from_elem(
+//!     distributed_destination_pencil.clone(),
+//!     extra_shape.clone(),
+//!     0.0_f64,
+//! )?;
 //! distributed_plan.execute_views(
 //!     source.view(),
 //!     distributed_destination.view_mut(),
 //!     &mut workspace,
 //! )?;
 //!
+//! let mut distributed_in_place = ManyPencilArray::from_elem(
+//!     vec![source_pencil, distributed_destination_pencil],
+//!     0,
+//!     extra_shape,
+//!     0.0_f64,
+//! )?;
+//! let mut in_place_workspace = AllToAllvTransposeWorkspace::from_vecs(
+//!     vec![0.0_f64; requirements.send_len],
+//!     vec![0.0_f64; requirements.receive_len],
+//! );
+//! distributed_plan.execute_in_place(&mut distributed_in_place, &mut in_place_workspace)?;
+//!
 //! assert_eq!(source.logical_shape(), [4, 6]);
 //! assert_eq!(destination.memory_shape(), [6, 4]);
 //! assert_eq!(destination.len(), 24);
 //! assert_eq!(distributed_destination.len(), 24);
+//! assert_eq!(distributed_in_place.active_view()?.len(), 24);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!

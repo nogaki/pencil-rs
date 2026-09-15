@@ -2,8 +2,8 @@ use std::{fmt::Debug, sync::Arc};
 
 use mpi::traits::*;
 use pencil_array::{
-    AllToAllvTransposeError, AllToAllvTransposePlan, AllToAllvTransposeWorkspace, AxisPermutation,
-    ExtraShape, MpiTopology, Pencil, PencilArray,
+    AllToAllvTransposeError, AllToAllvTransposePlan, AllToAllvTransposeWorkspace, ArrayError,
+    AxisPermutation, ExtraShape, ManyPencilArray, MpiTopology, Pencil, PencilArray,
 };
 
 fn value_2d_u64(extra: [usize; 2], global: [usize; 2]) -> u64 {
@@ -311,6 +311,400 @@ fn workspace_for<T: Clone>(
     )
 }
 
+fn fill_2d_scalar(pencil: Arc<Pencil<2, 1>>, value: u64) -> PencilArray<u64, 2, 1> {
+    let mut array =
+        PencilArray::from_elem(Arc::clone(&pencil), ExtraShape::scalar(), value).unwrap();
+    let shape = pencil.local_shape_logical();
+    for x in 0..shape[0] {
+        for y in 0..shape[1] {
+            let global = [
+                pencil.local_ranges()[0].start + x,
+                pencil.local_ranges()[1].start + y,
+            ];
+            *array.get_local_mut(&[], [x, y]).unwrap() = value_2d_u64([0, 0], global);
+        }
+    }
+    array
+}
+
+fn many_from_source_2d(
+    source_pencil: Arc<Pencil<2, 1>>,
+    destination_pencil: Arc<Pencil<2, 1>>,
+    extra_shape: ExtraShape,
+    source: &PencilArray<u64, 2, 1>,
+    tail: u64,
+) -> ManyPencilArray<u64, 2, 1> {
+    let required = source_pencil
+        .local_len()
+        .max(destination_pencil.local_len())
+        * extra_shape.element_count();
+    let mut array = ManyPencilArray::from_vec(
+        vec![source_pencil, destination_pencil],
+        0,
+        extra_shape,
+        vec![tail; required],
+    )
+    .unwrap();
+    array
+        .active_view_mut()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(source.as_slice());
+    array
+}
+
+fn many_2d_with_value(
+    source_pencil: Arc<Pencil<2, 1>>,
+    destination_pencil: Arc<Pencil<2, 1>>,
+    active: usize,
+    extra_shape: ExtraShape,
+    value: u64,
+) -> ManyPencilArray<u64, 2, 1> {
+    ManyPencilArray::from_elem(
+        vec![source_pencil, destination_pencil],
+        active,
+        extra_shape,
+        value,
+    )
+    .unwrap()
+}
+
+fn run_2d_in_place_success(topology: &Arc<MpiTopology<1>>) {
+    let source_pencil = Pencil::<2, 1>::new_permuted(
+        Arc::clone(topology),
+        [7, 9],
+        [0],
+        AxisPermutation::new([0, 1]).unwrap(),
+    )
+    .unwrap();
+    let destination_pencil = Pencil::<2, 1>::new_permuted(
+        Arc::clone(topology),
+        [7, 9],
+        [1],
+        AxisPermutation::new([1, 0]).unwrap(),
+    )
+    .unwrap();
+    let extra = ExtraShape::new([2, 3]).unwrap();
+    let source = fill_2d(
+        Arc::clone(&source_pencil),
+        extra.clone(),
+        0_u64,
+        value_2d_u64,
+    );
+    let source_before = source.as_slice().to_vec();
+    let mut expected =
+        PencilArray::from_elem(Arc::clone(&destination_pencil), extra.clone(), 0_u64).unwrap();
+    let plan =
+        AllToAllvTransposePlan::new(Arc::clone(&source_pencil), Arc::clone(&destination_pencil))
+            .unwrap();
+    let mut out_workspace = workspace_for(&plan, &extra, 0_u64);
+    plan.execute_views(source.view(), expected.view_mut(), &mut out_workspace)
+        .unwrap();
+
+    let mut array = many_from_source_2d(
+        Arc::clone(&source_pencil),
+        Arc::clone(&destination_pencil),
+        extra.clone(),
+        &source,
+        u64::MAX,
+    );
+    let mut in_workspace = workspace_for(&plan, &extra, 0_u64);
+    plan.execute_in_place(&mut array, &mut in_workspace)
+        .unwrap();
+    assert!(
+        array
+            .active_pencil()
+            .unwrap()
+            .same_layout(destination_pencil.as_ref())
+    );
+    assert_eq!(array.active_view().unwrap().as_slice(), expected.as_slice());
+
+    let reverse =
+        AllToAllvTransposePlan::new(Arc::clone(&destination_pencil), Arc::clone(&source_pencil))
+            .unwrap();
+    let mut reverse_workspace = workspace_for(&reverse, &extra, 0_u64);
+    reverse
+        .execute_in_place(&mut array, &mut reverse_workspace)
+        .unwrap();
+    assert!(
+        array
+            .active_pencil()
+            .unwrap()
+            .same_layout(source_pencil.as_ref())
+    );
+    assert_eq!(
+        array.active_view().unwrap().as_slice(),
+        source_before.as_slice()
+    );
+}
+
+fn run_2d_empty_partition_success(topology: &Arc<MpiTopology<1>>) {
+    let source_pencil = Pencil::<2, 1>::new(Arc::clone(topology), [3, 5], [0]).unwrap();
+    let destination_pencil = source_pencil.with_decomposition([1]).unwrap();
+    let coordinate = topology.local_coords()[0];
+    let empty_source_nonempty_destination = (topology.process_grid()[0] == 4 && coordinate == 0)
+        || (topology.process_grid()[0] == 6 && matches!(coordinate, 2 | 4));
+    if empty_source_nonempty_destination {
+        assert_eq!(source_pencil.local_len(), 0);
+        assert!(destination_pencil.local_len() > 0);
+    }
+    let source = fill_2d_scalar(Arc::clone(&source_pencil), 0);
+    let source_before = source.as_slice().to_vec();
+    let mut expected =
+        PencilArray::from_elem(Arc::clone(&destination_pencil), ExtraShape::scalar(), 0_u64)
+            .unwrap();
+    let plan =
+        AllToAllvTransposePlan::new(Arc::clone(&source_pencil), Arc::clone(&destination_pencil))
+            .unwrap();
+    let mut out_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![
+            0_u64;
+            plan.workspace_requirements(&ExtraShape::scalar())
+                .unwrap()
+                .send_len
+        ],
+        vec![
+            0_u64;
+            plan.workspace_requirements(&ExtraShape::scalar())
+                .unwrap()
+                .receive_len
+        ],
+    );
+    plan.execute_views(source.view(), expected.view_mut(), &mut out_workspace)
+        .unwrap();
+
+    let mut array = many_from_source_2d(
+        Arc::clone(&source_pencil),
+        Arc::clone(&destination_pencil),
+        ExtraShape::scalar(),
+        &source,
+        u64::MAX,
+    );
+    let mut in_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![
+            0_u64;
+            plan.workspace_requirements(&ExtraShape::scalar())
+                .unwrap()
+                .send_len
+        ],
+        vec![
+            0_u64;
+            plan.workspace_requirements(&ExtraShape::scalar())
+                .unwrap()
+                .receive_len
+        ],
+    );
+    plan.execute_in_place(&mut array, &mut in_workspace)
+        .unwrap();
+    assert_eq!(array.active_view().unwrap().as_slice(), expected.as_slice());
+
+    let reverse =
+        AllToAllvTransposePlan::new(Arc::clone(&destination_pencil), Arc::clone(&source_pencil))
+            .unwrap();
+    let mut reverse_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![
+            0_u64;
+            reverse
+                .workspace_requirements(&ExtraShape::scalar())
+                .unwrap()
+                .send_len
+        ],
+        vec![
+            0_u64;
+            reverse
+                .workspace_requirements(&ExtraShape::scalar())
+                .unwrap()
+                .receive_len
+        ],
+    );
+    reverse
+        .execute_in_place(&mut array, &mut reverse_workspace)
+        .unwrap();
+    assert_eq!(
+        array.active_view().unwrap().as_slice(),
+        source_before.as_slice()
+    );
+}
+
+fn run_3d_in_place_success(topology: &Arc<MpiTopology<2>>) {
+    let source_pencil = Pencil::<3, 2>::new_permuted(
+        Arc::clone(topology),
+        [5, 2, 7],
+        [2, 0],
+        AxisPermutation::new([2, 0, 1]).unwrap(),
+    )
+    .unwrap();
+    let destination_pencil = Pencil::<3, 2>::new_permuted(
+        Arc::clone(topology),
+        [5, 2, 7],
+        [2, 1],
+        AxisPermutation::new([1, 2, 0]).unwrap(),
+    )
+    .unwrap();
+    let source = fill_3d_physical(Arc::clone(&source_pencil));
+    let source_before = source.as_slice().to_vec();
+    let expected_physical = expected_3d_physical(&destination_pencil);
+    let mut expected = PencilArray::from_elem(
+        Arc::clone(&destination_pencil),
+        ExtraShape::scalar(),
+        u64::MAX,
+    )
+    .unwrap();
+    let plan =
+        AllToAllvTransposePlan::new(Arc::clone(&source_pencil), Arc::clone(&destination_pencil))
+            .unwrap();
+    let requirements = plan.workspace_requirements(&ExtraShape::scalar()).unwrap();
+    let mut out_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![0_u64; requirements.send_len],
+        vec![0_u64; requirements.receive_len],
+    );
+    plan.execute_views(source.view(), expected.view_mut(), &mut out_workspace)
+        .unwrap();
+
+    let required = source_pencil
+        .local_len()
+        .max(destination_pencil.local_len());
+    let mut array = ManyPencilArray::from_vec(
+        vec![Arc::clone(&source_pencil), Arc::clone(&destination_pencil)],
+        0,
+        ExtraShape::scalar(),
+        vec![u64::MAX; required],
+    )
+    .unwrap();
+    array
+        .active_view_mut()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(source.as_slice());
+    let mut in_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![0_u64; requirements.send_len],
+        vec![0_u64; requirements.receive_len],
+    );
+    plan.execute_in_place(&mut array, &mut in_workspace)
+        .unwrap();
+    assert_eq!(
+        array.active_view().unwrap().as_slice(),
+        expected_physical.as_slice()
+    );
+
+    let reverse =
+        AllToAllvTransposePlan::new(Arc::clone(&destination_pencil), Arc::clone(&source_pencil))
+            .unwrap();
+    let reverse_requirements = reverse
+        .workspace_requirements(&ExtraShape::scalar())
+        .unwrap();
+    let mut reverse_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![0_u64; reverse_requirements.send_len],
+        vec![0_u64; reverse_requirements.receive_len],
+    );
+    reverse
+        .execute_in_place(&mut array, &mut reverse_workspace)
+        .unwrap();
+    assert_eq!(
+        array.active_view().unwrap().as_slice(),
+        source_before.as_slice()
+    );
+}
+
+fn run_3d_tail_check(topology: &Arc<MpiTopology<2>>) {
+    let source_pencil = Pencil::<3, 2>::new_permuted(
+        Arc::clone(topology),
+        [5, 2, 7],
+        [2, 0],
+        AxisPermutation::new([2, 0, 1]).unwrap(),
+    )
+    .unwrap();
+    let destination_pencil = Pencil::<3, 2>::new_permuted(
+        Arc::clone(topology),
+        [5, 2, 7],
+        [2, 1],
+        AxisPermutation::new([1, 2, 0]).unwrap(),
+    )
+    .unwrap();
+    let third_pencil = Pencil::<3, 2>::new_permuted(
+        Arc::clone(topology),
+        [5, 2, 7],
+        [0, 1],
+        AxisPermutation::identity(),
+    )
+    .unwrap();
+    let source = fill_3d_physical(Arc::clone(&source_pencil));
+    let mut expected = PencilArray::from_elem(
+        Arc::clone(&destination_pencil),
+        ExtraShape::scalar(),
+        u64::MAX,
+    )
+    .unwrap();
+    let plan =
+        AllToAllvTransposePlan::new(Arc::clone(&source_pencil), Arc::clone(&destination_pencil))
+            .unwrap();
+    let requirements = plan.workspace_requirements(&ExtraShape::scalar()).unwrap();
+    let mut out_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![0_u64; requirements.send_len],
+        vec![0_u64; requirements.receive_len],
+    );
+    plan.execute_views(source.view(), expected.view_mut(), &mut out_workspace)
+        .unwrap();
+
+    let max_len = source_pencil
+        .local_len()
+        .max(destination_pencil.local_len())
+        .max(third_pencil.local_len());
+    let mut initial = vec![0xfeed_u64; max_len];
+    initial[..source.as_slice().len()].copy_from_slice(source.as_slice());
+    let mut array = ManyPencilArray::from_vec(
+        vec![
+            Arc::clone(&source_pencil),
+            Arc::clone(&destination_pencil),
+            Arc::clone(&third_pencil),
+        ],
+        0,
+        ExtraShape::scalar(),
+        initial.clone(),
+    )
+    .unwrap();
+    let mut in_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![0_u64; requirements.send_len],
+        vec![0_u64; requirements.receive_len],
+    );
+    plan.execute_in_place(&mut array, &mut in_workspace)
+        .unwrap();
+    assert_eq!(array.active_view().unwrap().as_slice(), expected.as_slice());
+
+    let destination_before = array.active_view().unwrap().as_slice().to_vec();
+    let mut failed_workspace = AllToAllvTransposeWorkspace::from_vecs(Vec::new(), Vec::new());
+    assert!(
+        plan.execute_in_place(&mut array, &mut failed_workspace)
+            .is_err()
+    );
+    assert_eq!(
+        array.active_view().unwrap().as_slice(),
+        destination_before.as_slice()
+    );
+
+    if (*topology.process_grid() == [2, 2] && *topology.local_coords() == [1, 0])
+        || (*topology.process_grid() == [2, 3] && *topology.local_coords() == [1, 1])
+    {
+        assert!(third_pencil.local_len() > destination_pencil.local_len());
+    }
+
+    if third_pencil.local_len() > destination_pencil.local_len() {
+        let destination_len = destination_pencil.local_len();
+        // The preflight failure above did not consume the unused storage tail.
+        array
+            .overwrite_with(third_pencil.as_ref(), |mut view| {
+                assert_eq!(
+                    &view.as_slice()[destination_len..],
+                    &initial[destination_len..third_pencil.local_len()]
+                );
+                view.as_mut_slice()
+                    .copy_from_slice(&initial[..third_pencil.local_len()]);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+    }
+}
+
 #[test]
 fn alltoallv_transpose_integration() {
     let universe = mpi::initialize().expect("MPI initialization failed");
@@ -351,6 +745,11 @@ fn alltoallv_transpose_integration() {
     run_2d_success(&topology_1d, value_2d_f64, 0.0_f64);
     run_3d_success(&topology_2d, [2, 0], [2, 1]);
     run_3d_success(&topology_2d, [0, 2], [1, 2]);
+    run_2d_in_place_success(&topology_1d);
+    run_2d_empty_partition_success(&topology_1d);
+    run_3d_in_place_success(&topology_2d);
+    run_3d_tail_check(&topology_2d);
+    world.barrier();
 
     let source_pencil = Pencil::<2, 1>::new_permuted(
         Arc::clone(&topology_1d),
@@ -857,5 +1256,491 @@ fn alltoallv_transpose_integration() {
 
     assert!(Pencil::<2, 1>::new(Arc::clone(&topology_1d), [usize::MAX, 2], [0],).is_err());
     assert!(ExtraShape::new([usize::MAX, 2]).is_err());
+    world.barrier();
+
+    let inplace_source_pencil = Pencil::<2, 1>::new_permuted(
+        Arc::clone(&topology_1d),
+        [7, 9],
+        [0],
+        AxisPermutation::new([0, 1]).unwrap(),
+    )
+    .unwrap();
+    let inplace_destination_pencil = Pencil::<2, 1>::new_permuted(
+        Arc::clone(&topology_1d),
+        [7, 9],
+        [1],
+        AxisPermutation::new([1, 0]).unwrap(),
+    )
+    .unwrap();
+    let inplace_extra = ExtraShape::new([2, 3]).unwrap();
+    let inplace_source = fill_2d(
+        Arc::clone(&inplace_source_pencil),
+        inplace_extra.clone(),
+        0_u64,
+        value_2d_u64,
+    );
+    let inplace_plan = AllToAllvTransposePlan::new(
+        Arc::clone(&inplace_source_pencil),
+        Arc::clone(&inplace_destination_pencil),
+    )
+    .unwrap();
+    let mut expected_inplace = PencilArray::from_elem(
+        Arc::clone(&inplace_destination_pencil),
+        inplace_extra.clone(),
+        0_u64,
+    )
+    .unwrap();
+    let mut expected_workspace = workspace_for(&inplace_plan, &inplace_extra, 0_u64);
+    inplace_plan
+        .execute_views(
+            inplace_source.view(),
+            expected_inplace.view_mut(),
+            &mut expected_workspace,
+        )
+        .unwrap();
+    let inplace_requirements = inplace_plan.workspace_requirements(&inplace_extra).unwrap();
+
+    // A source-layout mismatch is collected before the shared array is touched.
+    let active = usize::from(rank == 0);
+    let mut bad_source = many_2d_with_value(
+        Arc::clone(&inplace_source_pencil),
+        Arc::clone(&inplace_destination_pencil),
+        active,
+        inplace_extra.clone(),
+        101,
+    );
+    if active == 0 {
+        bad_source
+            .active_view_mut()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(inplace_source.as_slice());
+    }
+    let bad_source_before = bad_source.active_view().unwrap().as_slice().to_vec();
+    let mut bad_source_workspace = workspace_for(&inplace_plan, &inplace_extra, 0_u64);
+    let result = inplace_plan.execute_in_place(&mut bad_source, &mut bad_source_workspace);
+    assert!(result.is_err());
+    let expected_active = if rank == 0 {
+        &inplace_destination_pencil
+    } else {
+        &inplace_source_pencil
+    };
+    assert!(
+        bad_source
+            .active_pencil()
+            .unwrap()
+            .same_layout(expected_active.as_ref())
+    );
+    assert_eq!(
+        bad_source.active_view().unwrap().as_slice(),
+        bad_source_before
+    );
+    world.barrier();
+
+    // A destination absent from one registry is also a preflight-only error.
+    let mut missing_destination = if rank == 0 {
+        ManyPencilArray::from_elem(
+            vec![Arc::clone(&inplace_source_pencil)],
+            0,
+            inplace_extra.clone(),
+            102_u64,
+        )
+        .unwrap()
+    } else {
+        many_2d_with_value(
+            Arc::clone(&inplace_source_pencil),
+            Arc::clone(&inplace_destination_pencil),
+            0,
+            inplace_extra.clone(),
+            102,
+        )
+    };
+    missing_destination
+        .active_view_mut()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(inplace_source.as_slice());
+    let missing_before = missing_destination
+        .active_view()
+        .unwrap()
+        .as_slice()
+        .to_vec();
+    let mut missing_workspace = workspace_for(&inplace_plan, &inplace_extra, 0_u64);
+    let result = inplace_plan.execute_in_place(&mut missing_destination, &mut missing_workspace);
+    assert!(result.is_err());
+    assert!(
+        missing_destination
+            .active_pencil()
+            .unwrap()
+            .same_layout(inplace_source_pencil.as_ref())
+    );
+    assert_eq!(
+        missing_destination.active_view().unwrap().as_slice(),
+        missing_before
+    );
+    world.barrier();
+
+    // Poisoned is reported collectively without needing an inactive view.
+    let mut poisoned = many_from_source_2d(
+        Arc::clone(&inplace_source_pencil),
+        Arc::clone(&inplace_destination_pencil),
+        inplace_extra.clone(),
+        &inplace_source,
+        103,
+    );
+    let mut poisoned_expected = poisoned.active_view().unwrap().as_slice().to_vec();
+    if let Some(first) = poisoned_expected.first_mut() {
+        *first = 777;
+    }
+    if rank == 0 {
+        let writer_result = poisoned.overwrite_with(inplace_source_pencil.as_ref(), |mut view| {
+            if let Some(first) = view.as_mut_slice().first_mut() {
+                *first = 777;
+            }
+            Err::<(), _>("poison")
+        });
+        assert!(matches!(
+            writer_result,
+            Err(pencil_array::OverwriteError::Writer("poison"))
+        ));
+    }
+    let mut poisoned_workspace = workspace_for(&inplace_plan, &inplace_extra, 0_u64);
+    let result = inplace_plan.execute_in_place(&mut poisoned, &mut poisoned_workspace);
+    assert!(result.is_err());
+    if rank == 0 {
+        assert_eq!(poisoned.active_view().unwrap_err(), ArrayError::Poisoned);
+        poisoned
+            .overwrite_with(inplace_source_pencil.as_ref(), |mut view| {
+                assert_eq!(view.as_slice(), poisoned_expected.as_slice());
+                view.as_mut_slice().copy_from_slice(&poisoned_expected);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+    } else {
+        assert!(
+            poisoned
+                .active_pencil()
+                .unwrap()
+                .same_layout(inplace_source_pencil.as_ref())
+        );
+        assert_eq!(
+            poisoned.active_view().unwrap().as_slice(),
+            inplace_source.as_slice()
+        );
+    }
+    world.barrier();
+
+    // Both initialized workspace prefixes are checked before communication.
+    assert!(inplace_requirements.send_len > 0);
+    assert!(inplace_requirements.receive_len > 0);
+    for short_send in [true, false] {
+        let mut insufficient = many_from_source_2d(
+            Arc::clone(&inplace_source_pencil),
+            Arc::clone(&inplace_destination_pencil),
+            inplace_extra.clone(),
+            &inplace_source,
+            104,
+        );
+        let before = insufficient.active_view().unwrap().as_slice().to_vec();
+        let mut workspace = if rank == 0 {
+            if short_send {
+                AllToAllvTransposeWorkspace::from_vecs(
+                    Vec::new(),
+                    vec![0_u64; inplace_requirements.receive_len],
+                )
+            } else {
+                AllToAllvTransposeWorkspace::from_vecs(
+                    vec![0_u64; inplace_requirements.send_len],
+                    Vec::new(),
+                )
+            }
+        } else {
+            workspace_for(&inplace_plan, &inplace_extra, 0_u64)
+        };
+        let result = inplace_plan.execute_in_place(&mut insufficient, &mut workspace);
+        assert!(result.is_err());
+        assert!(
+            insufficient
+                .active_pencil()
+                .unwrap()
+                .same_layout(inplace_source_pencil.as_ref())
+        );
+        assert_eq!(insufficient.active_view().unwrap().as_slice(), before);
+        world.barrier();
+    }
+
+    // A rank-local extra-shape disagreement is rejected by the exact descriptor.
+    let alternate_inplace_extra = ExtraShape::new([3, 2]).unwrap();
+    let local_extra = if rank == 0 {
+        alternate_inplace_extra.clone()
+    } else {
+        inplace_extra.clone()
+    };
+    let mut extra_mismatch = many_2d_with_value(
+        Arc::clone(&inplace_source_pencil),
+        Arc::clone(&inplace_destination_pencil),
+        0,
+        local_extra.clone(),
+        105,
+    );
+    let extra_mismatch_before = extra_mismatch.active_view().unwrap().as_slice().to_vec();
+    let local_requirements = inplace_plan.workspace_requirements(&local_extra).unwrap();
+    let mut extra_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![0_u64; local_requirements.send_len],
+        vec![0_u64; local_requirements.receive_len],
+    );
+    let result = inplace_plan.execute_in_place(&mut extra_mismatch, &mut extra_workspace);
+    if size == 1 {
+        assert!(result.is_ok());
+        assert!(
+            extra_mismatch
+                .active_pencil()
+                .unwrap()
+                .same_layout(inplace_destination_pencil.as_ref())
+        );
+    } else {
+        assert!(result.is_err());
+        assert!(
+            extra_mismatch
+                .active_pencil()
+                .unwrap()
+                .same_layout(inplace_source_pencil.as_ref())
+        );
+        assert_eq!(
+            extra_mismatch.active_view().unwrap().as_slice(),
+            extra_mismatch_before
+        );
+    }
+    world.barrier();
+
+    // A constructor call and in-place execution cannot share this collective.
+    let mut mixed_new = many_from_source_2d(
+        Arc::clone(&inplace_source_pencil),
+        Arc::clone(&inplace_destination_pencil),
+        inplace_extra.clone(),
+        &inplace_source,
+        106,
+    );
+    let mixed_new_before = mixed_new.active_view().unwrap().as_slice().to_vec();
+    if size == 1 {
+        let mut workspace = workspace_for(&inplace_plan, &inplace_extra, 0_u64);
+        inplace_plan
+            .execute_in_place(&mut mixed_new, &mut workspace)
+            .unwrap();
+    } else {
+        let result = if rank == 0 {
+            AllToAllvTransposePlan::new(
+                Arc::clone(&inplace_source_pencil),
+                Arc::clone(&inplace_destination_pencil),
+            )
+            .map(|_| ())
+        } else {
+            let mut workspace = workspace_for(&inplace_plan, &inplace_extra, 0_u64);
+            inplace_plan.execute_in_place(&mut mixed_new, &mut workspace)
+        };
+        assert!(result.is_err());
+        assert_eq!(
+            mixed_new.active_view().unwrap().as_slice(),
+            mixed_new_before
+        );
+    }
+    world.barrier();
+
+    // The other execution API is rejected at the same fixed-header boundary.
+    if size == 1 {
+        let mut mixed_views = many_from_source_2d(
+            Arc::clone(&inplace_source_pencil),
+            Arc::clone(&inplace_destination_pencil),
+            inplace_extra.clone(),
+            &inplace_source,
+            107,
+        );
+        let mut workspace = workspace_for(&inplace_plan, &inplace_extra, 0_u64);
+        inplace_plan
+            .execute_in_place(&mut mixed_views, &mut workspace)
+            .unwrap();
+    } else if rank == 0 {
+        let mut destination = PencilArray::from_elem(
+            Arc::clone(&inplace_destination_pencil),
+            inplace_extra.clone(),
+            107_u64,
+        )
+        .unwrap();
+        let before = destination.as_slice().to_vec();
+        let mut workspace = workspace_for(&inplace_plan, &inplace_extra, 0_u64);
+        let result = inplace_plan.execute_views(
+            inplace_source.view(),
+            destination.view_mut(),
+            &mut workspace,
+        );
+        assert!(result.is_err());
+        assert_eq!(destination.as_slice(), before.as_slice());
+    } else {
+        let mut mixed_views = many_from_source_2d(
+            Arc::clone(&inplace_source_pencil),
+            Arc::clone(&inplace_destination_pencil),
+            inplace_extra.clone(),
+            &inplace_source,
+            107,
+        );
+        let before = mixed_views.active_view().unwrap().as_slice().to_vec();
+        let mut workspace = workspace_for(&inplace_plan, &inplace_extra, 0_u64);
+        let result = inplace_plan.execute_in_place(&mut mixed_views, &mut workspace);
+        assert!(result.is_err());
+        assert_eq!(mixed_views.active_view().unwrap().as_slice(), before);
+    }
+    world.barrier();
+
+    // A rank choosing the opposite direction is caught by the descriptor.
+    let reverse_inplace_plan = AllToAllvTransposePlan::new(
+        Arc::clone(&inplace_destination_pencil),
+        Arc::clone(&inplace_source_pencil),
+    )
+    .unwrap();
+    let reverse_requirements = reverse_inplace_plan
+        .workspace_requirements(&inplace_extra)
+        .unwrap();
+    let mut direction_mismatch = many_from_source_2d(
+        Arc::clone(&inplace_source_pencil),
+        Arc::clone(&inplace_destination_pencil),
+        inplace_extra.clone(),
+        &inplace_source,
+        108,
+    );
+    let direction_before = direction_mismatch
+        .active_view()
+        .unwrap()
+        .as_slice()
+        .to_vec();
+    let mut direction_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![
+            0_u64;
+            inplace_requirements
+                .send_len
+                .max(reverse_requirements.send_len)
+        ],
+        vec![
+            0_u64;
+            inplace_requirements
+                .receive_len
+                .max(reverse_requirements.receive_len)
+        ],
+    );
+    let result = if rank == 0 {
+        reverse_inplace_plan.execute_in_place(&mut direction_mismatch, &mut direction_workspace)
+    } else {
+        inplace_plan.execute_in_place(&mut direction_mismatch, &mut direction_workspace)
+    };
+    assert!(result.is_err());
+    assert!(
+        direction_mismatch
+            .active_pencil()
+            .unwrap()
+            .same_layout(inplace_source_pencil.as_ref())
+    );
+    assert_eq!(
+        direction_mismatch.active_view().unwrap().as_slice(),
+        direction_before
+    );
+    world.barrier();
+
+    // A normal preflight failure does not consume the plan or workspace.
+    let active = usize::from(rank == 0);
+    let mut reusable = many_2d_with_value(
+        Arc::clone(&inplace_source_pencil),
+        Arc::clone(&inplace_destination_pencil),
+        active,
+        inplace_extra.clone(),
+        109,
+    );
+    if active == 0 {
+        reusable
+            .active_view_mut()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(inplace_source.as_slice());
+    }
+    let reusable_before = reusable.active_view().unwrap().as_slice().to_vec();
+    let mut reusable_workspace = workspace_for(&inplace_plan, &inplace_extra, 0_u64);
+    assert!(
+        inplace_plan
+            .execute_in_place(&mut reusable, &mut reusable_workspace)
+            .is_err()
+    );
+    assert!(
+        reusable
+            .active_pencil()
+            .unwrap()
+            .same_layout(expected_active.as_ref())
+    );
+    assert_eq!(reusable.active_view().unwrap().as_slice(), reusable_before);
+    if rank == 0 {
+        reusable
+            .overwrite_with(inplace_source_pencil.as_ref(), |mut view| {
+                view.as_mut_slice()
+                    .copy_from_slice(inplace_source.as_slice());
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+    }
+    inplace_plan
+        .execute_in_place(&mut reusable, &mut reusable_workspace)
+        .unwrap();
+    assert!(
+        reusable
+            .active_pencil()
+            .unwrap()
+            .same_layout(inplace_destination_pencil.as_ref())
+    );
+    assert_eq!(
+        reusable.active_view().unwrap().as_slice(),
+        expected_inplace.as_slice()
+    );
+    world.barrier();
+
+    // Zero extra elements still complete the collective and commit the layout.
+    let zero_inplace = ExtraShape::new([2, 0]).unwrap();
+    let mut zero_many = ManyPencilArray::<u64, 2, 1>::from_vec(
+        vec![
+            Arc::clone(&inplace_source_pencil),
+            Arc::clone(&inplace_destination_pencil),
+        ],
+        0,
+        zero_inplace.clone(),
+        Vec::new(),
+    )
+    .unwrap();
+    let mut zero_inplace_workspace =
+        AllToAllvTransposeWorkspace::from_vecs(Vec::<u64>::new(), Vec::new());
+    inplace_plan
+        .execute_in_place(&mut zero_many, &mut zero_inplace_workspace)
+        .unwrap();
+    assert!(
+        zero_many
+            .active_pencil()
+            .unwrap()
+            .same_layout(inplace_destination_pencil.as_ref())
+    );
+    assert!(zero_many.active_view().unwrap().is_empty());
+
+    let mut giant_many = ManyPencilArray::<u8, 2, 1>::from_vec(
+        vec![Arc::clone(&giant_source), Arc::clone(&giant_destination)],
+        0,
+        zero_extra,
+        Vec::new(),
+    )
+    .unwrap();
+    let mut giant_inplace_workspace =
+        AllToAllvTransposeWorkspace::from_vecs(Vec::new(), Vec::new());
+    giant_plan
+        .execute_in_place(&mut giant_many, &mut giant_inplace_workspace)
+        .unwrap();
+    assert!(
+        giant_many
+            .active_pencil()
+            .unwrap()
+            .same_layout(giant_destination.as_ref())
+    );
+    assert!(giant_many.active_view().unwrap().is_empty());
     world.barrier();
 }
