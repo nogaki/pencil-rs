@@ -2,8 +2,8 @@
 
 - 日付: 2026-09-15
 - 基点: `159a16d`
-- 状態: `PointToPointTransposePlan` のcheckedなout-of-place実装と検証を完了。
-  P2P in-place、FFT、`WaitAny`による重畳、性能最適化は未実装。
+- 状態: `PointToPointTransposePlan` のcheckedなout/in-place実装と検証を完了。
+  後続未実装はFFTのみ。
 - 関連仕様: [Rust移植設計仕様](../specs/2026-09-11-pencil-arrays-rust-port-design.md)
 - 実装: [`point_to_point_transpose.rs`](../../../crates/pencil-array/src/point_to_point_transpose.rs)
 - 範囲: この計画は上記実装の設計・検証記録であり、commit・push・PRは行わない。
@@ -170,7 +170,7 @@ eagerかrendezvousか、またはどの閾値を使うかは規定しない（�
 
 ## 採用事項（短縮報告）
 
-- **API**: `PointToPointTransposePlan::{new, workspace_requirements, execute_views}`、`T: Equivalence + Copy`、共有`TransposeWorkspace`。P2P in-place/FFT/WaitAnyは延期。
+- **API**: `PointToPointTransposePlan::{new, workspace_requirements, execute_views, execute_in_place}`、`T: Equivalence + Copy`、共有`TransposeWorkspace`。後続未実装はFFTのみ。
 - **private共有境界**: `transpose.rs`の`TransposePlanCore`、peer region、checked preparation、header/descriptor、pack/unpack。旧Alltoallv 3型はcanonical型のre-export alias。
 - **rsmpi API**: 内部`CartesianCommunicator::process_at_rank`、`Destination::immediate_send_with_tag`、`Source::immediate_receive_into_with_tag`、`mpi::request::scope`、`Request::wait_without_status`。
 - **lifetime/失敗**: segmentとworkspaceをwait完了まで保持し、requestはlocal scope限定。全reserveをpost/pack前に全Cartesian rankで合意し、失敗時はrequestなしでreturnする。

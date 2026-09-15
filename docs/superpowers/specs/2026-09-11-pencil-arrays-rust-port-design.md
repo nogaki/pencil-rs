@@ -1,7 +1,7 @@
 # PencilArrays / PencilFFTs Rust移植 設計仕様
 
 日付: 2026-09-11  
-状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out-of-placeは実装済み。P2P in-placeとFFTは未実装。
+状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-placeは実装済み。FFTは未実装。
 対象: CPU + MPIによる任意次元分散配列基盤と分散FFT基盤
 
 ## 1. 参照実装
@@ -1166,6 +1166,64 @@ send/receive segmentとworkspaceはwait完了まで生存させ、requestをplan
 であり、raw FFI、`unsafe`、`MaybeUninit`、実行時の`Default`/`Clone` callbackは追加
 しない。MPI障害、任意panic、プロセス喪失後のglobal recoveryは既存契約と同じく保証
 しない。
+
+### 18.4 PointToPoint in-place追補（2026-09-15、基点 `198638e`、実装済み）
+
+実装計画: [P2P in-place計画](../plans/2026-09-15-point-to-point-in-place-implementation.md)。
+18.2のAlltoallv in-place状態契約と18.3のP2P transport契約を、既存の
+共有workspace/error型に対して組み合わせた。追加した公開APIは次だけである。
+
+```rust
+impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
+    pub fn execute_in_place<T>(
+        &self,
+        array: &mut ManyPencilArray<T, N, M>,
+        workspace: &mut TransposeWorkspace<T>,
+    ) -> Result<(), TransposeError>
+    where
+        T: mpi::datatype::Equivalence + Copy;
+}
+```
+
+固定headerは18.3の5語
+`[schema, combined_operation, N, M, descriptor_len]`を維持する。既存の
+operation 1（Alltoallv new）、2（Alltoallv views）、3（Alltoallv in-place）、
+4（P2P new）、5（P2P views）は変更せず、6をP2P in-placeに割り当てる。これに
+より5語headerの段階で`new`、views、Alltoallv in-place、P2P in-placeの混在を
+全rankが拒否し、descriptorまたは変更軸subcommunicatorへ進まない。
+
+実行descriptorはarrayの`active_view`を要求せず、`array.extra_shape()`とplan
+metadataから作る。arrayがPoisonedでもextra shape、方向、変更軸、topology、
+global shape、ordered decomposition、permutation、`T`の型記述を全rankで比較
+する。descriptor後のactive state、source layout、destination登録、source/destination
+のchecked必要prefix、workspace length、count/displacement、region offsetの
+local結果は、Cartesian communicatorで合意してから返す。一rankの失敗でもpack、
+request、guardへ進まない。sourceとdestinationのlocal lengthは一致すると仮定せず、
+最大registered storageのdestination prefix外のtailは保持する。
+
+Alltoallv in-placeとP2P in-placeは、上記preflightとpost-transferのguard、
+`unpack_destination`、`commit`を小さいcrate-private処理として共有してよい。
+P2Pは18.3の固定`POINT_TO_POINT_RESERVED_TAG`（`0x5054`）とtopology所有の
+変更軸subcommunicatorを使い、同じ内部contextで未完了転置を重ねない。source slice
+からworkspaceへpackするtransport helperは、request `Vec`のfallible reserveと
+その成否の全rank合意をpack・最初のpostより前に完了する。成功後の順序は、全Irecv、
+全Isend、全requestのwait、scope終了、destination prefixへのunpack、commitとする。
+wait中およびscope中にarrayを書き換えず、requestが借用するworkspace segmentを
+wait完了まで保持する。zero/片方向emptyとzero-extraではcountが0のpeerだけ
+requestを省略し、self peerもcountが非zeroなら他のpeerと同じIrecv/Isendを行う。
+
+全request完了後だけ`begin_in_place_write`でPoisonedに遷移し、destinationの必要
+prefixを全てunpackしてからdestinationをcommitする。通常のpreflight errorでは
+arrayのstate・内容とworkspaceを保持する。MPI故障、任意panic、プロセス喪失後の
+global recoveryは保証しない。新workspace/error/trait、unsafe、WaitAny、FFT、
+test専用panic hookはこの追補に含めず、panic時のPoisoned保証は既存
+`LayoutWriteGuard`に委ねる。
+
+検証は既存`alltoallv_transpose.rs`の一つのMPI initialize、fixture、success helperを
+共用し、1/4/6 rank、u64/f64、2D/3D、非正方・逆順communicator、両方式との完全一致、
+独立oracle、往復、長さ変化、tail、empty/zero payload、失敗後のworkspace再利用、
+rank-local preflightと全operation混在をtimeout付きで確認した。公開README、lib.rs、
+既存one-rank doctest、CI suite説明もP2P in-placeを反映し、FFTだけを後続に残す。
 
 ## 19. 便利関数
 

@@ -76,13 +76,13 @@ jobs:
       - name: Run four-rank local transpose tests
         run: timeout --foreground 120s mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test local_transpose --locked -- --nocapture --test-threads=1
 
-      - name: Run one-rank distributed transpose (Alltoallv and P2P out-of-place, Alltoallv in-place) tests
+      - name: Run one-rank distributed transpose (Alltoallv/P2P out-of-place and in-place) tests
         run: timeout --foreground 120s mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
 
-      - name: Run four-rank distributed transpose (Alltoallv and P2P out-of-place, Alltoallv in-place) tests
+      - name: Run four-rank distributed transpose (Alltoallv/P2P out-of-place and in-place) tests
         run: timeout --foreground 120s mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
 
-      - name: Run six-rank distributed transpose (Alltoallv and P2P out-of-place, Alltoallv in-place) tests
+      - name: Run six-rank distributed transpose (Alltoallv/P2P out-of-place and in-place) tests
         run: timeout --foreground 120s mpiexec --oversubscribe -n 6 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
 
       - name: Run Clippy

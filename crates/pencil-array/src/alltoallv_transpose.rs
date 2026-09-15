@@ -6,12 +6,11 @@ use mpi::{
 };
 
 use crate::{
-    ArrayError, ExtraShape, ManyPencilArray, Pencil, PencilArrayView, PencilArrayViewMut,
-    checked::checked_product,
+    ExtraShape, ManyPencilArray, Pencil, PencilArrayView, PencilArrayViewMut,
     transpose::{
-        CommunicationMode, OPERATION_ALLTOALLV_IN_PLACE, PreparedExchange, TransposeError,
-        TransposePlanCore, TransposeWorkspace, TransposeWorkspaceRequirements,
-        agree_execute_descriptor, collective_valid, pack_source, unpack_destination,
+        CommunicationMode, PreparedExchange, TransposeError, TransposePlanCore, TransposeWorkspace,
+        TransposeWorkspaceRequirements, agree_execute_descriptor, collective_valid,
+        finish_in_place, pack_source, prepare_in_place, unpack_destination,
     },
 };
 
@@ -169,37 +168,16 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
             communicator,
             array.extra_shape(),
             array.extra_shape(),
-            OPERATION_ALLTOALLV_IN_PLACE,
+            CommunicationMode::AllToAllv.in_place_operation(),
         )?;
 
-        let local_preflight = (|| {
-            let source_index = array.active_index().map_err(TransposeError::from)?;
-            let active_source = &array.pencils()[source_index];
-            if !active_source.same_layout(self.core.source().as_ref()) {
-                return Err(TransposeError::SourceLayoutMismatch);
-            }
-            let destination_index = array
-                .find_layout(self.core.destination().as_ref())
-                .ok_or(TransposeError::DestinationLayoutMismatch)?;
-            let extra_shape = array.extra_shape();
-            let batch = extra_shape.element_count();
-            let source_len = checked_product(&[active_source.local_len(), batch])
-                .map_err(|error| TransposeError::Array(ArrayError::from(error)))?;
-            let destination_pencil = &array.pencils()[destination_index];
-            let destination_len = checked_product(&[destination_pencil.local_len(), batch])
-                .map_err(|error| TransposeError::Array(ArrayError::from(error)))?;
-            let prepared =
-                self.core
-                    .prepare_common(extra_shape, source_len, destination_len, workspace)?;
-            Ok((destination_index, prepared))
-        })();
+        let local_preflight = prepare_in_place(&self.core, array, workspace);
         if !collective_valid(communicator, local_preflight.is_ok()) {
             return Err(local_preflight
                 .err()
                 .unwrap_or(TransposeError::CollectivePreconditionFailed));
         }
-        let (destination_index, prepared) =
-            local_preflight.expect("collective in-place preflight succeeded");
+        let prepared = local_preflight.expect("collective in-place preflight succeeded");
         let extra_count = array.extra_shape().element_count();
         {
             let source = array
@@ -209,29 +187,20 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
                 self.core.peers(),
                 self.core.source().as_ref(),
                 source.as_slice(),
-                &mut workspace.send_buffer[..prepared.requirements.send_len],
-                prepared.requirements.send_len,
+                &mut workspace.send_buffer[..prepared.exchange.requirements.send_len],
+                prepared.exchange.requirements.send_len,
                 extra_count,
             );
         }
-        execute_exchange(&self.core, &prepared, workspace);
-
-        let mut guard = array
-            .begin_in_place_write()
-            .expect("collective in-place preflight validated the active state");
-        {
-            let destination_storage = &mut guard.storage_mut()[..prepared.requirements.receive_len];
-            unpack_destination(
-                self.core.peers(),
-                self.core.destination().as_ref(),
-                destination_storage,
-                &workspace.receive_buffer[..prepared.requirements.receive_len],
-                extra_count,
-            );
-        }
-        guard
-            .commit(destination_index)
-            .expect("collective in-place preflight validated the destination layout");
+        execute_exchange(&self.core, &prepared.exchange, workspace);
+        finish_in_place(
+            &self.core,
+            array,
+            prepared.destination_index,
+            &prepared.exchange,
+            &workspace.receive_buffer[..prepared.exchange.requirements.receive_len],
+            extra_count,
+        );
         Ok(())
     }
 }
