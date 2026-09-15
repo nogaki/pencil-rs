@@ -19,18 +19,43 @@
 //! intracommunicators. Every topology, pencil, array, and borrowed view must be
 //! dropped before MPI is finalized. The owning arrays and their views enforce
 //! storage lengths and borrowing in safe Rust. [`LocalTransposePlan`] provides
-//! process-local memory-axis permutations, and [`AllToAllvTransposePlan`] provides
-//! checked Alltoallv redistribution through both out-of-place views and
-//! shared-storage in-place execution. Point-to-point distributed transposition
-//! and FFTs are not yet implemented.
+//! process-local memory-axis permutations, and the checked
+//! [`AllToAllvTransposePlan`] and [`PointToPointTransposePlan`] types provide
+//! distributed redistribution through out-of-place views. Alltoallv also
+//! supports shared-storage in-place execution. Point-to-point in-place
+//! transpose and FFT APIs are not implemented.
 //!
-//! Alltoallv construction and execution are collective: every rank must use
-//! the same source communicator context, API, order, `T`, and correct
-//! `Equivalence`. `execute_views` preserves its source. `execute_in_place`
-//! leaves the array valid through communication, then performs
-//! `Poisoned` -> destination-prefix unpack -> commit; ordinary descriptor or
-//! preflight errors preserve array state and contents. Recovery from global MPI
-//! failures, arbitrary panics, or process loss is not guaranteed.
+//! The two distributed transports share the canonical [`TransposeError`],
+//! [`TransposeWorkspace`] and [`TransposeWorkspaceRequirements`] types. The
+//! older [`AllToAllvTransposeError`], [`AllToAllvTransposeWorkspace`] and
+//! [`AllToAllvTransposeWorkspaceRequirements`] names remain compatibility
+//! aliases for those exact types.
+//!
+//! Alltoallv and point-to-point construction and execution are collective on
+//! the source topology's Cartesian communicator. Every rank must use the same
+//! source communicator context, API, order, `T`, and correct `Equivalence`
+//! implementation. Source and destination pencils must share the same
+//! topology object and global shape and differ in exactly one ordered
+//! decomposition position. Descriptor checks catch common mismatches but do
+//! not replace this communicator, collective-order, type, or `Equivalence`
+//! contract.
+//!
+//! [`TransposeWorkspace::from_vecs`] and both plans'
+//! `workspace_requirements` methods are noncollective and do not call MPI.
+//! Workspace validation uses initialized `len`, never capacity, and execution
+//! does not resize or reallocate the backing vectors. Count, displacement,
+//! checked total, offset, view length, and workspace length constraints are
+//! checked before payload communication. Ordinary preflight errors return on
+//! all ranks before communication: out-of-place execution preserves its source,
+//! destination, and workspace; Alltoallv in-place execution preserves array
+//! state, contents, and workspace.
+//!
+//! Point-to-point execution uses the topology-owned changed-axis context and a
+//! fixed internal tag. Do not overlap unfinished transposes on that context;
+//! it waits for every request and returns only after all borrowed request
+//! segments are complete. MPI failures, arbitrary panics, and process loss do
+//! not guarantee global recovery or a recovered `Result`;
+//! `mpi::request::scope` may abort if it exits with unfinished requests.
 //!
 //! # One-rank example
 //!
@@ -40,8 +65,9 @@
 //! ```
 //! use mpi::traits::*;
 //! use pencil_array::{
-//!     AllToAllvTransposePlan, AllToAllvTransposeWorkspace, AxisPermutation, ExtraShape,
-//!     LocalTransposePlan, ManyPencilArray, MpiTopology, Pencil, PencilArray,
+//!     AllToAllvTransposePlan, AxisPermutation, ExtraShape, LocalTransposePlan,
+//!     ManyPencilArray, MpiTopology, Pencil, PencilArray, PointToPointTransposePlan,
+//!     TransposeWorkspace,
 //! };
 //!
 //! let universe = mpi::initialize().expect("MPI must not already be initialized");
@@ -65,7 +91,7 @@
 //!     distributed_destination_pencil.clone(),
 //! )?;
 //! let requirements = distributed_plan.workspace_requirements(&extra_shape)?;
-//! let mut workspace = AllToAllvTransposeWorkspace::from_vecs(
+//! let mut workspace = TransposeWorkspace::from_vecs(
 //!     vec![0.0_f64; requirements.send_len],
 //!     vec![0.0_f64; requirements.receive_len],
 //! );
@@ -79,6 +105,15 @@
 //!     distributed_destination.view_mut(),
 //!     &mut workspace,
 //! )?;
+//! let point_to_point_plan = PointToPointTransposePlan::new(
+//!     source_pencil.clone(),
+//!     distributed_destination_pencil.clone(),
+//! )?;
+//! point_to_point_plan.execute_views(
+//!     source.view(),
+//!     distributed_destination.view_mut(),
+//!     &mut workspace,
+//! )?;
 //!
 //! let mut distributed_in_place = ManyPencilArray::from_elem(
 //!     vec![source_pencil, distributed_destination_pencil],
@@ -86,7 +121,7 @@
 //!     extra_shape,
 //!     0.0_f64,
 //! )?;
-//! let mut in_place_workspace = AllToAllvTransposeWorkspace::from_vecs(
+//! let mut in_place_workspace = TransposeWorkspace::from_vecs(
 //!     vec![0.0_f64; requirements.send_len],
 //!     vec![0.0_f64; requirements.receive_len],
 //! );
@@ -224,13 +259,12 @@ mod geometry;
 mod local_transpose;
 mod many;
 mod pencil;
+mod point_to_point_transpose;
 mod topology;
+mod transpose;
 mod view;
 
-pub use alltoallv_transpose::{
-    AllToAllvTransposeError, AllToAllvTransposePlan, AllToAllvTransposeWorkspace,
-    AllToAllvTransposeWorkspaceRequirements,
-};
+pub use alltoallv_transpose::AllToAllvTransposePlan;
 pub use array::PencilArray;
 pub use axis::{AxisPermutation, SpatialAxis};
 pub use decomposition::Decomposition;
@@ -240,5 +274,14 @@ pub use geometry::partition_range;
 pub use local_transpose::{LocalTransposeError, LocalTransposePlan};
 pub use many::{ManyPencilArray, OverwriteError};
 pub use pencil::{Pencil, PencilConfig};
+pub use point_to_point_transpose::PointToPointTransposePlan;
 pub use topology::MpiTopology;
+pub use transpose::{TransposeError, TransposeWorkspace, TransposeWorkspaceRequirements};
+
+/// Compatibility alias for the canonical [`TransposeError`].
+pub use transpose::TransposeError as AllToAllvTransposeError;
+/// Compatibility alias for the canonical [`TransposeWorkspace`].
+pub use transpose::TransposeWorkspace as AllToAllvTransposeWorkspace;
+/// Compatibility alias for the canonical [`TransposeWorkspaceRequirements`].
+pub use transpose::TransposeWorkspaceRequirements as AllToAllvTransposeWorkspaceRequirements;
 pub use view::{PencilArrayView, PencilArrayViewMut};
