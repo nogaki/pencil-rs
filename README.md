@@ -14,9 +14,9 @@ registered layouts and exposes only its active layout. Array shapes use
 logical order `[extra..., spatial...]`; their row-major buffers use memory
 order `[extra..., permuted spatial...]`. `LocalTransposePlan` provides
 process-local memory-axis permutations. `AllToAllvTransposePlan` and
-`PointToPointTransposePlan` provide checked out-of-place distributed
-redistribution; Alltoallv also provides shared-storage in-place redistribution.
-Point-to-point in-place transpose and FFTs remain next-stage work.
+`PointToPointTransposePlan` provide checked distributed redistribution through
+out-of-place views and shared-storage in-place execution. FFT APIs remain
+next-stage work.
 
 Alltoallv and point-to-point construction and execution are collective: every
 rank must use the same source communicator context, API, order, `T`, and
@@ -33,9 +33,10 @@ the same types. `workspace_requirements` and
 `TransposeWorkspace::from_vecs` are noncollective and do not call MPI;
 execution checks initialized `len` (not capacity), does not resize or
 reallocate workspace vectors, and checks count/length/displacement/offset
-limits before payload communication. Ordinary preflight errors preserve the
-source, destination, workspace, and (for Alltoallv in-place) array state and
-contents. Point-to-point uses a fixed internal tag on the topology-owned
+limits before payload communication. Ordinary out-of-place preflight errors
+preserve the source, destination, and workspace. Ordinary in-place preflight
+errors preserve the array state, active data, and workspace for both
+Alltoallv and point-to-point. Point-to-point uses a fixed internal tag on the topology-owned
 changed-axis context, posts all receives before sends, waits for every request,
 and must not overlap unfinished transposes on that context. MPI failures,
 arbitrary panics, and process loss do not guarantee global recovery; an
@@ -67,7 +68,7 @@ mpiexec -n 4 cargo test -p pencil-array --test many --locked -- --nocapture --te
 # The local operation is noncollective; keep a timeout to catch deadlocks.
 timeout --foreground 120s mpiexec -n 1 cargo test -p pencil-array --test local_transpose --locked -- --nocapture --test-threads=1
 timeout --foreground 120s mpiexec -n 4 cargo test -p pencil-array --test local_transpose --locked -- --nocapture --test-threads=1
-# The existing suite binary covers Alltoallv/P2P out-of-place and Alltoallv in-place APIs.
+# The existing suite binary covers Alltoallv/P2P out-of-place and both in-place APIs.
 timeout --foreground 120s mpiexec -n 1 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
 timeout --foreground 120s mpiexec -n 4 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
 timeout --foreground 120s mpiexec -n 6 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
@@ -91,3 +92,4 @@ all topologies and arrays before MPI finalizes.
 - `docs/superpowers/plans/2026-09-14-alltoallv-transpose-implementation.md`
 - `docs/superpowers/plans/2026-09-14-alltoallv-in-place-implementation.md`
 - [Point-to-point transpose implementation plan](docs/superpowers/plans/2026-09-15-point-to-point-transpose-implementation.md)
+- [Point-to-point in-place implementation plan](docs/superpowers/plans/2026-09-15-point-to-point-in-place-implementation.md)

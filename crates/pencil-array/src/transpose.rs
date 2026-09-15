@@ -14,18 +14,19 @@ use mpi::{
 use thiserror::Error;
 
 use crate::{
-    ArrayError, ExtraShape, Pencil, PencilArrayView, PencilArrayViewMut, checked::checked_product,
-    geometry::row_major_offset,
+    ArrayError, ExtraShape, ManyPencilArray, Pencil, PencilArrayView, PencilArrayViewMut,
+    checked::checked_product, geometry::row_major_offset,
 };
 
 const DESCRIPTOR_SCHEMA: u64 = 1;
-// The operation word combines transport and operation; 1..=3 are the
-// existing Alltoallv codes and 4..=5 are the point-to-point additions.
+// The operation word combines transport and operation; keep these values
+// stable because they are part of the collective preflight protocol.
 const OPERATION_ALLTOALLV_NEW: u64 = 1;
 const OPERATION_ALLTOALLV_VIEWS: u64 = 2;
 pub(crate) const OPERATION_ALLTOALLV_IN_PLACE: u64 = 3;
 const OPERATION_POINT_TO_POINT_NEW: u64 = 4;
 const OPERATION_POINT_TO_POINT_VIEWS: u64 = 5;
+const OPERATION_POINT_TO_POINT_IN_PLACE: u64 = 6;
 const INVALID_AXIS: u64 = u64::MAX;
 const HEADER_WORDS: usize = 5;
 pub(crate) const POINT_TO_POINT_RESERVED_TAG: mpi::Tag = 0x5054;
@@ -49,6 +50,13 @@ impl CommunicationMode {
         match self {
             Self::AllToAllv => OPERATION_ALLTOALLV_VIEWS,
             Self::PointToPoint => OPERATION_POINT_TO_POINT_VIEWS,
+        }
+    }
+
+    pub(crate) fn in_place_operation(self) -> u64 {
+        match self {
+            Self::AllToAllv => OPERATION_ALLTOALLV_IN_PLACE,
+            Self::PointToPoint => OPERATION_POINT_TO_POINT_IN_PLACE,
         }
     }
 }
@@ -198,6 +206,12 @@ pub(crate) struct PreparedExchange {
     pub(crate) send_displacements: Vec<Count>,
     pub(crate) receive_counts: Vec<Count>,
     pub(crate) receive_displacements: Vec<Count>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedInPlace {
+    pub(crate) destination_index: usize,
+    pub(crate) exchange: PreparedExchange,
 }
 
 impl<const N: usize, const M: usize> TransposePlanCore<N, M> {
@@ -423,6 +437,65 @@ impl<const N: usize, const M: usize> TransposePlanCore<N, M> {
         }
         Ok(prepared)
     }
+}
+
+pub(crate) fn prepare_in_place<T, const N: usize, const M: usize>(
+    plan: &TransposePlanCore<N, M>,
+    array: &ManyPencilArray<T, N, M>,
+    workspace: &TransposeWorkspace<T>,
+) -> Result<PreparedInPlace, TransposeError>
+where
+    T: Equivalence + Copy,
+{
+    let source_index = array.active_index().map_err(TransposeError::from)?;
+    let active_source = array
+        .pencils()
+        .get(source_index)
+        .ok_or(TransposeError::SourceLayoutMismatch)?;
+    if !active_source.same_layout(plan.source.as_ref()) {
+        return Err(TransposeError::SourceLayoutMismatch);
+    }
+    let destination_index = array
+        .find_layout(plan.destination.as_ref())
+        .ok_or(TransposeError::DestinationLayoutMismatch)?;
+    let extra_count = array.extra_shape().element_count();
+    let source_len = checked_product(&[active_source.local_len(), extra_count])
+        .map_err(|error| TransposeError::Array(ArrayError::from(error)))?;
+    let destination_pencil = array
+        .pencils()
+        .get(destination_index)
+        .ok_or(TransposeError::DestinationLayoutMismatch)?;
+    let destination_len = checked_product(&[destination_pencil.local_len(), extra_count])
+        .map_err(|error| TransposeError::Array(ArrayError::from(error)))?;
+    let exchange =
+        plan.prepare_common(array.extra_shape(), source_len, destination_len, workspace)?;
+    Ok(PreparedInPlace {
+        destination_index,
+        exchange,
+    })
+}
+
+pub(crate) fn finish_in_place<T: Copy, const N: usize, const M: usize>(
+    plan: &TransposePlanCore<N, M>,
+    array: &mut ManyPencilArray<T, N, M>,
+    destination_index: usize,
+    exchange: &PreparedExchange,
+    receive_buffer: &[T],
+    extra_count: usize,
+) {
+    let mut guard = array
+        .begin_in_place_write()
+        .expect("collective in-place preflight validated the active state");
+    unpack_destination(
+        plan.peers(),
+        plan.destination.as_ref(),
+        &mut guard.storage_mut()[..exchange.requirements.receive_len],
+        receive_buffer,
+        extra_count,
+    );
+    guard
+        .commit(destination_index)
+        .expect("collective in-place preflight validated the destination layout");
 }
 
 fn validate_plan_layout<const N: usize, const M: usize>(

@@ -19,6 +19,10 @@ fn value_3d(global: [usize; 3]) -> u64 {
     (global[0] * 10_000 + global[1] * 100 + global[2]) as u64
 }
 
+fn value_3d_f64(global: [usize; 3]) -> f64 {
+    value_3d(global) as f64
+}
+
 fn fill_2d<T: Copy + Clone>(
     pencil: Arc<Pencil<2, 1>>,
     extra_shape: ExtraShape,
@@ -197,10 +201,69 @@ fn run_2d_point_to_point_success<T>(
     assert_eq!(p2p_destination.as_slice(), all_destination.as_slice());
     check_2d(&p2p_destination, value);
 
+    let mut p2p_in_place = many_from_source_2d(
+        Arc::clone(&source_pencil),
+        Arc::clone(&destination_pencil),
+        extra.clone(),
+        &source,
+        zero,
+    );
     let reverse =
         PointToPointTransposePlan::new(Arc::clone(&destination_pencil), Arc::clone(&source_pencil))
             .unwrap();
     let reverse_requirements = reverse.workspace_requirements(&extra).unwrap();
+    let mut p2p_in_place_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![zero; p2p_requirements.send_len.max(reverse_requirements.send_len)],
+        vec![
+            zero;
+            p2p_requirements
+                .receive_len
+                .max(reverse_requirements.receive_len)
+        ],
+    );
+
+    // Reuse this same array and max-sized workspace in both directions, then
+    // run the forward operation again and compare each physical buffer.
+    p2p_plan
+        .execute_in_place(&mut p2p_in_place, &mut p2p_in_place_workspace)
+        .unwrap();
+    assert!(
+        p2p_in_place
+            .active_pencil()
+            .unwrap()
+            .same_layout(destination_pencil.as_ref())
+    );
+    assert_eq!(
+        p2p_in_place.active_view().unwrap().as_slice(),
+        all_destination.as_slice()
+    );
+    reverse
+        .execute_in_place(&mut p2p_in_place, &mut p2p_in_place_workspace)
+        .unwrap();
+    assert!(
+        p2p_in_place
+            .active_pencil()
+            .unwrap()
+            .same_layout(source_pencil.as_ref())
+    );
+    assert_eq!(
+        p2p_in_place.active_view().unwrap().as_slice(),
+        source_before.as_slice()
+    );
+    p2p_plan
+        .execute_in_place(&mut p2p_in_place, &mut p2p_in_place_workspace)
+        .unwrap();
+    assert!(
+        p2p_in_place
+            .active_pencil()
+            .unwrap()
+            .same_layout(destination_pencil.as_ref())
+    );
+    assert_eq!(
+        p2p_in_place.active_view().unwrap().as_slice(),
+        all_destination.as_slice()
+    );
+
     let mut reverse_workspace = AllToAllvTransposeWorkspace::from_vecs(
         vec![zero; reverse_requirements.send_len],
         vec![zero; reverse_requirements.receive_len],
@@ -294,10 +357,66 @@ fn run_2d_point_to_point_empty_success(topology: &Arc<MpiTopology<1>>) {
         }
     }
 
+    let mut p2p_in_place = many_from_source_2d(
+        Arc::clone(&source_pencil),
+        Arc::clone(&destination_pencil),
+        extra.clone(),
+        &source,
+        u64::MAX,
+    );
     let reverse =
         PointToPointTransposePlan::new(Arc::clone(&destination_pencil), Arc::clone(&source_pencil))
             .unwrap();
     let reverse_requirements = reverse.workspace_requirements(&extra).unwrap();
+    let mut p2p_in_place_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![0_u64; p2p_requirements.send_len.max(reverse_requirements.send_len)],
+        vec![
+            0_u64;
+            p2p_requirements
+                .receive_len
+                .max(reverse_requirements.receive_len)
+        ],
+    );
+    p2p_plan
+        .execute_in_place(&mut p2p_in_place, &mut p2p_in_place_workspace)
+        .unwrap();
+    assert!(
+        p2p_in_place
+            .active_pencil()
+            .unwrap()
+            .same_layout(destination_pencil.as_ref())
+    );
+    assert_eq!(
+        p2p_in_place.active_view().unwrap().as_slice(),
+        all_destination.as_slice()
+    );
+    reverse
+        .execute_in_place(&mut p2p_in_place, &mut p2p_in_place_workspace)
+        .unwrap();
+    assert!(
+        p2p_in_place
+            .active_pencil()
+            .unwrap()
+            .same_layout(source_pencil.as_ref())
+    );
+    assert_eq!(
+        p2p_in_place.active_view().unwrap().as_slice(),
+        source_before.as_slice()
+    );
+    p2p_plan
+        .execute_in_place(&mut p2p_in_place, &mut p2p_in_place_workspace)
+        .unwrap();
+    assert!(
+        p2p_in_place
+            .active_pencil()
+            .unwrap()
+            .same_layout(destination_pencil.as_ref())
+    );
+    assert_eq!(
+        p2p_in_place.active_view().unwrap().as_slice(),
+        all_destination.as_slice()
+    );
+
     let mut reusable_workspace = AllToAllvTransposeWorkspace::from_vecs(
         vec![0_u64; p2p_requirements.send_len.max(reverse_requirements.send_len)],
         vec![
@@ -361,6 +480,26 @@ fn run_2d_point_to_point_empty_success(topology: &Arc<MpiTopology<1>>) {
         )
         .unwrap();
     assert!(zero_p2p_destination.is_empty());
+
+    let mut zero_many = ManyPencilArray::<u64, 2, 1>::from_vec(
+        vec![Arc::clone(&source_pencil), Arc::clone(&destination_pencil)],
+        0,
+        zero_extra.clone(),
+        Vec::new(),
+    )
+    .unwrap();
+    let mut zero_in_place_workspace =
+        AllToAllvTransposeWorkspace::from_vecs(Vec::new(), Vec::new());
+    p2p_plan
+        .execute_in_place(&mut zero_many, &mut zero_in_place_workspace)
+        .unwrap();
+    assert!(
+        zero_many
+            .active_pencil()
+            .unwrap()
+            .same_layout(destination_pencil.as_ref())
+    );
+    assert!(zero_many.active_view().unwrap().is_empty());
 }
 
 fn run_point_to_point_large_payload(topology: &Arc<MpiTopology<1>>) {
@@ -442,6 +581,33 @@ fn run_point_to_point_large_payload(topology: &Arc<MpiTopology<1>>) {
             );
         }
     }
+
+    let required = source_pencil
+        .local_len()
+        .max(destination_pencil.local_len());
+    let mut p2p_in_place = ManyPencilArray::from_vec(
+        vec![Arc::clone(&source_pencil), Arc::clone(&destination_pencil)],
+        0,
+        ExtraShape::scalar(),
+        vec![u64::MAX; required],
+    )
+    .unwrap();
+    p2p_in_place
+        .active_view_mut()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(source.as_slice());
+    let mut p2p_in_place_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![0_u64; p2p_requirements.send_len],
+        vec![0_u64; p2p_requirements.receive_len],
+    );
+    p2p_plan
+        .execute_in_place(&mut p2p_in_place, &mut p2p_in_place_workspace)
+        .unwrap();
+    assert_eq!(
+        p2p_in_place.active_view().unwrap().as_slice(),
+        all_destination.as_slice()
+    );
 }
 
 fn run_point_to_point_preflight_failures(topology: &Arc<MpiTopology<1>>) {
@@ -781,7 +947,437 @@ fn run_point_to_point_preflight_failures(topology: &Arc<MpiTopology<1>>) {
     check_2d(&destination, value_2d_u64);
 }
 
-fn fill_3d_physical(pencil: Arc<Pencil<3, 2>>) -> PencilArray<u64, 3, 2> {
+fn run_point_to_point_in_place_preflight_failures(topology: &Arc<MpiTopology<1>>) {
+    let source_pencil = Pencil::<2, 1>::new_permuted(
+        Arc::clone(topology),
+        [7, 9],
+        [0],
+        AxisPermutation::identity(),
+    )
+    .unwrap();
+    let destination_pencil = source_pencil
+        .with_permutation(AxisPermutation::new([1, 0]).unwrap())
+        .unwrap()
+        .with_decomposition([1])
+        .unwrap();
+    let extra = ExtraShape::new([2, 3]).unwrap();
+    let source = fill_2d(
+        Arc::clone(&source_pencil),
+        extra.clone(),
+        0_u64,
+        value_2d_u64,
+    );
+    let plan =
+        PointToPointTransposePlan::new(Arc::clone(&source_pencil), Arc::clone(&destination_pencil))
+            .unwrap();
+    let all_plan =
+        AllToAllvTransposePlan::new(Arc::clone(&source_pencil), Arc::clone(&destination_pencil))
+            .unwrap();
+    let requirements = plan.workspace_requirements(&extra).unwrap();
+    let all_requirements = all_plan.workspace_requirements(&extra).unwrap();
+    let reverse =
+        PointToPointTransposePlan::new(Arc::clone(&destination_pencil), Arc::clone(&source_pencil))
+            .unwrap();
+    let reverse_requirements = reverse.workspace_requirements(&extra).unwrap();
+    let rank = usize::try_from(topology.rank()).unwrap();
+    let size = topology.size();
+    // This sentinel differs from every source value and makes accidental pack
+    // writes visible even when a later successful call reuses the workspace.
+    let full_workspace = || {
+        AllToAllvTransposeWorkspace::from_vecs(
+            vec![u64::MAX; requirements.send_len],
+            vec![u64::MAX; requirements.receive_len],
+        )
+    };
+    let make_array = || {
+        many_from_source_2d(
+            Arc::clone(&source_pencil),
+            Arc::clone(&destination_pencil),
+            extra.clone(),
+            &source,
+            700_u64,
+        )
+    };
+
+    let mut expected =
+        PencilArray::from_elem(Arc::clone(&destination_pencil), extra.clone(), 0_u64).unwrap();
+    let mut expected_workspace = full_workspace();
+    plan.execute_views(source.view(), expected.view_mut(), &mut expected_workspace)
+        .unwrap();
+    let source_before = source.as_slice().to_vec();
+
+    // Send and receive shortages are collective and do not touch the active
+    // array or either initialized workspace vector on any rank.
+    for short_send in [true, false] {
+        let mut insufficient = make_array();
+        let before = insufficient.active_view().unwrap().as_slice().to_vec();
+        let mut insufficient_workspace = if rank == 0 {
+            if short_send {
+                AllToAllvTransposeWorkspace::from_vecs(
+                    Vec::new(),
+                    vec![u64::MAX; requirements.receive_len],
+                )
+            } else {
+                AllToAllvTransposeWorkspace::from_vecs(
+                    vec![u64::MAX; requirements.send_len],
+                    Vec::new(),
+                )
+            }
+        } else {
+            full_workspace()
+        };
+        let workspace_before = format!("{insufficient_workspace:?}");
+        assert!(
+            plan.execute_in_place(&mut insufficient, &mut insufficient_workspace)
+                .is_err()
+        );
+        assert_eq!(
+            insufficient.active_view().unwrap().as_slice(),
+            before.as_slice()
+        );
+        assert_eq!(format!("{insufficient_workspace:?}"), workspace_before);
+    }
+
+    // A rank-local active source mismatch is agreed before a request is posted.
+    let mut wrong_source = if rank == 0 {
+        many_2d_with_value(
+            Arc::clone(&source_pencil),
+            Arc::clone(&destination_pencil),
+            1,
+            extra.clone(),
+            701_u64,
+        )
+    } else {
+        make_array()
+    };
+    let wrong_source_before = wrong_source.active_view().unwrap().as_slice().to_vec();
+    let mut wrong_source_workspace = full_workspace();
+    let wrong_source_workspace_before = format!("{wrong_source_workspace:?}");
+    assert!(
+        plan.execute_in_place(&mut wrong_source, &mut wrong_source_workspace)
+            .is_err()
+    );
+    let expected_wrong_layout = if rank == 0 {
+        &destination_pencil
+    } else {
+        &source_pencil
+    };
+    assert!(
+        wrong_source
+            .active_pencil()
+            .unwrap()
+            .same_layout(expected_wrong_layout.as_ref())
+    );
+    assert_eq!(
+        wrong_source.active_view().unwrap().as_slice(),
+        wrong_source_before.as_slice()
+    );
+    assert_eq!(
+        format!("{wrong_source_workspace:?}"),
+        wrong_source_workspace_before
+    );
+
+    // A rank-local missing destination registration is also preflight-only.
+    let mut missing_destination = if rank == 0 {
+        ManyPencilArray::from_elem(vec![Arc::clone(&source_pencil)], 0, extra.clone(), 702_u64)
+            .unwrap()
+    } else {
+        make_array()
+    };
+    missing_destination
+        .active_view_mut()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(source.as_slice());
+    let missing_before = missing_destination
+        .active_view()
+        .unwrap()
+        .as_slice()
+        .to_vec();
+    let mut missing_workspace = full_workspace();
+    let missing_workspace_before = format!("{missing_workspace:?}");
+    assert!(
+        plan.execute_in_place(&mut missing_destination, &mut missing_workspace)
+            .is_err()
+    );
+    assert_eq!(
+        missing_destination.active_view().unwrap().as_slice(),
+        missing_before.as_slice()
+    );
+    assert_eq!(format!("{missing_workspace:?}"), missing_workspace_before);
+
+    // Poisoned state is inspected after the operation-6 descriptor, not before it.
+    let mut poisoned = make_array();
+    if rank == 0 {
+        assert!(matches!(
+            poisoned.overwrite_with(source_pencil.as_ref(), |_view| { Err::<(), _>("poison") }),
+            Err(pencil_array::OverwriteError::Writer("poison"))
+        ));
+    }
+    let mut poisoned_workspace = full_workspace();
+    let poisoned_workspace_before = format!("{poisoned_workspace:?}");
+    assert!(
+        plan.execute_in_place(&mut poisoned, &mut poisoned_workspace)
+            .is_err()
+    );
+    if rank == 0 {
+        assert_eq!(poisoned.active_view().unwrap_err(), ArrayError::Poisoned);
+    } else {
+        assert!(
+            poisoned
+                .active_pencil()
+                .unwrap()
+                .same_layout(source_pencil.as_ref())
+        );
+    }
+    assert_eq!(format!("{poisoned_workspace:?}"), poisoned_workspace_before);
+
+    // The exact extra-shape descriptor rejects one rank's local shape.
+    let local_extra = if rank == 0 {
+        ExtraShape::new([3, 2]).unwrap()
+    } else {
+        extra.clone()
+    };
+    let local_source = fill_2d(
+        Arc::clone(&source_pencil),
+        local_extra.clone(),
+        0_u64,
+        value_2d_u64,
+    );
+    let mut local_array = many_from_source_2d(
+        Arc::clone(&source_pencil),
+        Arc::clone(&destination_pencil),
+        local_extra.clone(),
+        &local_source,
+        703_u64,
+    );
+    let local_before = local_array.active_view().unwrap().as_slice().to_vec();
+    let local_requirements = plan.workspace_requirements(&local_extra).unwrap();
+    let mut local_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![u64::MAX; local_requirements.send_len],
+        vec![u64::MAX; local_requirements.receive_len],
+    );
+    let local_workspace_before = format!("{local_workspace:?}");
+    let local_result = plan.execute_in_place(&mut local_array, &mut local_workspace);
+    if size == 1 {
+        assert!(local_result.is_ok());
+    } else {
+        assert!(local_result.is_err());
+        assert_eq!(
+            local_array.active_view().unwrap().as_slice(),
+            local_before.as_slice()
+        );
+        assert_eq!(format!("{local_workspace:?}"), local_workspace_before);
+    }
+
+    // Type descriptors use the same operation-6 boundary.
+    let source_f64 = fill_2d(
+        Arc::clone(&source_pencil),
+        extra.clone(),
+        0.0_f64,
+        value_2d_f64,
+    );
+    let type_result = if rank == 0 {
+        let mut array = many_from_source_2d(
+            Arc::clone(&source_pencil),
+            Arc::clone(&destination_pencil),
+            extra.clone(),
+            &source_f64,
+            704.0_f64,
+        );
+        let mut workspace = point_to_point_workspace_for(&plan, &extra, -1.0_f64);
+        let workspace_before = format!("{workspace:?}");
+        let result = plan.execute_in_place(&mut array, &mut workspace);
+        if size > 1 {
+            assert_eq!(format!("{workspace:?}"), workspace_before);
+        }
+        result
+    } else {
+        let mut array = make_array();
+        let mut workspace = full_workspace();
+        let workspace_before = format!("{workspace:?}");
+        let result = plan.execute_in_place(&mut array, &mut workspace);
+        if size > 1 {
+            assert_eq!(format!("{workspace:?}"), workspace_before);
+        }
+        result
+    };
+    if size == 1 {
+        assert!(type_result.is_ok());
+    } else {
+        assert!(type_result.is_err());
+    }
+
+    // A rank-local direction mismatch is rejected before changing state.
+    let mut direction = if rank == 0 {
+        many_2d_with_value(
+            Arc::clone(&source_pencil),
+            Arc::clone(&destination_pencil),
+            1,
+            extra.clone(),
+            705_u64,
+        )
+    } else {
+        make_array()
+    };
+    let direction_before = direction.active_view().unwrap().as_slice().to_vec();
+    let mut direction_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![u64::MAX; requirements.send_len.max(reverse_requirements.send_len)],
+        vec![
+            u64::MAX;
+            requirements
+                .receive_len
+                .max(reverse_requirements.receive_len)
+        ],
+    );
+    let direction_workspace_before = format!("{direction_workspace:?}");
+    let direction_result = if rank == 0 {
+        reverse.execute_in_place(&mut direction, &mut direction_workspace)
+    } else {
+        plan.execute_in_place(&mut direction, &mut direction_workspace)
+    };
+    if size == 1 {
+        assert!(direction_result.is_ok());
+    } else {
+        assert!(direction_result.is_err());
+        assert_eq!(
+            direction.active_view().unwrap().as_slice(),
+            direction_before.as_slice()
+        );
+    }
+    if size > 1 {
+        assert_eq!(
+            format!("{direction_workspace:?}"),
+            direction_workspace_before
+        );
+    }
+
+    // Operation 6 is distinct from every existing operation code.
+    let mixed_new = if rank == 0 {
+        AllToAllvTransposePlan::new(Arc::clone(&source_pencil), Arc::clone(&destination_pencil))
+            .map(|_| ())
+    } else {
+        let mut array = make_array();
+        let mut workspace = full_workspace();
+        plan.execute_in_place(&mut array, &mut workspace)
+    };
+    if size == 1 {
+        assert!(mixed_new.is_ok());
+    } else {
+        assert!(mixed_new.is_err());
+    }
+
+    let mixed_all_views = if rank == 0 {
+        let mut destination =
+            PencilArray::from_elem(Arc::clone(&destination_pencil), extra.clone(), 706_u64)
+                .unwrap();
+        let mut workspace = AllToAllvTransposeWorkspace::from_vecs(
+            vec![0_u64; all_requirements.send_len],
+            vec![0_u64; all_requirements.receive_len],
+        );
+        all_plan.execute_views(source.view(), destination.view_mut(), &mut workspace)
+    } else {
+        let mut array = make_array();
+        let mut workspace = full_workspace();
+        plan.execute_in_place(&mut array, &mut workspace)
+    };
+    if size == 1 {
+        assert!(mixed_all_views.is_ok());
+    } else {
+        assert!(mixed_all_views.is_err());
+    }
+
+    let mixed_all_in_place = if rank == 0 {
+        let mut array = make_array();
+        let mut workspace = AllToAllvTransposeWorkspace::from_vecs(
+            vec![0_u64; all_requirements.send_len],
+            vec![0_u64; all_requirements.receive_len],
+        );
+        all_plan.execute_in_place(&mut array, &mut workspace)
+    } else {
+        let mut array = make_array();
+        let mut workspace = full_workspace();
+        plan.execute_in_place(&mut array, &mut workspace)
+    };
+    if size == 1 {
+        assert!(mixed_all_in_place.is_ok());
+    } else {
+        assert!(mixed_all_in_place.is_err());
+    }
+
+    let mixed_p2p_new = if rank == 0 {
+        PointToPointTransposePlan::new(Arc::clone(&source_pencil), Arc::clone(&destination_pencil))
+            .map(|_| ())
+    } else {
+        let mut array = make_array();
+        let mut workspace = full_workspace();
+        plan.execute_in_place(&mut array, &mut workspace)
+    };
+    if size == 1 {
+        assert!(mixed_p2p_new.is_ok());
+    } else {
+        assert!(mixed_p2p_new.is_err());
+    }
+
+    let mixed_p2p_views = if rank == 0 {
+        let mut destination =
+            PencilArray::from_elem(Arc::clone(&destination_pencil), extra.clone(), 707_u64)
+                .unwrap();
+        let mut workspace = full_workspace();
+        plan.execute_views(source.view(), destination.view_mut(), &mut workspace)
+    } else {
+        let mut array = make_array();
+        let mut workspace = full_workspace();
+        plan.execute_in_place(&mut array, &mut workspace)
+    };
+    if size == 1 {
+        assert!(mixed_p2p_views.is_ok());
+    } else {
+        assert!(mixed_p2p_views.is_err());
+    }
+
+    // A preflight failure leaves the same workspace reusable for a later success.
+    let mut reusable = make_array();
+    let mut reusable_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![u64::MAX; requirements.send_len.max(reverse_requirements.send_len)],
+        vec![
+            u64::MAX;
+            requirements
+                .receive_len
+                .max(reverse_requirements.receive_len)
+        ],
+    );
+    if size == 1 {
+        plan.execute_in_place(&mut reusable, &mut reusable_workspace)
+            .unwrap();
+    } else {
+        let reusable_before = reusable.active_view().unwrap().as_slice().to_vec();
+        let reusable_workspace_before = format!("{reusable_workspace:?}");
+        let reusable_result = if rank == 0 {
+            reverse.execute_in_place(&mut reusable, &mut reusable_workspace)
+        } else {
+            plan.execute_in_place(&mut reusable, &mut reusable_workspace)
+        };
+        assert!(reusable_result.is_err());
+        assert_eq!(
+            reusable.active_view().unwrap().as_slice(),
+            reusable_before.as_slice()
+        );
+        assert_eq!(format!("{reusable_workspace:?}"), reusable_workspace_before);
+        plan.execute_in_place(&mut reusable, &mut reusable_workspace)
+            .unwrap();
+    }
+    assert_eq!(
+        reusable.active_view().unwrap().as_slice(),
+        expected.as_slice()
+    );
+    assert_eq!(source.as_slice(), source_before.as_slice());
+}
+
+fn fill_3d_physical<T: Copy>(
+    pencil: Arc<Pencil<3, 2>>,
+    value: fn([usize; 3]) -> T,
+) -> PencilArray<T, 3, 2> {
     let shape = pencil.local_shape_logical();
     let ranges = pencil.local_ranges();
     let mut physical = Vec::with_capacity(pencil.local_len());
@@ -790,7 +1386,7 @@ fn fill_3d_physical(pencil: Arc<Pencil<3, 2>>) -> PencilArray<u64, 3, 2> {
     for z in 0..shape[2] {
         for x in 0..shape[0] {
             for y in 0..shape[1] {
-                physical.push(value_3d([
+                physical.push(value([
                     ranges[0].start + x,
                     ranges[1].start + y,
                     ranges[2].start + z,
@@ -801,7 +1397,7 @@ fn fill_3d_physical(pencil: Arc<Pencil<3, 2>>) -> PencilArray<u64, 3, 2> {
     PencilArray::from_vec(pencil, ExtraShape::scalar(), physical).unwrap()
 }
 
-fn expected_3d_physical(pencil: &Pencil<3, 2>) -> Vec<u64> {
+fn expected_3d_physical<T: Copy>(pencil: &Pencil<3, 2>, value: fn([usize; 3]) -> T) -> Vec<T> {
     let shape = pencil.local_shape_logical();
     let ranges = pencil.local_ranges();
     let mut expected = Vec::with_capacity(pencil.local_len());
@@ -810,7 +1406,7 @@ fn expected_3d_physical(pencil: &Pencil<3, 2>) -> Vec<u64> {
     for y in 0..shape[1] {
         for z in 0..shape[2] {
             for x in 0..shape[0] {
-                expected.push(value_3d([
+                expected.push(value([
                     ranges[0].start + x,
                     ranges[1].start + y,
                     ranges[2].start + z,
@@ -821,7 +1417,7 @@ fn expected_3d_physical(pencil: &Pencil<3, 2>) -> Vec<u64> {
     expected
 }
 
-fn check_3d(array: &PencilArray<u64, 3, 2>) {
+fn check_3d<T: PartialEq + Debug>(array: &PencilArray<T, 3, 2>, value: fn([usize; 3]) -> T) {
     let pencil = array.pencil();
     let shape = pencil.local_shape_logical();
     for x in 0..shape[0] {
@@ -832,17 +1428,21 @@ fn check_3d(array: &PencilArray<u64, 3, 2>) {
                     pencil.local_ranges()[1].start + y,
                     pencil.local_ranges()[2].start + z,
                 ];
-                assert_eq!(array.get_local(&[], [x, y, z]), Some(&value_3d(global)));
+                assert_eq!(array.get_local(&[], [x, y, z]), Some(&value(global)));
             }
         }
     }
 }
 
-fn run_3d_point_to_point_success(
+fn run_3d_point_to_point_success<T>(
     topology: &Arc<MpiTopology<2>>,
     source_decomposition: [usize; 2],
     destination_decomposition: [usize; 2],
-) {
+    value: fn([usize; 3]) -> T,
+    zero: T,
+) where
+    T: mpi::datatype::Equivalence + Copy + PartialEq + Debug,
+{
     let source_pencil = Pencil::<3, 2>::new_permuted(
         Arc::clone(topology),
         [5, 2, 7],
@@ -857,9 +1457,9 @@ fn run_3d_point_to_point_success(
         AxisPermutation::new([1, 2, 0]).unwrap(),
     )
     .unwrap();
-    let source = fill_3d_physical(Arc::clone(&source_pencil));
+    let source = fill_3d_physical(Arc::clone(&source_pencil), value);
     let source_before = source.as_slice().to_vec();
-    let expected = expected_3d_physical(&destination_pencil);
+    let expected = expected_3d_physical(&destination_pencil, value);
     let all_plan =
         AllToAllvTransposePlan::new(Arc::clone(&source_pencil), Arc::clone(&destination_pencil))
             .unwrap();
@@ -871,16 +1471,16 @@ fn run_3d_point_to_point_success(
     let p2p_requirements = p2p_plan.workspace_requirements(&extra).unwrap();
     assert_eq!(all_requirements, p2p_requirements);
     let mut all_destination =
-        PencilArray::from_elem(Arc::clone(&destination_pencil), extra.clone(), u64::MAX).unwrap();
+        PencilArray::from_elem(Arc::clone(&destination_pencil), extra.clone(), zero).unwrap();
     let mut p2p_destination =
-        PencilArray::from_elem(Arc::clone(&destination_pencil), extra.clone(), u64::MAX).unwrap();
+        PencilArray::from_elem(Arc::clone(&destination_pencil), extra.clone(), zero).unwrap();
     let mut all_workspace = AllToAllvTransposeWorkspace::from_vecs(
-        vec![0_u64; all_requirements.send_len],
-        vec![0_u64; all_requirements.receive_len],
+        vec![zero; all_requirements.send_len],
+        vec![zero; all_requirements.receive_len],
     );
     let mut p2p_workspace = AllToAllvTransposeWorkspace::from_vecs(
-        vec![0_u64; p2p_requirements.send_len],
-        vec![0_u64; p2p_requirements.receive_len],
+        vec![zero; p2p_requirements.send_len],
+        vec![zero; p2p_requirements.receive_len],
     );
     all_plan
         .execute_views(
@@ -900,8 +1500,23 @@ fn run_3d_point_to_point_success(
     assert_eq!(all_destination.as_slice(), expected.as_slice());
     assert_eq!(p2p_destination.as_slice(), expected.as_slice());
     assert_eq!(p2p_destination.as_slice(), all_destination.as_slice());
-    check_3d(&p2p_destination);
+    check_3d(&p2p_destination, value);
 
+    let required = source_pencil
+        .local_len()
+        .max(destination_pencil.local_len());
+    let mut p2p_in_place = ManyPencilArray::from_vec(
+        vec![Arc::clone(&source_pencil), Arc::clone(&destination_pencil)],
+        0,
+        extra.clone(),
+        vec![zero; required],
+    )
+    .unwrap();
+    p2p_in_place
+        .active_view_mut()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(source.as_slice());
     let reverse =
         PointToPointTransposePlan::new(Arc::clone(&destination_pencil), Arc::clone(&source_pencil))
             .unwrap();
@@ -910,9 +1525,55 @@ fn run_3d_point_to_point_success(
     let max_receive = p2p_requirements
         .receive_len
         .max(reverse_requirements.receive_len);
+    let mut p2p_in_place_workspace =
+        AllToAllvTransposeWorkspace::from_vecs(vec![zero; max_send], vec![zero; max_receive]);
+
+    // The same array and max-sized workspace make a forward, reverse, and
+    // forward trip; each assertion observes the active physical buffer.
+    p2p_plan
+        .execute_in_place(&mut p2p_in_place, &mut p2p_in_place_workspace)
+        .unwrap();
+    assert!(
+        p2p_in_place
+            .active_pencil()
+            .unwrap()
+            .same_layout(destination_pencil.as_ref())
+    );
+    assert_eq!(
+        p2p_in_place.active_view().unwrap().as_slice(),
+        expected.as_slice()
+    );
+    reverse
+        .execute_in_place(&mut p2p_in_place, &mut p2p_in_place_workspace)
+        .unwrap();
+    assert!(
+        p2p_in_place
+            .active_pencil()
+            .unwrap()
+            .same_layout(source_pencil.as_ref())
+    );
+    assert_eq!(
+        p2p_in_place.active_view().unwrap().as_slice(),
+        source_before.as_slice()
+    );
+    p2p_plan
+        .execute_in_place(&mut p2p_in_place, &mut p2p_in_place_workspace)
+        .unwrap();
+    assert!(
+        p2p_in_place
+            .active_pencil()
+            .unwrap()
+            .same_layout(destination_pencil.as_ref())
+    );
+    assert_eq!(
+        p2p_in_place.active_view().unwrap().as_slice(),
+        expected.as_slice()
+    );
+
     let mut reusable_workspace =
-        AllToAllvTransposeWorkspace::from_vecs(vec![0_u64; max_send], vec![0_u64; max_receive]);
-    let mut roundtrip = PencilArray::from_elem(Arc::clone(&source_pencil), extra, 0_u64).unwrap();
+        AllToAllvTransposeWorkspace::from_vecs(vec![zero; max_send], vec![zero; max_receive]);
+    let mut roundtrip =
+        PencilArray::from_elem(Arc::clone(&source_pencil), extra.clone(), zero).unwrap();
     reverse
         .execute_views(
             p2p_destination.view(),
@@ -942,9 +1603,9 @@ fn run_3d_success(
         AxisPermutation::new([1, 2, 0]).unwrap(),
     )
     .unwrap();
-    let source = fill_3d_physical(Arc::clone(&source_pencil));
+    let source = fill_3d_physical(Arc::clone(&source_pencil), value_3d);
     let source_before = source.as_slice().to_vec();
-    let expected_destination = expected_3d_physical(&destination_pencil);
+    let expected_destination = expected_3d_physical(&destination_pencil, value_3d);
     let mut destination = PencilArray::from_elem(
         Arc::clone(&destination_pencil),
         ExtraShape::scalar(),
@@ -963,7 +1624,7 @@ fn run_3d_success(
         .unwrap();
     assert_eq!(source.as_slice(), source_before.as_slice());
     assert_eq!(destination.as_slice(), expected_destination.as_slice());
-    check_3d(&destination);
+    check_3d(&destination, value_3d);
 
     let destination_before = destination.as_slice().to_vec();
     let last_coords: [usize; 2] = std::array::from_fn(|axis| topology.process_grid()[axis] - 1);
@@ -1074,13 +1735,13 @@ fn fill_2d_scalar(pencil: Arc<Pencil<2, 1>>, value: u64) -> PencilArray<u64, 2, 
     array
 }
 
-fn many_from_source_2d(
+fn many_from_source_2d<T: Copy>(
     source_pencil: Arc<Pencil<2, 1>>,
     destination_pencil: Arc<Pencil<2, 1>>,
     extra_shape: ExtraShape,
-    source: &PencilArray<u64, 2, 1>,
-    tail: u64,
-) -> ManyPencilArray<u64, 2, 1> {
+    source: &PencilArray<T, 2, 1>,
+    tail: T,
+) -> ManyPencilArray<T, 2, 1> {
     let required = source_pencil
         .local_len()
         .max(destination_pencil.local_len())
@@ -1288,9 +1949,9 @@ fn run_3d_in_place_success(topology: &Arc<MpiTopology<2>>) {
         AxisPermutation::new([1, 2, 0]).unwrap(),
     )
     .unwrap();
-    let source = fill_3d_physical(Arc::clone(&source_pencil));
+    let source = fill_3d_physical(Arc::clone(&source_pencil), value_3d);
     let source_before = source.as_slice().to_vec();
-    let expected_physical = expected_3d_physical(&destination_pencil);
+    let expected_physical = expected_3d_physical(&destination_pencil, value_3d);
     let mut expected = PencilArray::from_elem(
         Arc::clone(&destination_pencil),
         ExtraShape::scalar(),
@@ -1375,7 +2036,7 @@ fn run_3d_tail_check(topology: &Arc<MpiTopology<2>>) {
         AxisPermutation::identity(),
     )
     .unwrap();
-    let source = fill_3d_physical(Arc::clone(&source_pencil));
+    let source = fill_3d_physical(Arc::clone(&source_pencil), value_3d);
     let mut expected = PencilArray::from_elem(
         Arc::clone(&destination_pencil),
         ExtraShape::scalar(),
@@ -1450,6 +2111,65 @@ fn run_3d_tail_check(topology: &Arc<MpiTopology<2>>) {
             })
             .unwrap();
     }
+
+    let p2p_plan =
+        PointToPointTransposePlan::new(Arc::clone(&source_pencil), Arc::clone(&destination_pencil))
+            .unwrap();
+    let p2p_requirements = p2p_plan
+        .workspace_requirements(&ExtraShape::scalar())
+        .unwrap();
+    let mut p2p_array = ManyPencilArray::from_vec(
+        vec![
+            Arc::clone(&source_pencil),
+            Arc::clone(&destination_pencil),
+            Arc::clone(&third_pencil),
+        ],
+        0,
+        ExtraShape::scalar(),
+        initial.clone(),
+    )
+    .unwrap();
+    p2p_array
+        .active_view_mut()
+        .unwrap()
+        .as_mut_slice()
+        .copy_from_slice(source.as_slice());
+    let mut p2p_workspace = AllToAllvTransposeWorkspace::from_vecs(
+        vec![0_u64; p2p_requirements.send_len],
+        vec![0_u64; p2p_requirements.receive_len],
+    );
+    p2p_plan
+        .execute_in_place(&mut p2p_array, &mut p2p_workspace)
+        .unwrap();
+    assert_eq!(
+        p2p_array.active_view().unwrap().as_slice(),
+        expected.as_slice()
+    );
+    let p2p_destination_before = p2p_array.active_view().unwrap().as_slice().to_vec();
+    let mut p2p_failed_workspace = AllToAllvTransposeWorkspace::from_vecs(Vec::new(), Vec::new());
+    assert!(
+        p2p_plan
+            .execute_in_place(&mut p2p_array, &mut p2p_failed_workspace)
+            .is_err()
+    );
+    assert_eq!(
+        p2p_array.active_view().unwrap().as_slice(),
+        p2p_destination_before.as_slice()
+    );
+    if third_pencil.local_len() > destination_pencil.local_len() {
+        let destination_len = destination_pencil.local_len();
+        p2p_array
+            .overwrite_with(third_pencil.as_ref(), |mut view| {
+                assert_eq!(
+                    &view.as_slice()[destination_len..],
+                    &initial[destination_len..third_pencil.local_len()]
+                );
+                view.as_mut_slice()
+                    .copy_from_slice(&initial[..third_pencil.local_len()]);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+    }
 }
 
 #[test]
@@ -1494,11 +2214,14 @@ fn alltoallv_transpose_integration() {
     run_2d_point_to_point_success(&topology_1d, value_2d_f64, 0.0_f64);
     run_2d_point_to_point_empty_success(&topology_1d);
     run_point_to_point_preflight_failures(&topology_1d);
+    run_point_to_point_in_place_preflight_failures(&topology_1d);
     run_point_to_point_large_payload(&topology_1d);
     run_3d_success(&topology_2d, [2, 0], [2, 1]);
     run_3d_success(&topology_2d, [0, 2], [1, 2]);
-    run_3d_point_to_point_success(&topology_2d, [2, 0], [2, 1]);
-    run_3d_point_to_point_success(&topology_2d, [0, 2], [1, 2]);
+    run_3d_point_to_point_success(&topology_2d, [2, 0], [2, 1], value_3d, 0_u64);
+    run_3d_point_to_point_success(&topology_2d, [0, 2], [1, 2], value_3d, 0_u64);
+    run_3d_point_to_point_success(&topology_2d, [2, 0], [2, 1], value_3d_f64, 0.0_f64);
+    run_3d_point_to_point_success(&topology_2d, [0, 2], [1, 2], value_3d_f64, 0.0_f64);
     run_2d_in_place_success(&topology_1d);
     run_2d_empty_partition_success(&topology_1d);
     run_3d_in_place_success(&topology_2d);
@@ -2480,7 +3203,7 @@ fn alltoallv_transpose_integration() {
     let mut giant_many = ManyPencilArray::<u8, 2, 1>::from_vec(
         vec![Arc::clone(&giant_source), Arc::clone(&giant_destination)],
         0,
-        zero_extra,
+        zero_extra.clone(),
         Vec::new(),
     )
     .unwrap();
@@ -2496,5 +3219,30 @@ fn alltoallv_transpose_integration() {
             .same_layout(giant_destination.as_ref())
     );
     assert!(giant_many.active_view().unwrap().is_empty());
+
+    let giant_p2p_plan =
+        PointToPointTransposePlan::new(Arc::clone(&giant_source), Arc::clone(&giant_destination))
+            .unwrap();
+    let giant_p2p_requirements = giant_p2p_plan.workspace_requirements(&zero_extra).unwrap();
+    assert_eq!(giant_p2p_requirements.send_len, 0);
+    assert_eq!(giant_p2p_requirements.receive_len, 0);
+    let mut giant_p2p_array = ManyPencilArray::<u8, 2, 1>::from_vec(
+        vec![Arc::clone(&giant_source), Arc::clone(&giant_destination)],
+        0,
+        zero_extra,
+        Vec::new(),
+    )
+    .unwrap();
+    let mut giant_p2p_workspace = AllToAllvTransposeWorkspace::from_vecs(Vec::new(), Vec::new());
+    giant_p2p_plan
+        .execute_in_place(&mut giant_p2p_array, &mut giant_p2p_workspace)
+        .unwrap();
+    assert!(
+        giant_p2p_array
+            .active_pencil()
+            .unwrap()
+            .same_layout(giant_destination.as_ref())
+    );
+    assert!(giant_p2p_array.active_view().unwrap().is_empty());
     world.barrier();
 }

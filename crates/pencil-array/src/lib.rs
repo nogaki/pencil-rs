@@ -21,9 +21,9 @@
 //! storage lengths and borrowing in safe Rust. [`LocalTransposePlan`] provides
 //! process-local memory-axis permutations, and the checked
 //! [`AllToAllvTransposePlan`] and [`PointToPointTransposePlan`] types provide
-//! distributed redistribution through out-of-place views. Alltoallv also
-//! supports shared-storage in-place execution. Point-to-point in-place
-//! transpose and FFT APIs are not implemented.
+//! distributed redistribution through out-of-place views. Both Alltoallv and
+//! point-to-point plans also support shared-storage in-place execution;
+//! FFT APIs remain future work.
 //!
 //! The two distributed transports share the canonical [`TransposeError`],
 //! [`TransposeWorkspace`] and [`TransposeWorkspaceRequirements`] types. The
@@ -31,14 +31,14 @@
 //! [`AllToAllvTransposeWorkspaceRequirements`] names remain compatibility
 //! aliases for those exact types.
 //!
-//! Alltoallv and point-to-point construction and execution are collective on
-//! the source topology's Cartesian communicator. Every rank must use the same
-//! source communicator context, API, order, `T`, and correct `Equivalence`
-//! implementation. Source and destination pencils must share the same
-//! topology object and global shape and differ in exactly one ordered
-//! decomposition position. Descriptor checks catch common mismatches but do
-//! not replace this communicator, collective-order, type, or `Equivalence`
-//! contract.
+//! Alltoallv and point-to-point construction, `execute_views`, and
+//! `execute_in_place` are collective on the source topology's Cartesian
+//! communicator. Every rank must use the same source communicator context, API,
+//! order, `T`, and correct `Equivalence` implementation. Source and destination
+//! pencils must share the same topology object and global shape and differ in
+//! exactly one ordered decomposition position. Descriptor checks catch common
+//! mismatches but do not replace this communicator, collective-order, type, or
+//! `Equivalence` contract.
 //!
 //! [`TransposeWorkspace::from_vecs`] and both plans'
 //! `workspace_requirements` methods are noncollective and do not call MPI.
@@ -47,8 +47,10 @@
 //! checked total, offset, view length, and workspace length constraints are
 //! checked before payload communication. Ordinary preflight errors return on
 //! all ranks before communication: out-of-place execution preserves its source,
-//! destination, and workspace; Alltoallv in-place execution preserves array
-//! state, contents, and workspace.
+//! destination, and workspace; both in-place APIs preserve array state, active
+//! data, and workspace. Successful out-of-place execution writes the destination;
+//! successful in-place execution replaces the active layout/data and preserves
+//! any excess registered storage tail.
 //!
 //! Point-to-point execution uses the topology-owned changed-axis context and a
 //! fixed internal tag. Do not overlap unfinished transposes on that context;
@@ -116,9 +118,9 @@
 //! )?;
 //!
 //! let mut distributed_in_place = ManyPencilArray::from_elem(
-//!     vec![source_pencil, distributed_destination_pencil],
+//!     vec![source_pencil.clone(), distributed_destination_pencil.clone()],
 //!     0,
-//!     extra_shape,
+//!     extra_shape.clone(),
 //!     0.0_f64,
 //! )?;
 //! let mut in_place_workspace = TransposeWorkspace::from_vecs(
@@ -127,11 +129,24 @@
 //! );
 //! distributed_plan.execute_in_place(&mut distributed_in_place, &mut in_place_workspace)?;
 //!
+//! // The same initialized workspace also serves the P2P in-place API.
+//! let mut point_to_point_in_place = ManyPencilArray::from_elem(
+//!     vec![source_pencil, distributed_destination_pencil],
+//!     0,
+//!     extra_shape,
+//!     0.0_f64,
+//! )?;
+//! point_to_point_plan.execute_in_place(
+//!     &mut point_to_point_in_place,
+//!     &mut in_place_workspace,
+//! )?;
+//!
 //! assert_eq!(source.logical_shape(), [4, 6]);
 //! assert_eq!(destination.memory_shape(), [6, 4]);
 //! assert_eq!(destination.len(), 24);
 //! assert_eq!(distributed_destination.len(), 24);
 //! assert_eq!(distributed_in_place.active_view()?.len(), 24);
+//! assert_eq!(point_to_point_in_place.active_view()?.len(), 24);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
