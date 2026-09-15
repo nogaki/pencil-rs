@@ -14,17 +14,22 @@ use mpi::{
 use thiserror::Error;
 
 use crate::{
-    ArrayError, ExtraShape, Pencil, PencilArrayView, PencilArrayViewMut, checked::checked_product,
-    geometry::row_major_offset,
+    ArrayError, ExtraShape, ManyPencilArray, Pencil, PencilArrayView, PencilArrayViewMut,
+    checked::checked_product, geometry::row_major_offset,
 };
 
 const DESCRIPTOR_SCHEMA: u64 = 1;
 const OPERATION_NEW: u64 = 1;
 const OPERATION_EXECUTE: u64 = 2;
+const OPERATION_EXECUTE_IN_PLACE: u64 = 3;
 const INVALID_AXIS: u64 = u64::MAX;
 const HEADER_WORDS: usize = 5;
 
-/// Errors returned by an out-of-place `MPI_Alltoallv` distributed transpose.
+/// Errors returned by checked `MPI_Alltoallv` distributed transpose operations.
+///
+/// [`AllToAllvTransposePlan::execute_views`] is the out-of-place path, while
+/// [`AllToAllvTransposePlan::execute_in_place`] replaces the active layout in
+/// shared storage.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum AllToAllvTransposeError {
     /// The source and destination pencils do not share the same topology object.
@@ -39,15 +44,17 @@ pub enum AllToAllvTransposeError {
     #[error("source and destination decompositions do not differ at exactly one position")]
     UnsupportedDecompositionChange,
 
-    /// The supplied source view does not match the plan's source layout.
+    /// The supplied source view or active array layout does not match the
+    /// plan's source layout.
     #[error("source view does not match the transpose plan")]
     SourceLayoutMismatch,
 
-    /// The supplied destination view does not match the plan's destination layout.
+    /// The supplied destination view or registered array layout does not match
+    /// the plan's destination layout.
     #[error("destination view does not match the transpose plan")]
     DestinationLayoutMismatch,
 
-    /// The source and destination views have different extra shapes.
+    /// The source and destination extra shapes differ.
     #[error("source and destination extra shapes differ")]
     ExtraShapeMismatch,
 
@@ -122,23 +129,25 @@ pub struct AllToAllvTransposeWorkspaceRequirements {
     pub receive_len: usize,
 }
 
-/// A checked, out-of-place distributed transpose using one `MPI_Alltoallv`.
+/// A checked distributed transpose using one `MPI_Alltoallv`.
 ///
-/// [`Self::new`] is collective on the source topology's Cartesian
-/// communicator. Every rank must call it in the same order with the same
-/// source communicator context and matching source-to-destination layouts.
-/// [`Self::execute_views`] has the same collective contract and additionally
-/// requires every rank to use the same `T` with a correct
+/// [`Self::new`] and both execution methods are collective on the source
+/// topology's Cartesian communicator. Every rank must call the same API in the
+/// same order with the same source communicator context and matching
+/// source-to-destination layouts. Both execution methods additionally require
+/// every rank to use the same `T` with a correct
 /// [`Equivalence`](mpi::datatype::Equivalence) implementation. These are API
 /// contracts; descriptor checks can catch common mismatches but cannot prove
 /// type identity, the correctness of an unsafe `Equivalence` implementation,
 /// or communicator/collective-order correctness.
 ///
-/// Counts and displacements are checked against `mpi::Count` before any MPI
-/// payload call. Ordinary descriptor or preflight errors leave the source
-/// unchanged and do not write the destination. MPI failures, arbitrary panics,
-/// and process loss do not guarantee that a `Result` is returned or that the
-/// destination remains unchanged.
+/// [`Self::execute_views`] is out-of-place: it preserves the source and leaves
+/// the destination unchanged for ordinary descriptor or preflight errors.
+/// [`Self::execute_in_place`] instead replaces the active source layout on
+/// success; its ordinary descriptor or preflight errors leave the array state
+/// and contents unchanged. MPI failures, arbitrary panics, and process loss do
+/// not guarantee that a `Result` is recovered or that storage remains
+/// unchanged.
 #[derive(Debug)]
 pub struct AllToAllvTransposePlan<const N: usize, const M: usize> {
     source: Arc<Pencil<N, M>>,
@@ -301,23 +310,13 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
         T: Equivalence + Copy,
     {
         let communicator = self.source.topology().cartesian();
-        let expected_len = execute_descriptor_len::<T, N, M>(self, &source, &destination);
-        let descriptor_result = expected_len
-            .ok()
-            .and_then(|_| build_execute_descriptor(self, &source, &destination).ok());
-        let descriptor_len_word = expected_len.map_or(INVALID_AXIS, |len| len as u64);
-        let header = [
-            DESCRIPTOR_SCHEMA,
+        agree_execute_descriptor::<_, T, N, M>(
+            self,
+            communicator,
+            source.extra_shape(),
+            destination.extra_shape(),
             OPERATION_EXECUTE,
-            N as u64,
-            M as u64,
-            descriptor_len_word,
-        ];
-        if !agree_header(communicator, header) {
-            return Err(AllToAllvTransposeError::CollectiveDescriptorMismatch);
-        }
-        let _descriptor =
-            collective_descriptor(communicator, descriptor_result, expected_len.ok())?;
+        )?;
 
         let local_preflight = self.prepare_execution(&source, &destination, workspace);
         if !collective_valid(communicator, local_preflight.is_ok()) {
@@ -329,63 +328,167 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
 
         pack_source(
             &self.peers,
-            &source,
+            self.source.as_ref(),
+            source.as_slice(),
             &mut workspace.send_buffer[..prepared.requirements.send_len],
             prepared.requirements.send_len,
             source.extra_shape().element_count(),
         );
-
-        {
-            let subcommunicator = self
-                .source
-                .topology()
-                .subcommunicator(self.changed_topology_axis);
-            if prepared.requirements.send_len == 0 && prepared.requirements.receive_len == 0 {
-                // Some MPI implementations require a distinct real buffer
-                // address even when every count is zero. Rust empty slices have
-                // a non-null dangling pointer, but this initialized i32 buffer
-                // avoids relying on that address and never touches the user's
-                // workspace. Every MPI type signature here has count zero, so
-                // the dummy i32 does not fabricate a T value.
-                let send_dummy = [0i32; 1];
-                let mut receive_dummy = [0i32; 1];
-                let send_partition = Partition::new(
-                    &send_dummy[..],
-                    prepared.send_counts.as_slice(),
-                    prepared.send_displacements.as_slice(),
-                );
-                let mut receive_partition = PartitionMut::new(
-                    &mut receive_dummy[..],
-                    prepared.receive_counts.as_slice(),
-                    prepared.receive_displacements.as_slice(),
-                );
-                subcommunicator.all_to_all_varcount_into(&send_partition, &mut receive_partition);
-            } else {
-                let send_buffer = &workspace.send_buffer[..prepared.requirements.send_len];
-                let receive_buffer =
-                    &mut workspace.receive_buffer[..prepared.requirements.receive_len];
-                let send_partition = Partition::new(
-                    send_buffer,
-                    prepared.send_counts.as_slice(),
-                    prepared.send_displacements.as_slice(),
-                );
-                let mut receive_partition = PartitionMut::new(
-                    receive_buffer,
-                    prepared.receive_counts.as_slice(),
-                    prepared.receive_displacements.as_slice(),
-                );
-                subcommunicator.all_to_all_varcount_into(&send_partition, &mut receive_partition);
-            }
-        }
+        self.execute_exchange(&prepared, workspace);
 
         let destination_extra_count = destination.extra_shape().element_count();
         unpack_destination(
             &self.peers,
-            &mut destination,
+            self.destination.as_ref(),
+            destination.as_mut_slice(),
             &workspace.receive_buffer[..prepared.requirements.receive_len],
             destination_extra_count,
         );
         Ok(())
+    }
+
+    /// Executes the transpose by replacing the active layout in a shared array.
+    ///
+    /// Every rank must call this same API in the same order on the same source
+    /// communicator context, with the same `T` and a correct
+    /// `Equivalence` implementation. The active layout must match the plan's
+    /// source and the destination must be registered. Ordinary descriptor or
+    /// preflight errors leave the array state and contents, and the workspace,
+    /// untouched. The array remains valid with its source layout through pack
+    /// and communication. Only after communication completes is it poisoned,
+    /// then its destination prefix is unpacked and committed. A successful
+    /// in-place operation therefore replaces the active source; it does not
+    /// preserve source contents. MPI failures, arbitrary panics, and process
+    /// loss do not guarantee that a `Result` is recovered or that storage is
+    /// unchanged.
+    pub fn execute_in_place<T>(
+        &self,
+        array: &mut ManyPencilArray<T, N, M>,
+        workspace: &mut AllToAllvTransposeWorkspace<T>,
+    ) -> Result<(), AllToAllvTransposeError>
+    where
+        T: Equivalence + Copy,
+    {
+        let communicator = self.source.topology().cartesian();
+        agree_execute_descriptor::<_, T, N, M>(
+            self,
+            communicator,
+            array.extra_shape(),
+            array.extra_shape(),
+            OPERATION_EXECUTE_IN_PLACE,
+        )?;
+
+        let local_preflight = (|| {
+            let source_index = array
+                .active_index()
+                .map_err(AllToAllvTransposeError::from)?;
+            let active_source = &array.pencils()[source_index];
+            if !active_source.same_layout(self.source.as_ref()) {
+                return Err(AllToAllvTransposeError::SourceLayoutMismatch);
+            }
+            let destination_index = array
+                .find_layout(self.destination.as_ref())
+                .ok_or(AllToAllvTransposeError::DestinationLayoutMismatch)?;
+            let extra_shape = array.extra_shape();
+            let batch = extra_shape.element_count();
+            let source_len = checked_product(&[active_source.local_len(), batch])
+                .map_err(|error| AllToAllvTransposeError::Array(ArrayError::from(error)))?;
+            let destination_pencil = &array.pencils()[destination_index];
+            let destination_len = checked_product(&[destination_pencil.local_len(), batch])
+                .map_err(|error| AllToAllvTransposeError::Array(ArrayError::from(error)))?;
+            let prepared =
+                self.prepare_common(extra_shape, source_len, destination_len, workspace)?;
+            Ok((destination_index, prepared))
+        })();
+        if !collective_valid(communicator, local_preflight.is_ok()) {
+            return Err(local_preflight
+                .err()
+                .unwrap_or(AllToAllvTransposeError::CollectivePreconditionFailed));
+        }
+        let (destination_index, prepared) =
+            local_preflight.expect("collective in-place preflight succeeded");
+        let extra_count = array.extra_shape().element_count();
+
+        {
+            let source = array
+                .active_view()
+                .expect("collective in-place preflight validated the active source");
+            pack_source(
+                &self.peers,
+                self.source.as_ref(),
+                source.as_slice(),
+                &mut workspace.send_buffer[..prepared.requirements.send_len],
+                prepared.requirements.send_len,
+                extra_count,
+            );
+        }
+        self.execute_exchange(&prepared, workspace);
+
+        let mut guard = array
+            .begin_in_place_write()
+            .expect("collective in-place preflight validated the active state");
+        {
+            let destination_storage = &mut guard.storage_mut()[..prepared.requirements.receive_len];
+            unpack_destination(
+                &self.peers,
+                self.destination.as_ref(),
+                destination_storage,
+                &workspace.receive_buffer[..prepared.requirements.receive_len],
+                extra_count,
+            );
+        }
+        guard
+            .commit(destination_index)
+            .expect("collective in-place preflight validated the destination layout");
+        Ok(())
+    }
+
+    fn execute_exchange<T>(
+        &self,
+        prepared: &PreparedExchange,
+        workspace: &mut AllToAllvTransposeWorkspace<T>,
+    ) where
+        T: Equivalence + Copy,
+    {
+        let subcommunicator = self
+            .source
+            .topology()
+            .subcommunicator(self.changed_topology_axis);
+        if prepared.requirements.send_len == 0 && prepared.requirements.receive_len == 0 {
+            // Some MPI implementations require a distinct real buffer
+            // address even when every count is zero. Rust empty slices have
+            // a non-null dangling pointer, but this initialized i32 buffer
+            // avoids relying on that address and never touches the user's
+            // workspace. Every MPI type signature here has count zero, so
+            // the dummy i32 does not fabricate a T value.
+            let send_dummy = [0i32; 1];
+            let mut receive_dummy = [0i32; 1];
+            let send_partition = Partition::new(
+                &send_dummy[..],
+                prepared.send_counts.as_slice(),
+                prepared.send_displacements.as_slice(),
+            );
+            let mut receive_partition = PartitionMut::new(
+                &mut receive_dummy[..],
+                prepared.receive_counts.as_slice(),
+                prepared.receive_displacements.as_slice(),
+            );
+            subcommunicator.all_to_all_varcount_into(&send_partition, &mut receive_partition);
+        } else {
+            let send_buffer = &workspace.send_buffer[..prepared.requirements.send_len];
+            let receive_buffer = &mut workspace.receive_buffer[..prepared.requirements.receive_len];
+            let send_partition = Partition::new(
+                send_buffer,
+                prepared.send_counts.as_slice(),
+                prepared.send_displacements.as_slice(),
+            );
+            let mut receive_partition = PartitionMut::new(
+                receive_buffer,
+                prepared.receive_counts.as_slice(),
+                prepared.receive_displacements.as_slice(),
+            );
+            subcommunicator.all_to_all_varcount_into(&send_partition, &mut receive_partition);
+        }
     }
 
     fn prepare_execution<T>(
@@ -406,8 +509,22 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
         if source.extra_shape() != destination.extra_shape() {
             return Err(AllToAllvTransposeError::ExtraShapeMismatch);
         }
+        self.prepare_common(
+            source.extra_shape(),
+            source.len(),
+            destination.len(),
+            workspace,
+        )
+    }
 
-        let requirements = self.workspace_requirements(source.extra_shape())?;
+    fn prepare_common<T>(
+        &self,
+        extra_shape: &ExtraShape,
+        source_len: usize,
+        destination_len: usize,
+        workspace: &AllToAllvTransposeWorkspace<T>,
+    ) -> Result<PreparedExchange, AllToAllvTransposeError> {
+        let requirements = self.workspace_requirements(extra_shape)?;
         if workspace.send_buffer.len() < requirements.send_len
             || workspace.receive_buffer.len() < requirements.receive_len
         {
@@ -419,7 +536,26 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
             });
         }
 
-        let prepared = prepare_exchange_counts(self, source.extra_shape())?;
+        let prepared = prepare_exchange_counts(self, extra_shape)?;
+        if requirements.send_len != source_len || requirements.receive_len != destination_len {
+            return Err(AllToAllvTransposeError::PreparationFailed);
+        }
+        for (counts, expected_len) in [
+            (prepared.send_counts.as_slice(), source_len),
+            (prepared.receive_counts.as_slice(), destination_len),
+        ] {
+            let total = counts.iter().try_fold(0usize, |total, &count| {
+                let count = usize::try_from(count)
+                    .map_err(|_| AllToAllvTransposeError::PreparationFailed)?;
+                total
+                    .checked_add(count)
+                    .ok_or(AllToAllvTransposeError::PreparationFailed)
+            })?;
+            if total != expected_len {
+                return Err(AllToAllvTransposeError::PreparationFailed);
+            }
+        }
+
         for peer in &self.peers {
             let send_len = region_spatial_len(&peer.send_region)?;
             let receive_len = region_spatial_len(&peer.receive_region)?;
@@ -428,15 +564,15 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
             }
             validate_region_offsets(
                 self.source.as_ref(),
-                source.len(),
+                source_len,
                 &peer.send_region,
-                source.extra_shape().element_count(),
+                extra_shape.element_count(),
             )?;
             validate_region_offsets(
                 self.destination.as_ref(),
-                destination.len(),
+                destination_len,
                 &peer.receive_region,
-                destination.extra_shape().element_count(),
+                extra_shape.element_count(),
             )?;
         }
         Ok(prepared)
@@ -728,7 +864,8 @@ fn local_spatial_offset<const N: usize, const M: usize>(
 // add no index table or unmeasured optimization.
 fn pack_source<T: Copy, const N: usize, const M: usize>(
     peers: &[PeerMetadata<N>],
-    source: &PencilArrayView<'_, T, N, M>,
+    source_pencil: &Pencil<N, M>,
+    source_storage: &[T],
     send_buffer: &mut [T],
     send_len: usize,
     extra_count: usize,
@@ -747,7 +884,7 @@ fn pack_source<T: Copy, const N: usize, const M: usize>(
             .expect("checked exchange preflight validated send displacement");
         for extra_linear in 0..extra_count {
             let source_extra_offset = extra_linear
-                .checked_mul(source.pencil().local_len())
+                .checked_mul(source_pencil.local_len())
                 .expect("checked exchange preflight validated source offset");
             let payload_offset = segment_start
                 .checked_add(
@@ -761,14 +898,14 @@ fn pack_source<T: Copy, const N: usize, const M: usize>(
                     .expect("checked exchange preflight validated send region");
                 let source_offset = source_extra_offset
                     .checked_add(
-                        local_spatial_offset(source.pencil(), global)
+                        local_spatial_offset(source_pencil, global)
                             .expect("checked exchange preflight validated source mapping"),
                     )
                     .expect("checked exchange preflight validated source offset");
                 let payload_index = payload_offset
                     .checked_add(linear)
                     .expect("checked exchange preflight validated send index");
-                send_buffer[payload_index] = source.as_slice()[source_offset];
+                send_buffer[payload_index] = source_storage[source_offset];
             }
         }
     }
@@ -776,7 +913,8 @@ fn pack_source<T: Copy, const N: usize, const M: usize>(
 
 fn unpack_destination<T: Copy, const N: usize, const M: usize>(
     peers: &[PeerMetadata<N>],
-    destination: &mut PencilArrayViewMut<'_, T, N, M>,
+    destination_pencil: &Pencil<N, M>,
+    destination_storage: &mut [T],
     receive_buffer: &[T],
     extra_count: usize,
 ) {
@@ -793,7 +931,7 @@ fn unpack_destination<T: Copy, const N: usize, const M: usize>(
             .expect("checked exchange preflight validated receive displacement");
         for extra_linear in 0..extra_count {
             let destination_extra_offset = extra_linear
-                .checked_mul(destination.pencil().local_len())
+                .checked_mul(destination_pencil.local_len())
                 .expect("checked exchange preflight validated destination offset");
             let payload_offset = segment_start
                 .checked_add(
@@ -807,14 +945,14 @@ fn unpack_destination<T: Copy, const N: usize, const M: usize>(
                     .expect("checked exchange preflight validated receive region");
                 let destination_offset = destination_extra_offset
                     .checked_add(
-                        local_spatial_offset(destination.pencil(), global)
+                        local_spatial_offset(destination_pencil, global)
                             .expect("checked exchange preflight validated destination mapping"),
                     )
                     .expect("checked exchange preflight validated destination offset");
                 let payload_index = payload_offset
                     .checked_add(linear)
                     .expect("checked exchange preflight validated receive index");
-                destination.as_mut_slice()[destination_offset] = receive_buffer[payload_index];
+                destination_storage[destination_offset] = receive_buffer[payload_index];
             }
         }
     }
@@ -891,10 +1029,47 @@ fn append_usizes(descriptor: &mut Vec<u64>, values: &[usize]) {
     descriptor.extend(values.iter().copied().map(|value| value as u64));
 }
 
+fn agree_execute_descriptor<C, T, const N: usize, const M: usize>(
+    plan: &AllToAllvTransposePlan<N, M>,
+    communicator: &C,
+    source_extra_shape: &ExtraShape,
+    destination_extra_shape: &ExtraShape,
+    operation: u64,
+) -> Result<(), AllToAllvTransposeError>
+where
+    C: CommunicatorCollectives,
+    T: Equivalence,
+{
+    let expected_len =
+        execute_descriptor_len::<T, N, M>(plan, source_extra_shape, destination_extra_shape);
+    let descriptor_result = expected_len.ok().and_then(|_| {
+        build_execute_descriptor::<T, N, M>(
+            plan,
+            source_extra_shape,
+            destination_extra_shape,
+            operation,
+        )
+        .ok()
+    });
+    let descriptor_len_word = expected_len.map_or(INVALID_AXIS, |len| len as u64);
+    let header = [
+        DESCRIPTOR_SCHEMA,
+        operation,
+        N as u64,
+        M as u64,
+        descriptor_len_word,
+    ];
+    if !agree_header(communicator, header) {
+        return Err(AllToAllvTransposeError::CollectiveDescriptorMismatch);
+    }
+    collective_descriptor(communicator, descriptor_result, expected_len.ok())?;
+    Ok(())
+}
+
 fn execute_descriptor_len<T: Equivalence, const N: usize, const M: usize>(
     plan: &AllToAllvTransposePlan<N, M>,
-    source: &PencilArrayView<'_, T, N, M>,
-    destination: &PencilArrayViewMut<'_, T, N, M>,
+    source_extra_shape: &ExtraShape,
+    destination_extra_shape: &ExtraShape,
 ) -> Result<usize, ()> {
     let source_name_len = type_name::<T>().len();
     let mpi_name_len = type_name::<<T as Equivalence>::Out>().len();
@@ -902,14 +1077,14 @@ fn execute_descriptor_len<T: Equivalence, const N: usize, const M: usize>(
     length = length
         .checked_add(
             1usize
-                .checked_add(source.extra_shape().dimensions().len())
+                .checked_add(source_extra_shape.dimensions().len())
                 .ok_or(())?,
         )
         .ok_or(())?;
     length = length
         .checked_add(
             1usize
-                .checked_add(destination.extra_shape().dimensions().len())
+                .checked_add(destination_extra_shape.dimensions().len())
                 .ok_or(())?,
         )
         .ok_or(())?;
@@ -925,22 +1100,23 @@ fn execute_descriptor_len<T: Equivalence, const N: usize, const M: usize>(
 
 fn build_execute_descriptor<T, const N: usize, const M: usize>(
     plan: &AllToAllvTransposePlan<N, M>,
-    source: &PencilArrayView<'_, T, N, M>,
-    destination: &PencilArrayViewMut<'_, T, N, M>,
+    source_extra_shape: &ExtraShape,
+    destination_extra_shape: &ExtraShape,
+    operation: u64,
 ) -> Result<Vec<u64>, ()>
 where
     T: Equivalence,
 {
-    let len = execute_descriptor_len(plan, source, destination)?;
+    let len = execute_descriptor_len::<T, N, M>(plan, source_extra_shape, destination_extra_shape)?;
     let mut descriptor = Vec::new();
     descriptor.try_reserve_exact(len).map_err(|_| ())?;
     descriptor.push(DESCRIPTOR_SCHEMA);
-    descriptor.push(OPERATION_EXECUTE);
+    descriptor.push(operation);
     descriptor.push(N as u64);
     descriptor.push(M as u64);
     descriptor.extend(plan.descriptor.iter().copied());
-    append_shape(&mut descriptor, source.extra_shape());
-    append_shape(&mut descriptor, destination.extra_shape());
+    append_shape(&mut descriptor, source_extra_shape);
+    append_shape(&mut descriptor, destination_extra_shape);
     descriptor.push(size_of::<T>() as u64);
     descriptor.push(align_of::<T>() as u64);
     append_type_name(&mut descriptor, type_name::<T>());
