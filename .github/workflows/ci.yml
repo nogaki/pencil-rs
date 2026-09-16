@@ -12,6 +12,15 @@ permissions:
   contents: read
 
 jobs:
+  local-fft:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run local FFT tests
+        run: cargo test -p pencil-fft --locked
+
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 20

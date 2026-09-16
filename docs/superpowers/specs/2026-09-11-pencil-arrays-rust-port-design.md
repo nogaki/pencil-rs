@@ -1,7 +1,7 @@
 # PencilArrays / PencilFFTs Rust移植 設計仕様
 
 日付: 2026-09-11  
-状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-placeは実装済み。FFTは未実装。
+状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2Cは実装済み。R2C/C2Rと分散FFTは後続実装。
 対象: CPU + MPIによる任意次元分散配列基盤と分散FFT基盤
 
 ## 1. 参照実装
@@ -24,12 +24,20 @@
 5. 全空間軸に対するout-of-place R2C/C2R FFT
 6. Julia実装と比較可能な正当性・性能評価基盤
 
-分散配列基盤とFFT層は別crateとし、一方向の依存関係にする。
+分散配列基盤とFFT層は別crateとし、一方向の依存関係にする。現在のlocal C2C段階では、
+`pencil-array`はMPIに依存する一方でFFTライブラリには依存せず、`pencil-fft`は
+RustFFTに依存する一方でMPIと`pencil-array`には依存しない。分散FFTを統合する
+後続段階でのみ、`pencil-fft`から`pencil-array`への依存を追加する。
 
 ```text
-pencil-fft
-    depends on
-pencil-array
+current local C2C:
+    pencil-array -- MPI
+    pencil-fft   -- RustFFT
+
+future distributed FFT:
+    pencil-fft
+        depends on
+    pencil-array
 
 pencil-array
     does not depend on FFT libraries
@@ -158,9 +166,9 @@ workspace/
 └── docs/
 ```
 
-`pencil-array`はMPIに依存するが、RustFFT、RealFFT、FFTWには依存しない。
-
-`pencil-fft`は`pencil-array`、RustFFT、RealFFTに依存する。
+現在のlocal C2C段階では、`pencil-array`はMPIに依存するが、RustFFT、RealFFT、FFTWには
+依存しない。`pencil-fft`のlocal pathはRustFFTに依存するが、MPIと`pencil-array`には
+依存しない。分散FFT統合後の`pencil-fft`は`pencil-array`にも依存する。
 
 ## 7. MPI資源とtopology
 
@@ -1097,7 +1105,8 @@ unpackはdestination `Pencil`、mutable slice、receive buffer、extra countを�
 
 実装計画: [Point-to-point transpose plan](../plans/2026-09-15-point-to-point-transpose-implementation.md)。
 15.5の将来の汎用`PointToPointPlan`案をこの段階で公開せず、専用のchecked APIだけを
-追加する。P2P in-place、FFT、`WaitAny`によるunpack重畳、性能用fast pathは含めない。
+追加する。P2P in-place、R2C/C2R、分散FFT、`WaitAny`によるunpack重畳、性能用fast pathは
+含めない。
 `TransposeError`、`TransposeWorkspace<T>`、`TransposeWorkspaceRequirements`は
 Alltoallvと共有する通信方式非依存の実体とし、既存の
 `AllToAllvTransposeError`、`AllToAllvTransposeWorkspace<T>`、
@@ -1215,7 +1224,7 @@ requestを省略し、self peerもcountが非zeroなら他のpeerと同じIrecv/
 全request完了後だけ`begin_in_place_write`でPoisonedに遷移し、destinationの必要
 prefixを全てunpackしてからdestinationをcommitする。通常のpreflight errorでは
 arrayのstate・内容とworkspaceを保持する。MPI故障、任意panic、プロセス喪失後の
-global recoveryは保証しない。新workspace/error/trait、unsafe、WaitAny、FFT、
+global recoveryは保証しない。新workspace/error/trait、unsafe、WaitAny、R2C/C2R、分散FFT、
 test専用panic hookはこの追補に含めず、panic時のPoisoned保証は既存
 `LayoutWriteGuard`に委ねる。
 
@@ -1223,7 +1232,8 @@ test専用panic hookはこの追補に含めず、panic時のPoisoned保証は�
 共用し、1/4/6 rank、u64/f64、2D/3D、非正方・逆順communicator、両方式との完全一致、
 独立oracle、往復、長さ変化、tail、empty/zero payload、失敗後のworkspace再利用、
 rank-local preflightと全operation混在をtimeout付きで確認した。公開README、lib.rs、
-既存one-rank doctest、CI suite説明もP2P in-placeを反映し、FFTだけを後続に残す。
+既存one-rank doctest、CI suite説明もP2P in-placeを反映した。local C2Cは実装済みで、
+R2C/C2Rと分散FFTを後続に残す。
 
 ## 19. 便利関数
 
@@ -1999,10 +2009,46 @@ rankごとの最大時間を主要指標とする。
 
 ### Milestone 6: Local FFT backend
 
-- RustFFT C2C
-- RealFFT R2C/C2R
+- RustFFT C2C（実装済み）
+- RealFFT R2C/C2R（後続）
 - row-major batched lines
 - input-preserving out-of-place wrappers
+
+#### Milestone 6最初のPR追補（2026-09-15、基点 `28b1358`）
+
+上記Milestone 6の最初のPRは、後続のRealFFTおよび分散FFTとは分け、local C2C
+だけを実装対象とした。この追補はsections 20、27、28、31にある全体設計のうち、
+現在実装済みのlocal C2C範囲を限定する。
+
+- 新crate `pencil-fft`は追加済みだが、`pencil-array`のmanifest、公開API、ソースは
+ 変更しない。local slice処理は`pencil-array`やMPIを使わず、両方を
+ `pencil-fft`の依存にも入れない。分散FFT統合時に必要な依存だけを後続で追加する。
+- MSRV 1.61のRustFFT 6.4系をC2C backendとして使う（workspace MSRV 1.85に適合）。
+ RealFFT/R2C/C2R、分散FFT、FFTW、GPU、公開`FftBackend` trait、stage framework、
+ 未使用feature flagはこのPRに含めない。
+- 公開境界はsealedな`FftReal`（実装は`f32`/`f64`のみ）と、1D line lengthを
+ runtimeに持つ`LocalC2cPlan<R>`とする。公開signatureにはRustFFTのplan、direction、
+ `FftNum`などを要求しない。複素値はbackend-neutralな`num_complex::Complex<R>`を
+ 使い、RustFFTのre-exportを使う場合も型自体をbackend型にしない。
+- `forward`/`inverse`は同じlengthの連続batch sliceを受けるout-of-place API、
+ `forward_in_place`/`inverse_in_place`は最小のin-place APIとする。forwardは無正規化、
+ inverseは各lineの`n`だけで除算し、batch数は含めない。
+- planはimmutableなforward/inverse計画とlength/scratch metadataだけを持ち、
+ scratchはcaller-ownedの初期化済みslice/Vecとする。RustFFTの
+ `get_immutable_scratch_len()`および`get_inplace_scratch_len()`を正逆計画について
+ 問い合わせ、公開する一つのscratch requirementはその最大値とする。out-of-placeは
+ 入力を保持する`process_immutable_with_scratch`を使い、入力を変更し得る
+ `process_outofplace_with_scratch`で代用しない。in-placeは`process_with_scratch`を使う。
+ `n`とscratch長は同じとは仮定しない。
+- `n=0`、checked計算で表現できないlength、非整数batch、src/dst長不一致、
+ scratch不足はbackend呼出しおよび出力更新前に`Result`で返す。zero batchは長さと
+ scratchを検査した後にno-opとし、backendへ空sliceを渡さない。`new(0)`は有効な
+ `new(1)`のzero batchとは別に扱う。plannerの資源枯渇や任意backend panicを
+ `Result`へ回収する保証はなく、unsafeは使わない。
+- このPRのlocal C2CテストはMPIなしで実行し、小さい独立直接DFTとのforward/inverse
+ 直接比較を必須とする。符号、単一周波数、正規化、f32/f64、single/multiple batch、
+ prime/composite/length1、zero batch、invalid length/destination/scratch、未変更保証、
+ scratch再利用を確認する。単なる往復だけをoracleにしない。
 
 ### Milestone 7: Distributed C2C
 
