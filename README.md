@@ -1,12 +1,13 @@
 # Pencil Arrays for Rust
 
 A row-major, MPI-distributed multidimensional array foundation inspired by
-PencilArrays.jl, with a separately layered distributed FFT implementation
-planned on top.
+PencilArrays.jl, with a separately layered FFT implementation.
 
-The repository currently contains the `pencil-array` core crate. The Array
-layer is intentionally independent of RustFFT, RealFFT, FFTW, and any
-FFT-specific API.
+The workspace contains the `pencil-array` core crate and the local C2C
+`pencil-fft` crate. `pencil-array` is intentionally independent of RustFFT,
+RealFFT, FFTW, and any FFT-specific API. The local `pencil-fft` path accepts
+flat slices, uses RustFFT, and is independent of MPI and `pencil-array`.
+R2C/C2R and distributed FFTs are follow-up work.
 
 `Pencil` describes spatial distribution. `PencilArray` owns one layout and
 one local buffer. `ManyPencilArray` owns a buffer large enough for several
@@ -15,8 +16,8 @@ logical order `[extra..., spatial...]`; their row-major buffers use memory
 order `[extra..., permuted spatial...]`. `LocalTransposePlan` provides
 process-local memory-axis permutations. `AllToAllvTransposePlan` and
 `PointToPointTransposePlan` provide checked distributed redistribution through
-out-of-place views and shared-storage in-place execution. FFT APIs remain
-next-stage work.
+out-of-place views and shared-storage in-place execution. R2C/C2R and
+distributed FFT APIs remain next-stage work.
 
 Alltoallv and point-to-point construction and execution are collective: every
 rank must use the same source communicator context, API, order, `T`, and
@@ -45,7 +46,8 @@ unfinished request scope may abort.
 ## Prerequisites
 
 - Rust stable, with a minimum supported Rust version of 1.85
-- A C MPI implementation such as Open MPI or MPICH
+- A C MPI implementation such as Open MPI or MPICH (for `pencil-array` and
+  distributed tests; local `pencil-fft` tests do not require MPI)
 - `mpicc` and `mpiexec` available on `PATH`
 - libclang and its C development headers, required by bindgen while building
   the MPI bindings
@@ -54,6 +56,7 @@ unfinished request scope may abort.
 
 ```bash
 cargo fmt --all -- --check
+cargo test -p pencil-fft --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --lib --locked
 
@@ -93,3 +96,4 @@ all topologies and arrays before MPI finalizes.
 - `docs/superpowers/plans/2026-09-14-alltoallv-in-place-implementation.md`
 - [Point-to-point transpose implementation plan](docs/superpowers/plans/2026-09-15-point-to-point-transpose-implementation.md)
 - [Point-to-point in-place implementation plan](docs/superpowers/plans/2026-09-15-point-to-point-in-place-implementation.md)
+- [Local C2C implementation plan](docs/superpowers/plans/2026-09-15-local-c2c-implementation.md)
