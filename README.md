@@ -7,8 +7,9 @@ The workspace contains the `pencil-array` core crate and the local FFT
 `pencil-fft` crate. `pencil-array` is intentionally independent of RustFFT,
 RealFFT, FFTW, and any FFT-specific API. The local `pencil-fft` path accepts
 flat slices, uses RustFFT/RealFFT, and is independent of MPI and
-`pencil-array`. Local C2C and out-of-place R2C/C2R are available; distributed
-FFT integration remains follow-up work.
+`pencil-array`. Local C2C and out-of-place R2C/C2R are available. An opt-in
+`pencil-fft/distributed` feature adds out-of-place, input-preserving distributed
+C2C FFTs over checked Alltoallv transitions.
 
 `Pencil` describes spatial distribution. `PencilArray` owns one layout and
 one local buffer. `ManyPencilArray` owns a buffer large enough for several
@@ -17,8 +18,10 @@ logical order `[extra..., spatial...]`; their row-major buffers use memory
 order `[extra..., permuted spatial...]`. `LocalTransposePlan` provides
 process-local memory-axis permutations. `AllToAllvTransposePlan` and
 `PointToPointTransposePlan` provide checked distributed redistribution through
-out-of-place views and shared-storage in-place execution. Distributed FFT
-APIs remain next-stage work.
+out-of-place views and shared-storage in-place execution. The optional
+`pencil-fft/distributed` feature composes these checked transitions into
+out-of-place distributed C2C transforms; it does not change the MPI-free
+local FFT default.
 
 Alltoallv and point-to-point construction and execution are collective: every
 rank must use the same source communicator context, API, order, `T`, and
@@ -38,11 +41,27 @@ reallocate workspace vectors, and checks count/length/displacement/offset
 limits before payload communication. Ordinary out-of-place preflight errors
 preserve the source, destination, and workspace. Ordinary in-place preflight
 errors preserve the array state, active data, and workspace for both
-Alltoallv and point-to-point. Point-to-point uses a fixed internal tag on the topology-owned
-changed-axis context, posts all receives before sends, waits for every request,
-and must not overlap unfinished transposes on that context. MPI failures,
-arbitrary panics, and process loss do not guarantee global recovery; an
-unfinished request scope may abort.
+Alltoallv and point-to-point. Point-to-point uses a fixed internal tag on the
+topology-owned changed-axis context, posts all receives before sends, waits for
+every request, and must not overlap unfinished transposes on that context. MPI
+failures, arbitrary panics, and process loss do not guarantee global recovery;
+an unfinished request scope may abort.
+
+## Distributed C2C FFT
+
+Enable the feature in this workspace with
+`cargo check -p pencil-fft --features distributed --locked`. The public
+`C2cPlan` supports `N >= 2` and `1 <= M < N`, canonical identity input
+pencils, normalized inverse transforms, exact extra shapes, reusable
+plan-bound `C2cOutOfPlaceWorkspace`, and input-preserving forward/inverse
+execution. Construction and execution are collective on the topology's
+Cartesian communicator; every rank must call matching operations in order.
+Each rank checks its actual source and destination against the plan before a
+full-Cartesian preflight agreement, and no data is changed before that initial
+agreement. Once execution starts, a resource failure or later Alltoallv
+metadata failure may mutate the workspace; no general allocation-free
+rollback is promised. The distributed API uses the array crate's checked
+Alltoallv and local-transpose plans and is not enabled by default.
 
 ## Prerequisites
 
@@ -56,10 +75,16 @@ unfinished request scope may abort.
 ## Verification
 
 ```bash
+set -euo pipefail
 cargo fmt --all -- --check
-cargo test -p pencil-fft --locked
+cargo test -p pencil-fft --no-default-features --locked
+cargo tree -p pencil-fft --no-default-features --edges normal --locked | tee /tmp/pencil-fft-local-tree.txt
+if grep -Eq '(^|[[:space:]])(mpi|pencil-array)([[:space:]]|$)' /tmp/pencil-fft-local-tree.txt; then exit 1; fi
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy -p pencil-fft --features distributed --all-targets --locked -- -D warnings
 cargo test --workspace --lib --locked
+cargo check -p pencil-fft --features distributed --all-targets --locked
+cargo test -p pencil-fft --features distributed --lib --locked
 
 mpiexec -n 1 cargo test -p pencil-array --test topology --locked -- --nocapture --test-threads=1
 mpiexec -n 4 cargo test -p pencil-array --test topology --locked -- --nocapture --test-threads=1
@@ -78,7 +103,14 @@ timeout --foreground 120s mpiexec -n 4 cargo test -p pencil-array --test alltoal
 timeout --foreground 120s mpiexec -n 6 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
 
 cargo doc --workspace --no-deps --locked
+cargo doc -p pencil-fft --features distributed --no-deps --locked
 cargo test --workspace --doc --locked -- --show-output
+cargo test -p pencil-fft --features distributed --doc --locked -- --show-output
+for n in 1 4 6; do
+  timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
+    cargo test -p pencil-fft --features distributed --test distributed_c2c \
+      --locked -- --nocapture --test-threads=1 || exit 1
+done
 ```
 
 Rustdoc tests cover usage examples and compile-time borrowing and visibility
@@ -108,3 +140,4 @@ all topologies and arrays before MPI finalizes.
 - [Point-to-point in-place implementation plan](docs/superpowers/plans/2026-09-15-point-to-point-in-place-implementation.md)
 - [Local C2C implementation plan](docs/superpowers/plans/2026-09-15-local-c2c-implementation.md)
 - [Local R2C/C2R implementation plan](docs/superpowers/plans/2026-09-17-local-r2c-implementation.md)
+- [Distributed C2C implementation plan](docs/superpowers/plans/2026-09-17-distributed-c2c-implementation.md)

@@ -10,6 +10,12 @@
 //! Forward transforms are unnormalized. Inverse transforms divide by the line
 //! length: the complex length for C2C, or the original real length for R2C/C2R.
 //!
+//! With the opt-in `distributed` feature, `C2cPlan` and
+//! `C2cOutOfPlaceWorkspace` provide input-preserving distributed C2C transforms
+//! for `N >= 2` and `1 <= M < N` using checked Alltoallv transitions. Their
+//! constructors and execution methods are collective on the topology's
+//! Cartesian communicator; the default feature set remains MPI-free.
+//!
 //! # Example
 //!
 //! ```
@@ -125,6 +131,12 @@ impl FftReal for f64 {}
 mod r2c;
 
 pub use r2c::{LocalR2cError, LocalR2cPlan};
+
+#[cfg(feature = "distributed")]
+mod distributed;
+
+#[cfg(feature = "distributed")]
+pub use distributed::{C2cOutOfPlaceWorkspace, C2cPlan, FftError};
 
 /// Errors returned by local C2C plan construction and execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]

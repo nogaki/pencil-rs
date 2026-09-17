@@ -18,8 +18,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Run local FFT tests
-        run: cargo test -p pencil-fft --locked
+      - name: Run local FFT tests without optional features
+        run: cargo test -p pencil-fft --no-default-features --locked
+
+      - name: Check local FFT dependency boundary
+        run: |
+          set -euo pipefail
+          cargo tree -p pencil-fft --no-default-features --edges normal --locked | tee /tmp/pencil-fft-local-tree.txt
+          if grep -Eq '(^|[[:space:]])(mpi|pencil-array)([[:space:]]|$)' /tmp/pencil-fft-local-tree.txt; then
+            echo "local pencil-fft unexpectedly depends on MPI or pencil-array" >&2
+            exit 1
+          fi
 
   rust:
     runs-on: ubuntu-latest
@@ -54,6 +63,12 @@ jobs:
 
       - name: Run library tests
         run: cargo test --workspace --lib --locked
+
+      - name: Check distributed FFT targets
+        run: cargo check -p pencil-fft --features distributed --all-targets --locked
+
+      - name: Run distributed FFT library tests
+        run: cargo test -p pencil-fft --features distributed --lib --locked
 
       - name: Run one-rank topology tests
         run: mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test topology --locked -- --nocapture --test-threads=1
@@ -94,14 +109,32 @@ jobs:
       - name: Run six-rank distributed transpose (Alltoallv/P2P out-of-place and in-place) tests
         run: timeout --foreground 120s mpiexec --oversubscribe -n 6 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
 
+      - name: Run distributed C2C FFT on one rank
+        run: timeout --foreground 120s mpiexec --oversubscribe -n 1 cargo test -p pencil-fft --features distributed --test distributed_c2c --locked -- --nocapture --test-threads=1
+
+      - name: Run distributed C2C FFT on four ranks
+        run: timeout --foreground 120s mpiexec --oversubscribe -n 4 cargo test -p pencil-fft --features distributed --test distributed_c2c --locked -- --nocapture --test-threads=1
+
+      - name: Run distributed C2C FFT on six ranks
+        run: timeout --foreground 120s mpiexec --oversubscribe -n 6 cargo test -p pencil-fft --features distributed --test distributed_c2c --locked -- --nocapture --test-threads=1
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run distributed FFT Clippy
+        run: cargo clippy -p pencil-fft --features distributed --all-targets --locked -- -D warnings
 
       - name: Build API documentation
         run: cargo doc --workspace --no-deps --locked
 
+      - name: Build distributed FFT documentation
+        run: cargo doc -p pencil-fft --features distributed --no-deps --locked
+
       - name: Test documentation examples and public API restrictions
         run: cargo test --workspace --doc --locked -- --show-output
+
+      - name: Test distributed FFT documentation
+        run: cargo test -p pencil-fft --features distributed --doc --locked -- --show-output
 
       - name: Save Cargo build data
         if: always() && steps.cargo-cache.outputs.cache-hit != 'true'
@@ -127,3 +160,6 @@ jobs:
         run: rustup toolchain install 1.85.0 --profile minimal
       - name: Check minimum supported Rust
         run: cargo +1.85.0 check --workspace --all-targets --locked
+
+      - name: Check distributed FFT on minimum supported Rust
+        run: cargo +1.85.0 check -p pencil-fft --features distributed --all-targets --locked

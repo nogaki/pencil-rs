@@ -22,8 +22,9 @@
 //! process-local memory-axis permutations, and the checked
 //! [`AllToAllvTransposePlan`] and [`PointToPointTransposePlan`] types provide
 //! distributed redistribution through out-of-place views. Both Alltoallv and
-//! point-to-point plans also support shared-storage in-place execution;
-//! FFT APIs remain future work.
+//! point-to-point plans also support shared-storage in-place execution. The
+//! optional distributed C2C FFT API lives in `pencil-fft` and composes these
+//! array transitions.
 //!
 //! The two distributed transports share the canonical [`TransposeError`],
 //! [`TransposeWorkspace`] and [`TransposeWorkspaceRequirements`] types. The
@@ -50,7 +51,11 @@
 //! destination, and workspace; both in-place APIs preserve array state, active
 //! data, and workspace. Successful out-of-place execution writes the destination;
 //! successful in-place execution replaces the active layout/data and preserves
-//! any excess registered storage tail.
+//! any excess registered storage tail. These are array-level preflight
+//! guarantees; a higher-level distributed FFT preserves its source,
+//! destination, and workspace through its initial collective preflight only.
+//! After execution starts, a resource or Alltoallv metadata failure may mutate
+//! its workspace, and no general allocation-free rollback is promised.
 //!
 //! Point-to-point execution uses the topology-owned changed-axis context and a
 //! fixed internal tag. Do not overlap unfinished transposes on that context;
@@ -232,7 +237,7 @@
 //! # }
 //! ```
 //!
-//! The topology's owned communicators are private:
+//! The topology's crate-private internals are not public:
 //!
 //! ```compile_fail
 //! # use pencil_array::MpiTopology;

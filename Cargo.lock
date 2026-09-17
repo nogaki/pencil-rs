@@ -252,6 +252,7 @@ dependencies = [
  "conv",
  "libffi",
  "mpi-sys",
+ "num-complex",
  "once_cell",
  "smallvec",
  "thiserror",
@@ -324,6 +325,8 @@ dependencies = [
 name = "pencil-fft"
 version = "0.1.0"
 dependencies = [
+ "mpi",
+ "pencil-array",
  "realfft",
  "rustfft",
  "thiserror",

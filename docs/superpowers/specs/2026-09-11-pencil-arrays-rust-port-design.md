@@ -1,7 +1,7 @@
 # PencilArrays / PencilFFTs Rust移植 設計仕様
 
 日付: 2026-09-11  
-状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2Rは実装済み。分散FFTは後続実装。
+状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R、分散C2C FFT out-of-placeは実装済み。分散C2Cのin-placeとR2C/C2Rは後続実装。
 対象: CPU + MPIによる任意次元分散配列基盤と分散FFT基盤
 
 ## 1. 参照実装
@@ -24,20 +24,20 @@
 5. 全空間軸に対するout-of-place R2C/C2R FFT
 6. Julia実装と比較可能な正当性・性能評価基盤
 
-分散配列基盤とFFT層は別crateとし、一方向の依存関係にする。現在のlocal FFT段階では、
-`pencil-array`はMPIに依存する一方でFFTライブラリには依存せず、`pencil-fft`は
-RustFFT/RealFFTに依存する一方でMPIと`pencil-array`には依存しない。分散FFTを統合する
-後続段階でのみ、`pencil-fft`から`pencil-array`への依存を追加する。
+分散配列基盤とFFT層は別crateとし、一方向の依存関係にする。`pencil-array`はMPIに依存する
+一方でFFTライブラリには依存しない。`pencil-fft`のlocal pathはRustFFT/RealFFTに依存する
+がMPIと`pencil-array`には依存せず、`distributed` featureのときだけ分散C2Cのために
+`pencil-array`とMPIを有効にする。
 
 ```text
-current local FFT:
+local FFT (default):
     pencil-array -- MPI
     pencil-fft   -- RustFFT + RealFFT
 
-future distributed FFT:
+optional distributed C2C:
     pencil-fft
         depends on
-    pencil-array
+    pencil-array + MPI
 
 pencil-array
     does not depend on FFT libraries
@@ -166,9 +166,10 @@ workspace/
 └── docs/
 ```
 
-現在のlocal FFT段階では、`pencil-array`はMPIに依存するが、RustFFT、RealFFT、FFTWには
-依存しない。`pencil-fft`のlocal pathはRustFFT/RealFFTに依存するが、MPIと`pencil-array`
-には依存しない。分散FFT統合後の`pencil-fft`は`pencil-array`にも依存する。
+`pencil-array`はMPIに依存するが、RustFFT、RealFFT、FFTWには依存しない。
+`pencil-fft`のlocal pathはRustFFT/RealFFTに依存するが、MPIと`pencil-array`には依存しない。
+`distributed` featureを有効にした`pencil-fft`だけが分散C2Cのために`pencil-array`とMPIへ
+依存する。
 
 ## 7. MPI資源とtopology
 
@@ -966,7 +967,7 @@ in-placeはactive sourceと登録済みdestination、checkedな必要要素数�
 
 通信開始前に、各rankのローカル事前検査結果をcollectiveに集約する。一つでも失敗すれば、全rankが実通信前にエラーを返す。
 
-distributed plan構築時には、source/destination global shape、decomposition、permutation、変更されるtopology軸、通信方式からなる固定形式の`CollectiveDescriptor`を全rankで厳密比較する。planはそのdescriptorから安定に計算した128-bitの`PlanFingerprint`を保持する。実行時の事前検査では、このfingerprintとforward/backward等の操作種別をローカル成功フラグと一緒に小さなcollective検査へ含め、rankごとに異なるplanまたは方向を呼ぶ典型的な誤りを検出する。hash衝突の理論的可能性は残るため、全rankが同じcollectiveを同じ順序で呼ぶことはAPI契約でもある。テスト・debug buildではdescriptorの厳密比較を再実行できる。
+将来の汎用distributed planでは専用の`CollectiveDescriptor`を設計できるが、Milestone 7の分散C2C第一PRは後述の最小descriptorを使う。第一PRでは128-bitの`PlanFingerprint`やhashを導入しない。全rankが同じcommunicatorで同じcollectiveを同じ順序に呼ぶことは、いずれの方式でもAPI契約である。
 
 初期版の公開実行APIはchecked実行のみとする。crate-privateなunchecked fast pathは初期版には実装せず、性能測定で必要性が確認された後に別途設計する。
 
@@ -2079,13 +2080,56 @@ out-of-place R2C/C2Rだけを実装した。`pencil-array`、MPI、分散FFT、i
   Hermitian reconstruction、f32/f64、odd/evenのprime/composite、n=1/2、複数batch、DC/Nyquist、
   任意half-spectrum、dirty/oversized workspace、later-batch endpointのatomicityを確認する。
 
+#### Milestone 7最初のPR追補（2026-09-17、Alltoallv C2C）
+
+Milestone 7の第一PRでは、将来のgeneric `TransformPlanCore`を先取りせず、
+`pencil-fft`のfeature-gatedなC2C専用実装だけを追加する。18.1--18.4の既存
+transpose transport固有descriptor metadataはこのC2C APIには引き継がない。デフォルト
+featureは空のままなので、`cargo test -p pencil-fft --no-default-features --locked`はMPIと
+`pencil-array`を有効化しない。
+
+- `distributed` featureの公開APIは`C2cPlan`、
+  `C2cOutOfPlaceWorkspace`、`FftError`である。対象は`N >= 2`、
+  `1 <= M < N`、identity permutationと`[0, ..., M-1]` decompositionの入力で、
+  `from_pencil`、`from_array`、`from_shape`を提供する。forwardは無正規化、
+  inverseは各spatial軸のlocal inverseを一度ずつ使う正規化済みであり、extra
+  batchは正規化に含めない。両方向とも入力を保持し、出力を書き込む。workspaceは
+  再利用可能なmutable scratchであり、実行中に更新される。
+- routeはaxis `N-1`から`0`へ進み、memory tailに移したaxisが未分割になるように
+  stageを作る。same-decomposition edgeはlocal transpose、decompositionが一箇所だけ
+  変わるedgeはchecked Alltoallvとし、唯一の中間`ManyPencilArray`を使う。公開in-place
+  FFT、P2P FFT、R2C/C2R、generic marker hierarchyはこのPRに含めない。
+- `LocalTransposePlan`には`TransposeWorkspace`の初期化済みsend prefixへ直接stageする
+  narrow adapterを追加する。adapterはsend Vecのlength、capacity、tailを変更せず、
+  既存のVec APIはcapacity契約のまま残す。`MpiTopology::communicator()`は所有権を移さない
+  借用native Cartesian communicatorであり、`self`のdropまたはMPI finalizationまで有効で、
+  同じcontext/order/countのcollective契約を持つ。追加のraw accessorは作らない。
+- 分散C2Cの計画生成、forward、inverseは、固定5語header
+  `[schema, operation, N, M, descriptor_len]`（`schema = 1`、operationは計画生成`7`、
+  forward`8`、inverse`9`）を全Cartesian communicatorでmin/max比較する。header後の
+  最小descriptor payloadは`global_shape`、`process_grid`、exactなextra shapeのrankと
+  dimensions、sealed scalarのbyte widthだけであり、全stage/transition metadata、
+  type name/alignment、`Equivalence::Out`、fingerprintは含めない。canonical routeは
+  `N`、`M`、global shape、process gridから決定的に再生成する。実行時はactual source/
+  destination layoutを各rankでplanと照合してからfull Cartesianでvalidityを合意し、合意
+  前にbackend、FFT、workspace、destinationを変更しない。zero global extent、型/N/M/
+  shape/extra/layout/workspaceの不一致は初期preflightで全rankが`Err`を返す。
+  zero extra batchとempty local rankは有効なまま残す。初期preflightのErrはsource、
+  destination、workspaceを保持するが、実行開始後のresource failureまたは後段Alltoallv
+  metadata failureはworkspaceを変更し得る。全実行をallocation-freeまたはrollback可能
+  とは約束しない。
+- MPI統合テストは一つのbinaryと一つのtop-level testで、1/4/6 rank、f32/f64、
+  `N=2,3,4`、`M=1,2`、direct DFT oracle、逆変換、入力保持、zero batch、空local領域、
+  workspace再利用、negative collective phasesを検証する。README、CI、feature付きdoc/
+  clippy/checkコマンドはこの境界を明記する。
+
 ### Milestone 7: Distributed C2C
 
 - common stage/path generation
-- one-intermediate out-of-place execution
-- `C2cInPlaceArray`
-- in-place execution
-- normalization
+- one-intermediate out-of-place execution (第一PRで実装)
+- normalized distributed C2C inverse (第一PRで実装)
+- `C2cInPlaceArray` and in-place execution (後続)
+
 
 ### Milestone 8: Distributed R2C/C2R
 

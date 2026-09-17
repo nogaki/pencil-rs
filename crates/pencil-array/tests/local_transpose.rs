@@ -7,8 +7,9 @@ use std::{
 
 use mpi::traits::*;
 use pencil_array::{
-    ArrayError, AxisPermutation, ExtraShape, GeometryError, LocalTransposeError,
-    LocalTransposePlan, ManyPencilArray, MpiTopology, Pencil, PencilArray,
+    AllToAllvTransposePlan, ArrayError, AxisPermutation, ExtraShape, GeometryError,
+    LocalTransposeError, LocalTransposePlan, ManyPencilArray, MpiTopology, Pencil, PencilArray,
+    TransposeWorkspace,
 };
 
 #[derive(Debug)]
@@ -87,6 +88,22 @@ fn value_3d(pencil: &Pencil<3, 2>, spatial: [usize; 3]) -> u64 {
     let y = ranges[1].start + spatial[1];
     let z = ranges[2].start + spatial[2];
     (x * 10_000 + y * 100 + z) as u64
+}
+
+fn assert_many_values_3d(array: &ManyPencilArray<u64, 3, 2>, pencil: &Pencil<3, 2>) {
+    assert!(array.active_pencil().unwrap().same_layout(pencil));
+    let shape = pencil.local_shape_logical();
+    let view = array.active_view().unwrap();
+    for x in 0..shape[0] {
+        for y in 0..shape[1] {
+            for z in 0..shape[2] {
+                assert_eq!(
+                    view.get_local(&[], [x, y, z]),
+                    Some(&value_3d(pencil, [x, y, z])),
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -440,6 +457,81 @@ fn local_transpose_covers_layouts_shapes_validation_and_panics() {
         PencilArray::from_elem(Arc::clone(&destination_3d), ExtraShape::scalar(), 0_u64).unwrap();
     let plan_3d =
         LocalTransposePlan::new(Arc::clone(&source_3d), Arc::clone(&destination_3d)).unwrap();
+
+    // The initialized-prefix adapter keeps its Vec length and tail intact,
+    // then the same workspace remains usable by Alltoallv.
+    let alltoallv_redistributed_3d = source_3d.with_decomposition([0, 2]).unwrap();
+    let redistributed_3d_transposed = alltoallv_redistributed_3d
+        .with_permutation(AxisPermutation::new([2, 0, 1]).unwrap())
+        .unwrap();
+    let alltoallv_after_local = AllToAllvTransposePlan::new(
+        Arc::clone(&destination_3d),
+        Arc::clone(&redistributed_3d_transposed),
+    )
+    .unwrap();
+    let alltoallv_requirements = alltoallv_after_local
+        .workspace_requirements(&ExtraShape::scalar())
+        .unwrap();
+    let required_local = source_3d.local_len();
+    assert!(required_local > 0);
+    let shared_send_len = required_local.max(alltoallv_requirements.send_len);
+    let tail = [0xfeed_u64, 0xcafe_u64, 0xbeef_u64];
+    let mut shared_send = vec![0xabad_u64; shared_send_len];
+    shared_send.extend_from_slice(&tail);
+    let mut shared_workspace =
+        TransposeWorkspace::from_vecs(shared_send, vec![0_u64; alltoallv_requirements.receive_len]);
+    let mut shared_storage = source_3d_before.clone();
+    shared_storage.resize(
+        source_3d
+            .local_len()
+            .max(redistributed_3d_transposed.local_len()),
+        0_u64,
+    );
+    let mut shared_many = ManyPencilArray::from_vec(
+        vec![
+            Arc::clone(&source_3d),
+            Arc::clone(&destination_3d),
+            Arc::clone(&redistributed_3d_transposed),
+        ],
+        0,
+        ExtraShape::scalar(),
+        shared_storage,
+    )
+    .unwrap();
+    plan_3d
+        .execute_in_place_with_transpose_workspace(&mut shared_many, &mut shared_workspace)
+        .unwrap();
+    assert_eq!(shared_workspace.send_len(), shared_send_len + tail.len());
+    assert_eq!(
+        shared_workspace.receive_len(),
+        alltoallv_requirements.receive_len
+    );
+    assert_many_values_3d(&shared_many, destination_3d.as_ref());
+    alltoallv_after_local
+        .execute_in_place(&mut shared_many, &mut shared_workspace)
+        .unwrap();
+    assert_many_values_3d(&shared_many, redistributed_3d_transposed.as_ref());
+
+    // Initialized length, not spare capacity, controls the adapter's check.
+    let mut short_many = ManyPencilArray::from_vec(
+        vec![Arc::clone(&source_3d), Arc::clone(&destination_3d)],
+        0,
+        ExtraShape::scalar(),
+        source_3d_before.clone(),
+    )
+    .unwrap();
+    let mut short_send = Vec::with_capacity(required_local);
+    short_send.resize(required_local - 1, 0_u64);
+    let mut short_workspace = TransposeWorkspace::from_vecs(short_send, Vec::new());
+    let short_before = short_many.active_view().unwrap().as_slice().to_vec();
+    assert!(matches!(
+        plan_3d.execute_in_place_with_transpose_workspace(&mut short_many, &mut short_workspace),
+        Err(LocalTransposeError::ScratchTooSmall { required, actual })
+            if required == required_local && actual == required_local - 1
+    ));
+    assert_eq!(short_many.active_view().unwrap().as_slice(), short_before);
+    assert_eq!(short_workspace.send_len(), required_local - 1);
+
     plan_3d
         .execute_views(source_3d_array.view(), destination_3d_array.view_mut())
         .unwrap();
