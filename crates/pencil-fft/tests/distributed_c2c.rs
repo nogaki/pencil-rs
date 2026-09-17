@@ -6,10 +6,13 @@ use mpi::{
     traits::CommunicatorCollectives,
 };
 use pencil_array::{
-    AllToAllvTransposePlan, AxisPermutation, ExtraShape, MpiTopology, Pencil, PencilArray,
-    PointToPointTransposePlan, TransposeWorkspace,
+    AllToAllvTransposePlan, AxisPermutation, ExtraShape, ManyPencilArray, MpiTopology, Pencil,
+    PencilArray, PencilArrayView, PointToPointTransposePlan, TransposeWorkspace,
 };
-use pencil_fft::{C2cOutOfPlaceWorkspace, C2cPlan, Complex, FftError, FftReal};
+use pencil_fft::{
+    C2cInPlaceArray, C2cInPlaceWorkspace, C2cOutOfPlaceWorkspace, C2cPlan, C2cState, Complex,
+    FftError, FftReal,
+};
 
 trait TestReal: FftReal + mpi::datatype::Equivalence {
     fn from_f64(value: f64) -> Self;
@@ -167,7 +170,7 @@ fn run_case<R: TestReal, const N: usize, const M: usize>(
         .unwrap();
     assert_eq!(spectrum.as_slice(), second_spectrum.as_slice());
     assert_eq!(source.as_slice(), source_before.as_slice());
-    check_forward(&spectrum, &extra_shape, global_shape, seed);
+    check_forward(&spectrum.view(), &extra_shape, global_shape, seed);
 
     // Inverse is checked against an independently generated spectrum rather
     // than only against the forward output.
@@ -178,7 +181,7 @@ fn run_case<R: TestReal, const N: usize, const M: usize>(
     plan.inverse(&arbitrary_spectrum, &mut inverse, &mut workspace)
         .unwrap();
     assert_eq!(arbitrary_spectrum.as_slice(), arbitrary_before.as_slice());
-    check_inverse(&inverse, &extra_shape, global_shape, seed + 31.0);
+    check_inverse(&inverse.view(), &extra_shape, global_shape, seed + 31.0);
 
     let mut roundtrip = plan.allocate_input().unwrap();
     plan.inverse(&spectrum, &mut roundtrip, &mut second_workspace)
@@ -187,6 +190,107 @@ fn run_case<R: TestReal, const N: usize, const M: usize>(
     for (actual, expected) in roundtrip.as_slice().iter().zip(source_before.iter()) {
         assert_close(*actual, *expected);
     }
+
+    let mut in_place = plan.allocate_in_place().unwrap();
+    fill_in_place(&mut in_place, seed, false);
+    let in_place_storage = in_place.view().unwrap().as_slice().as_ptr();
+    let in_place_original = in_place.view().unwrap().as_slice().to_vec();
+    let mut in_place_workspace = plan.allocate_in_place_workspace().unwrap();
+    assert_eq!(in_place.state(), C2cState::Input);
+    assert!(
+        in_place
+            .view()
+            .unwrap()
+            .pencil()
+            .same_layout(plan.input_pencil().as_ref())
+    );
+    plan.forward_in_place(&mut in_place, &mut in_place_workspace)
+        .unwrap();
+    assert_eq!(in_place.state(), C2cState::Output);
+    assert_eq!(
+        in_place.view().unwrap().as_slice().as_ptr(),
+        in_place_storage
+    );
+    assert!(
+        in_place
+            .view()
+            .unwrap()
+            .pencil()
+            .same_layout(plan.output_pencil().as_ref())
+    );
+    for (actual, expected) in in_place
+        .view()
+        .unwrap()
+        .as_slice()
+        .iter()
+        .zip(spectrum.as_slice())
+    {
+        assert_close(*actual, *expected);
+    }
+    check_forward(&in_place.view().unwrap(), &extra_shape, global_shape, seed);
+
+    plan.inverse_in_place(&mut in_place, &mut in_place_workspace)
+        .unwrap();
+    assert_eq!(in_place.state(), C2cState::Input);
+    assert_eq!(
+        in_place.view().unwrap().as_slice().as_ptr(),
+        in_place_storage
+    );
+    assert!(
+        in_place
+            .view()
+            .unwrap()
+            .pencil()
+            .same_layout(plan.input_pencil().as_ref())
+    );
+    for (actual, expected) in in_place
+        .view()
+        .unwrap()
+        .as_slice()
+        .iter()
+        .zip(&in_place_original)
+    {
+        assert_close(*actual, *expected);
+    }
+
+    // Output remains mutable so callers can supply arbitrary spectra to the
+    // normalized inverse, including every extra batch independently.
+    plan.forward_in_place(&mut in_place, &mut in_place_workspace)
+        .unwrap();
+    fill_in_place(&mut in_place, seed + 31.0, true);
+    plan.inverse_in_place(&mut in_place, &mut in_place_workspace)
+        .unwrap();
+    assert_eq!(in_place.state(), C2cState::Input);
+    assert_eq!(
+        in_place.view().unwrap().as_slice().as_ptr(),
+        in_place_storage
+    );
+    for (actual, expected) in in_place
+        .view()
+        .unwrap()
+        .as_slice()
+        .iter()
+        .zip(inverse.as_slice())
+    {
+        assert_close(*actual, *expected);
+    }
+    check_inverse(
+        &in_place.view().unwrap(),
+        &extra_shape,
+        global_shape,
+        seed + 31.0,
+    );
+
+    // The same array and workspace can be used again after a successful pair.
+    plan.forward_in_place(&mut in_place, &mut in_place_workspace)
+        .unwrap();
+    plan.inverse_in_place(&mut in_place, &mut in_place_workspace)
+        .unwrap();
+    assert_eq!(in_place.state(), C2cState::Input);
+    assert_eq!(
+        in_place.view().unwrap().as_slice().as_ptr(),
+        in_place_storage
+    );
 
     if extra_shape.element_count() == 0 {
         assert!(spectrum.is_empty());
@@ -218,6 +322,35 @@ fn fill_input<R: TestReal, const N: usize, const M: usize>(
     }
 }
 
+fn fill_in_place<R: TestReal, const N: usize, const M: usize>(
+    array: &mut C2cInPlaceArray<R, N, M>,
+    seed: f64,
+    spectrum: bool,
+) where
+    Complex<R>: mpi::datatype::Equivalence,
+{
+    let mut view = array.view_mut().unwrap();
+    let extra_dimensions = view.extra_shape().dimensions().to_vec();
+    let extra_count = view.extra_shape().element_count();
+    let local_shape = view.pencil().local_shape_logical();
+    let starts = std::array::from_fn::<_, N, _>(|axis| view.pencil().local_ranges()[axis].start);
+    for extra_linear in 0..extra_count {
+        let extra_indices = unravel_extra(extra_linear, &extra_dimensions);
+        for spatial_linear in 0..view.pencil().local_len() {
+            let spatial = unravel_spatial(spatial_linear, local_shape);
+            let global: [usize; N] = std::array::from_fn(|axis| starts[axis] + spatial[axis]);
+            let value = if spectrum {
+                spectrum_value(&extra_indices, global, seed)
+            } else {
+                input_value(&extra_indices, global, seed)
+            };
+            *view
+                .get_local_mut(&extra_indices, spatial)
+                .expect("filled in-place index is local") = value;
+        }
+    }
+}
+
 fn fill_spectrum<R: TestReal, const N: usize, const M: usize>(
     array: &mut PencilArray<Complex<R>, N, M>,
     seed: f64,
@@ -241,13 +374,11 @@ fn fill_spectrum<R: TestReal, const N: usize, const M: usize>(
 }
 
 fn check_forward<R: TestReal, const N: usize, const M: usize>(
-    array: &PencilArray<Complex<R>, N, M>,
+    array: &PencilArrayView<'_, Complex<R>, N, M>,
     extra_shape: &ExtraShape,
     global_shape: [usize; N],
     seed: f64,
-) where
-    Complex<R>: mpi::datatype::Equivalence,
-{
+) {
     let local_shape = array.pencil().local_shape_logical();
     let ranges = array.pencil().local_ranges();
     for extra_linear in 0..extra_shape.element_count() {
@@ -266,13 +397,11 @@ fn check_forward<R: TestReal, const N: usize, const M: usize>(
 }
 
 fn check_inverse<R: TestReal, const N: usize, const M: usize>(
-    array: &PencilArray<Complex<R>, N, M>,
+    array: &PencilArrayView<'_, Complex<R>, N, M>,
     extra_shape: &ExtraShape,
     global_shape: [usize; N],
     seed: f64,
-) where
-    Complex<R>: mpi::datatype::Equivalence,
-{
+) {
     let local_shape = array.pencil().local_shape_logical();
     let ranges = array.pencil().local_ranges();
     for extra_linear in 0..extra_shape.element_count() {
@@ -427,6 +556,40 @@ fn assert_c2c_rejected<R, const N: usize, const M: usize, F>(
     assert_eq!(source.as_slice(), source_before.as_slice());
     assert_eq!(destination.as_slice(), destination_before.as_slice());
     assert_eq!(format!("{workspace:?}"), workspace_before);
+}
+
+fn assert_in_place_rejected<R, const N: usize, const M: usize, F>(
+    array: &mut C2cInPlaceArray<R, N, M>,
+    workspace: &mut C2cInPlaceWorkspace<R, N, M>,
+    execute: F,
+) where
+    R: TestReal + std::fmt::Debug,
+    Complex<R>: mpi::datatype::Equivalence,
+    F: FnOnce(
+        &mut C2cInPlaceArray<R, N, M>,
+        &mut C2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<(), FftError>,
+{
+    let state_before = array.state();
+    let array_before = format!("{array:?}");
+    let workspace_before = format!("{workspace:?}");
+    assert!(execute(array, workspace).is_err());
+    assert_eq!(array.state(), state_before);
+    assert_eq!(format!("{array:?}"), array_before);
+    assert_eq!(format!("{workspace:?}"), workspace_before);
+}
+
+fn fresh_in_place<R: TestReal, const N: usize, const M: usize>(
+    plan: &C2cPlan<R, N, M>,
+    seed: f64,
+) -> (C2cInPlaceArray<R, N, M>, C2cInPlaceWorkspace<R, N, M>)
+where
+    Complex<R>: mpi::datatype::Equivalence,
+{
+    let mut array = plan.allocate_in_place().unwrap();
+    fill_in_place(&mut array, seed, false);
+    let workspace = plan.allocate_in_place_workspace().unwrap();
+    (array, workspace)
 }
 
 fn reuse_forward<R: TestReal, const N: usize, const M: usize>(
@@ -909,6 +1072,331 @@ fn negative_collective_cases(
         }
         world.barrier();
         reuse_forward(&plan_2d, &source_2d, &mut workspace_2d);
+        world.barrier();
+    }
+
+    negative_in_place_cases(world, topology_1d, topology_2d);
+}
+
+fn negative_in_place_cases(
+    world: &mpi::topology::SimpleCommunicator,
+    topology_1d: &Arc<MpiTopology<1>>,
+    topology_2d: &Arc<MpiTopology<2>>,
+) {
+    let rank = world.rank();
+    let size = world.size();
+    let plan =
+        C2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology_1d), [3, 4], ExtraShape::scalar())
+            .unwrap();
+
+    // The wrong direction is rejected collectively without changing the
+    // initial input state.
+    let (mut wrong_state, mut wrong_state_workspace) = fresh_in_place(&plan, 50.0);
+    assert_in_place_rejected(
+        &mut wrong_state,
+        &mut wrong_state_workspace,
+        |array, workspace| plan.inverse_in_place(array, workspace),
+    );
+    plan.forward_in_place(&mut wrong_state, &mut wrong_state_workspace)
+        .unwrap();
+    plan.inverse_in_place(&mut wrong_state, &mut wrong_state_workspace)
+        .unwrap();
+    world.barrier();
+
+    if size > 1 {
+        // A live in-place direction mismatch must stop at the shared header:
+        // rank zero has valid input for operation 10 while every peer has
+        // valid output for operation 11.
+        let mut mixed_direction = plan.allocate_in_place().unwrap();
+        fill_in_place(&mut mixed_direction, 50.25, false);
+        let mut mixed_direction_workspace = plan.allocate_in_place_workspace().unwrap();
+        plan.forward_in_place(&mut mixed_direction, &mut mixed_direction_workspace)
+            .unwrap();
+        if rank == 0 {
+            mixed_direction = plan.allocate_in_place().unwrap();
+            fill_in_place(&mut mixed_direction, 50.25, false);
+        }
+        let mixed_state_before = mixed_direction.state();
+        let mixed_data_before = mixed_direction.view().unwrap().as_slice().to_vec();
+        let mixed_workspace_before = format!("{mixed_direction_workspace:?}");
+        let result = if rank == 0 {
+            plan.forward_in_place(&mut mixed_direction, &mut mixed_direction_workspace)
+        } else {
+            plan.inverse_in_place(&mut mixed_direction, &mut mixed_direction_workspace)
+        };
+        assert!(matches!(
+            result,
+            Err(FftError::CollectiveDescriptorMismatch)
+        ));
+        assert_eq!(mixed_direction.state(), mixed_state_before);
+        assert_eq!(
+            mixed_direction.view().unwrap().as_slice(),
+            mixed_data_before.as_slice()
+        );
+        assert_eq!(
+            format!("{mixed_direction_workspace:?}"),
+            mixed_workspace_before
+        );
+
+        // Re-align all ranks with fresh input while reusing the workspace.
+        mixed_direction = plan.allocate_in_place().unwrap();
+        fill_in_place(&mut mixed_direction, 50.25, false);
+        plan.forward_in_place(&mut mixed_direction, &mut mixed_direction_workspace)
+            .unwrap();
+        plan.inverse_in_place(&mut mixed_direction, &mut mixed_direction_workspace)
+            .unwrap();
+        world.barrier();
+    }
+
+    // Replacing only rank zero after a successful collective creates a
+    // rank-local state mismatch. The full Cartesian preflight must reject it
+    // before any rank writes.
+    let (mut rank_local_state, mut rank_local_workspace) = fresh_in_place(&plan, 50.5);
+    plan.forward_in_place(&mut rank_local_state, &mut rank_local_workspace)
+        .unwrap();
+    if rank == 0 {
+        rank_local_state = plan.allocate_in_place().unwrap();
+        fill_in_place(&mut rank_local_state, 50.5, false);
+    }
+    let rank_local_state_before = format!("{rank_local_state:?}");
+    let rank_local_workspace_before = format!("{rank_local_workspace:?}");
+    let result = plan.forward_in_place(&mut rank_local_state, &mut rank_local_workspace);
+    if size == 1 {
+        assert!(result.is_ok());
+    } else {
+        assert!(result.is_err());
+        assert_eq!(format!("{rank_local_state:?}"), rank_local_state_before);
+        assert_eq!(
+            format!("{rank_local_workspace:?}"),
+            rank_local_workspace_before
+        );
+    }
+    rank_local_state = plan.allocate_in_place().unwrap();
+    fill_in_place(&mut rank_local_state, 50.5, false);
+    plan.forward_in_place(&mut rank_local_state, &mut rank_local_workspace)
+        .unwrap();
+    plan.inverse_in_place(&mut rank_local_state, &mut rank_local_workspace)
+        .unwrap();
+    world.barrier();
+
+    // A second forward is rejected while the completed output remains usable.
+    let (mut twice, mut twice_workspace) = fresh_in_place(&plan, 51.0);
+    plan.forward_in_place(&mut twice, &mut twice_workspace)
+        .unwrap();
+    assert_eq!(twice.state(), C2cState::Output);
+    assert_in_place_rejected(&mut twice, &mut twice_workspace, |array, workspace| {
+        plan.forward_in_place(array, workspace)
+    });
+    plan.inverse_in_place(&mut twice, &mut twice_workspace)
+        .unwrap();
+    world.barrier();
+
+    // Same-layout arrays from a separately constructed plan are still foreign
+    // because plan identity is an Arc contract, not just a layout comparison.
+    let foreign_plan =
+        C2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology_1d), [3, 4], ExtraShape::scalar())
+            .unwrap();
+    let (mut valid_array, mut valid_workspace) = fresh_in_place(&plan, 52.0);
+    let mut foreign_array = foreign_plan.allocate_in_place().unwrap();
+    fill_in_place(&mut foreign_array, 52.0, false);
+    let valid_array_before = format!("{valid_array:?}");
+    let foreign_array_before = format!("{foreign_array:?}");
+    let valid_workspace_before = format!("{valid_workspace:?}");
+    let result = if rank == 0 {
+        plan.forward_in_place(&mut foreign_array, &mut valid_workspace)
+    } else {
+        plan.forward_in_place(&mut valid_array, &mut valid_workspace)
+    };
+    assert!(result.is_err());
+    assert_eq!(format!("{valid_array:?}"), valid_array_before);
+    assert_eq!(format!("{foreign_array:?}"), foreign_array_before);
+    assert_eq!(format!("{valid_workspace:?}"), valid_workspace_before);
+    plan.forward_in_place(&mut valid_array, &mut valid_workspace)
+        .unwrap();
+    plan.inverse_in_place(&mut valid_array, &mut valid_workspace)
+        .unwrap();
+    world.barrier();
+
+    // Check the workspace identity independently from the array identity.
+    let (mut workspace_array, mut workspace_for_plan) = fresh_in_place(&plan, 53.0);
+    let mut foreign_workspace = foreign_plan.allocate_in_place_workspace().unwrap();
+    let workspace_array_before = format!("{workspace_array:?}");
+    let workspace_for_plan_before = format!("{workspace_for_plan:?}");
+    let foreign_workspace_before = format!("{foreign_workspace:?}");
+    let result = if rank == 0 {
+        plan.forward_in_place(&mut workspace_array, &mut foreign_workspace)
+    } else {
+        plan.forward_in_place(&mut workspace_array, &mut workspace_for_plan)
+    };
+    assert!(result.is_err());
+    assert_eq!(format!("{workspace_array:?}"), workspace_array_before);
+    assert_eq!(format!("{workspace_for_plan:?}"), workspace_for_plan_before);
+    assert_eq!(format!("{foreign_workspace:?}"), foreign_workspace_before);
+    plan.forward_in_place(&mut workspace_array, &mut workspace_for_plan)
+        .unwrap();
+    plan.inverse_in_place(&mut workspace_array, &mut workspace_for_plan)
+        .unwrap();
+    world.barrier();
+
+    // In-place and out-of-place forward calls have distinct operation words.
+    let (mut mixed_array, mut mixed_workspace) = fresh_in_place(&plan, 54.0);
+    let mut mixed_source = plan.allocate_input().unwrap();
+    fill_input(&mut mixed_source, 54.0);
+    let mut mixed_destination = plan.allocate_output().unwrap();
+    let mut mixed_oop_workspace = plan.allocate_out_of_place_workspace().unwrap();
+    let mixed_array_before = format!("{mixed_array:?}");
+    let mixed_workspace_before = format!("{mixed_workspace:?}");
+    let mixed_source_before = mixed_source.as_slice().to_vec();
+    let mixed_destination_before = mixed_destination.as_slice().to_vec();
+    let mixed_oop_workspace_before = format!("{mixed_oop_workspace:?}");
+    let result = if rank == 0 {
+        plan.forward(
+            &mixed_source,
+            &mut mixed_destination,
+            &mut mixed_oop_workspace,
+        )
+    } else {
+        plan.forward_in_place(&mut mixed_array, &mut mixed_workspace)
+    };
+    if size == 1 {
+        assert!(result.is_ok());
+    } else {
+        assert!(result.is_err());
+        assert_eq!(mixed_source.as_slice(), mixed_source_before.as_slice());
+        assert_eq!(
+            mixed_destination.as_slice(),
+            mixed_destination_before.as_slice()
+        );
+        assert_eq!(
+            format!("{mixed_oop_workspace:?}"),
+            mixed_oop_workspace_before
+        );
+    }
+    assert_eq!(format!("{mixed_array:?}"), mixed_array_before);
+    assert_eq!(format!("{mixed_workspace:?}"), mixed_workspace_before);
+    plan.forward_in_place(&mut mixed_array, &mut mixed_workspace)
+        .unwrap();
+    plan.inverse_in_place(&mut mixed_array, &mut mixed_workspace)
+        .unwrap();
+    world.barrier();
+
+    // A constructor cannot pair with an in-place execution on another rank.
+    let (mut constructor_array, mut constructor_workspace) = fresh_in_place(&plan, 55.0);
+    let constructor_array_before = format!("{constructor_array:?}");
+    let constructor_workspace_before = format!("{constructor_workspace:?}");
+    let result = if rank == 0 {
+        C2cPlan::<f64, 2, 1>::from_pencil(Arc::clone(plan.input_pencil()), ExtraShape::scalar())
+            .map(|_| ())
+    } else {
+        plan.forward_in_place(&mut constructor_array, &mut constructor_workspace)
+    };
+    if size == 1 {
+        assert!(result.is_ok());
+    } else {
+        assert!(result.is_err());
+    }
+    assert_eq!(format!("{constructor_array:?}"), constructor_array_before);
+    assert_eq!(
+        format!("{constructor_workspace:?}"),
+        constructor_workspace_before
+    );
+    plan.forward_in_place(&mut constructor_array, &mut constructor_workspace)
+        .unwrap();
+    plan.inverse_in_place(&mut constructor_array, &mut constructor_workspace)
+        .unwrap();
+    world.barrier();
+
+    // The array-level Alltoallv in-place protocol also has a distinct fixed
+    // header and must not enter the FFT path.
+    let transpose_plan = AllToAllvTransposePlan::new(
+        Arc::clone(plan.input_pencil()),
+        Arc::clone(plan.output_pencil()),
+    )
+    .unwrap();
+    let transpose_requirements = transpose_plan
+        .workspace_requirements(&ExtraShape::scalar())
+        .unwrap();
+    let mut transpose_array = ManyPencilArray::from_elem(
+        vec![
+            Arc::clone(plan.input_pencil()),
+            Arc::clone(plan.output_pencil()),
+        ],
+        0,
+        ExtraShape::scalar(),
+        Complex::new(0.0_f64, 0.0),
+    )
+    .unwrap();
+    let mut transpose_workspace = TransposeWorkspace::from_vecs(
+        vec![Complex::new(0.0_f64, 0.0); transpose_requirements.send_len],
+        vec![Complex::new(0.0_f64, 0.0); transpose_requirements.receive_len],
+    );
+    let (mut fft_array, mut fft_workspace) = fresh_in_place(&plan, 56.0);
+    let transpose_array_before = format!("{transpose_array:?}");
+    let transpose_workspace_before = format!("{transpose_workspace:?}");
+    let fft_array_before = format!("{fft_array:?}");
+    let fft_workspace_before = format!("{fft_workspace:?}");
+    let result = if rank == 0 {
+        transpose_plan
+            .execute_in_place(&mut transpose_array, &mut transpose_workspace)
+            .map_err(FftError::Transpose)
+    } else {
+        plan.forward_in_place(&mut fft_array, &mut fft_workspace)
+    };
+    if size == 1 {
+        assert!(result.is_ok());
+    } else {
+        assert!(result.is_err());
+        assert_eq!(format!("{transpose_array:?}"), transpose_array_before);
+        assert_eq!(
+            format!("{transpose_workspace:?}"),
+            transpose_workspace_before
+        );
+    }
+    assert_eq!(format!("{fft_array:?}"), fft_array_before);
+    assert_eq!(format!("{fft_workspace:?}"), fft_workspace_before);
+    plan.forward_in_place(&mut fft_array, &mut fft_workspace)
+        .unwrap();
+    plan.inverse_in_place(&mut fft_array, &mut fft_workspace)
+        .unwrap();
+    world.barrier();
+
+    // Rank 5 is deliberately in a different next-stage subgroup from rank
+    // zero. Full-Cartesian preflight must catch its foreign array before any
+    // rank starts a transition.
+    if size == 6 {
+        let plan_2d = C2cPlan::<f64, 4, 2>::from_shape(
+            Arc::clone(topology_2d),
+            [3, 1, 3, 4],
+            ExtraShape::scalar(),
+        )
+        .unwrap();
+        let foreign_plan_2d = C2cPlan::<f64, 4, 2>::from_shape(
+            Arc::clone(topology_2d),
+            [3, 1, 3, 4],
+            ExtraShape::scalar(),
+        )
+        .unwrap();
+        let (mut array_2d, mut workspace_2d) = fresh_in_place(&plan_2d, 57.0);
+        let mut bad_array_2d = foreign_plan_2d.allocate_in_place().unwrap();
+        fill_in_place(&mut bad_array_2d, 57.0, false);
+        let array_2d_before = format!("{array_2d:?}");
+        let bad_array_2d_before = format!("{bad_array_2d:?}");
+        let workspace_2d_before = format!("{workspace_2d:?}");
+        let result = if rank == 5 {
+            plan_2d.forward_in_place(&mut bad_array_2d, &mut workspace_2d)
+        } else {
+            plan_2d.forward_in_place(&mut array_2d, &mut workspace_2d)
+        };
+        assert!(result.is_err());
+        assert_eq!(format!("{array_2d:?}"), array_2d_before);
+        assert_eq!(format!("{bad_array_2d:?}"), bad_array_2d_before);
+        assert_eq!(format!("{workspace_2d:?}"), workspace_2d_before);
+        plan_2d
+            .forward_in_place(&mut array_2d, &mut workspace_2d)
+            .unwrap();
+        plan_2d
+            .inverse_in_place(&mut array_2d, &mut workspace_2d)
+            .unwrap();
         world.barrier();
     }
 }

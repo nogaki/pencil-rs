@@ -1,7 +1,7 @@
 # PencilArrays / PencilFFTs Rust移植 設計仕様
 
 日付: 2026-09-11  
-状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R、分散C2C FFT out-of-placeは実装済み。分散C2Cのin-placeとR2C/C2Rは後続実装。
+状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R、分散C2C FFT out/in-placeは実装済み。分散R2C/C2Rは後続実装。
 対象: CPU + MPIによる任意次元分散配列基盤と分散FFT基盤
 
 ## 1. 参照実装
@@ -2128,7 +2128,36 @@ featureは空のままなので、`cargo test -p pencil-fft --no-default-feature
 - common stage/path generation
 - one-intermediate out-of-place execution (第一PRで実装)
 - normalized distributed C2C inverse (第一PRで実装)
-- `C2cInPlaceArray` and in-place execution (後続)
+- `C2cInPlaceArray` and in-place execution (第二PRで実装済み)
+
+#### Milestone 7第二PR追補（2026-09-18、基点 `cbd1c17`）
+
+実装計画: [分散C2C in-place計画](../plans/2026-09-18-distributed-c2c-in-place-implementation.md)。
+
+分散C2Cの第二PRとして、既存のAlltoallv route/core、local FFT、transitionを
+共有するsingle-buffer in-place APIを追加した。pencil-arrayのソース変更や新しい
+transport/backend abstractionは行わない。
+
+- `distributed` featureの公開APIに`C2cInPlaceArray`、`C2cInPlaceWorkspace`、
+  `C2cState`を追加した。arrayはprivateな`Arc`、一つの`ManyPencilArray`、stateだけを
+  所有し、workspaceはprivateなplan `Arc`、`TransposeWorkspace`、native scratchだけを
+  所有する。公開されるのは`state`とInput/Output時だけの`view`/`view_mut`であり、
+  raw storage、Many access、state setter、recovery APIはない。
+- `Input -> Poisoned -> Output`、`Output -> Poisoned -> Input`を実行契約とした。
+  固定5語headerのoperation 10/11を予約し、descriptorは第一PRと同じものを借用する。
+  header、descriptor、全Cartesian preflight（state、active layout、exact extra shape、
+  private allocationのArc provenance、initialized workspace長）の成功後、最初のlocal
+  FFT前にPoisonedへ変更し、全stage成功後だけtarget stateへcommitする。Errまたはpanicでは
+  Poisonedを維持し、rollbackや本番catch_unwindは行わない。
+- arrayの一つのMany bufferへ全local FFTをin-placeで適用し、既存のforward/reverse
+  transitionをそのまま実行する。workspaceへ中間arrayを複製せず、inverseは既存local
+  inverseの各空間軸正規化だけを使う。empty local rankとzero extra batchも全transitionへ
+  参加する。
+- 一つのMPI integration binary/top-level testへf32/f64、N=2/3/4、M=1/2、非均等・空領域・
+  zero extra・逆順communicator、OOP/DFT比較、任意spectrum inverse、再利用、状態/endpoint、
+  rank-local preflightとAPI混在を追加した。private transaction helperの実際のErr/panic
+  経路はfeature付きunit testでcatch_unwindを外側から使ってPoisonedとview gateを確認する。
+  README、public doctest、privacy compile-fail、CI suite名も反映した。
 
 
 ### Milestone 8: Distributed R2C/C2R

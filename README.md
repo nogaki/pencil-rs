@@ -8,8 +8,8 @@ The workspace contains the `pencil-array` core crate and the local FFT
 RealFFT, FFTW, and any FFT-specific API. The local `pencil-fft` path accepts
 flat slices, uses RustFFT/RealFFT, and is independent of MPI and
 `pencil-array`. Local C2C and out-of-place R2C/C2R are available. An opt-in
-`pencil-fft/distributed` feature adds out-of-place, input-preserving distributed
-C2C FFTs over checked Alltoallv transitions.
+`pencil-fft/distributed` feature adds out-of-place, input-preserving and
+single-buffer in-place distributed C2C FFTs over checked Alltoallv transitions.
 
 `Pencil` describes spatial distribution. `PencilArray` owns one layout and
 one local buffer. `ManyPencilArray` owns a buffer large enough for several
@@ -20,8 +20,8 @@ process-local memory-axis permutations. `AllToAllvTransposePlan` and
 `PointToPointTransposePlan` provide checked distributed redistribution through
 out-of-place views and shared-storage in-place execution. The optional
 `pencil-fft/distributed` feature composes these checked transitions into
-out-of-place distributed C2C transforms; it does not change the MPI-free
-local FFT default.
+out-of-place and in-place distributed C2C transforms; it does not change the
+MPI-free local FFT default.
 
 Alltoallv and point-to-point construction and execution are collective: every
 rank must use the same source communicator context, API, order, `T`, and
@@ -62,6 +62,17 @@ agreement. Once execution starts, a resource failure or later Alltoallv
 metadata failure may mutate the workspace; no general allocation-free
 rollback is promised. The distributed API uses the array crate's checked
 Alltoallv and local-transpose plans and is not enabled by default.
+
+Plan construction and transform calls are collective. In-place array/workspace
+allocation and views are noncollective; callers must coordinate an allocation
+failure before the next collective call. `C2cPlan::allocate_in_place` returns
+an opaque `C2cInPlaceArray` and `allocate_in_place_workspace` returns its
+plan-bound scratch. The array exposes only `state`, `view`, and `view_mut`:
+`Input -> Poisoned -> Output` for forward and `Output -> Poisoned -> Input`
+for inverse. Initial collective preflight errors preserve state, data, and
+workspace; once execution begins, the array is poisoned before its first write,
+and any later failure or panic leaves it `Poisoned`, so callers reallocate it.
+A mutable output view may contain arbitrary spectral data for inverse execution.
 
 ## Prerequisites
 
@@ -141,3 +152,4 @@ all topologies and arrays before MPI finalizes.
 - [Local C2C implementation plan](docs/superpowers/plans/2026-09-15-local-c2c-implementation.md)
 - [Local R2C/C2R implementation plan](docs/superpowers/plans/2026-09-17-local-r2c-implementation.md)
 - [Distributed C2C implementation plan](docs/superpowers/plans/2026-09-17-distributed-c2c-implementation.md)
+- [Distributed C2C in-place implementation plan](docs/superpowers/plans/2026-09-18-distributed-c2c-in-place-implementation.md)
