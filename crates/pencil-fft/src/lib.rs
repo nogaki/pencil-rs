@@ -12,9 +12,13 @@
 //!
 //! With the opt-in `distributed` feature, `C2cPlan` and
 //! `C2cOutOfPlaceWorkspace` provide input-preserving distributed C2C transforms
-//! for `N >= 2` and `1 <= M < N` using checked Alltoallv transitions. Their
-//! constructors and execution methods are collective on the topology's
-//! Cartesian communicator; the default feature set remains MPI-free.
+//! for `N >= 2` and `1 <= M < N` using checked Alltoallv transitions. The
+//! feature also provides state-checked single-buffer C2C execution through
+//! `C2cInPlaceArray` and `C2cInPlaceWorkspace`. Plan construction and transform
+//! calls are collective on the topology's Cartesian communicator; in-place
+//! array/workspace allocation and views are noncollective. Allocation failures
+//! must be coordinated by callers before the next collective call. The default
+//! feature set remains MPI-free.
 //!
 //! # Example
 //!
@@ -136,7 +140,9 @@ pub use r2c::{LocalR2cError, LocalR2cPlan};
 mod distributed;
 
 #[cfg(feature = "distributed")]
-pub use distributed::{C2cOutOfPlaceWorkspace, C2cPlan, FftError};
+pub use distributed::{
+    C2cInPlaceArray, C2cInPlaceWorkspace, C2cOutOfPlaceWorkspace, C2cPlan, C2cState, FftError,
+};
 
 /// Errors returned by local C2C plan construction and execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]

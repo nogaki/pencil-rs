@@ -1,16 +1,21 @@
 //! Distributed complex-to-complex FFTs behind the `distributed` feature.
 //!
-//! [`C2cPlan`] construction and execution are collective: every rank must use
-//! the same Cartesian communicator context, API, order, scalar type, and
-//! matching layouts. Forward transforms consume the canonical input layout and
-//! produce the reversed output layout; [`C2cPlan::inverse`] consumes those
-//! layouts in reverse and applies the complete normalization.
+//! [`C2cPlan`] construction and transform calls are collective: every rank
+//! must use the same Cartesian communicator context, API, order, scalar type,
+//! and matching layouts. In-place array/workspace allocation and array views
+//! are noncollective. Callers must coordinate a local allocation failure
+//! before entering the next collective call. The out-of-place forward
+//! transform consumes the canonical input layout and produces the reversed
+//! output layout; [`C2cPlan::inverse`] consumes those layouts in reverse and
+//! applies the complete normalization. In-place execution uses the same route
+//! and state-checks its single buffer.
 //!
 //! Descriptor and initial preflight errors are collectively reported before any
-//! source, destination, or workspace write. After the first FFT stage starts,
-//! a checked Alltoallv transition may prepare its own metadata and return a
-//! collectively agreed preparation or allocation error; the source remains
-//! preserved, but workspace contents are not transactional on that path.
+//! source, destination, or workspace write. After execution begins, a checked
+//! Alltoallv transition may prepare its own metadata and return a collectively
+//! agreed preparation or allocation error; out-of-place sources remain
+//! preserved, while in-place state is poisoned before the first write and
+//! workspace contents are not transactional on that path.
 
 use std::{mem::size_of, sync::Arc};
 
@@ -21,8 +26,8 @@ use mpi::{
 };
 use pencil_array::{
     AllToAllvTransposePlan, ArrayError, AxisPermutation, ExtraShape, LocalTransposeError,
-    LocalTransposePlan, ManyPencilArray, MpiTopology, Pencil, PencilArray, PencilConfig,
-    PencilError, SpatialAxis, TransposeError, TransposeWorkspace,
+    LocalTransposePlan, ManyPencilArray, MpiTopology, Pencil, PencilArray, PencilArrayView,
+    PencilArrayViewMut, PencilConfig, PencilError, SpatialAxis, TransposeError, TransposeWorkspace,
 };
 use thiserror::Error;
 
@@ -32,8 +37,21 @@ const DESCRIPTOR_SCHEMA: u64 = 1;
 const OPERATION_PLAN: u64 = 7;
 const OPERATION_FORWARD: u64 = 8;
 const OPERATION_INVERSE: u64 = 9;
+const OPERATION_FORWARD_IN_PLACE: u64 = 10;
+const OPERATION_INVERSE_IN_PLACE: u64 = 11;
 const INVALID_WORD: u64 = u64::MAX;
 const HEADER_WORDS: usize = 5;
+
+/// Completion state of a distributed C2C in-place array.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum C2cState {
+    /// The active buffer contains canonical spatial input data.
+    Input,
+    /// The active buffer contains reversed-layout spectral data.
+    Output,
+    /// An in-place execution started but did not complete.
+    Poisoned,
+}
 
 /// Errors returned by the feature-gated distributed C2C API.
 #[derive(Debug, Error)]
@@ -115,13 +133,17 @@ pub enum FftError {
 
 /// An immutable, checked Alltoallv distributed complex-to-complex FFT plan.
 ///
-/// Construction and execution are collective on the topology's Cartesian
-/// communicator. Every rank must use the same communicator context and call
-/// the same API in the same order. The input must use the identity permutation
-/// and decomposition `[0, ..., M)`; this feature supports `N >= 2` and
-/// `1 <= M < N`. The derived output uses decomposition `[1, ..., M]` and
-/// reversed spatial memory order. Forward and inverse execution are out of
-/// place and input preserving.
+/// Construction and transform calls are collective on the topology's
+/// Cartesian communicator. Every rank must use the same communicator context
+/// and call the same API in the same order. In-place array/workspace
+/// allocation and views are noncollective; callers must coordinate an
+/// allocation failure before the next collective call. The input must use the
+/// identity permutation and decomposition `[0, ..., M)`; this feature supports
+/// `N >= 2` and `1 <= M < N`. The derived output uses decomposition
+/// `[1, ..., M]` and reversed spatial memory order. The [`Self::forward`] and
+/// [`Self::inverse`] methods are out of place and input preserving;
+/// [`Self::forward_in_place`] and [`Self::inverse_in_place`] use one
+/// state-checked buffer.
 ///
 /// # Example
 ///
@@ -180,6 +202,85 @@ pub struct C2cPlan<R: FftReal, const N: usize, const M: usize> {
 pub struct C2cOutOfPlaceWorkspace<R: FftReal, const N: usize, const M: usize> {
     core: Arc<C2cPlanCore<R, N, M>>,
     intermediate: ManyPencilArray<Complex<R>, N, M>,
+    transpose: TransposeWorkspace<Complex<R>>,
+    fft_scratch: Vec<Complex<R>>,
+}
+
+/// An opaque single-buffer array for distributed C2C in-place execution.
+///
+/// The active view is available only in [`C2cState::Input`] or
+/// [`C2cState::Output`]. An execution changes the state to
+/// [`C2cState::Poisoned`] before its first write and commits the target state
+/// only after every local FFT and transition succeeds. Reallocate after a
+/// poisoned execution; this initial API has no recovery operation.
+///
+/// # Example
+///
+/// ```
+/// use mpi::traits::*;
+/// use pencil_array::{ExtraShape, MpiTopology};
+/// use pencil_fft::{C2cPlan, C2cState, Complex};
+///
+/// fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let universe = mpi::initialize().expect("MPI must not already be initialized");
+///     let world = universe.world();
+///     let result = {
+///         let world_size = usize::try_from(world.size())?;
+///         let topology = MpiTopology::<1>::new(&world, [world_size])?;
+///         let plan = C2cPlan::<f64, 2, 1>::from_shape(
+///             topology,
+///             [2 * world_size, 3],
+///             ExtraShape::scalar(),
+///         )?;
+///         let mut array = plan.allocate_in_place()?;
+///         {
+///             let mut input = array.view_mut()?;
+///             for (index, value) in input.as_mut_slice().iter_mut().enumerate() {
+///                 *value = Complex::new(index as f64 + 1.0, -(index as f64));
+///             }
+///         }
+///         let original = array.view()?.as_slice().to_vec();
+///         let mut workspace = plan.allocate_in_place_workspace()?;
+///         plan.forward_in_place(&mut array, &mut workspace)?;
+///         assert_eq!(array.state(), C2cState::Output);
+///         plan.inverse_in_place(&mut array, &mut workspace)?;
+///         assert_eq!(array.state(), C2cState::Input);
+///         for (actual, expected) in array.view()?.as_slice().iter().zip(&original) {
+///             assert!((actual.re - expected.re).abs() < 1e-9);
+///             assert!((actual.im - expected.im).abs() < 1e-9);
+///         }
+///         Ok::<(), Box<dyn std::error::Error>>(())
+///     };
+///     result
+/// }
+/// ```
+///
+/// The backing `ManyPencilArray` and raw slices are intentionally private:
+///
+/// ```compile_fail
+/// use pencil_fft::{C2cInPlaceArray, FftReal};
+///
+/// fn no_raw_storage<R: FftReal, const N: usize, const M: usize>(
+///     array: &mut C2cInPlaceArray<R, N, M>,
+/// ) {
+///     let _ = &array.array;
+/// }
+/// ```
+#[derive(Debug)]
+pub struct C2cInPlaceArray<R: FftReal, const N: usize, const M: usize> {
+    core: Arc<C2cPlanCore<R, N, M>>,
+    array: ManyPencilArray<Complex<R>, N, M>,
+    state: C2cState,
+}
+
+/// Reusable scratch for distributed C2C in-place execution.
+///
+/// The workspace is private to the exact plan that allocated it. It contains
+/// only shared checked transpose buffers and native FFT scratch; the transform
+/// data is owned by [`C2cInPlaceArray`].
+#[derive(Debug)]
+pub struct C2cInPlaceWorkspace<R: FftReal, const N: usize, const M: usize> {
+    core: Arc<C2cPlanCore<R, N, M>>,
     transpose: TransposeWorkspace<Complex<R>>,
     fft_scratch: Vec<Complex<R>>,
 }
@@ -315,24 +416,46 @@ where
         .map_err(FftError::Array)
     }
 
+    /// Allocates a zero-initialized canonical input for in-place execution.
+    ///
+    /// This method is noncollective. If allocation fails on one rank, callers
+    /// must coordinate that failure before the next collective call.
+    pub fn allocate_in_place(&self) -> Result<C2cInPlaceArray<R, N, M>, FftError> {
+        let array = ManyPencilArray::from_elem(
+            registered_pencils(&self.core)?,
+            0,
+            self.core.extra_shape.clone(),
+            zero_complex::<R>(),
+        )
+        .map_err(map_array_allocation)?;
+        Ok(C2cInPlaceArray {
+            core: Arc::clone(&self.core),
+            array,
+            state: C2cState::Input,
+        })
+    }
+
+    /// Allocates reusable scratch for in-place forward and inverse execution.
+    ///
+    /// This method is noncollective. If allocation fails on one rank, callers
+    /// must coordinate that failure before the next collective call.
+    pub fn allocate_in_place_workspace(&self) -> Result<C2cInPlaceWorkspace<R, N, M>, FftError> {
+        Ok(C2cInPlaceWorkspace {
+            core: Arc::clone(&self.core),
+            transpose: TransposeWorkspace::from_vecs(
+                initialized_vec(self.core.transpose_send_len, zero_complex::<R>())?,
+                initialized_vec(self.core.transpose_receive_len, zero_complex::<R>())?,
+            ),
+            fft_scratch: initialized_vec(self.core.fft_scratch_len, zero_complex::<R>())?,
+        })
+    }
+
     /// Allocates a reusable workspace for out-of-place forward and inverse execution.
     pub fn allocate_out_of_place_workspace(
         &self,
     ) -> Result<C2cOutOfPlaceWorkspace<R, N, M>, FftError> {
-        let mut pencils = Vec::new();
-        pencils
-            .try_reserve_exact(self.core.stages.len())
-            .map_err(|_| FftError::AllocationFailed {
-                required: self.core.stages.len(),
-            })?;
-        pencils.extend(
-            self.core
-                .stages
-                .iter()
-                .map(|stage| Arc::clone(&stage.pencil)),
-        );
         let intermediate = ManyPencilArray::from_elem(
-            pencils.into_boxed_slice(),
+            registered_pencils(&self.core)?,
             0,
             self.core.extra_shape.clone(),
             zero_complex::<R>(),
@@ -387,6 +510,42 @@ where
         workspace: &mut C2cOutOfPlaceWorkspace<R, N, M>,
     ) -> Result<(), FftError> {
         self.execute(Direction::Inverse, source, destination, workspace)
+    }
+
+    /// Computes an unnormalized forward transform in the array's single buffer.
+    ///
+    /// The array must be in [`C2cState::Input`]. Initial collective
+    /// preflight errors preserve its state, data, and workspace. Once
+    /// execution begins, the state is set to [`C2cState::Poisoned`] before the
+    /// first write and remains so until the complete route succeeds; a later
+    /// error or panic does not roll back the buffer. A foreign-plan array maps to
+    /// `FftError::Array(ArrayError::IncompatiblePencils)`, a poisoned array to
+    /// `FftError::Array(ArrayError::Poisoned)`, and a wrong state or active
+    /// endpoint layout to `FftError::InputLayoutMismatch`; inspect
+    /// [`C2cInPlaceArray::state`] to distinguish state outcomes. A foreign
+    /// workspace remains `FftError::WorkspaceMismatch`.
+    pub fn forward_in_place(
+        &self,
+        array: &mut C2cInPlaceArray<R, N, M>,
+        workspace: &mut C2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<(), FftError> {
+        self.execute_in_place(Direction::Forward, array, workspace)
+    }
+
+    /// Computes a normalized inverse transform in the array's single buffer.
+    ///
+    /// The array must be in [`C2cState::Output`] and may be edited through
+    /// [`C2cInPlaceArray::view_mut`] before this call. The inverse normalizes
+    /// once per spatial axis through the existing local inverse plans; extra
+    /// batches are not included. It has the same collective preflight,
+    /// poisoning, and MPI failure contract as
+    /// [`Self::forward_in_place`], including its error mappings.
+    pub fn inverse_in_place(
+        &self,
+        array: &mut C2cInPlaceArray<R, N, M>,
+        workspace: &mut C2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<(), FftError> {
+        self.execute_in_place(Direction::Inverse, array, workspace)
     }
 
     fn construct(
@@ -450,19 +609,7 @@ where
             Direction::Forward => OPERATION_FORWARD,
             Direction::Inverse => OPERATION_INVERSE,
         };
-        let descriptor = self.core.descriptor.as_ref();
-        let descriptor_len_word = u64::try_from(descriptor.len()).unwrap_or(INVALID_WORD);
-        let header = [
-            DESCRIPTOR_SCHEMA,
-            operation,
-            u64::try_from(N).unwrap_or(INVALID_WORD),
-            u64::try_from(M).unwrap_or(INVALID_WORD),
-            descriptor_len_word,
-        ];
-        if !agree_header(communicator, header) {
-            return Err(FftError::CollectiveDescriptorMismatch);
-        }
-        collective_descriptor_ref(communicator, Some(descriptor), Some(descriptor.len()))?;
+        agree_execution_descriptor(communicator, operation, &self.core)?;
 
         let local_preflight = self.preflight(direction, source, destination, workspace);
         if !collective_valid(communicator, local_preflight.is_ok()) {
@@ -507,27 +654,12 @@ where
             return Err(FftError::ExtraShapeMismatch);
         }
 
-        if workspace.fft_scratch.len() < self.core.fft_scratch_len {
-            return Err(FftError::WorkspaceTooSmall {
-                kind: "FFT scratch",
-                required: self.core.fft_scratch_len,
-                actual: workspace.fft_scratch.len(),
-            });
-        }
-        if workspace.transpose.send_len() < self.core.transpose_send_len {
-            return Err(FftError::WorkspaceTooSmall {
-                kind: "transpose send",
-                required: self.core.transpose_send_len,
-                actual: workspace.transpose.send_len(),
-            });
-        }
-        if workspace.transpose.receive_len() < self.core.transpose_receive_len {
-            return Err(FftError::WorkspaceTooSmall {
-                kind: "transpose receive",
-                required: self.core.transpose_receive_len,
-                actual: workspace.transpose.receive_len(),
-            });
-        }
+        validate_workspace_lengths(
+            &self.core,
+            workspace.fft_scratch.len(),
+            workspace.transpose.send_len(),
+            workspace.transpose.receive_len(),
+        )?;
 
         if workspace.intermediate.extra_shape() != &self.core.extra_shape {
             return Err(FftError::WorkspaceMismatch);
@@ -543,6 +675,140 @@ where
         }
         Ok(())
     }
+
+    fn execute_in_place(
+        &self,
+        direction: Direction,
+        array: &mut C2cInPlaceArray<R, N, M>,
+        workspace: &mut C2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<(), FftError> {
+        let communicator = self.input_pencil().topology().communicator();
+        let operation = match direction {
+            Direction::Forward => OPERATION_FORWARD_IN_PLACE,
+            Direction::Inverse => OPERATION_INVERSE_IN_PLACE,
+        };
+        agree_execution_descriptor(communicator, operation, &self.core)?;
+
+        let local_preflight = self.preflight_in_place(direction, array, workspace);
+        if !collective_valid(communicator, local_preflight.is_ok()) {
+            return Err(local_preflight
+                .err()
+                .unwrap_or(FftError::CollectivePreconditionFailed));
+        }
+        local_preflight.expect("collective distributed C2C in-place preflight succeeded");
+
+        let target = match direction {
+            Direction::Forward => C2cState::Output,
+            Direction::Inverse => C2cState::Input,
+        };
+        run_in_place_transaction(
+            array,
+            workspace,
+            target,
+            |array, workspace| match direction {
+                Direction::Forward => execute_forward_in_place(
+                    &self.core,
+                    &mut array.array,
+                    &mut workspace.transpose,
+                    &mut workspace.fft_scratch,
+                ),
+                Direction::Inverse => execute_inverse_in_place(
+                    &self.core,
+                    &mut array.array,
+                    &mut workspace.transpose,
+                    &mut workspace.fft_scratch,
+                ),
+            },
+        )
+    }
+
+    fn preflight_in_place(
+        &self,
+        direction: Direction,
+        array: &C2cInPlaceArray<R, N, M>,
+        workspace: &C2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<(), FftError> {
+        if !Arc::ptr_eq(&array.core, &self.core) {
+            return Err(FftError::Array(ArrayError::IncompatiblePencils));
+        }
+        if !Arc::ptr_eq(&workspace.core, &self.core) {
+            return Err(FftError::WorkspaceMismatch);
+        }
+
+        let expected_state = match direction {
+            Direction::Forward => C2cState::Input,
+            Direction::Inverse => C2cState::Output,
+        };
+        match array.state {
+            C2cState::Poisoned => return Err(FftError::Array(ArrayError::Poisoned)),
+            state if state != expected_state => return Err(FftError::InputLayoutMismatch),
+            _ => {}
+        }
+
+        if array.array.extra_shape() != &self.core.extra_shape {
+            return Err(FftError::ExtraShapeMismatch);
+        }
+
+        let expected_pencil = match direction {
+            Direction::Forward => self.input_pencil(),
+            Direction::Inverse => self.output_pencil(),
+        };
+        let active = array.array.active_pencil().map_err(FftError::Array)?;
+        if !active.same_layout(expected_pencil.as_ref()) {
+            return Err(FftError::InputLayoutMismatch);
+        }
+
+        validate_workspace_lengths(
+            &self.core,
+            workspace.fft_scratch.len(),
+            workspace.transpose.send_len(),
+            workspace.transpose.receive_len(),
+        )?;
+        Ok(())
+    }
+}
+
+impl<R: FftReal, const N: usize, const M: usize> C2cInPlaceArray<R, N, M> {
+    /// Returns the array's FFT completion state.
+    pub fn state(&self) -> C2cState {
+        self.state
+    }
+
+    /// Borrows the active array view when the state is valid.
+    ///
+    /// This borrow is noncollective.
+    pub fn view(&self) -> Result<PencilArrayView<'_, Complex<R>, N, M>, FftError> {
+        self.ensure_viewable()?;
+        self.array.active_view().map_err(FftError::Array)
+    }
+
+    /// Borrows the active mutable array view when the state is valid.
+    ///
+    /// This borrow is noncollective.
+    pub fn view_mut(&mut self) -> Result<PencilArrayViewMut<'_, Complex<R>, N, M>, FftError> {
+        self.ensure_viewable()?;
+        self.array.active_view_mut().map_err(FftError::Array)
+    }
+
+    fn ensure_viewable(&self) -> Result<(), FftError> {
+        match self.state {
+            C2cState::Input | C2cState::Output => Ok(()),
+            C2cState::Poisoned => Err(FftError::Array(ArrayError::Poisoned)),
+        }
+    }
+}
+
+fn registered_pencils<R: FftReal, const N: usize, const M: usize>(
+    core: &C2cPlanCore<R, N, M>,
+) -> Result<Box<[Arc<Pencil<N, M>>]>, FftError> {
+    let mut pencils = Vec::new();
+    pencils
+        .try_reserve_exact(core.stages.len())
+        .map_err(|_| FftError::AllocationFailed {
+            required: core.stages.len(),
+        })?;
+    pencils.extend(core.stages.iter().map(|stage| Arc::clone(&stage.pencil)));
+    Ok(pencils.into_boxed_slice())
 }
 
 fn build_route<const N: usize, const M: usize>(
@@ -872,6 +1138,82 @@ where
     Ok(())
 }
 
+fn execute_forward_in_place<R: FftReal, const N: usize, const M: usize>(
+    core: &Arc<C2cPlanCore<R, N, M>>,
+    array: &mut ManyPencilArray<Complex<R>, N, M>,
+    transpose: &mut TransposeWorkspace<Complex<R>>,
+    fft_scratch: &mut [Complex<R>],
+) -> Result<(), FftError>
+where
+    Complex<R>: Equivalence,
+{
+    {
+        let stage = &core.stages[0];
+        let mut active = array.active_view_mut().map_err(FftError::Array)?;
+        stage
+            .local
+            .forward_in_place(active.as_mut_slice(), fft_scratch)?;
+    }
+
+    for index in 0..N - 1 {
+        execute_transition(&core.transitions[index].forward, array, transpose)?;
+        let stage = &core.stages[index + 1];
+        let mut active = array.active_view_mut().map_err(FftError::Array)?;
+        stage
+            .local
+            .forward_in_place(active.as_mut_slice(), fft_scratch)?;
+    }
+    Ok(())
+}
+
+fn execute_inverse_in_place<R: FftReal, const N: usize, const M: usize>(
+    core: &Arc<C2cPlanCore<R, N, M>>,
+    array: &mut ManyPencilArray<Complex<R>, N, M>,
+    transpose: &mut TransposeWorkspace<Complex<R>>,
+    fft_scratch: &mut [Complex<R>],
+) -> Result<(), FftError>
+where
+    Complex<R>: Equivalence,
+{
+    {
+        let stage = &core.stages[N - 1];
+        let mut active = array.active_view_mut().map_err(FftError::Array)?;
+        stage
+            .local
+            .inverse_in_place(active.as_mut_slice(), fft_scratch)?;
+    }
+
+    for index in (0..N - 1).rev() {
+        execute_transition(&core.transitions[index].backward, array, transpose)?;
+        let stage = &core.stages[index];
+        let mut active = array.active_view_mut().map_err(FftError::Array)?;
+        stage
+            .local
+            .inverse_in_place(active.as_mut_slice(), fft_scratch)?;
+    }
+    Ok(())
+}
+
+fn run_in_place_transaction<R: FftReal, const N: usize, const M: usize, F>(
+    array: &mut C2cInPlaceArray<R, N, M>,
+    workspace: &mut C2cInPlaceWorkspace<R, N, M>,
+    target: C2cState,
+    body: F,
+) -> Result<(), FftError>
+where
+    F: FnOnce(
+        &mut C2cInPlaceArray<R, N, M>,
+        &mut C2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<(), FftError>,
+{
+    array.state = C2cState::Poisoned;
+    let result = body(array, workspace);
+    if result.is_ok() {
+        array.state = target;
+    }
+    result
+}
+
 fn execute_transition<T: Equivalence + Copy + Clone, const N: usize, const M: usize>(
     transition: &C2cTransition<N, M>,
     intermediate: &mut ManyPencilArray<T, N, M>,
@@ -931,6 +1273,55 @@ fn agree_header<C: CommunicatorCollectives>(comm: &C, header: [u64; HEADER_WORDS
     comm.all_reduce_into(&header[..], &mut minimum[..], SystemOperation::min());
     comm.all_reduce_into(&header[..], &mut maximum[..], SystemOperation::max());
     minimum == maximum
+}
+
+fn agree_execution_descriptor<R: FftReal, const N: usize, const M: usize>(
+    communicator: &mpi::topology::CartesianCommunicator,
+    operation: u64,
+    core: &C2cPlanCore<R, N, M>,
+) -> Result<(), FftError> {
+    let descriptor = core.descriptor.as_ref();
+    let header = [
+        DESCRIPTOR_SCHEMA,
+        operation,
+        u64::try_from(N).unwrap_or(INVALID_WORD),
+        u64::try_from(M).unwrap_or(INVALID_WORD),
+        u64::try_from(descriptor.len()).unwrap_or(INVALID_WORD),
+    ];
+    if !agree_header(communicator, header) {
+        return Err(FftError::CollectiveDescriptorMismatch);
+    }
+    collective_descriptor_ref(communicator, Some(descriptor), Some(descriptor.len()))
+}
+
+fn validate_workspace_lengths<R: FftReal, const N: usize, const M: usize>(
+    core: &C2cPlanCore<R, N, M>,
+    fft_scratch_len: usize,
+    transpose_send_len: usize,
+    transpose_receive_len: usize,
+) -> Result<(), FftError> {
+    for (actual, required, kind) in [
+        (fft_scratch_len, core.fft_scratch_len, "FFT scratch"),
+        (
+            transpose_send_len,
+            core.transpose_send_len,
+            "transpose send",
+        ),
+        (
+            transpose_receive_len,
+            core.transpose_receive_len,
+            "transpose receive",
+        ),
+    ] {
+        if actual < required {
+            return Err(FftError::WorkspaceTooSmall {
+                kind,
+                required,
+                actual,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn collective_valid<C: CommunicatorCollectives>(comm: &C, valid: bool) -> bool {
@@ -1029,8 +1420,16 @@ fn zero_complex<R: FftReal>() -> Complex<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OPERATION_FORWARD, OPERATION_INVERSE, OPERATION_PLAN, descriptor_len};
-    use pencil_array::ExtraShape;
+    use std::{panic::AssertUnwindSafe, sync::Arc};
+
+    use super::{
+        C2cInPlaceArray, C2cInPlaceWorkspace, C2cPlan, C2cState, Complex, Direction, ExtraShape,
+        FftError, LocalC2cError, LocalC2cPlan, OPERATION_FORWARD, OPERATION_FORWARD_IN_PLACE,
+        OPERATION_INVERSE, OPERATION_INVERSE_IN_PLACE, OPERATION_PLAN, descriptor_len,
+        run_in_place_transaction,
+    };
+    use mpi::topology::Communicator;
+    use pencil_array::{MpiTopology, TransposeWorkspace};
 
     #[test]
     fn protocol_words_and_minimal_descriptor_length_are_stable() {
@@ -1046,6 +1445,157 @@ mod tests {
             batched_len - descriptor_len::<4, 2>(&ExtraShape::scalar()).unwrap(),
             2,
         );
+    }
+
+    #[test]
+    fn in_place_operation_words_are_reserved_after_out_of_place_words() {
+        assert_eq!(
+            (
+                OPERATION_PLAN,
+                OPERATION_FORWARD,
+                OPERATION_INVERSE,
+                OPERATION_FORWARD_IN_PLACE,
+                OPERATION_INVERSE_IN_PLACE,
+            ),
+            (7, 8, 9, 10, 11)
+        );
+    }
+
+    #[test]
+    fn in_place_transaction_poison_survives_error_and_panic() {
+        let universe = mpi::initialize().expect("MPI initialization failed");
+        let world = universe.world();
+        assert_eq!(world.size(), 1, "run this unit test with one MPI rank");
+        let result = {
+            let topology = MpiTopology::<1>::new(&world, [1]).unwrap();
+            let plan = C2cPlan::<f64, 2, 1>::from_shape(
+                Arc::clone(&topology),
+                [2, 3],
+                ExtraShape::scalar(),
+            )
+            .unwrap();
+
+            let mut short_array = plan.allocate_in_place().unwrap();
+            let mut short_workspace = C2cInPlaceWorkspace {
+                core: Arc::clone(&plan.core),
+                transpose: TransposeWorkspace::from_vecs(Vec::new(), Vec::new()),
+                fft_scratch: Vec::new(),
+            };
+            let short_array_before = format!("{short_array:?}");
+            let short_workspace_before = format!("{short_workspace:?}");
+            assert!(matches!(
+                plan.forward_in_place(&mut short_array, &mut short_workspace),
+                Err(FftError::WorkspaceTooSmall { .. })
+            ));
+            assert_eq!(short_array.state(), C2cState::Input);
+            assert_eq!(format!("{short_array:?}"), short_array_before);
+            assert_eq!(format!("{short_workspace:?}"), short_workspace_before);
+
+            for direction in [Direction::Forward, Direction::Inverse] {
+                for panic_failure in [false, true] {
+                    let mut array = plan.allocate_in_place().unwrap();
+                    let mut workspace = plan.allocate_in_place_workspace().unwrap();
+                    if matches!(direction, Direction::Inverse) {
+                        plan.forward_in_place(&mut array, &mut workspace).unwrap();
+                        assert_eq!(array.state(), C2cState::Output);
+                    }
+                    let target = match direction {
+                        Direction::Forward => C2cState::Output,
+                        Direction::Inverse => C2cState::Input,
+                    };
+                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        run_in_place_transaction(
+                            &mut array,
+                            &mut workspace,
+                            target,
+                            |array, workspace| {
+                                assert_eq!(array.state(), C2cState::Poisoned);
+                                let mut view = array.array.active_view_mut().unwrap();
+                                view.as_mut_slice()[0].re = 7.0;
+                                if let Some(value) = workspace.fft_scratch.first_mut() {
+                                    value.re = 9.0;
+                                }
+                                if panic_failure {
+                                    panic!("in-place test panic after start");
+                                }
+                                Err(FftError::PreparationFailed)
+                            },
+                        )
+                    }));
+                    if panic_failure {
+                        assert!(result.is_err());
+                    } else {
+                        assert!(matches!(result, Ok(Err(FftError::PreparationFailed))));
+                    }
+                    assert_poisoned_views_and_retries(&plan, &mut array, &mut workspace);
+                }
+            }
+
+            // Corrupt only the last immutable backend plan. The six-element
+            // active buffer passes the first stage and transition, then the
+            // replacement length four plan returns NonIntegralBatch.
+            let mut corrupted_plan = C2cPlan::<f64, 2, 1>::from_shape(
+                Arc::clone(&topology),
+                [2, 3],
+                ExtraShape::scalar(),
+            )
+            .unwrap();
+            Arc::get_mut(&mut corrupted_plan.core)
+                .expect("the separate plan core has no other owners")
+                .stages
+                .last_mut()
+                .expect("the C2C route has a final stage")
+                .local = LocalC2cPlan::new(4).unwrap();
+            let mut array = corrupted_plan.allocate_in_place().unwrap();
+            {
+                let mut view = array.view_mut().unwrap();
+                for (index, value) in view.as_mut_slice().iter_mut().enumerate() {
+                    *value = Complex::new(index as f64 + 1.0, -(index as f64));
+                }
+            }
+            let mut workspace = corrupted_plan.allocate_in_place_workspace().unwrap();
+            let result = corrupted_plan.forward_in_place(&mut array, &mut workspace);
+            assert!(matches!(
+                result,
+                Err(FftError::LocalC2c(LocalC2cError::NonIntegralBatch))
+            ));
+            assert_eq!(array.state(), C2cState::Poisoned);
+            assert_poisoned_views_and_retries(&corrupted_plan, &mut array, &mut workspace);
+
+            Ok::<(), ()>(())
+        };
+        result.unwrap();
+    }
+
+    fn assert_poisoned_views_and_retries(
+        plan: &C2cPlan<f64, 2, 1>,
+        array: &mut C2cInPlaceArray<f64, 2, 1>,
+        workspace: &mut C2cInPlaceWorkspace<f64, 2, 1>,
+    ) {
+        assert_eq!(array.state(), C2cState::Poisoned);
+        assert!(matches!(
+            array.view(),
+            Err(FftError::Array(pencil_array::ArrayError::Poisoned))
+        ));
+        assert!(matches!(
+            array.view_mut(),
+            Err(FftError::Array(pencil_array::ArrayError::Poisoned))
+        ));
+        for direction in [Direction::Forward, Direction::Inverse] {
+            let array_before = format!("{array:?}");
+            let workspace_before = format!("{workspace:?}");
+            let result = match direction {
+                Direction::Forward => plan.forward_in_place(array, workspace),
+                Direction::Inverse => plan.inverse_in_place(array, workspace),
+            };
+            assert!(matches!(
+                result,
+                Err(FftError::Array(pencil_array::ArrayError::Poisoned))
+            ));
+            assert_eq!(array.state(), C2cState::Poisoned);
+            assert_eq!(format!("{array:?}"), array_before);
+            assert_eq!(format!("{workspace:?}"), workspace_before);
+        }
     }
 
     #[test]
