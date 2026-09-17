@@ -3,11 +3,12 @@
 A row-major, MPI-distributed multidimensional array foundation inspired by
 PencilArrays.jl, with a separately layered FFT implementation.
 
-The workspace contains the `pencil-array` core crate and the local C2C
+The workspace contains the `pencil-array` core crate and the local FFT
 `pencil-fft` crate. `pencil-array` is intentionally independent of RustFFT,
 RealFFT, FFTW, and any FFT-specific API. The local `pencil-fft` path accepts
-flat slices, uses RustFFT, and is independent of MPI and `pencil-array`.
-R2C/C2R and distributed FFTs are follow-up work.
+flat slices, uses RustFFT/RealFFT, and is independent of MPI and
+`pencil-array`. Local C2C and out-of-place R2C/C2R are available; distributed
+FFT integration remains follow-up work.
 
 `Pencil` describes spatial distribution. `PencilArray` owns one layout and
 one local buffer. `ManyPencilArray` owns a buffer large enough for several
@@ -16,8 +17,8 @@ logical order `[extra..., spatial...]`; their row-major buffers use memory
 order `[extra..., permuted spatial...]`. `LocalTransposePlan` provides
 process-local memory-axis permutations. `AllToAllvTransposePlan` and
 `PointToPointTransposePlan` provide checked distributed redistribution through
-out-of-place views and shared-storage in-place execution. R2C/C2R and
-distributed FFT APIs remain next-stage work.
+out-of-place views and shared-storage in-place execution. Distributed FFT
+APIs remain next-stage work.
 
 Alltoallv and point-to-point construction and execution are collective: every
 rank must use the same source communicator context, API, order, `T`, and
@@ -81,7 +82,16 @@ cargo test --workspace --doc --locked -- --show-output
 ```
 
 Rustdoc tests cover usage examples and compile-time borrowing and visibility
-restrictions.
+restrictions. `LocalR2cPlan` preserves its source by copying one line at a time
+into caller-owned initialized storage, uses caller-owned complex scratch, and
+provides no real in-place API. It exposes the original real length `n`, the
+reduced complex length `n/2+1`, and the shared native scratch requirement;
+forward is unscaled and inverse divides each line by `n`. Its inverse accepts
+only strict-zero DC and, for even lengths, Nyquist imaginary components; for
+odd lengths greater than one, the final-bin imaginary component is
+unconstrained, while `n = 1` DC remains constrained. Ordinary validation
+errors preserve data and workspace, while backend/resource panics are not
+converted.
 
 The topology constructors are collective over an MPI intracommunicator. Run
 each integration-test binary with one MPI initialization per process, and drop
@@ -97,3 +107,4 @@ all topologies and arrays before MPI finalizes.
 - [Point-to-point transpose implementation plan](docs/superpowers/plans/2026-09-15-point-to-point-transpose-implementation.md)
 - [Point-to-point in-place implementation plan](docs/superpowers/plans/2026-09-15-point-to-point-in-place-implementation.md)
 - [Local C2C implementation plan](docs/superpowers/plans/2026-09-15-local-c2c-implementation.md)
+- [Local R2C/C2R implementation plan](docs/superpowers/plans/2026-09-17-local-r2c-implementation.md)

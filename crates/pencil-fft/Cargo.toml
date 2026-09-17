@@ -6,5 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+realfft = "~3.5.0"
 rustfft = "~6.4.1"
 thiserror.workspace = true

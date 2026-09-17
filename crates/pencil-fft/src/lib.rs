@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! Local one-dimensional complex-to-complex FFTs.
+//! Local one-dimensional FFTs.
 //!
 //! [`LocalC2cPlan`] treats each input slice as a row-major batch of contiguous
-//! lines. The plan owns immutable RustFFT plans, while callers own initialized
-//! scratch storage and all data buffers. Forward transforms are unnormalized;
-//! inverse transforms divide each line by its line length.
+//! complex lines. [`LocalR2cPlan`] does the same for real-to-half-complex and
+//! half-complex-to-real transforms. Plans own immutable backend plans, while
+//! callers own initialized line buffers, scratch storage, and data buffers.
+//! Forward transforms are unnormalized. Inverse transforms divide by the line
+//! length: the complex length for C2C, or the original real length for R2C/C2R.
 //!
 //! # Example
 //!
@@ -45,6 +47,31 @@
 //! struct ExternalReal(f64);
 //!
 //! impl FftReal for ExternalReal {}
+//! ```
+//!
+//! A real transform is out of place and uses caller-owned buffers for the
+//! native line operation:
+//!
+//! ```
+//! use pencil_fft::{Complex, LocalR2cError, LocalR2cPlan};
+//!
+//! fn main() -> Result<(), LocalR2cError> {
+//!     let plan = LocalR2cPlan::<f64>::new(4)?;
+//!     let source = [1.0, 2.0, -1.0, 0.25];
+//!     let mut spectrum = vec![Complex::new(0.0, 0.0); plan.complex_len()];
+//!     let mut real_line = vec![0.0; plan.real_len()];
+//!     let mut scratch = vec![Complex::new(0.0, 0.0); plan.scratch_len()];
+//!
+//!     plan.forward(&source, &mut spectrum, &mut real_line, &mut scratch)?;
+//!     let mut recovered = vec![0.0; plan.real_len()];
+//!     let mut complex_line = vec![Complex::new(0.0, 0.0); plan.complex_len()];
+//!     plan.inverse(&spectrum, &mut recovered, &mut complex_line, &mut scratch)?;
+//!     assert!(recovered
+//!         .iter()
+//!         .zip(source)
+//!         .all(|(actual, expected)| (actual - expected).abs() < 1e-10));
+//!     Ok(())
+//! }
 //! ```
 
 use std::fmt;
@@ -87,13 +114,17 @@ mod private {
     }
 }
 
-/// A real scalar supported by [`LocalC2cPlan`].
+/// A real scalar supported by the local FFT plans.
 ///
 /// This trait is sealed and is implemented only for `f32` and `f64`.
 pub trait FftReal: private::Sealed + Copy + Send + Sync + 'static {}
 
 impl FftReal for f32 {}
 impl FftReal for f64 {}
+
+mod r2c;
+
+pub use r2c::{LocalR2cError, LocalR2cPlan};
 
 /// Errors returned by local C2C plan construction and execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
