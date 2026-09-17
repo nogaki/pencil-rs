@@ -160,6 +160,16 @@ impl<T> TransposeWorkspace<T> {
             receive_buffer: receive,
         }
     }
+
+    /// Returns the initialized send-buffer length without exposing its storage.
+    pub fn send_len(&self) -> usize {
+        self.send_buffer.len()
+    }
+
+    /// Returns the initialized receive-buffer length without exposing its storage.
+    pub fn receive_len(&self) -> usize {
+        self.receive_buffer.len()
+    }
 }
 
 /// The initialized send and receive lengths needed by either transport for one

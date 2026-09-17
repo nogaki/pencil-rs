@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::{
     ArrayError, ManyPencilArray, Pencil, PencilArrayView, PencilArrayViewMut,
-    checked::checked_product, geometry::row_major_offset,
+    checked::checked_product, geometry::row_major_offset, transpose::TransposeWorkspace,
 };
 
 #[derive(Debug, Error)]
@@ -27,11 +27,12 @@ pub enum LocalTransposeError {
     ExtraShapeMismatch,
 
     /// The supplied scratch storage is too small for an in-place operation.
-    #[error("scratch capacity {actual} is less than required {required}")]
+    #[error("scratch storage length or capacity {actual} is less than required {required}")]
     ScratchTooSmall {
         /// The number of elements required by the operation.
         required: usize,
-        /// The scratch vector's capacity.
+        /// The old `Vec` API reports capacity; the workspace adapter reports
+        /// initialized length.
         actual: usize,
     },
 
@@ -171,16 +172,7 @@ impl<const N: usize, const M: usize> LocalTransposePlan<N, M> {
         array: &mut ManyPencilArray<T, N, M>,
         scratch: &mut Vec<T>,
     ) -> Result<(), LocalTransposeError> {
-        let source_index = array.active_index()?;
-        if !array.pencils()[source_index].same_layout(self.source.as_ref()) {
-            return Err(LocalTransposeError::SourceLayoutMismatch);
-        }
-        let destination_index = array
-            .find_layout(self.destination.as_ref())
-            .ok_or(LocalTransposeError::DestinationLayoutMismatch)?;
-        let required =
-            checked_product(&[self.source.local_len(), array.extra_shape().element_count()])
-                .map_err(ArrayError::from)?;
+        let (destination_index, required) = self.validate_in_place(array)?;
         if scratch.capacity() < required {
             return Err(LocalTransposeError::ScratchTooSmall {
                 required,
@@ -190,25 +182,7 @@ impl<const N: usize, const M: usize> LocalTransposePlan<N, M> {
 
         {
             let source = array.active_view()?;
-            if source.len() != required {
-                return Err(ArrayError::StorageLengthMismatch {
-                    required,
-                    actual: source.len(),
-                }
-                .into());
-            }
-            for linear in 0..required {
-                let (source_offset, destination_offset) =
-                    logical_offsets(self.source.as_ref(), self.destination.as_ref(), linear)?;
-                if source_offset >= source.len() || destination_offset >= required {
-                    return Err(ArrayError::StorageLengthMismatch {
-                        required,
-                        actual: source.len().min(required),
-                    }
-                    .into());
-                }
-            }
-
+            self.validate_source(&source, required)?;
             scratch.clear();
             for value in source.as_slice() {
                 scratch.push(value.clone());
@@ -223,6 +197,92 @@ impl<const N: usize, const M: usize> LocalTransposePlan<N, M> {
             storage[destination_offset].clone_from(&scratch[source_offset]);
         }
         guard.commit(destination_index)?;
+        Ok(())
+    }
+
+    /// Permutes the active layout using the initialized prefix of a shared
+    /// transpose workspace.
+    ///
+    /// Unlike [`Self::execute_in_place`], this adapter checks
+    /// `workspace.send_len()` rather than vector capacity and never changes
+    /// the send vector's length, capacity, or tail. It is process-local and
+    /// noncollective. Ordinary validation errors leave both the array and
+    /// workspace unchanged; clone panics have the same staging boundary as the
+    /// existing `Vec` API.
+    pub fn execute_in_place_with_transpose_workspace<T: Clone>(
+        &self,
+        array: &mut ManyPencilArray<T, N, M>,
+        workspace: &mut TransposeWorkspace<T>,
+    ) -> Result<(), LocalTransposeError> {
+        let (destination_index, required) = self.validate_in_place(array)?;
+        if workspace.send_buffer.len() < required {
+            return Err(LocalTransposeError::ScratchTooSmall {
+                required,
+                actual: workspace.send_buffer.len(),
+            });
+        }
+
+        {
+            let source = array.active_view()?;
+            self.validate_source(&source, required)?;
+            let send = &mut workspace.send_buffer[..required];
+            for (slot, value) in send.iter_mut().zip(source.as_slice()) {
+                slot.clone_from(value);
+            }
+        }
+
+        let mut guard = array.begin_in_place_write()?;
+        let storage = guard.storage_mut();
+        let send = &workspace.send_buffer[..required];
+        for linear in 0..required {
+            let (source_offset, destination_offset) =
+                logical_offsets(self.source.as_ref(), self.destination.as_ref(), linear)?;
+            storage[destination_offset].clone_from(&send[source_offset]);
+        }
+        guard.commit(destination_index)?;
+        Ok(())
+    }
+
+    fn validate_in_place<T>(
+        &self,
+        array: &ManyPencilArray<T, N, M>,
+    ) -> Result<(usize, usize), LocalTransposeError> {
+        let source_index = array.active_index()?;
+        if !array.pencils()[source_index].same_layout(self.source.as_ref()) {
+            return Err(LocalTransposeError::SourceLayoutMismatch);
+        }
+        let destination_index = array
+            .find_layout(self.destination.as_ref())
+            .ok_or(LocalTransposeError::DestinationLayoutMismatch)?;
+        let required =
+            checked_product(&[self.source.local_len(), array.extra_shape().element_count()])
+                .map_err(ArrayError::from)?;
+        Ok((destination_index, required))
+    }
+
+    fn validate_source<T>(
+        &self,
+        source: &PencilArrayView<'_, T, N, M>,
+        required: usize,
+    ) -> Result<(), LocalTransposeError> {
+        if source.len() != required {
+            return Err(ArrayError::StorageLengthMismatch {
+                required,
+                actual: source.len(),
+            }
+            .into());
+        }
+        for linear in 0..required {
+            let (source_offset, destination_offset) =
+                logical_offsets(self.source.as_ref(), self.destination.as_ref(), linear)?;
+            if source_offset >= source.len() || destination_offset >= required {
+                return Err(ArrayError::StorageLengthMismatch {
+                    required,
+                    actual: source.len().min(required),
+                }
+                .into());
+            }
+        }
         Ok(())
     }
 }

@@ -135,6 +135,17 @@ impl<const M: usize> MpiTopology<M> {
         &self.local_coords
     }
 
+    /// Borrows the topology-owned native Cartesian communicator.
+    ///
+    /// No communicator ownership is transferred. The returned borrow is valid
+    /// until `self` is dropped or MPI is finalized, whichever comes first.
+    /// Native collectives on it use this topology's communicator context and
+    /// must use the same order and counts on every rank. Drop the topology and
+    /// all objects that share it before MPI finalization.
+    pub fn communicator(&self) -> &CartesianCommunicator {
+        &self.cartesian
+    }
+
     /// Returns the calling process's rank in the Cartesian communicator.
     pub fn rank(&self) -> i32 {
         self.cartesian().rank()
