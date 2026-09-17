@@ -1,7 +1,7 @@
 # PencilArrays / PencilFFTs Rust移植 設計仕様
 
 日付: 2026-09-11  
-状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2Cは実装済み。R2C/C2Rと分散FFTは後続実装。
+状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2Rは実装済み。分散FFTは後続実装。
 対象: CPU + MPIによる任意次元分散配列基盤と分散FFT基盤
 
 ## 1. 参照実装
@@ -24,15 +24,15 @@
 5. 全空間軸に対するout-of-place R2C/C2R FFT
 6. Julia実装と比較可能な正当性・性能評価基盤
 
-分散配列基盤とFFT層は別crateとし、一方向の依存関係にする。現在のlocal C2C段階では、
+分散配列基盤とFFT層は別crateとし、一方向の依存関係にする。現在のlocal FFT段階では、
 `pencil-array`はMPIに依存する一方でFFTライブラリには依存せず、`pencil-fft`は
-RustFFTに依存する一方でMPIと`pencil-array`には依存しない。分散FFTを統合する
+RustFFT/RealFFTに依存する一方でMPIと`pencil-array`には依存しない。分散FFTを統合する
 後続段階でのみ、`pencil-fft`から`pencil-array`への依存を追加する。
 
 ```text
-current local C2C:
+current local FFT:
     pencil-array -- MPI
-    pencil-fft   -- RustFFT
+    pencil-fft   -- RustFFT + RealFFT
 
 future distributed FFT:
     pencil-fft
@@ -166,9 +166,9 @@ workspace/
 └── docs/
 ```
 
-現在のlocal C2C段階では、`pencil-array`はMPIに依存するが、RustFFT、RealFFT、FFTWには
-依存しない。`pencil-fft`のlocal pathはRustFFTに依存するが、MPIと`pencil-array`には
-依存しない。分散FFT統合後の`pencil-fft`は`pencil-array`にも依存する。
+現在のlocal FFT段階では、`pencil-array`はMPIに依存するが、RustFFT、RealFFT、FFTWには
+依存しない。`pencil-fft`のlocal pathはRustFFT/RealFFTに依存するが、MPIと`pencil-array`
+には依存しない。分散FFT統合後の`pencil-fft`は`pencil-array`にも依存する。
 
 ## 7. MPI資源とtopology
 
@@ -2010,7 +2010,7 @@ rankごとの最大時間を主要指標とする。
 ### Milestone 6: Local FFT backend
 
 - RustFFT C2C（実装済み）
-- RealFFT R2C/C2R（後続）
+- RealFFT R2C/C2R（実装済み）
 - row-major batched lines
 - input-preserving out-of-place wrappers
 
@@ -2049,6 +2049,35 @@ rankごとの最大時間を主要指標とする。
  直接比較を必須とする。符号、単一周波数、正規化、f32/f64、single/multiple batch、
  prime/composite/length1、zero batch、invalid length/destination/scratch、未変更保証、
  scratch再利用を確認する。単なる往復だけをoracleにしない。
+
+#### Milestone 6第二PR追補（2026-09-17、基点 `f5f4658`）
+
+local `pencil-fft`へRealFFT 3.5系を追加し、既存のC2C APIを変更せず、1次元の
+out-of-place R2C/C2Rだけを実装した。`pencil-array`、MPI、分散FFT、in-place real FFT、
+共通workspace abstraction、公開backend traitはこのPRにも含めない。
+
+- 公開APIはsealed `FftReal`（`f32`/`f64`のみ）、`Complex<R>`、
+  `LocalR2cPlan<R>::new`、`real_len`、`complex_len`、`scratch_len`、`forward`、`inverse`。
+  forwardのsource/destinationはreal line長`n`とreduced complex line長`n/2+1`、inverseの
+  source/destinationはreduced complex line長`n/2+1`とreal line長`n`の連続batchで、batch数は
+  各sliceを方向に応じて除算して一致を確認する。in-place real APIはない。
+- planは`realfft`のimmutable forward/inverse plan、元の正の`n`、reduced length、
+  両native `get_scratch_len()`の最大値だけを所有する。forwardにはcaller-owned real line、
+  inverseにはcaller-owned complex line、両方にcaller-owned initialized complex scratchを
+  渡す。oversized tailは使わず、実行中のallocation/resizeは行わない。
+- forwardは無正規化、inverseはRealFFT出力を各lineの元の`n`だけで除算する。両方向とも
+  sourceは保持し、RealFFTが入力lineを変更するため一度に一lineだけcaller bufferへcopyする。
+- inverseはbackend実行前に全batchのDC、偶数`n`のNyquistのimaginary componentを検査する。
+  `+0.0`/`-0.0`だけがzeroで、NaNは不正。odd`n`が1より大きい場合のfinal binは制約せず、
+  interior binはいずれの長さでも制約しない。`n=1`のfinal binはDCなので制約する。通常のvalidationおよびこのendpoint errorでは
+  source、destination、line/scratch workspaceを
+  保持する。backend/resource panicや検証済み不変条件後の予期しないbackend errorをResultへ
+  変換せず、output atomicityも保証しない。
+- `n=0`、address-spaceを超えるreal/complex/odd staging長、非整数batch、batch数不一致、
+  短いline/scratchはbackend前に拒否する。valid empty batchもline/scratch検査後にworkspaceを
+  変更しないno-opとする。テストは独立DFT、実数入力のC2C結果とのhalf-spectrum prefix比較、
+  Hermitian reconstruction、f32/f64、odd/evenのprime/composite、n=1/2、複数batch、DC/Nyquist、
+  任意half-spectrum、dirty/oversized workspace、later-batch endpointのatomicityを確認する。
 
 ### Milestone 7: Distributed C2C
 
