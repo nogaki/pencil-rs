@@ -9,8 +9,8 @@ RealFFT, FFTW, and any FFT-specific API. The local `pencil-fft` path accepts
 flat slices, uses RustFFT/RealFFT, and is independent of MPI and
 `pencil-array`. Local C2C and out-of-place R2C/C2R are available. An opt-in
 `pencil-fft/distributed` feature adds out-of-place, input-preserving and
-single-buffer in-place distributed C2C FFTs over checked Alltoallv or
-point-to-point transitions.
+single-buffer in-place distributed C2C FFTs and out-of-place distributed
+R2C/C2R over checked Alltoallv or point-to-point transitions.
 
 `Pencil` describes spatial distribution. `PencilArray` owns one layout and
 one local buffer. `ManyPencilArray` owns a buffer large enough for several
@@ -21,11 +21,12 @@ process-local memory-axis permutations. `AllToAllvTransposePlan` and
 `PointToPointTransposePlan` provide checked distributed redistribution through
 out-of-place views and shared-storage in-place execution. The optional
 `pencil-fft/distributed` feature composes these checked transitions into
-out-of-place and in-place distributed C2C transforms; it does not change the
-MPI-free local FFT default. `C2cPlan::from_pencil_with_method`,
-`from_array_with_method`, and `from_shape_with_method` select
-`TransposeMethod::AllToAllv` or `TransposeMethod::PointToPoint`. The legacy
-constructors retain the Alltoallv default.
+out-of-place and in-place distributed C2C transforms and out-of-place
+R2C/C2R; it does not change the MPI-free local FFT default. `C2cPlan` and
+`R2cPlan` provide matching `from_pencil_with_method`,
+`from_array_with_method`, and `from_shape_with_method` constructors. The
+legacy constructors retain the Alltoallv default; R2C output uses the original
+shape with its final extent reduced to `n/2+1`.
 
 Alltoallv and point-to-point construction and execution are collective: every
 rank must use the same source communicator context, API, order, `T`, and
@@ -50,6 +51,36 @@ topology-owned changed-axis context, posts all receives before sends, waits for
 every request, and must not overlap unfinished transposes on that context. MPI
 failures, arbitrary panics, and process loss do not guarantee global recovery;
 an unfinished request scope may abort.
+
+## Distributed R2C/C2R FFT
+
+`R2cPlan<R, N, M>` accepts a canonical real input pencil and returns a
+complex output pencil whose original final extent `n` is reduced to `n/2+1`.
+The initial reduced-complex stage keeps decomposition `[0..M)`, while the
+final output uses `[1..=M]` and reversed spatial memory order. Other axes,
+process-grid choices, and extra dimensions are retained. `allocate_workspace`
+is noncollective; coordinate any local allocation failure before the next
+collective. It owns one reduced-complex intermediate, checked transpose
+storage, native scratch, and one real/complex line buffer. Only `forward` and
+`inverse` are exposed—there is no real in-place API. The constructors and
+operations require the same communicator context, API/order, scalar type,
+method, and layouts on every rank. Legacy constructors use Alltoallv;
+point-to-point uses the fixed `0x5054` tag and must not overlap unfinished
+transposes on its context.
+
+The inverse performs the transverse complex inverse stages first, then
+validates each extra batch and constrained DC/Nyquist plane. It accepts a
+plane when either `max(abs(imaginary)) <= 128 * min_subnormal_R * D` or its
+imaginary L2 norm is at most `128 * epsilon_R * D` times its real L2 norm,
+where `D = 1 + sum(ceil(log2(n_a)))` over original axes before the real axis.
+This is an explicit normwise-relative/componentwise-absolute acceptance
+policy, not a formal RustFFT error bound. All constrained endpoint values
+must be finite; odd lengths constrain DC only (for `n=1` the final bin is DC),
+even lengths also constrain Nyquist, and interior bins have no blanket finite
+policy. Nonfinite or materially non-real constrained planes return
+`R2cError::InvalidSpectrum` before any real destination write; the workspace
+may already have changed on that post-start error path, while source and
+destination remain unchanged.
 
 ## Distributed C2C FFT
 
@@ -119,7 +150,6 @@ mpiexec -n 4 cargo test -p pencil-array --test many --locked -- --nocapture --te
 # The local operation is noncollective; keep a timeout to catch deadlocks.
 timeout --foreground 120s mpiexec -n 1 cargo test -p pencil-array --test local_transpose --locked -- --nocapture --test-threads=1
 timeout --foreground 120s mpiexec -n 4 cargo test -p pencil-array --test local_transpose --locked -- --nocapture --test-threads=1
-# The existing suite binary covers Alltoallv/P2P out-of-place and both in-place APIs.
 timeout --foreground 120s mpiexec -n 1 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
 timeout --foreground 120s mpiexec -n 4 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
 timeout --foreground 120s mpiexec -n 6 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
@@ -128,6 +158,7 @@ cargo doc --workspace --no-deps --locked
 cargo doc -p pencil-fft --features distributed --no-deps --locked
 cargo test --workspace --doc --locked -- --show-output
 cargo test -p pencil-fft --features distributed --doc --locked -- --show-output
+# The existing suite binary covers distributed C2C/R2C/C2R over Alltoallv/P2P; only C2C has in-place APIs.
 for n in 1 4 6; do
   timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
     cargo test -p pencil-fft --features distributed --test distributed_c2c \
@@ -165,3 +196,4 @@ all topologies and arrays before MPI finalizes.
 - [Distributed C2C implementation plan](docs/superpowers/plans/2026-09-17-distributed-c2c-implementation.md)
 - [Distributed C2C in-place implementation plan](docs/superpowers/plans/2026-09-18-distributed-c2c-in-place-implementation.md)
 - [Distributed C2C point-to-point implementation plan](docs/superpowers/plans/2026-09-18-distributed-c2c-point-to-point-implementation.md)
+- [Distributed R2C/C2R implementation plan](docs/superpowers/plans/2026-09-18-distributed-r2c-implementation.md)

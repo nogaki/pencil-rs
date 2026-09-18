@@ -11,13 +11,16 @@ use pencil_array::{
 };
 use pencil_fft::{
     C2cInPlaceArray, C2cInPlaceWorkspace, C2cOutOfPlaceWorkspace, C2cPlan, C2cState, Complex,
-    FftError, FftReal, TransposeMethod,
+    FftError, FftReal, R2cError, R2cPlan, R2cWorkspace, TransposeMethod,
 };
 
-trait TestReal: FftReal + mpi::datatype::Equivalence {
+trait TestReal: FftReal + mpi::datatype::Equivalence + std::fmt::Debug {
     fn from_f64(value: f64) -> Self;
     fn to_f64(value: Self) -> f64;
     fn tolerance() -> f64;
+    fn epsilon() -> f64;
+    fn min_subnormal() -> f64;
+    fn huge() -> f64;
 }
 
 impl TestReal for f32 {
@@ -32,6 +35,18 @@ impl TestReal for f32 {
     fn tolerance() -> f64 {
         4e-4
     }
+
+    fn epsilon() -> f64 {
+        f32::EPSILON as f64
+    }
+
+    fn min_subnormal() -> f64 {
+        f32::from_bits(1) as f64
+    }
+
+    fn huge() -> f64 {
+        1e20
+    }
 }
 
 impl TestReal for f64 {
@@ -45,6 +60,18 @@ impl TestReal for f64 {
 
     fn tolerance() -> f64 {
         2e-10
+    }
+
+    fn epsilon() -> f64 {
+        f64::EPSILON
+    }
+
+    fn min_subnormal() -> f64 {
+        f64::from_bits(1)
+    }
+
+    fn huge() -> f64 {
+        1e200
     }
 }
 
@@ -146,7 +173,15 @@ fn distributed_c2c_one_mpi_binary() {
         false,
     );
 
+    run_r2c_cases(&topology_1d, &topology_2d);
+    assert_r2c_method_parity::<f64, 3, 1>(
+        &reversed_topology,
+        [3, 2, 5],
+        ExtraShape::scalar(),
+        26.0,
+    );
     negative_collective_cases(&world, &topology_1d, &topology_2d);
+    negative_r2c_collective_cases(&world, &topology_1d, &topology_2d);
 }
 
 fn run_case<R: TestReal, const N: usize, const M: usize>(
@@ -399,6 +434,1089 @@ where
     );
     topology_barrier(topology);
     snapshots
+}
+
+fn run_r2c_cases(topology_1d: &Arc<MpiTopology<1>>, topology_2d: &Arc<MpiTopology<2>>) {
+    // Both transports run every case; comparing the two returned local
+    // matrices catches parity errors in either the forward or inverse path.
+    assert_r2c_method_parity::<f64, 2, 1>(topology_1d, [3, 1], ExtraShape::scalar(), 20.0);
+    assert_r2c_method_parity::<f64, 2, 1>(
+        topology_1d,
+        [3, 2],
+        ExtraShape::new([2, 3]).unwrap(),
+        20.5,
+    );
+    assert_r2c_method_parity::<f64, 3, 1>(topology_1d, [2, 3, 2], ExtraShape::scalar(), 21.0);
+    assert_r2c_method_parity::<f64, 3, 1>(
+        topology_1d,
+        [3, 2, 5],
+        ExtraShape::new([2]).unwrap(),
+        21.5,
+    );
+    assert_r2c_method_parity::<f64, 4, 2>(
+        topology_2d,
+        [3, 1, 2, 4],
+        ExtraShape::new([2, 3]).unwrap(),
+        22.0,
+    );
+    assert_r2c_method_parity::<f64, 4, 2>(topology_2d, [3, 1, 2, 3], ExtraShape::scalar(), 22.5);
+    assert_r2c_method_parity::<f64, 4, 2>(
+        topology_2d,
+        [3, 1, 2, 4],
+        ExtraShape::new([0]).unwrap(),
+        23.0,
+    );
+
+    assert_r2c_method_parity::<f32, 2, 1>(topology_1d, [3, 1], ExtraShape::scalar(), 24.0);
+    assert_r2c_method_parity::<f32, 2, 1>(topology_1d, [3, 2], ExtraShape::new([2]).unwrap(), 24.5);
+    assert_r2c_method_parity::<f32, 3, 1>(
+        topology_1d,
+        [2, 3, 2],
+        ExtraShape::new([0]).unwrap(),
+        25.0,
+    );
+    assert_r2c_method_parity::<f32, 4, 2>(
+        topology_2d,
+        [3, 1, 2, 4],
+        ExtraShape::new([2, 3]).unwrap(),
+        25.5,
+    );
+    assert_r2c_method_parity::<f32, 4, 2>(topology_2d, [3, 1, 2, 3], ExtraShape::scalar(), 26.0);
+
+    run_r2c_boundary_cases(topology_1d);
+    run_r2c_boundary_hard_cases(topology_1d, topology_2d);
+}
+
+fn assert_r2c_method_parity<R: TestReal, const N: usize, const M: usize>(
+    topology: &Arc<MpiTopology<M>>,
+    global_shape: [usize; N],
+    extra_shape: ExtraShape,
+    seed: f64,
+) -> (Vec<Complex<R>>, Vec<R>)
+where
+    Complex<R>: mpi::datatype::Equivalence,
+{
+    let alltoallv = run_r2c_case::<R, N, M>(
+        topology,
+        global_shape,
+        extra_shape.clone(),
+        seed,
+        TransposeMethod::AllToAllv,
+    );
+    let point_to_point = run_r2c_case::<R, N, M>(
+        topology,
+        global_shape,
+        extra_shape,
+        seed,
+        TransposeMethod::PointToPoint,
+    );
+    assert_eq!(alltoallv, point_to_point);
+    alltoallv
+}
+
+fn run_r2c_case<R: TestReal, const N: usize, const M: usize>(
+    topology: &Arc<MpiTopology<M>>,
+    global_shape: [usize; N],
+    extra_shape: ExtraShape,
+    seed: f64,
+    method: TransposeMethod,
+) -> (Vec<Complex<R>>, Vec<R>)
+where
+    Complex<R>: mpi::datatype::Equivalence,
+{
+    let plan = R2cPlan::<R, N, M>::from_shape_with_method(
+        Arc::clone(topology),
+        global_shape,
+        extra_shape.clone(),
+        method,
+    )
+    .unwrap();
+    let mut source = plan.allocate_input().unwrap();
+    fill_r2c_input(&mut source, seed);
+    assert_r2c_layout(&plan, global_shape, &extra_shape);
+
+    // Exercise all six public constructors. The legacy forms must continue to
+    // describe the same reduced endpoint as their method-selecting forms.
+    let legacy_shape =
+        R2cPlan::<R, N, M>::from_shape(Arc::clone(topology), global_shape, extra_shape.clone())
+            .unwrap();
+    let legacy_pencil =
+        R2cPlan::<R, N, M>::from_pencil(Arc::clone(plan.input_pencil()), extra_shape.clone())
+            .unwrap();
+    let legacy_array = R2cPlan::<R, N, M>::from_array(&source).unwrap();
+    let explicit_pencil = R2cPlan::<R, N, M>::from_pencil_with_method(
+        Arc::clone(plan.input_pencil()),
+        extra_shape.clone(),
+        method,
+    )
+    .unwrap();
+    let explicit_array = R2cPlan::<R, N, M>::from_array_with_method(&source, method).unwrap();
+    for candidate in [
+        &legacy_shape,
+        &legacy_pencil,
+        &legacy_array,
+        &explicit_pencil,
+        &explicit_array,
+    ] {
+        assert!(
+            candidate
+                .output_pencil()
+                .same_layout(plan.output_pencil().as_ref())
+        );
+        assert_eq!(candidate.extra_shape(), &extra_shape);
+    }
+    let source_before = source.as_slice().to_vec();
+    let mut spectrum = plan.allocate_output().unwrap();
+    let mut workspace = plan.allocate_workspace().unwrap();
+    plan.forward(&source, &mut spectrum, &mut workspace)
+        .unwrap();
+    assert_eq!(source.as_slice(), source_before.as_slice());
+    check_r2c_forward(&spectrum.view(), &extra_shape, global_shape, seed);
+
+    let forward_snapshot = spectrum.as_slice().to_vec();
+    let mut recovered = plan.allocate_input().unwrap();
+    plan.inverse(&spectrum, &mut recovered, &mut workspace)
+        .unwrap();
+    assert_eq!(spectrum.as_slice(), forward_snapshot.as_slice());
+    for (actual, expected) in recovered.as_slice().iter().zip(&source_before) {
+        assert!((R::to_f64(*actual) - R::to_f64(*expected)).abs() <= R::tolerance());
+    }
+
+    fill_r2c_spectrum(&mut spectrum, global_shape, seed + 17.0);
+    assert_raw_boundary_imaginary(&spectrum.view(), &extra_shape, global_shape);
+    let arbitrary_before = spectrum.as_slice().to_vec();
+    let mut arbitrary_inverse = plan.allocate_input().unwrap();
+    plan.inverse(&spectrum, &mut arbitrary_inverse, &mut workspace)
+        .unwrap();
+    assert_eq!(spectrum.as_slice(), arbitrary_before.as_slice());
+    check_r2c_inverse(
+        &arbitrary_inverse.view(),
+        &extra_shape,
+        global_shape,
+        seed + 17.0,
+    );
+
+    plan.forward(&source, &mut spectrum, &mut workspace)
+        .unwrap();
+    assert_eq!(source.as_slice(), source_before.as_slice());
+    (forward_snapshot, arbitrary_inverse.as_slice().to_vec())
+}
+
+fn assert_r2c_layout<R: TestReal, const N: usize, const M: usize>(
+    plan: &R2cPlan<R, N, M>,
+    original_shape: [usize; N],
+    extra_shape: &ExtraShape,
+) where
+    Complex<R>: mpi::datatype::Equivalence,
+{
+    assert_eq!(plan.input_pencil().global_shape(), &original_shape);
+    assert_eq!(plan.extra_shape(), extra_shape);
+    let output = plan.output_pencil();
+    let expected_shape = std::array::from_fn(|axis| {
+        if axis + 1 == N {
+            original_shape[axis] / 2 + 1
+        } else {
+            original_shape[axis]
+        }
+    });
+    assert_eq!(output.global_shape(), &expected_shape);
+    assert_eq!(
+        output
+            .decomposition()
+            .iter()
+            .map(|axis| axis.index())
+            .collect::<Vec<_>>(),
+        (1..=M).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        output
+            .permutation()
+            .axes()
+            .iter()
+            .map(|axis| axis.index())
+            .collect::<Vec<_>>(),
+        (0..N).rev().collect::<Vec<_>>()
+    );
+}
+
+fn assert_raw_boundary_imaginary<R: TestReal, const N: usize, const M: usize>(
+    array: &PencilArrayView<'_, Complex<R>, N, M>,
+    extra_shape: &ExtraShape,
+    original_shape: [usize; N],
+) {
+    if extra_shape.element_count() == 0 || !original_shape[..N - 1].iter().any(|&n| n > 2) {
+        return;
+    }
+    let plane_count = if original_shape[N - 1] % 2 == 0 { 2 } else { 1 };
+    let mut local = [0.0_f64; 2];
+    let ranges = array.pencil().local_ranges();
+    let local_shape = array.pencil().local_shape_logical();
+    for extra_linear in 0..extra_shape.element_count() {
+        let extra = unravel_extra(extra_linear, extra_shape.dimensions());
+        for spatial_linear in 0..array.pencil().local_len() {
+            let spatial = unravel_spatial(spatial_linear, local_shape);
+            let frequency: [usize; N] =
+                std::array::from_fn(|axis| ranges[axis].start + spatial[axis]);
+            let plane = if frequency[N - 1] == 0 {
+                Some(0)
+            } else if plane_count == 2 && frequency[N - 1] == original_shape[N - 1] / 2 {
+                Some(1)
+            } else {
+                None
+            };
+            if let Some(plane) = plane {
+                let value = array
+                    .get_local(&extra, spatial)
+                    .expect("raw half-spectrum index is local");
+                local[plane] = local[plane].max(R::to_f64(value.im).abs());
+            }
+        }
+    }
+    let mut global = [0.0_f64; 2];
+    array.pencil().topology().communicator().all_reduce_into(
+        &local,
+        &mut global,
+        SystemOperation::max(),
+    );
+    for (plane, value) in global.iter().enumerate().take(plane_count) {
+        assert!(
+            *value > 0.0,
+            "valid raw boundary plane {plane} unexpectedly has zero imaginary part"
+        );
+    }
+}
+
+fn fill_r2c_input<R: TestReal, const N: usize, const M: usize>(
+    array: &mut PencilArray<R, N, M>,
+    seed: f64,
+) {
+    let dimensions = array.extra_shape().dimensions().to_vec();
+    let local_shape = array.pencil().local_shape_logical();
+    for extra_linear in 0..array.extra_shape().element_count() {
+        let extra = unravel_extra(extra_linear, &dimensions);
+        for spatial_linear in 0..array.pencil().local_len() {
+            let spatial = unravel_spatial(spatial_linear, local_shape);
+            let global: [usize; N] = std::array::from_fn(|axis| {
+                array.pencil().local_ranges()[axis].start + spatial[axis]
+            });
+            *array
+                .get_local_mut(&extra, spatial)
+                .expect("real input index is local") =
+                <R as TestReal>::from_f64(r2c_real_value(&extra, global, seed));
+        }
+    }
+}
+
+fn fill_r2c_spectrum<R: TestReal, const N: usize, const M: usize>(
+    array: &mut PencilArray<Complex<R>, N, M>,
+    original_shape: [usize; N],
+    seed: f64,
+) {
+    let dimensions = array.extra_shape().dimensions().to_vec();
+    let local_shape = array.pencil().local_shape_logical();
+    for extra_linear in 0..array.extra_shape().element_count() {
+        let extra = unravel_extra(extra_linear, &dimensions);
+        for spatial_linear in 0..array.pencil().local_len() {
+            let spatial = unravel_spatial(spatial_linear, local_shape);
+            let frequency = std::array::from_fn(|axis| {
+                array.pencil().local_ranges()[axis].start + spatial[axis]
+            });
+            let value = arbitrary_half_value(&extra, frequency, original_shape, seed);
+            *array
+                .get_local_mut(&extra, spatial)
+                .expect("half-spectrum index is local") = Complex::new(
+                <R as TestReal>::from_f64(value.re),
+                <R as TestReal>::from_f64(value.im),
+            );
+        }
+    }
+}
+
+fn check_r2c_forward<R: TestReal, const N: usize, const M: usize>(
+    array: &PencilArrayView<'_, Complex<R>, N, M>,
+    extra_shape: &ExtraShape,
+    original_shape: [usize; N],
+    seed: f64,
+) {
+    let local_shape = array.pencil().local_shape_logical();
+    let ranges = array.pencil().local_ranges();
+    let dimensions = extra_shape.dimensions();
+    for extra_linear in 0..extra_shape.element_count() {
+        let extra = unravel_extra(extra_linear, dimensions);
+        for spatial_linear in 0..array.pencil().local_len() {
+            let spatial = unravel_spatial(spatial_linear, local_shape);
+            let frequency: [usize; N] =
+                std::array::from_fn(|axis| ranges[axis].start + spatial[axis]);
+            let expected = r2c_half_value::<R, N>(&extra, frequency, original_shape, seed);
+            let actual = *array
+                .get_local(&extra, spatial)
+                .expect("forward half-spectrum index is local");
+            let bound = R::tolerance() * (1.0 + expected.re.abs().max(expected.im.abs()));
+            assert!((R::to_f64(actual.re) - expected.re).abs() <= bound);
+            assert!((R::to_f64(actual.im) - expected.im).abs() <= bound);
+        }
+    }
+}
+
+fn check_r2c_inverse<R: TestReal, const N: usize, const M: usize>(
+    array: &PencilArrayView<'_, R, N, M>,
+    extra_shape: &ExtraShape,
+    original_shape: [usize; N],
+    seed: f64,
+) {
+    let local_shape = array.pencil().local_shape_logical();
+    let ranges = array.pencil().local_ranges();
+    let dimensions = extra_shape.dimensions();
+    for extra_linear in 0..extra_shape.element_count() {
+        let extra = unravel_extra(extra_linear, dimensions);
+        for spatial_linear in 0..array.pencil().local_len() {
+            let spatial = unravel_spatial(spatial_linear, local_shape);
+            let target = std::array::from_fn(|axis| ranges[axis].start + spatial[axis]);
+            let expected = r2c_inverse_value::<R, N>(&extra, target, original_shape, seed);
+            let actual = R::to_f64(
+                *array
+                    .get_local(&extra, spatial)
+                    .expect("inverse real index is local"),
+            );
+            assert!((actual - expected).abs() <= R::tolerance() * (1.0 + expected.abs()));
+        }
+    }
+}
+
+fn r2c_real_value<const N: usize>(extra: &[usize], spatial: [usize; N], seed: f64) -> f64 {
+    let mut value = 0.17 + seed * 0.013;
+    for (index, &coordinate) in extra.iter().enumerate() {
+        value += (index + 2) as f64 * (coordinate + 1) as f64 * 0.041;
+    }
+    for (axis, coordinate) in spatial.into_iter().enumerate() {
+        value += (axis + 1) as f64 * (coordinate + 1) as f64 * 0.23;
+        value += ((coordinate + axis + 1) as f64).sin() * 0.019;
+    }
+    // Pairwise products make the real fixture genuinely nonseparable. A
+    // separable sum cannot expose a mistaken mirror on another transverse axis.
+    for left in 0..N {
+        for right in left + 1..N {
+            value += 0.013
+                * (left + 1) as f64
+                * (right + 2) as f64
+                * (spatial[left] + 1) as f64
+                * (spatial[right] + 2) as f64;
+        }
+    }
+    value
+}
+
+fn r2c_half_value<R: TestReal, const N: usize>(
+    extra: &[usize],
+    frequency: [usize; N],
+    shape: [usize; N],
+    seed: f64,
+) -> Complex<f64> {
+    let mut real = 0.0;
+    let mut imaginary = 0.0;
+    let total = shape.iter().product::<usize>();
+    for linear in 0..total {
+        let spatial = unravel_spatial(linear, shape);
+        let value = R::to_f64(<R as TestReal>::from_f64(r2c_real_value(
+            extra, spatial, seed,
+        )));
+        let phase = -TAU
+            * (0..N)
+                .map(|axis| spatial[axis] as f64 * frequency[axis] as f64 / shape[axis] as f64)
+                .sum::<f64>();
+        let (sin, cos) = phase.sin_cos();
+        real += value * cos;
+        imaginary += value * sin;
+    }
+    Complex::new(real, imaginary)
+}
+
+fn arbitrary_base_value<const N: usize>(
+    extra: &[usize],
+    frequency: [usize; N],
+    shape: [usize; N],
+    seed: f64,
+) -> Complex<f64> {
+    let mut real = 0.31 + seed * 0.017;
+    let mut imaginary = -0.29 - seed * 0.011;
+    for (index, &coordinate) in extra.iter().enumerate() {
+        real += (index + 2) as f64 * (coordinate + 1) as f64 * 0.067;
+        imaginary -= (index + 3) as f64 * (coordinate + 1) as f64 * 0.053;
+    }
+    for (axis, &coordinate) in frequency.iter().enumerate() {
+        real += (axis + 1) as f64 * (coordinate + 1) as f64 * 0.173;
+        imaginary += (axis + 2) as f64 * (coordinate + 1) as f64 * 0.119;
+        real += ((coordinate + axis + 2) as f64).sin() * 0.037;
+    }
+    for left in 0..N.saturating_sub(1) {
+        for right in left + 1..N.saturating_sub(1) {
+            real += 0.021 * (frequency[left] + 1) as f64 * (frequency[right] + 2) as f64;
+            imaginary -=
+                0.015 * (shape[left] + frequency[left] + 1) as f64 * (frequency[right] + 1) as f64;
+        }
+    }
+    Complex::new(real, imaginary)
+}
+
+fn arbitrary_half_value<const N: usize>(
+    extra: &[usize],
+    frequency: [usize; N],
+    shape: [usize; N],
+    seed: f64,
+) -> Complex<f64> {
+    let last = frequency[N - 1];
+    let half = shape[N - 1] / 2;
+    let base = arbitrary_base_value(extra, frequency, shape, seed);
+    if last != 0 && !(shape[N - 1] % 2 == 0 && last == half) {
+        return base;
+    }
+    let mirror = std::array::from_fn(|axis| {
+        if axis + 1 == N {
+            last
+        } else if frequency[axis] == 0 {
+            0
+        } else {
+            shape[axis] - frequency[axis]
+        }
+    });
+    let partner = arbitrary_base_value(extra, mirror, shape, seed);
+    Complex::new(base.re + partner.re, base.im - partner.im)
+}
+
+fn converted_complex<R: TestReal>(value: Complex<f64>) -> Complex<f64> {
+    Complex::new(
+        R::to_f64(<R as TestReal>::from_f64(value.re)),
+        R::to_f64(<R as TestReal>::from_f64(value.im)),
+    )
+}
+
+fn r2c_inverse_value<R: TestReal, const N: usize>(
+    extra: &[usize],
+    target: [usize; N],
+    shape: [usize; N],
+    seed: f64,
+) -> f64 {
+    let total = shape.iter().product::<usize>();
+    let mut result = 0.0;
+    for linear in 0..total {
+        let frequency = unravel_spatial(linear, shape);
+        let spectrum = if frequency[N - 1] <= shape[N - 1] / 2 {
+            converted_complex::<R>(arbitrary_half_value(extra, frequency, shape, seed))
+        } else {
+            let mirror = std::array::from_fn(|axis| {
+                if axis + 1 == N {
+                    shape[axis] - frequency[axis]
+                } else if frequency[axis] == 0 {
+                    0
+                } else {
+                    shape[axis] - frequency[axis]
+                }
+            });
+            converted_complex::<R>(arbitrary_half_value(extra, mirror, shape, seed)).conj()
+        };
+        let phase = TAU
+            * (0..N)
+                .map(|axis| target[axis] as f64 * frequency[axis] as f64 / shape[axis] as f64)
+                .sum::<f64>();
+        let (sin, cos) = phase.sin_cos();
+        result += spectrum.re * cos - spectrum.im * sin;
+    }
+    result / total as f64
+}
+
+fn set_r2c_global<R: TestReal, const N: usize, const M: usize>(
+    array: &mut PencilArray<Complex<R>, N, M>,
+    extra: &[usize],
+    global: [usize; N],
+    value: Complex<R>,
+) {
+    let local: [Option<usize>; N] = std::array::from_fn(|axis| {
+        let range = &array.pencil().local_ranges()[axis];
+        if range.start <= global[axis] && global[axis] < range.end {
+            Some(global[axis] - range.start)
+        } else {
+            None
+        }
+    });
+    if local.iter().all(Option::is_some) {
+        let local = std::array::from_fn(|axis| local[axis].expect("local owner was checked"));
+        *array
+            .get_local_mut(extra, local)
+            .expect("global endpoint is local on its owner") = value;
+    }
+}
+
+fn run_r2c_boundary_cases(topology: &Arc<MpiTopology<1>>) {
+    for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
+        let plan = R2cPlan::<f32, 3, 1>::from_shape_with_method(
+            Arc::clone(topology),
+            [128, 128, 3],
+            ExtraShape::scalar(),
+            method,
+        )
+        .unwrap();
+        let mut spectrum = plan.allocate_output().unwrap();
+        set_r2c_global(&mut spectrum, &[], [0, 0, 0], Complex::new(0.0, 1.0));
+        let source_before = spectrum.as_slice().to_vec();
+        let mut destination = plan.allocate_input().unwrap();
+        for value in destination.as_mut_slice() {
+            *value = 19.0;
+        }
+        let destination_before = destination.as_slice().to_vec();
+        let mut workspace = plan.allocate_workspace().unwrap();
+        assert!(matches!(
+            plan.inverse(&spectrum, &mut destination, &mut workspace),
+            Err(R2cError::InvalidSpectrum)
+        ));
+        assert_eq!(spectrum.as_slice(), source_before.as_slice());
+        assert_eq!(destination.as_slice(), destination_before.as_slice());
+
+        let mut real_source = plan.allocate_input().unwrap();
+        fill_r2c_input(&mut real_source, 25.0);
+        plan.forward(&real_source, &mut spectrum, &mut workspace)
+            .unwrap();
+        plan.inverse(&spectrum, &mut destination, &mut workspace)
+            .unwrap();
+
+        let batched = R2cPlan::<f32, 3, 1>::from_shape_with_method(
+            Arc::clone(topology),
+            [8, 8, 4],
+            ExtraShape::new([2]).unwrap(),
+            method,
+        )
+        .unwrap();
+        let mut batched_spectrum = batched.allocate_output().unwrap();
+        set_r2c_global(
+            &mut batched_spectrum,
+            &[1],
+            [0, 0, 0],
+            Complex::new(0.0, 1.0),
+        );
+        let batched_source_before = batched_spectrum.as_slice().to_vec();
+        let mut batched_destination = batched.allocate_input().unwrap();
+        let batched_destination_before = batched_destination.as_slice().to_vec();
+        let mut batched_workspace = batched.allocate_workspace().unwrap();
+        assert!(matches!(
+            batched.inverse(
+                &batched_spectrum,
+                &mut batched_destination,
+                &mut batched_workspace,
+            ),
+            Err(R2cError::InvalidSpectrum)
+        ));
+        assert_eq!(
+            batched_spectrum.as_slice(),
+            batched_source_before.as_slice()
+        );
+        assert_eq!(
+            batched_destination.as_slice(),
+            batched_destination_before.as_slice()
+        );
+
+        let small = R2cPlan::<f64, 2, 1>::from_shape_with_method(
+            Arc::clone(topology),
+            [1, 2],
+            ExtraShape::scalar(),
+            method,
+        )
+        .unwrap();
+        let mut small_spectrum = small.allocate_output().unwrap();
+        let mut small_destination = small.allocate_input().unwrap();
+        let mut small_workspace = small.allocate_workspace().unwrap();
+        set_r2c_global(
+            &mut small_spectrum,
+            &[],
+            [0, 0],
+            Complex::new(1.0, f64::from_bits(1)),
+        );
+        small
+            .inverse(
+                &small_spectrum,
+                &mut small_destination,
+                &mut small_workspace,
+            )
+            .unwrap();
+        set_r2c_global(&mut small_spectrum, &[], [0, 0], Complex::new(1.0, 1e-15));
+        small
+            .inverse(
+                &small_spectrum,
+                &mut small_destination,
+                &mut small_workspace,
+            )
+            .unwrap();
+        set_r2c_global(&mut small_spectrum, &[], [0, 0], Complex::new(1.0, 1e-12));
+        assert!(matches!(
+            small.inverse(
+                &small_spectrum,
+                &mut small_destination,
+                &mut small_workspace,
+            ),
+            Err(R2cError::InvalidSpectrum)
+        ));
+        set_r2c_global(
+            &mut small_spectrum,
+            &[],
+            [0, 0],
+            Complex::new(f64::NAN, 0.0),
+        );
+        assert!(matches!(
+            small.inverse(
+                &small_spectrum,
+                &mut small_destination,
+                &mut small_workspace,
+            ),
+            Err(R2cError::InvalidSpectrum)
+        ));
+
+        let odd = R2cPlan::<f64, 2, 1>::from_shape_with_method(
+            Arc::clone(topology),
+            [2, 3],
+            ExtraShape::scalar(),
+            method,
+        )
+        .unwrap();
+        let mut odd_spectrum = odd.allocate_output().unwrap();
+        set_r2c_global(&mut odd_spectrum, &[], [0, 1], Complex::new(0.0, 1.0));
+        let mut odd_destination = odd.allocate_input().unwrap();
+        let mut odd_workspace = odd.allocate_workspace().unwrap();
+        odd.inverse(&odd_spectrum, &mut odd_destination, &mut odd_workspace)
+            .unwrap();
+    }
+}
+
+fn real_bits<R: TestReal>(values: &[R]) -> Vec<u64> {
+    values
+        .iter()
+        .map(|value| R::to_f64(*value).to_bits())
+        .collect()
+}
+
+fn complex_bits<R: TestReal>(values: &[Complex<R>]) -> Vec<(u64, u64)> {
+    values
+        .iter()
+        .map(|value| (R::to_f64(value.re).to_bits(), R::to_f64(value.im).to_bits()))
+        .collect()
+}
+
+fn dirty_real<R: TestReal, const N: usize, const M: usize>(array: &mut PencilArray<R, N, M>) {
+    for (index, value) in array.as_mut_slice().iter_mut().enumerate() {
+        *value = <R as TestReal>::from_f64(31.0 + index as f64 * 0.25);
+    }
+}
+
+fn r2c_depth<const N: usize>(shape: [usize; N]) -> f64 {
+    1.0 + shape[..N - 1]
+        .iter()
+        .map(|&length| {
+            if length <= 1 {
+                0.0
+            } else {
+                (usize::BITS - (length - 1).leading_zeros()) as f64
+            }
+        })
+        .sum::<f64>()
+}
+
+fn r2c_boundary_reject<R: TestReal, const N: usize, const M: usize, F>(
+    plan: &R2cPlan<R, N, M>,
+    mutate: F,
+) where
+    Complex<R>: mpi::datatype::Equivalence,
+    F: FnOnce(&mut PencilArray<Complex<R>, N, M>),
+{
+    let mut source = plan.allocate_output().unwrap();
+    mutate(&mut source);
+    let source_before = complex_bits(source.as_slice());
+    let mut destination = plan.allocate_input().unwrap();
+    dirty_real(&mut destination);
+    let destination_before = real_bits(destination.as_slice());
+    let mut workspace = plan.allocate_workspace().unwrap();
+    let result = plan.inverse(&source, &mut destination, &mut workspace);
+    assert!(matches!(result, Err(R2cError::InvalidSpectrum)));
+    assert_eq!(complex_bits(source.as_slice()), source_before);
+    assert_eq!(real_bits(destination.as_slice()), destination_before);
+    // The post-tail boundary check is allowed to use the workspace before it
+    // rejects, so only the caller-owned source and destination are compared.
+    reuse_r2c_after_boundary(plan, &mut workspace);
+}
+
+fn r2c_boundary_accept<R: TestReal, const N: usize, const M: usize, F>(
+    plan: &R2cPlan<R, N, M>,
+    mutate: F,
+) where
+    Complex<R>: mpi::datatype::Equivalence,
+    F: FnOnce(&mut PencilArray<Complex<R>, N, M>),
+{
+    let mut source = plan.allocate_output().unwrap();
+    mutate(&mut source);
+    let source_before = complex_bits(source.as_slice());
+    let mut destination = plan.allocate_input().unwrap();
+    dirty_real(&mut destination);
+    let mut workspace = plan.allocate_workspace().unwrap();
+    plan.inverse(&source, &mut destination, &mut workspace)
+        .unwrap();
+    assert_eq!(complex_bits(source.as_slice()), source_before);
+    reuse_r2c_after_boundary(plan, &mut workspace);
+}
+
+fn r2c_interior_nonfinite<R: TestReal, const M: usize>(plan: &R2cPlan<R, 2, M>, value: R)
+where
+    Complex<R>: mpi::datatype::Equivalence,
+{
+    let mut source = plan.allocate_output().unwrap();
+    set_r2c_global(
+        &mut source,
+        &[],
+        [0, 1],
+        Complex::new(value, <R as TestReal>::from_f64(0.0)),
+    );
+    let source_before = complex_bits(source.as_slice());
+    let mut destination = plan.allocate_input().unwrap();
+    dirty_real(&mut destination);
+    let mut workspace = plan.allocate_workspace().unwrap();
+    assert!(
+        plan.inverse(&source, &mut destination, &mut workspace)
+            .is_ok()
+    );
+    assert_eq!(complex_bits(source.as_slice()), source_before);
+    reuse_r2c_after_boundary(plan, &mut workspace);
+}
+
+fn reuse_r2c_after_boundary<R: TestReal, const N: usize, const M: usize>(
+    plan: &R2cPlan<R, N, M>,
+    workspace: &mut R2cWorkspace<R, N, M>,
+) where
+    Complex<R>: mpi::datatype::Equivalence,
+{
+    let mut source = plan.allocate_input().unwrap();
+    fill_r2c_input(&mut source, 71.0);
+    let mut spectrum = plan.allocate_output().unwrap();
+    plan.forward(&source, &mut spectrum, workspace).unwrap();
+    let mut recovered = plan.allocate_input().unwrap();
+    plan.inverse(&spectrum, &mut recovered, workspace).unwrap();
+}
+
+fn run_r2c_boundary_precision<R: TestReal>(topology: &Arc<MpiTopology<1>>, method: TransposeMethod)
+where
+    Complex<R>: mpi::datatype::Equivalence,
+{
+    let small = R2cPlan::<R, 2, 1>::from_shape_with_method(
+        Arc::clone(topology),
+        [1, 2],
+        ExtraShape::scalar(),
+        method,
+    )
+    .unwrap();
+    let relative = 128.0 * R::epsilon() * r2c_depth([1, 2]);
+    let absolute = 128.0 * R::min_subnormal() * r2c_depth([1, 2]);
+    r2c_boundary_accept(&small, |spectrum| {
+        set_r2c_global(
+            spectrum,
+            &[],
+            [0, 0],
+            Complex::new(
+                <R as TestReal>::from_f64(1.0),
+                <R as TestReal>::from_f64(0.5 * relative),
+            ),
+        );
+    });
+    r2c_boundary_reject(&small, |spectrum| {
+        set_r2c_global(
+            spectrum,
+            &[],
+            [0, 0],
+            Complex::new(
+                <R as TestReal>::from_f64(1.0),
+                <R as TestReal>::from_f64(2.0 * relative),
+            ),
+        );
+    });
+    r2c_boundary_accept(&small, |spectrum| {
+        set_r2c_global(
+            spectrum,
+            &[],
+            [0, 0],
+            Complex::new(
+                <R as TestReal>::from_f64(0.0),
+                <R as TestReal>::from_f64(0.5 * absolute),
+            ),
+        );
+    });
+    r2c_boundary_reject(&small, |spectrum| {
+        set_r2c_global(
+            spectrum,
+            &[],
+            [0, 0],
+            Complex::new(
+                <R as TestReal>::from_f64(0.0),
+                <R as TestReal>::from_f64(2.0 * absolute),
+            ),
+        );
+    });
+
+    for re in [0.0, -0.0] {
+        for im in [0.0, -0.0] {
+            r2c_boundary_accept(&small, |spectrum| {
+                set_r2c_global(
+                    spectrum,
+                    &[],
+                    [0, 0],
+                    Complex::new(<R as TestReal>::from_f64(re), <R as TestReal>::from_f64(im)),
+                );
+            });
+        }
+    }
+    for (re, im) in [(R::huge(), 0.0), (1e-20, 0.0), (1e4, 0.0)] {
+        r2c_boundary_accept(&small, |spectrum| {
+            set_r2c_global(
+                spectrum,
+                &[],
+                [0, 0],
+                Complex::new(<R as TestReal>::from_f64(re), <R as TestReal>::from_f64(im)),
+            );
+        });
+    }
+
+    let cancellation = R2cPlan::<R, 2, 1>::from_shape_with_method(
+        Arc::clone(topology),
+        [3, 2],
+        ExtraShape::scalar(),
+        method,
+    )
+    .unwrap();
+    r2c_boundary_accept(&cancellation, |spectrum| {
+        set_r2c_global(
+            spectrum,
+            &[],
+            [0, 0],
+            Complex::new(
+                <R as TestReal>::from_f64(3.0),
+                <R as TestReal>::from_f64(0.0),
+            ),
+        );
+        set_r2c_global(
+            spectrum,
+            &[],
+            [1, 0],
+            Complex::new(
+                <R as TestReal>::from_f64(2.0),
+                <R as TestReal>::from_f64(3.0),
+            ),
+        );
+        set_r2c_global(
+            spectrum,
+            &[],
+            [2, 0],
+            Complex::new(
+                <R as TestReal>::from_f64(2.0),
+                <R as TestReal>::from_f64(-3.0),
+            ),
+        );
+    });
+
+    let endpoints = R2cPlan::<R, 2, 1>::from_shape_with_method(
+        Arc::clone(topology),
+        [1, 4],
+        ExtraShape::scalar(),
+        method,
+    )
+    .unwrap();
+    for endpoint in [0, 2] {
+        for component in 0..2 {
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                r2c_boundary_reject(&endpoints, |spectrum| {
+                    let value = if component == 0 {
+                        Complex::new(
+                            <R as TestReal>::from_f64(bad),
+                            <R as TestReal>::from_f64(0.0),
+                        )
+                    } else {
+                        Complex::new(
+                            <R as TestReal>::from_f64(0.0),
+                            <R as TestReal>::from_f64(bad),
+                        )
+                    };
+                    set_r2c_global(spectrum, &[], [0, endpoint], value);
+                });
+            }
+        }
+    }
+    r2c_interior_nonfinite(&endpoints, <R as TestReal>::from_f64(f64::NAN));
+    r2c_interior_nonfinite(&endpoints, <R as TestReal>::from_f64(f64::INFINITY));
+    let odd_end = R2cPlan::<R, 2, 1>::from_shape_with_method(
+        Arc::clone(topology),
+        [1, 3],
+        ExtraShape::scalar(),
+        method,
+    )
+    .unwrap();
+    r2c_interior_nonfinite(&odd_end, <R as TestReal>::from_f64(f64::NAN));
+
+    run_r2c_boundary_isolation(topology, method);
+}
+
+fn run_r2c_boundary_isolation<R: TestReal>(topology: &Arc<MpiTopology<1>>, method: TransposeMethod)
+where
+    Complex<R>: mpi::datatype::Equivalence,
+{
+    let batched = R2cPlan::<R, 2, 1>::from_shape_with_method(
+        Arc::clone(topology),
+        [1, 4],
+        ExtraShape::new([2]).unwrap(),
+        method,
+    )
+    .unwrap();
+    r2c_boundary_reject(&batched, |spectrum| {
+        set_r2c_global(
+            spectrum,
+            &[0],
+            [0, 0],
+            Complex::new(
+                <R as TestReal>::from_f64(R::huge()),
+                <R as TestReal>::from_f64(0.0),
+            ),
+        );
+        set_r2c_global(
+            spectrum,
+            &[1],
+            [0, 0],
+            Complex::new(
+                <R as TestReal>::from_f64(0.0),
+                <R as TestReal>::from_f64(1.0),
+            ),
+        );
+    });
+
+    let interior = R2cPlan::<R, 2, 1>::from_shape_with_method(
+        Arc::clone(topology),
+        [1, 4],
+        ExtraShape::scalar(),
+        method,
+    )
+    .unwrap();
+    r2c_boundary_reject(&interior, |spectrum| {
+        set_r2c_global(
+            spectrum,
+            &[],
+            [0, 0],
+            Complex::new(
+                <R as TestReal>::from_f64(0.0),
+                <R as TestReal>::from_f64(1.0),
+            ),
+        );
+        set_r2c_global(
+            spectrum,
+            &[],
+            [0, 1],
+            Complex::new(
+                <R as TestReal>::from_f64(R::huge()),
+                <R as TestReal>::from_f64(0.0),
+            ),
+        );
+    });
+
+    r2c_boundary_reject(&interior, |spectrum| {
+        set_r2c_global(
+            spectrum,
+            &[],
+            [0, 0],
+            Complex::new(
+                <R as TestReal>::from_f64(0.0),
+                <R as TestReal>::from_f64(1.0),
+            ),
+        );
+        set_r2c_global(
+            spectrum,
+            &[],
+            [0, 2],
+            Complex::new(
+                <R as TestReal>::from_f64(R::huge()),
+                <R as TestReal>::from_f64(0.0),
+            ),
+        );
+    });
+    r2c_boundary_reject(&interior, |spectrum| {
+        set_r2c_global(
+            spectrum,
+            &[],
+            [0, 0],
+            Complex::new(
+                <R as TestReal>::from_f64(R::huge()),
+                <R as TestReal>::from_f64(0.0),
+            ),
+        );
+        set_r2c_global(
+            spectrum,
+            &[],
+            [0, 2],
+            Complex::new(
+                <R as TestReal>::from_f64(0.0),
+                <R as TestReal>::from_f64(1.0),
+            ),
+        );
+    });
+}
+
+fn run_r2c_analytic_f32_boundary(topology: &Arc<MpiTopology<1>>, method: TransposeMethod) {
+    let plan = R2cPlan::<f32, 3, 1>::from_shape_with_method(
+        Arc::clone(topology),
+        [128, 128, 3],
+        ExtraShape::scalar(),
+        method,
+    )
+    .unwrap();
+    r2c_boundary_reject(&plan, |spectrum| {
+        set_r2c_global(spectrum, &[], [0, 0, 0], Complex::new(0.0, 1.0));
+    });
+}
+
+fn run_r2c_boundary_hard_cases(
+    topology_1d: &Arc<MpiTopology<1>>,
+    topology_2d: &Arc<MpiTopology<2>>,
+) {
+    for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
+        run_r2c_boundary_precision::<f32>(topology_1d, method);
+        run_r2c_boundary_precision::<f64>(topology_1d, method);
+        run_r2c_analytic_f32_boundary(topology_1d, method);
+    }
+    if topology_2d.communicator().size() == 6 {
+        run_r2c_six_rank_endpoint_failure(topology_2d);
+    }
+}
+
+fn run_r2c_six_rank_endpoint_failure(topology: &Arc<MpiTopology<2>>) {
+    for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
+        let plan = R2cPlan::<f64, 4, 2>::from_shape_with_method(
+            Arc::clone(topology),
+            [2, 1, 2, 4],
+            ExtraShape::scalar(),
+            method,
+        )
+        .unwrap();
+        let mut source = plan.allocate_output().unwrap();
+        for k0 in 0..2 {
+            for k1 in 0..1 {
+                for k2 in 0..2 {
+                    set_r2c_global(
+                        &mut source,
+                        &[],
+                        [k0, k1, k2, 0],
+                        Complex::new(0.0, if k0 == 0 { 1.0 } else { -1.0 }),
+                    );
+                }
+            }
+        }
+        let source_before = complex_bits(source.as_slice());
+        let mut destination = plan.allocate_input().unwrap();
+        dirty_real(&mut destination);
+        let destination_before = real_bits(destination.as_slice());
+        let mut workspace = plan.allocate_workspace().unwrap();
+        let result = plan.inverse(&source, &mut destination, &mut workspace);
+        assert!(matches!(result, Err(R2cError::InvalidSpectrum)));
+        assert_eq!(complex_bits(source.as_slice()), source_before);
+        assert_eq!(real_bits(destination.as_slice()), destination_before);
+        reuse_r2c_after_boundary(&plan, &mut workspace);
+    }
 }
 
 fn fill_input<R: TestReal, const N: usize, const M: usize>(
@@ -1904,4 +3022,992 @@ fn negative_in_place_cases(
             .unwrap();
         world.barrier();
     }
+}
+
+fn assert_r2c_forward_rejected<R: TestReal, const N: usize, const M: usize, F, P>(
+    source: &PencilArray<R, N, M>,
+    destination: &mut PencilArray<Complex<R>, N, M>,
+    workspace: &mut R2cWorkspace<R, N, M>,
+    execute: F,
+    predicate: P,
+) where
+    Complex<R>: mpi::datatype::Equivalence,
+    F: FnOnce(
+        &PencilArray<R, N, M>,
+        &mut PencilArray<Complex<R>, N, M>,
+        &mut R2cWorkspace<R, N, M>,
+    ) -> Result<(), R2cError>,
+    P: Fn(&R2cError) -> bool,
+{
+    let source_before = real_bits(source.as_slice());
+    let destination_before = complex_bits(destination.as_slice());
+    let workspace_before = format!("{workspace:?}");
+    let error =
+        execute(source, destination, workspace).expect_err("R2C call unexpectedly succeeded");
+    assert!(predicate(&error), "unexpected R2C error: {error:?}");
+    assert_eq!(real_bits(source.as_slice()), source_before);
+    assert_eq!(complex_bits(destination.as_slice()), destination_before);
+    assert_eq!(format!("{workspace:?}"), workspace_before);
+}
+
+fn assert_r2c_inverse_rejected<R: TestReal, const N: usize, const M: usize, F, P>(
+    source: &PencilArray<Complex<R>, N, M>,
+    destination: &mut PencilArray<R, N, M>,
+    workspace: &mut R2cWorkspace<R, N, M>,
+    execute: F,
+    predicate: P,
+) where
+    Complex<R>: mpi::datatype::Equivalence,
+    F: FnOnce(
+        &PencilArray<Complex<R>, N, M>,
+        &mut PencilArray<R, N, M>,
+        &mut R2cWorkspace<R, N, M>,
+    ) -> Result<(), R2cError>,
+    P: Fn(&R2cError) -> bool,
+{
+    let source_before = complex_bits(source.as_slice());
+    let destination_before = real_bits(destination.as_slice());
+    let workspace_before = format!("{workspace:?}");
+    let error =
+        execute(source, destination, workspace).expect_err("R2C inverse unexpectedly succeeded");
+    assert!(predicate(&error), "unexpected R2C inverse error: {error:?}");
+    assert_eq!(complex_bits(source.as_slice()), source_before);
+    assert_eq!(real_bits(destination.as_slice()), destination_before);
+    assert_eq!(format!("{workspace:?}"), workspace_before);
+}
+
+fn r2c_collective_descriptor_error(error: &R2cError) -> bool {
+    matches!(error, R2cError::Fft(FftError::CollectiveDescriptorMismatch))
+}
+
+fn r2c_precondition_or(error: &R2cError, local: fn(&FftError) -> bool, root: bool) -> bool {
+    match error {
+        R2cError::Fft(error) if root => local(error),
+        R2cError::Fft(FftError::CollectivePreconditionFailed) if !root => true,
+        _ => false,
+    }
+}
+
+fn r2c_collective_reuse<R: TestReal, const N: usize, const M: usize>(plan: &R2cPlan<R, N, M>)
+where
+    Complex<R>: mpi::datatype::Equivalence,
+{
+    let mut workspace = plan.allocate_workspace().unwrap();
+    reuse_r2c_after_boundary(plan, &mut workspace);
+}
+
+fn negative_r2c_collective_cases(
+    world: &mpi::topology::SimpleCommunicator,
+    topology_1d: &Arc<MpiTopology<1>>,
+    topology_2d: &Arc<MpiTopology<2>>,
+) {
+    negative_r2c_header_cases(world, topology_1d);
+    negative_r2c_shape_and_type_cases(world, topology_1d);
+    negative_r2c_layout_cases(world, topology_1d);
+    if world.size() == 6 {
+        negative_r2c_2d_preflight_case(world, topology_2d);
+    }
+}
+
+fn negative_r2c_header_cases(
+    world: &mpi::topology::SimpleCommunicator,
+    topology: &Arc<MpiTopology<1>>,
+) {
+    let rank = world.rank();
+    // Every valid plan is constructed on every rank before any deliberately
+    // mixed call below.
+    let r2c_all = R2cPlan::<f64, 2, 1>::from_shape_with_method(
+        Arc::clone(topology),
+        [3, 4],
+        ExtraShape::scalar(),
+        TransposeMethod::AllToAllv,
+    )
+    .unwrap();
+    let r2c_p2p = R2cPlan::<f64, 2, 1>::from_shape_with_method(
+        Arc::clone(topology),
+        [3, 4],
+        ExtraShape::scalar(),
+        TransposeMethod::PointToPoint,
+    )
+    .unwrap();
+    let even = R2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology), [3, 2], ExtraShape::scalar())
+        .unwrap();
+    let odd = R2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology), [3, 3], ExtraShape::scalar())
+        .unwrap();
+    let n3 =
+        R2cPlan::<f64, 3, 1>::from_shape(Arc::clone(topology), [3, 1, 4], ExtraShape::scalar())
+            .unwrap();
+    let f32_plan =
+        R2cPlan::<f32, 2, 1>::from_shape(Arc::clone(topology), [3, 4], ExtraShape::scalar())
+            .unwrap();
+    let c2c = C2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology), [3, 4], ExtraShape::scalar())
+        .unwrap();
+
+    if world.size() > 1 {
+        let constructor_mismatch = if rank == 0 {
+            C2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology), [3, 4], ExtraShape::scalar())
+                .map(|_| ())
+                .map_err(|error| matches!(error, FftError::CollectiveDescriptorMismatch))
+        } else {
+            R2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology), [3, 4], ExtraShape::scalar())
+                .map(|_| ())
+                .map_err(|error| r2c_collective_descriptor_error(&error))
+        };
+        assert!(matches!(constructor_mismatch, Err(true)));
+        r2c_collective_reuse(&r2c_all);
+        world.barrier();
+
+        let mut constructor_source = r2c_all.allocate_input().unwrap();
+        fill_r2c_input(&mut constructor_source, 81.0);
+        let mut constructor_destination = r2c_all.allocate_output().unwrap();
+        let mut constructor_workspace = r2c_all.allocate_workspace().unwrap();
+        let constructor_source_before = real_bits(constructor_source.as_slice());
+        let constructor_destination_before = complex_bits(constructor_destination.as_slice());
+        let constructor_workspace_before = format!("{constructor_workspace:?}");
+        let constructor_execution = if rank == 0 {
+            R2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology), [3, 4], ExtraShape::scalar())
+                .map(|_| ())
+                .map_err(|error| r2c_collective_descriptor_error(&error))
+        } else {
+            r2c_all
+                .forward(
+                    &constructor_source,
+                    &mut constructor_destination,
+                    &mut constructor_workspace,
+                )
+                .map(|_| ())
+                .map_err(|error| r2c_collective_descriptor_error(&error))
+        };
+        assert!(matches!(constructor_execution, Err(true)));
+        assert_eq!(
+            real_bits(constructor_source.as_slice()),
+            constructor_source_before
+        );
+        assert_eq!(
+            complex_bits(constructor_destination.as_slice()),
+            constructor_destination_before
+        );
+        assert_eq!(
+            format!("{constructor_workspace:?}"),
+            constructor_workspace_before
+        );
+        r2c_collective_reuse(&r2c_all);
+        world.barrier();
+
+        let mut c2c_source = c2c.allocate_input().unwrap();
+        fill_input(&mut c2c_source, 82.0);
+        let mut c2c_destination = c2c.allocate_output().unwrap();
+        let mut c2c_workspace = c2c.allocate_out_of_place_workspace().unwrap();
+        let mut r2c_source = r2c_all.allocate_input().unwrap();
+        fill_r2c_input(&mut r2c_source, 82.0);
+        let mut r2c_destination = r2c_all.allocate_output().unwrap();
+        let mut r2c_workspace = r2c_all.allocate_workspace().unwrap();
+        let c2c_source_before = complex_bits(c2c_source.as_slice());
+        let c2c_destination_before = complex_bits(c2c_destination.as_slice());
+        let c2c_workspace_before = format!("{c2c_workspace:?}");
+        let r2c_source_before = real_bits(r2c_source.as_slice());
+        let r2c_destination_before = complex_bits(r2c_destination.as_slice());
+        let r2c_workspace_before = format!("{r2c_workspace:?}");
+        let execution_mismatch = if rank == 0 {
+            c2c.forward(&c2c_source, &mut c2c_destination, &mut c2c_workspace)
+                .map(|_| ())
+                .map_err(|error| matches!(error, FftError::CollectiveDescriptorMismatch))
+        } else {
+            r2c_all
+                .forward(&r2c_source, &mut r2c_destination, &mut r2c_workspace)
+                .map(|_| ())
+                .map_err(|error| r2c_collective_descriptor_error(&error))
+        };
+        assert!(matches!(execution_mismatch, Err(true)));
+        assert_eq!(complex_bits(c2c_source.as_slice()), c2c_source_before);
+        assert_eq!(
+            complex_bits(c2c_destination.as_slice()),
+            c2c_destination_before
+        );
+        assert_eq!(format!("{c2c_workspace:?}"), c2c_workspace_before);
+        assert_eq!(real_bits(r2c_source.as_slice()), r2c_source_before);
+        assert_eq!(
+            complex_bits(r2c_destination.as_slice()),
+            r2c_destination_before
+        );
+        assert_eq!(format!("{r2c_workspace:?}"), r2c_workspace_before);
+        c2c.forward(&c2c_source, &mut c2c_destination, &mut c2c_workspace)
+            .unwrap();
+        r2c_all
+            .forward(&r2c_source, &mut r2c_destination, &mut r2c_workspace)
+            .unwrap();
+        world.barrier();
+
+        let mut forward_source = r2c_all.allocate_input().unwrap();
+        fill_r2c_input(&mut forward_source, 83.0);
+        let mut forward_destination = r2c_all.allocate_output().unwrap();
+        let mut forward_workspace = r2c_all.allocate_workspace().unwrap();
+        let mut inverse_source = r2c_all.allocate_output().unwrap();
+        fill_r2c_spectrum(&mut inverse_source, [3, 4], 84.0);
+        let mut inverse_destination = r2c_all.allocate_input().unwrap();
+        let mut inverse_workspace = r2c_all.allocate_workspace().unwrap();
+        let forward_source_before = real_bits(forward_source.as_slice());
+        let forward_destination_before = complex_bits(forward_destination.as_slice());
+        let forward_workspace_before = format!("{forward_workspace:?}");
+        let inverse_source_before = complex_bits(inverse_source.as_slice());
+        let inverse_destination_before = real_bits(inverse_destination.as_slice());
+        let inverse_workspace_before = format!("{inverse_workspace:?}");
+        let direction_mismatch = if rank == 0 {
+            r2c_all
+                .forward(
+                    &forward_source,
+                    &mut forward_destination,
+                    &mut forward_workspace,
+                )
+                .map(|_| ())
+                .map_err(|error| r2c_collective_descriptor_error(&error))
+        } else {
+            r2c_all
+                .inverse(
+                    &inverse_source,
+                    &mut inverse_destination,
+                    &mut inverse_workspace,
+                )
+                .map(|_| ())
+                .map_err(|error| r2c_collective_descriptor_error(&error))
+        };
+        assert!(matches!(direction_mismatch, Err(true)));
+        assert_eq!(real_bits(forward_source.as_slice()), forward_source_before);
+        assert_eq!(
+            complex_bits(forward_destination.as_slice()),
+            forward_destination_before
+        );
+        assert_eq!(format!("{forward_workspace:?}"), forward_workspace_before);
+        assert_eq!(
+            complex_bits(inverse_source.as_slice()),
+            inverse_source_before
+        );
+        assert_eq!(
+            real_bits(inverse_destination.as_slice()),
+            inverse_destination_before
+        );
+        assert_eq!(format!("{inverse_workspace:?}"), inverse_workspace_before);
+        r2c_all
+            .forward(
+                &forward_source,
+                &mut forward_destination,
+                &mut forward_workspace,
+            )
+            .unwrap();
+        r2c_all
+            .inverse(
+                &forward_destination,
+                &mut inverse_destination,
+                &mut inverse_workspace,
+            )
+            .unwrap();
+        world.barrier();
+
+        let mut all_source = r2c_all.allocate_input().unwrap();
+        fill_r2c_input(&mut all_source, 85.0);
+        let mut all_destination = r2c_all.allocate_output().unwrap();
+        let mut all_workspace = r2c_all.allocate_workspace().unwrap();
+        let mut p2p_source = r2c_p2p.allocate_input().unwrap();
+        fill_r2c_input(&mut p2p_source, 85.0);
+        let mut p2p_destination = r2c_p2p.allocate_output().unwrap();
+        let mut p2p_workspace = r2c_p2p.allocate_workspace().unwrap();
+        mixed_r2c_method_forward(
+            world,
+            &r2c_all,
+            &r2c_p2p,
+            &mut all_source,
+            &mut all_destination,
+            &mut all_workspace,
+            &mut p2p_source,
+            &mut p2p_destination,
+            &mut p2p_workspace,
+            true,
+        );
+        mixed_r2c_method_forward(
+            world,
+            &r2c_all,
+            &r2c_p2p,
+            &mut all_source,
+            &mut all_destination,
+            &mut all_workspace,
+            &mut p2p_source,
+            &mut p2p_destination,
+            &mut p2p_workspace,
+            false,
+        );
+    }
+    let _ = (even, odd, n3, f32_plan);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mixed_r2c_method_forward(
+    world: &mpi::topology::SimpleCommunicator,
+    alltoallv: &R2cPlan<f64, 2, 1>,
+    point_to_point: &R2cPlan<f64, 2, 1>,
+    all_source: &mut PencilArray<f64, 2, 1>,
+    all_destination: &mut PencilArray<Complex<f64>, 2, 1>,
+    all_workspace: &mut R2cWorkspace<f64, 2, 1>,
+    p2p_source: &mut PencilArray<f64, 2, 1>,
+    p2p_destination: &mut PencilArray<Complex<f64>, 2, 1>,
+    p2p_workspace: &mut R2cWorkspace<f64, 2, 1>,
+    rank_zero_uses_alltoallv: bool,
+) {
+    let rank = world.rank();
+    let all_source_before = real_bits(all_source.as_slice());
+    let all_destination_before = complex_bits(all_destination.as_slice());
+    let all_workspace_before = format!("{all_workspace:?}");
+    let p2p_source_before = real_bits(p2p_source.as_slice());
+    let p2p_destination_before = complex_bits(p2p_destination.as_slice());
+    let p2p_workspace_before = format!("{p2p_workspace:?}");
+    let result = if (rank == 0) == rank_zero_uses_alltoallv {
+        alltoallv.forward(all_source, all_destination, all_workspace)
+    } else {
+        point_to_point.forward(p2p_source, p2p_destination, p2p_workspace)
+    };
+    let error = result.expect_err("mixed R2C transports unexpectedly succeeded");
+    assert!(r2c_collective_descriptor_error(&error));
+    assert_eq!(real_bits(all_source.as_slice()), all_source_before);
+    assert_eq!(
+        complex_bits(all_destination.as_slice()),
+        all_destination_before
+    );
+    assert_eq!(format!("{all_workspace:?}"), all_workspace_before);
+    assert_eq!(real_bits(p2p_source.as_slice()), p2p_source_before);
+    assert_eq!(
+        complex_bits(p2p_destination.as_slice()),
+        p2p_destination_before
+    );
+    assert_eq!(format!("{p2p_workspace:?}"), p2p_workspace_before);
+
+    alltoallv
+        .forward(all_source, all_destination, all_workspace)
+        .unwrap();
+    point_to_point
+        .forward(p2p_source, p2p_destination, p2p_workspace)
+        .unwrap();
+    world.barrier();
+}
+
+fn negative_r2c_shape_and_type_cases(
+    world: &mpi::topology::SimpleCommunicator,
+    topology: &Arc<MpiTopology<1>>,
+) {
+    let rank = world.rank();
+    let even = R2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology), [3, 2], ExtraShape::scalar())
+        .unwrap();
+    let odd = R2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology), [3, 3], ExtraShape::scalar())
+        .unwrap();
+    let n2 = R2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology), [3, 4], ExtraShape::scalar())
+        .unwrap();
+    let n3 =
+        R2cPlan::<f64, 3, 1>::from_shape(Arc::clone(topology), [3, 1, 4], ExtraShape::scalar())
+            .unwrap();
+    let f32_plan =
+        R2cPlan::<f32, 2, 1>::from_shape(Arc::clone(topology), [3, 4], ExtraShape::scalar())
+            .unwrap();
+    let f64_plan =
+        R2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology), [3, 4], ExtraShape::scalar())
+            .unwrap();
+    assert_eq!(
+        even.output_pencil().global_shape(),
+        odd.output_pencil().global_shape()
+    );
+
+    if world.size() == 1 {
+        r2c_collective_reuse(&even);
+        r2c_collective_reuse(&odd);
+        r2c_collective_reuse(&n2);
+        r2c_collective_reuse(&n3);
+        r2c_collective_reuse(&f32_plan);
+        r2c_collective_reuse(&f64_plan);
+        return;
+    }
+
+    let shape_ctor = if rank == 0 {
+        R2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology), [3, 2], ExtraShape::scalar())
+    } else {
+        R2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology), [3, 3], ExtraShape::scalar())
+    };
+    let shape_error = shape_ctor.expect_err("even and odd constructor unexpectedly agreed");
+    assert!(r2c_collective_descriptor_error(&shape_error));
+    r2c_collective_reuse(&even);
+    r2c_collective_reuse(&odd);
+    world.barrier();
+
+    let mut even_source = even.allocate_input().unwrap();
+    fill_r2c_input(&mut even_source, 86.0);
+    let mut even_destination = even.allocate_output().unwrap();
+    let mut even_workspace = even.allocate_workspace().unwrap();
+    let mut odd_source = odd.allocate_input().unwrap();
+    fill_r2c_input(&mut odd_source, 86.0);
+    let mut odd_destination = odd.allocate_output().unwrap();
+    let mut odd_workspace = odd.allocate_workspace().unwrap();
+    mixed_r2c_shape_forward(
+        world,
+        &even,
+        &odd,
+        &mut even_source,
+        &mut even_destination,
+        &mut even_workspace,
+        &mut odd_source,
+        &mut odd_destination,
+        &mut odd_workspace,
+        true,
+    );
+    mixed_r2c_shape_forward(
+        world,
+        &even,
+        &odd,
+        &mut even_source,
+        &mut even_destination,
+        &mut even_workspace,
+        &mut odd_source,
+        &mut odd_destination,
+        &mut odd_workspace,
+        false,
+    );
+
+    let n2_ctor = if rank == 0 {
+        R2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology), [3, 4], ExtraShape::scalar())
+            .map(|_| ())
+            .map_err(|error| r2c_collective_descriptor_error(&error))
+    } else {
+        R2cPlan::<f64, 3, 1>::from_shape(Arc::clone(topology), [3, 1, 4], ExtraShape::scalar())
+            .map(|_| ())
+            .map_err(|error| r2c_collective_descriptor_error(&error))
+    };
+    assert!(matches!(n2_ctor, Err(true)));
+    r2c_collective_reuse(&n2);
+    r2c_collective_reuse(&n3);
+    world.barrier();
+
+    let mut n2_source = n2.allocate_input().unwrap();
+    fill_r2c_input(&mut n2_source, 87.0);
+    let mut n2_destination = n2.allocate_output().unwrap();
+    let mut n2_workspace = n2.allocate_workspace().unwrap();
+    let mut n3_source = n3.allocate_input().unwrap();
+    fill_r2c_input(&mut n3_source, 87.0);
+    let mut n3_destination = n3.allocate_output().unwrap();
+    let mut n3_workspace = n3.allocate_workspace().unwrap();
+    let n2_source_before = real_bits(n2_source.as_slice());
+    let n2_destination_before = complex_bits(n2_destination.as_slice());
+    let n2_workspace_before = format!("{n2_workspace:?}");
+    let n3_source_before = real_bits(n3_source.as_slice());
+    let n3_destination_before = complex_bits(n3_destination.as_slice());
+    let n3_workspace_before = format!("{n3_workspace:?}");
+    let n_execution = if rank == 0 {
+        n2.forward(&n2_source, &mut n2_destination, &mut n2_workspace)
+            .map(|_| ())
+            .map_err(|error| r2c_collective_descriptor_error(&error))
+    } else {
+        n3.forward(&n3_source, &mut n3_destination, &mut n3_workspace)
+            .map(|_| ())
+            .map_err(|error| r2c_collective_descriptor_error(&error))
+    };
+    assert!(matches!(n_execution, Err(true)));
+    assert_eq!(real_bits(n2_source.as_slice()), n2_source_before);
+    assert_eq!(
+        complex_bits(n2_destination.as_slice()),
+        n2_destination_before
+    );
+    assert_eq!(format!("{n2_workspace:?}"), n2_workspace_before);
+    assert_eq!(real_bits(n3_source.as_slice()), n3_source_before);
+    assert_eq!(
+        complex_bits(n3_destination.as_slice()),
+        n3_destination_before
+    );
+    assert_eq!(format!("{n3_workspace:?}"), n3_workspace_before);
+    n2.forward(&n2_source, &mut n2_destination, &mut n2_workspace)
+        .unwrap();
+    n3.forward(&n3_source, &mut n3_destination, &mut n3_workspace)
+        .unwrap();
+    world.barrier();
+
+    let scalar_ctor = if rank == 0 {
+        R2cPlan::<f32, 2, 1>::from_shape(Arc::clone(topology), [3, 4], ExtraShape::scalar())
+            .map(|_| ())
+            .map_err(|error| r2c_collective_descriptor_error(&error))
+    } else {
+        R2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology), [3, 4], ExtraShape::scalar())
+            .map(|_| ())
+            .map_err(|error| r2c_collective_descriptor_error(&error))
+    };
+    assert!(matches!(scalar_ctor, Err(true)));
+    r2c_collective_reuse(&f32_plan);
+    r2c_collective_reuse(&f64_plan);
+    world.barrier();
+
+    let mut f32_source = f32_plan.allocate_input().unwrap();
+    fill_r2c_input(&mut f32_source, 88.0);
+    let mut f32_destination = f32_plan.allocate_output().unwrap();
+    let mut f32_workspace = f32_plan.allocate_workspace().unwrap();
+    let mut f64_source = f64_plan.allocate_input().unwrap();
+    fill_r2c_input(&mut f64_source, 88.0);
+    let mut f64_destination = f64_plan.allocate_output().unwrap();
+    let mut f64_workspace = f64_plan.allocate_workspace().unwrap();
+    let f32_source_before = real_bits(f32_source.as_slice());
+    let f32_destination_before = complex_bits(f32_destination.as_slice());
+    let f32_workspace_before = format!("{f32_workspace:?}");
+    let f64_source_before = real_bits(f64_source.as_slice());
+    let f64_destination_before = complex_bits(f64_destination.as_slice());
+    let f64_workspace_before = format!("{f64_workspace:?}");
+    let scalar_execution = if rank == 0 {
+        f32_plan
+            .forward(&f32_source, &mut f32_destination, &mut f32_workspace)
+            .map(|_| ())
+            .map_err(|error| r2c_collective_descriptor_error(&error))
+    } else {
+        f64_plan
+            .forward(&f64_source, &mut f64_destination, &mut f64_workspace)
+            .map(|_| ())
+            .map_err(|error| r2c_collective_descriptor_error(&error))
+    };
+    assert!(matches!(scalar_execution, Err(true)));
+    assert_eq!(real_bits(f32_source.as_slice()), f32_source_before);
+    assert_eq!(
+        complex_bits(f32_destination.as_slice()),
+        f32_destination_before
+    );
+    assert_eq!(format!("{f32_workspace:?}"), f32_workspace_before);
+    assert_eq!(real_bits(f64_source.as_slice()), f64_source_before);
+    assert_eq!(
+        complex_bits(f64_destination.as_slice()),
+        f64_destination_before
+    );
+    assert_eq!(format!("{f64_workspace:?}"), f64_workspace_before);
+    f32_plan
+        .forward(&f32_source, &mut f32_destination, &mut f32_workspace)
+        .unwrap();
+    f64_plan
+        .forward(&f64_source, &mut f64_destination, &mut f64_workspace)
+        .unwrap();
+    world.barrier();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mixed_r2c_shape_forward(
+    world: &mpi::topology::SimpleCommunicator,
+    even: &R2cPlan<f64, 2, 1>,
+    odd: &R2cPlan<f64, 2, 1>,
+    even_source: &mut PencilArray<f64, 2, 1>,
+    even_destination: &mut PencilArray<Complex<f64>, 2, 1>,
+    even_workspace: &mut R2cWorkspace<f64, 2, 1>,
+    odd_source: &mut PencilArray<f64, 2, 1>,
+    odd_destination: &mut PencilArray<Complex<f64>, 2, 1>,
+    odd_workspace: &mut R2cWorkspace<f64, 2, 1>,
+    rank_zero_uses_even: bool,
+) {
+    let rank = world.rank();
+    let even_source_before = real_bits(even_source.as_slice());
+    let even_destination_before = complex_bits(even_destination.as_slice());
+    let even_workspace_before = format!("{even_workspace:?}");
+    let odd_source_before = real_bits(odd_source.as_slice());
+    let odd_destination_before = complex_bits(odd_destination.as_slice());
+    let odd_workspace_before = format!("{odd_workspace:?}");
+    let result = if (rank == 0) == rank_zero_uses_even {
+        even.forward(even_source, even_destination, even_workspace)
+    } else {
+        odd.forward(odd_source, odd_destination, odd_workspace)
+    };
+    let error = result.expect_err("even/odd R2C execution unexpectedly succeeded");
+    assert!(r2c_collective_descriptor_error(&error));
+    assert_eq!(real_bits(even_source.as_slice()), even_source_before);
+    assert_eq!(
+        complex_bits(even_destination.as_slice()),
+        even_destination_before
+    );
+    assert_eq!(format!("{even_workspace:?}"), even_workspace_before);
+    assert_eq!(real_bits(odd_source.as_slice()), odd_source_before);
+    assert_eq!(
+        complex_bits(odd_destination.as_slice()),
+        odd_destination_before
+    );
+    assert_eq!(format!("{odd_workspace:?}"), odd_workspace_before);
+    even.forward(even_source, even_destination, even_workspace)
+        .unwrap();
+    odd.forward(odd_source, odd_destination, odd_workspace)
+        .unwrap();
+    world.barrier();
+}
+
+fn negative_r2c_layout_cases(
+    world: &mpi::topology::SimpleCommunicator,
+    topology: &Arc<MpiTopology<1>>,
+) {
+    let plan = R2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology), [3, 4], ExtraShape::scalar())
+        .unwrap();
+    let same_layout_plan =
+        R2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology), [3, 4], ExtraShape::scalar())
+            .unwrap();
+    let world_size = usize::try_from(world.size()).unwrap();
+    let foreign_topology = MpiTopology::<1>::new(world, [world_size]).unwrap();
+    let foreign_plan = R2cPlan::<f64, 2, 1>::from_shape(
+        Arc::clone(&foreign_topology),
+        [3, 4],
+        ExtraShape::scalar(),
+    )
+    .unwrap();
+    let rank = world.rank();
+    let root = rank == 0;
+
+    let canonical = Arc::clone(plan.input_pencil());
+    let noncanonical = canonical
+        .with_permutation(AxisPermutation::new([1, 0]).unwrap())
+        .unwrap();
+    let constructor_result = if root {
+        R2cPlan::<f64, 2, 1>::from_pencil(noncanonical, ExtraShape::scalar())
+    } else {
+        R2cPlan::<f64, 2, 1>::from_pencil(canonical, ExtraShape::scalar())
+    };
+    assert!(matches!(constructor_result, Err(R2cError::Fft(_))));
+    r2c_collective_reuse(&plan);
+    world.barrier();
+
+    let mut valid_source = plan.allocate_input().unwrap();
+    fill_r2c_input(&mut valid_source, 91.0);
+    let mut valid_destination = plan.allocate_output().unwrap();
+    let mut valid_workspace = plan.allocate_workspace().unwrap();
+    let wrong_source = PencilArray::from_elem(
+        Arc::clone(plan.output_pencil()),
+        ExtraShape::scalar(),
+        9.0_f64,
+    )
+    .unwrap();
+    assert_r2c_forward_rejected(
+        if root { &wrong_source } else { &valid_source },
+        &mut valid_destination,
+        &mut valid_workspace,
+        |source, destination, workspace| plan.forward(source, destination, workspace),
+        |error| {
+            r2c_precondition_or(
+                error,
+                |error| matches!(error, FftError::InputLayoutMismatch),
+                root,
+            )
+        },
+    );
+    plan.forward(&valid_source, &mut valid_destination, &mut valid_workspace)
+        .unwrap();
+    world.barrier();
+
+    let mut wrong_destination = PencilArray::from_elem(
+        Arc::clone(plan.input_pencil()),
+        ExtraShape::scalar(),
+        Complex::new(8.0_f64, -8.0),
+    )
+    .unwrap();
+    let mut destination_workspace = plan.allocate_workspace().unwrap();
+    assert_r2c_forward_rejected(
+        &valid_source,
+        if root {
+            &mut wrong_destination
+        } else {
+            &mut valid_destination
+        },
+        &mut destination_workspace,
+        |source, destination, workspace| plan.forward(source, destination, workspace),
+        |error| {
+            r2c_precondition_or(
+                error,
+                |error| matches!(error, FftError::OutputLayoutMismatch),
+                root,
+            )
+        },
+    );
+    plan.forward(
+        &valid_source,
+        &mut valid_destination,
+        &mut destination_workspace,
+    )
+    .unwrap();
+    world.barrier();
+
+    let wrong_extra = ExtraShape::new([2]).unwrap();
+    let wrong_extra_source = PencilArray::from_elem(
+        Arc::clone(plan.input_pencil()),
+        wrong_extra.clone(),
+        7.0_f64,
+    )
+    .unwrap();
+    let mut extra_source_workspace = plan.allocate_workspace().unwrap();
+    assert_r2c_forward_rejected(
+        if root {
+            &wrong_extra_source
+        } else {
+            &valid_source
+        },
+        &mut valid_destination,
+        &mut extra_source_workspace,
+        |source, destination, workspace| plan.forward(source, destination, workspace),
+        |error| {
+            r2c_precondition_or(
+                error,
+                |error| matches!(error, FftError::ExtraShapeMismatch),
+                root,
+            )
+        },
+    );
+    plan.forward(
+        &valid_source,
+        &mut valid_destination,
+        &mut extra_source_workspace,
+    )
+    .unwrap();
+    world.barrier();
+
+    let mut wrong_extra_destination = PencilArray::from_elem(
+        Arc::clone(plan.output_pencil()),
+        wrong_extra,
+        Complex::new(6.0_f64, -6.0),
+    )
+    .unwrap();
+    let mut extra_destination_workspace = plan.allocate_workspace().unwrap();
+    assert_r2c_forward_rejected(
+        &valid_source,
+        if root {
+            &mut wrong_extra_destination
+        } else {
+            &mut valid_destination
+        },
+        &mut extra_destination_workspace,
+        |source, destination, workspace| plan.forward(source, destination, workspace),
+        |error| {
+            r2c_precondition_or(
+                error,
+                |error| matches!(error, FftError::ExtraShapeMismatch),
+                root,
+            )
+        },
+    );
+    plan.forward(
+        &valid_source,
+        &mut valid_destination,
+        &mut extra_destination_workspace,
+    )
+    .unwrap();
+    world.barrier();
+
+    let mut foreign_source = foreign_plan.allocate_input().unwrap();
+    fill_r2c_input(&mut foreign_source, 92.0);
+    let mut foreign_source_workspace = plan.allocate_workspace().unwrap();
+    assert_r2c_forward_rejected(
+        if root { &foreign_source } else { &valid_source },
+        &mut valid_destination,
+        &mut foreign_source_workspace,
+        |source, destination, workspace| plan.forward(source, destination, workspace),
+        |error| {
+            r2c_precondition_or(
+                error,
+                |error| matches!(error, FftError::InputLayoutMismatch),
+                root,
+            )
+        },
+    );
+    plan.forward(
+        &valid_source,
+        &mut valid_destination,
+        &mut foreign_source_workspace,
+    )
+    .unwrap();
+    world.barrier();
+
+    let mut foreign_destination = foreign_plan.allocate_output().unwrap();
+    let mut foreign_destination_workspace = plan.allocate_workspace().unwrap();
+    assert_r2c_forward_rejected(
+        &valid_source,
+        if root {
+            &mut foreign_destination
+        } else {
+            &mut valid_destination
+        },
+        &mut foreign_destination_workspace,
+        |source, destination, workspace| plan.forward(source, destination, workspace),
+        |error| {
+            r2c_precondition_or(
+                error,
+                |error| matches!(error, FftError::OutputLayoutMismatch),
+                root,
+            )
+        },
+    );
+    plan.forward(
+        &valid_source,
+        &mut valid_destination,
+        &mut foreign_destination_workspace,
+    )
+    .unwrap();
+    world.barrier();
+
+    let mut foreign_workspace = same_layout_plan.allocate_workspace().unwrap();
+    let mut workspace_source = same_layout_plan.allocate_input().unwrap();
+    fill_r2c_input(&mut workspace_source, 93.0);
+    let mut workspace_destination = same_layout_plan.allocate_output().unwrap();
+    let foreign_workspace_before = format!("{foreign_workspace:?}");
+    assert_r2c_forward_rejected(
+        &valid_source,
+        &mut valid_destination,
+        if root {
+            &mut foreign_workspace
+        } else {
+            &mut valid_workspace
+        },
+        |source, destination, workspace| plan.forward(source, destination, workspace),
+        |error| {
+            r2c_precondition_or(
+                error,
+                |error| matches!(error, FftError::WorkspaceMismatch),
+                root,
+            )
+        },
+    );
+    assert_eq!(format!("{foreign_workspace:?}"), foreign_workspace_before);
+    plan.forward(&valid_source, &mut valid_destination, &mut valid_workspace)
+        .unwrap();
+    same_layout_plan
+        .forward(
+            &workspace_source,
+            &mut workspace_destination,
+            &mut foreign_workspace,
+        )
+        .unwrap();
+    world.barrier();
+
+    let mut inverse_source = plan.allocate_output().unwrap();
+    fill_r2c_spectrum(&mut inverse_source, [3, 4], 93.5);
+    let mut inverse_destination = plan.allocate_input().unwrap();
+    dirty_real(&mut inverse_destination);
+    let wrong_inverse_source = PencilArray::from_elem(
+        Arc::clone(plan.input_pencil()),
+        ExtraShape::scalar(),
+        Complex::new(3.0_f64, -3.0),
+    )
+    .unwrap();
+    let mut inverse_workspace = plan.allocate_workspace().unwrap();
+    assert_r2c_inverse_rejected(
+        if root {
+            &wrong_inverse_source
+        } else {
+            &inverse_source
+        },
+        &mut inverse_destination,
+        &mut inverse_workspace,
+        |source, destination, workspace| plan.inverse(source, destination, workspace),
+        |error| {
+            r2c_precondition_or(
+                error,
+                |error| matches!(error, FftError::InputLayoutMismatch),
+                root,
+            )
+        },
+    );
+    plan.inverse(
+        &inverse_source,
+        &mut inverse_destination,
+        &mut inverse_workspace,
+    )
+    .unwrap();
+    world.barrier();
+
+    let mut wrong_inverse_destination = PencilArray::from_elem(
+        Arc::clone(plan.output_pencil()),
+        ExtraShape::scalar(),
+        2.0_f64,
+    )
+    .unwrap();
+    let mut inverse_destination_workspace = plan.allocate_workspace().unwrap();
+    assert_r2c_inverse_rejected(
+        &inverse_source,
+        if root {
+            &mut wrong_inverse_destination
+        } else {
+            &mut inverse_destination
+        },
+        &mut inverse_destination_workspace,
+        |source, destination, workspace| plan.inverse(source, destination, workspace),
+        |error| {
+            r2c_precondition_or(
+                error,
+                |error| matches!(error, FftError::OutputLayoutMismatch),
+                root,
+            )
+        },
+    );
+    plan.inverse(
+        &inverse_source,
+        &mut inverse_destination,
+        &mut inverse_destination_workspace,
+    )
+    .unwrap();
+    world.barrier();
+
+    let wrong_global_pencil = Pencil::<2, 1>::new(Arc::clone(topology), [2, 6], [0]).unwrap();
+    let wrong_global_source =
+        PencilArray::from_elem(wrong_global_pencil, ExtraShape::scalar(), 4.0_f64).unwrap();
+    let mut global_workspace = plan.allocate_workspace().unwrap();
+    assert_r2c_forward_rejected(
+        if root {
+            &wrong_global_source
+        } else {
+            &valid_source
+        },
+        &mut valid_destination,
+        &mut global_workspace,
+        |source, destination, workspace| plan.forward(source, destination, workspace),
+        |error| {
+            r2c_precondition_or(
+                error,
+                |error| matches!(error, FftError::InputLayoutMismatch),
+                root,
+            )
+        },
+    );
+    plan.forward(&valid_source, &mut valid_destination, &mut global_workspace)
+        .unwrap();
+    world.barrier();
+}
+
+fn negative_r2c_2d_preflight_case(
+    world: &mpi::topology::SimpleCommunicator,
+    topology: &Arc<MpiTopology<2>>,
+) {
+    let plan =
+        R2cPlan::<f64, 4, 2>::from_shape(Arc::clone(topology), [2, 1, 2, 4], ExtraShape::scalar())
+            .unwrap();
+    let rank = world.rank();
+    let bad_rank = rank == 5;
+    let constructor_result = if bad_rank {
+        R2cPlan::<f64, 4, 2>::from_pencil(Arc::clone(plan.output_pencil()), ExtraShape::scalar())
+    } else {
+        R2cPlan::<f64, 4, 2>::from_pencil(Arc::clone(plan.input_pencil()), ExtraShape::scalar())
+    };
+    assert!(matches!(constructor_result, Err(R2cError::Fft(_))));
+    r2c_collective_reuse(&plan);
+    world.barrier();
+
+    let mut source = plan.allocate_input().unwrap();
+    fill_r2c_input(&mut source, 94.0);
+    let mut destination = plan.allocate_output().unwrap();
+    let mut workspace = plan.allocate_workspace().unwrap();
+    let wrong_source = PencilArray::from_elem(
+        Arc::clone(plan.output_pencil()),
+        ExtraShape::scalar(),
+        5.0_f64,
+    )
+    .unwrap();
+    assert_r2c_forward_rejected(
+        if bad_rank { &wrong_source } else { &source },
+        &mut destination,
+        &mut workspace,
+        |source, destination, workspace| plan.forward(source, destination, workspace),
+        |error| {
+            r2c_precondition_or(
+                error,
+                |error| matches!(error, FftError::InputLayoutMismatch),
+                bad_rank,
+            )
+        },
+    );
+    plan.forward(&source, &mut destination, &mut workspace)
+        .unwrap();
+    world.barrier();
 }

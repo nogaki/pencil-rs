@@ -1,7 +1,7 @@
 # PencilArrays / PencilFFTs Rust移植 設計仕様
 
 日付: 2026-09-11  
-状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R、Alltoallv/P2P分散C2C FFT out/in-placeは実装済み。分散R2C/C2Rは後続実装。
+状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R、Alltoallv/P2P分散C2C FFT out/in-place、分散R2C/C2R out-of-placeは実装済み。
 対象: CPU + MPIによる任意次元分散配列基盤と分散FFT基盤
 
 ## 1. 参照実装
@@ -26,7 +26,7 @@
 
 分散配列基盤とFFT層は別crateとし、一方向の依存関係にする。`pencil-array`はMPIに依存する
 一方でFFTライブラリには依存しない。`pencil-fft`のlocal pathはRustFFT/RealFFTに依存する
-がMPIと`pencil-array`には依存せず、`distributed` featureのときだけ分散C2Cのために
+がMPIと`pencil-array`には依存せず、`distributed` featureのときだけ分散FFTのために
 `pencil-array`とMPIを有効にする。
 
 ```text
@@ -168,7 +168,7 @@ workspace/
 
 `pencil-array`はMPIに依存するが、RustFFT、RealFFT、FFTWには依存しない。
 `pencil-fft`のlocal pathはRustFFT/RealFFTに依存するが、MPIと`pencil-array`には依存しない。
-`distributed` featureを有効にした`pencil-fft`だけが分散C2Cのために`pencil-array`とMPIへ
+`distributed` featureを有効にした`pencil-fft`だけが分散FFTのために`pencil-array`とMPIへ
 依存する。
 
 ## 7. MPI資源とtopology
@@ -2174,10 +2174,56 @@ transport/backend abstractionは行わない。
 
 ### Milestone 8: Distributed R2C/C2R
 
-- generic RealComplex stage
-- reduced shape path
-- one complex intermediate
-- even/odd lengths
+- generic `RealComplex` stage（実装済み）
+- reduced shape path（実装済み）
+- one complex intermediate（実装済み）
+- even/odd lengths（実装済み）
+- out-of-place forward/inverse over Alltoallv and PointToPoint（実装済み）
+
+#### Milestone 8追補（2026-09-18、分散R2C/C2R out-of-place実装済み）
+
+実装計画: [分散R2C/C2R計画](../plans/2026-09-18-distributed-r2c-implementation.md)。この追補は
+現在の実装境界を記録し、以前の追補にある将来計画・履歴の記述は変更しない。
+
+The distributed feature exposes `R2cPlan<R, N, M>`, `R2cWorkspace`, and
+`R2cError` only when `distributed` is enabled. `N >= 2`, `1 <= M < N`, and
+the input pencil is canonical identity with decomposition `[0..M)`. The real
+input keeps its original last extent `n`; the complex output has last extent
+`m = n/2+1`. Constructors mirror `C2cPlan`, including both checked transports,
+and allocation is noncollective. There is no real in-place API.
+
+The first stage is `LocalR2cPlan::forward` or `inverse`; all remaining stages
+are complex FFTs over the other `N - 1` axes. The reduced canonical pencil is
+never passed through a full C2C plan, so its last axis is not transformed
+again. A workspace owns one reduced-complex `ManyPencilArray`, shared
+transpose storage, the maximum native complex scratch, and one real line plus
+one complex line. Inverse scaling is exactly once per original spatial axis,
+including `n`; extra batch dimensions and `m` are never normalization factors.
+
+Inverse boundary acceptance is post-tail and per extra batch/per constrained
+plane. DC is constrained always; Nyquist is constrained only for even `n`,
+while an odd final bin is unconstrained. For each plane `z(x)`, all real and
+imaginary values must be finite and the plane is accepted when
+`max_x abs(Im z) <= 128*min_subnormal_R*D` or
+`||Im z||_2 <= 128*epsilon_R*D*||Re z||_2`, with
+`D = 1 + sum(ceil(log2(n_a)))` for original axes `a < N-1`. This is an
+explicit normwise-relative/componentwise-absolute policy, not a formal
+RustFFT error bound. Fixed four-word max and four-word sum arrays are reduced
+across the full Cartesian communicator for each batch; nonfinite values are
+excluded from MAX/SUM but set a validity flag. Every rank completes all
+reductions, including empty ranks, and one final MIN-valid reduction occurs
+before any real destination write. Invalid boundaries return
+`R2cError::InvalidSpectrum`; the source and destination stay unchanged, while
+workspace mutation is permitted after execution has started. Accepted endpoint
+imaginary values are zeroed only in the private intermediate before the
+unchanged strict local C2R call.
+
+Collective operation words 12, 13, and 14 are R2C construction, forward, and
+inverse. The five-word header and words 1--11 remain unchanged. The exact
+R2C descriptor records the original real shape, process grid, extra rank and
+extents, scalar width, and transport method, distinguishing even and odd
+shapes that share `m`. No public tolerance knobs, offender-ID reductions, or
+full-spectrum gather are part of this API.
 
 ### Milestone 9: 交差検証と性能評価
 

@@ -11,11 +11,13 @@
 //! length: the complex length for C2C, or the original real length for R2C/C2R.
 //!
 //! With the opt-in `distributed` feature, `C2cPlan` and its workspaces provide
-//! input-preserving and state-checked in-place distributed C2C transforms for
-//! `N >= 2` and `1 <= M < N`. `TransposeMethod` selects checked Alltoallv or
-//! receive-before-send point-to-point transitions; the legacy constructors
-//! default to Alltoallv. Plan construction and transform calls are collective
-//! on the topology's Cartesian communicator; in-place array/workspace
+//! input-preserving distributed C2C transforms, while `R2cPlan` provides
+//! input-preserving out-of-place R2C/C2R with a reduced final complex axis.
+//! C2C also retains its state-checked single-buffer API; distributed R2C has
+//! no real in-place API. Both support `N >= 2`, `1 <= M < N`, and checked
+//! Alltoallv or receive-before-send point-to-point transitions; legacy
+//! constructors default to Alltoallv. Plan construction and transform calls
+//! are collective on the topology's Cartesian communicator; workspace
 //! allocation and views are noncollective. Allocation failures must be
 //! coordinated by callers before the next collective call. The default feature
 //! set remains MPI-free.
@@ -101,6 +103,9 @@ mod private {
 
     pub trait Sealed: rustfft::FftNum {
         fn normalize_inverse(values: &mut [Complex<Self>], line_len: usize);
+        fn pencil_fft_as_f64(self) -> f64;
+        fn pencil_fft_epsilon_f64() -> f64;
+        fn pencil_fft_min_subnormal_f64() -> f64;
     }
 
     impl Sealed for f32 {
@@ -111,6 +116,18 @@ mod private {
                 value.im *= scale;
             }
         }
+
+        fn pencil_fft_as_f64(self) -> f64 {
+            self as f64
+        }
+
+        fn pencil_fft_epsilon_f64() -> f64 {
+            f32::EPSILON as f64
+        }
+
+        fn pencil_fft_min_subnormal_f64() -> f64 {
+            f32::from_bits(1) as f64
+        }
     }
 
     impl Sealed for f64 {
@@ -120,6 +137,18 @@ mod private {
                 value.re *= scale;
                 value.im *= scale;
             }
+        }
+
+        fn pencil_fft_as_f64(self) -> f64 {
+            self
+        }
+
+        fn pencil_fft_epsilon_f64() -> f64 {
+            f64::EPSILON
+        }
+
+        fn pencil_fft_min_subnormal_f64() -> f64 {
+            f64::from_bits(1)
         }
     }
 }
@@ -142,7 +171,7 @@ mod distributed;
 #[cfg(feature = "distributed")]
 pub use distributed::{
     C2cInPlaceArray, C2cInPlaceWorkspace, C2cOutOfPlaceWorkspace, C2cPlan, C2cState, FftError,
-    TransposeMethod,
+    R2cError, R2cPlan, R2cWorkspace, TransposeMethod,
 };
 
 /// Errors returned by local C2C plan construction and execution.
