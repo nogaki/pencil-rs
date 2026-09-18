@@ -109,13 +109,13 @@ jobs:
       - name: Run six-rank distributed transpose (Alltoallv/P2P out-of-place and in-place) tests
         run: timeout --foreground 120s mpiexec --oversubscribe -n 6 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
 
-      - name: Run distributed C2C FFT (out-of-place/in-place) on one rank
+      - name: Run distributed C2C FFT (Alltoallv/P2P out-of-place/in-place) on one rank
         run: timeout --foreground 120s mpiexec --oversubscribe -n 1 cargo test -p pencil-fft --features distributed --test distributed_c2c --locked -- --nocapture --test-threads=1
 
-      - name: Run distributed C2C FFT (out-of-place/in-place) on four ranks
+      - name: Run distributed C2C FFT (Alltoallv/P2P out-of-place/in-place) on four ranks
         run: timeout --foreground 120s mpiexec --oversubscribe -n 4 cargo test -p pencil-fft --features distributed --test distributed_c2c --locked -- --nocapture --test-threads=1
 
-      - name: Run distributed C2C FFT (out-of-place/in-place) on six ranks
+      - name: Run distributed C2C FFT (Alltoallv/P2P out-of-place/in-place) on six ranks
         run: timeout --foreground 120s mpiexec --oversubscribe -n 6 cargo test -p pencil-fft --features distributed --test distributed_c2c --locked -- --nocapture --test-threads=1
 
       - name: Run Clippy

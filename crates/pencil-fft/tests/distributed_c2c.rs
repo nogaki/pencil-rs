@@ -11,7 +11,7 @@ use pencil_array::{
 };
 use pencil_fft::{
     C2cInPlaceArray, C2cInPlaceWorkspace, C2cOutOfPlaceWorkspace, C2cPlan, C2cState, Complex,
-    FftError, FftReal,
+    FftError, FftReal, TransposeMethod,
 };
 
 trait TestReal: FftReal + mpi::datatype::Equivalence {
@@ -46,6 +46,26 @@ impl TestReal for f64 {
     fn tolerance() -> f64 {
         2e-10
     }
+}
+
+type ResultSnapshots<R> = (
+    Vec<Complex<R>>,
+    Vec<Complex<R>>,
+    Vec<Complex<R>>,
+    Vec<Complex<R>>,
+);
+
+struct OopTransport<'a, R: TestReal, const N: usize, const M: usize> {
+    plan: &'a C2cPlan<R, N, M>,
+    source: &'a PencilArray<Complex<R>, N, M>,
+    destination: &'a mut PencilArray<Complex<R>, N, M>,
+    workspace: &'a mut C2cOutOfPlaceWorkspace<R, N, M>,
+}
+
+struct InPlaceTransport<'a, R: TestReal, const N: usize, const M: usize> {
+    plan: &'a C2cPlan<R, N, M>,
+    array: &'a mut C2cInPlaceArray<R, N, M>,
+    workspace: &'a mut C2cInPlaceWorkspace<R, N, M>,
 }
 
 #[test]
@@ -138,23 +158,92 @@ fn run_case<R: TestReal, const N: usize, const M: usize>(
 ) where
     Complex<R>: mpi::datatype::Equivalence,
 {
-    let plan =
-        C2cPlan::<R, N, M>::from_shape(Arc::clone(topology), global_shape, extra_shape.clone())
-            .unwrap();
+    let outputs = [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint].map(|method| {
+        run_case_with_method::<R, N, M>(
+            topology,
+            global_shape,
+            extra_shape.clone(),
+            seed,
+            constructor_checks,
+            method,
+        )
+    });
+    assert_eq!(outputs[0], outputs[1]);
+}
+
+fn run_case_with_method<R: TestReal, const N: usize, const M: usize>(
+    topology: &Arc<MpiTopology<M>>,
+    global_shape: [usize; N],
+    extra_shape: ExtraShape,
+    seed: f64,
+    constructor_checks: bool,
+    method: TransposeMethod,
+) -> ResultSnapshots<R>
+where
+    Complex<R>: mpi::datatype::Equivalence,
+{
+    let plan = C2cPlan::<R, N, M>::from_shape_with_method(
+        Arc::clone(topology),
+        global_shape,
+        extra_shape.clone(),
+        method,
+    )
+    .unwrap();
     let mut source = plan.allocate_input().unwrap();
     fill_input(&mut source, seed);
 
     if constructor_checks {
-        let from_pencil =
+        let legacy_pencil =
             C2cPlan::<R, N, M>::from_pencil(Arc::clone(plan.input_pencil()), extra_shape.clone())
                 .unwrap();
-        let from_array = C2cPlan::<R, N, M>::from_array(&source).unwrap();
+        let legacy_array = C2cPlan::<R, N, M>::from_array(&source).unwrap();
+        let explicit_pencil = C2cPlan::<R, N, M>::from_pencil_with_method(
+            Arc::clone(plan.input_pencil()),
+            extra_shape.clone(),
+            method,
+        )
+        .unwrap();
+        let explicit_array = C2cPlan::<R, N, M>::from_array_with_method(&source, method).unwrap();
         assert!(
-            from_pencil
+            legacy_pencil
                 .output_pencil()
-                .same_layout(from_array.output_pencil().as_ref())
+                .same_layout(legacy_array.output_pencil().as_ref())
         );
-        assert_eq!(from_array.extra_shape(), &extra_shape);
+        assert!(
+            explicit_pencil
+                .output_pencil()
+                .same_layout(explicit_array.output_pencil().as_ref())
+        );
+        assert!(
+            explicit_pencil
+                .output_pencil()
+                .same_layout(plan.output_pencil().as_ref())
+        );
+        assert_eq!(legacy_array.extra_shape(), &extra_shape);
+        assert_eq!(explicit_array.extra_shape(), &extra_shape);
+        if matches!(method, TransposeMethod::AllToAllv) {
+            let legacy_shape = C2cPlan::<R, N, M>::from_shape(
+                Arc::clone(topology),
+                global_shape,
+                extra_shape.clone(),
+            )
+            .unwrap();
+            assert!(
+                legacy_shape
+                    .output_pencil()
+                    .same_layout(plan.output_pencil().as_ref())
+            );
+            let mut legacy_output = legacy_shape.allocate_output().unwrap();
+            let mut legacy_workspace = legacy_shape.allocate_out_of_place_workspace().unwrap();
+            let mut explicit_output = plan.allocate_output().unwrap();
+            let mut explicit_workspace = plan.allocate_out_of_place_workspace().unwrap();
+            legacy_shape
+                .forward(&source, &mut legacy_output, &mut legacy_workspace)
+                .unwrap();
+            plan.forward(&source, &mut explicit_output, &mut explicit_workspace)
+                .unwrap();
+            assert_eq!(legacy_output.as_slice(), explicit_output.as_slice());
+        }
     }
 
     let source_before = source.as_slice().to_vec();
@@ -171,6 +260,7 @@ fn run_case<R: TestReal, const N: usize, const M: usize>(
     assert_eq!(spectrum.as_slice(), second_spectrum.as_slice());
     assert_eq!(source.as_slice(), source_before.as_slice());
     check_forward(&spectrum.view(), &extra_shape, global_shape, seed);
+    let oop_forward_snapshot = spectrum.as_slice().to_vec();
 
     // Inverse is checked against an independently generated spectrum rather
     // than only against the forward output.
@@ -182,6 +272,7 @@ fn run_case<R: TestReal, const N: usize, const M: usize>(
         .unwrap();
     assert_eq!(arbitrary_spectrum.as_slice(), arbitrary_before.as_slice());
     check_inverse(&inverse.view(), &extra_shape, global_shape, seed + 31.0);
+    let oop_inverse_snapshot = inverse.as_slice().to_vec();
 
     let mut roundtrip = plan.allocate_input().unwrap();
     plan.inverse(&spectrum, &mut roundtrip, &mut second_workspace)
@@ -228,6 +319,7 @@ fn run_case<R: TestReal, const N: usize, const M: usize>(
         assert_close(*actual, *expected);
     }
     check_forward(&in_place.view().unwrap(), &extra_shape, global_shape, seed);
+    let in_place_forward_snapshot = in_place.view().unwrap().as_slice().to_vec();
 
     plan.inverse_in_place(&mut in_place, &mut in_place_workspace)
         .unwrap();
@@ -280,6 +372,7 @@ fn run_case<R: TestReal, const N: usize, const M: usize>(
         global_shape,
         seed + 31.0,
     );
+    let in_place_inverse_snapshot = in_place.view().unwrap().as_slice().to_vec();
 
     // The same array and workspace can be used again after a successful pair.
     plan.forward_in_place(&mut in_place, &mut in_place_workspace)
@@ -298,7 +391,14 @@ fn run_case<R: TestReal, const N: usize, const M: usize>(
     } else if !spectrum.is_empty() {
         assert_ne!(spectrum.as_slice(), spectrum_before.as_slice());
     }
+    let snapshots = (
+        oop_forward_snapshot,
+        oop_inverse_snapshot,
+        in_place_forward_snapshot,
+        in_place_inverse_snapshot,
+    );
     topology_barrier(topology);
+    snapshots
 }
 
 fn fill_input<R: TestReal, const N: usize, const M: usize>(
@@ -601,6 +701,393 @@ fn reuse_forward<R: TestReal, const N: usize, const M: usize>(
 {
     let mut destination = plan.allocate_output().unwrap();
     plan.forward(source, &mut destination, workspace).unwrap();
+}
+
+fn assert_mixed_transport_oop<R: TestReal + std::fmt::Debug, const N: usize, const M: usize>(
+    use_point_to_point: bool,
+    inverse: bool,
+    alltoallv: OopTransport<'_, R, N, M>,
+    point_to_point: OopTransport<'_, R, N, M>,
+) where
+    Complex<R>: mpi::datatype::Equivalence,
+{
+    let OopTransport {
+        plan: alltoallv_plan,
+        source: alltoallv_source,
+        destination: alltoallv_destination,
+        workspace: alltoallv_workspace,
+    } = alltoallv;
+    let OopTransport {
+        plan: point_to_point_plan,
+        source: point_to_point_source,
+        destination: point_to_point_destination,
+        workspace: point_to_point_workspace,
+    } = point_to_point;
+    let alltoallv_source_before = alltoallv_source.as_slice().to_vec();
+    let alltoallv_destination_before = alltoallv_destination.as_slice().to_vec();
+    let alltoallv_workspace_before = format!("{alltoallv_workspace:?}");
+    let point_to_point_source_before = point_to_point_source.as_slice().to_vec();
+    let point_to_point_destination_before = point_to_point_destination.as_slice().to_vec();
+    let point_to_point_workspace_before = format!("{point_to_point_workspace:?}");
+
+    let result = match (use_point_to_point, inverse) {
+        (true, true) => point_to_point_plan.inverse(
+            point_to_point_source,
+            point_to_point_destination,
+            point_to_point_workspace,
+        ),
+        (true, false) => point_to_point_plan.forward(
+            point_to_point_source,
+            point_to_point_destination,
+            point_to_point_workspace,
+        ),
+        (false, true) => {
+            alltoallv_plan.inverse(alltoallv_source, alltoallv_destination, alltoallv_workspace)
+        }
+        (false, false) => {
+            alltoallv_plan.forward(alltoallv_source, alltoallv_destination, alltoallv_workspace)
+        }
+    };
+    assert!(matches!(
+        result,
+        Err(FftError::CollectiveDescriptorMismatch)
+    ));
+    assert_eq!(
+        alltoallv_source.as_slice(),
+        alltoallv_source_before.as_slice()
+    );
+    assert_eq!(
+        alltoallv_destination.as_slice(),
+        alltoallv_destination_before.as_slice()
+    );
+    assert_eq!(
+        format!("{alltoallv_workspace:?}"),
+        alltoallv_workspace_before
+    );
+    assert_eq!(
+        point_to_point_source.as_slice(),
+        point_to_point_source_before.as_slice()
+    );
+    assert_eq!(
+        point_to_point_destination.as_slice(),
+        point_to_point_destination_before.as_slice()
+    );
+    assert_eq!(
+        format!("{point_to_point_workspace:?}"),
+        point_to_point_workspace_before
+    );
+}
+
+fn assert_mixed_transport_in_place<R: TestReal + std::fmt::Debug, const N: usize, const M: usize>(
+    use_point_to_point: bool,
+    inverse: bool,
+    alltoallv: InPlaceTransport<'_, R, N, M>,
+    point_to_point: InPlaceTransport<'_, R, N, M>,
+) where
+    Complex<R>: mpi::datatype::Equivalence,
+{
+    let InPlaceTransport {
+        plan: alltoallv_plan,
+        array: alltoallv_array,
+        workspace: alltoallv_workspace,
+    } = alltoallv;
+    let InPlaceTransport {
+        plan: point_to_point_plan,
+        array: point_to_point_array,
+        workspace: point_to_point_workspace,
+    } = point_to_point;
+    let alltoallv_state = alltoallv_array.state();
+    let alltoallv_data = alltoallv_array.view().unwrap().as_slice().to_vec();
+    let alltoallv_workspace_before = format!("{alltoallv_workspace:?}");
+    let point_to_point_state = point_to_point_array.state();
+    let point_to_point_data = point_to_point_array.view().unwrap().as_slice().to_vec();
+    let point_to_point_workspace_before = format!("{point_to_point_workspace:?}");
+
+    let result = match (use_point_to_point, inverse) {
+        (true, true) => {
+            point_to_point_plan.inverse_in_place(point_to_point_array, point_to_point_workspace)
+        }
+        (true, false) => {
+            point_to_point_plan.forward_in_place(point_to_point_array, point_to_point_workspace)
+        }
+        (false, true) => alltoallv_plan.inverse_in_place(alltoallv_array, alltoallv_workspace),
+        (false, false) => alltoallv_plan.forward_in_place(alltoallv_array, alltoallv_workspace),
+    };
+    assert!(matches!(
+        result,
+        Err(FftError::CollectiveDescriptorMismatch)
+    ));
+    assert_eq!(alltoallv_array.state(), alltoallv_state);
+    assert_eq!(
+        alltoallv_array.view().unwrap().as_slice(),
+        alltoallv_data.as_slice()
+    );
+    assert_eq!(
+        format!("{alltoallv_workspace:?}"),
+        alltoallv_workspace_before
+    );
+    assert_eq!(point_to_point_array.state(), point_to_point_state);
+    assert_eq!(
+        point_to_point_array.view().unwrap().as_slice(),
+        point_to_point_data.as_slice()
+    );
+    assert_eq!(
+        format!("{point_to_point_workspace:?}"),
+        point_to_point_workspace_before
+    );
+}
+
+fn negative_transport_cases(
+    world: &mpi::topology::SimpleCommunicator,
+    topology_1d: &Arc<MpiTopology<1>>,
+    topology_2d: &Arc<MpiTopology<2>>,
+) {
+    if world.size() == 1 {
+        return;
+    }
+    negative_transport_layout(world, topology_1d, [3, 4], 0, 61.0);
+    if world.size() == 6 {
+        // Rank 5 is outside the changed-axis subgroup; the layout helper also
+        // reuses both valid plans after every rejected operation.
+        negative_transport_layout(world, topology_2d, [3, 1, 3, 4], 5, 63.0);
+    }
+}
+
+fn negative_transport_layout<const N: usize, const M: usize>(
+    world: &mpi::topology::SimpleCommunicator,
+    topology: &Arc<MpiTopology<M>>,
+    global_shape: [usize; N],
+    mismatch_rank: i32,
+    seed: f64,
+) where
+    Complex<f64>: mpi::datatype::Equivalence,
+{
+    let alltoallv_plan = C2cPlan::<f64, N, M>::from_shape_with_method(
+        Arc::clone(topology),
+        global_shape,
+        ExtraShape::scalar(),
+        TransposeMethod::AllToAllv,
+    )
+    .unwrap();
+    let point_to_point_plan = C2cPlan::<f64, N, M>::from_shape_with_method(
+        Arc::clone(topology),
+        global_shape,
+        ExtraShape::scalar(),
+        TransposeMethod::PointToPoint,
+    )
+    .unwrap();
+    let use_point_to_point = world.rank() == mismatch_rank;
+
+    let mut alltoallv_source = alltoallv_plan.allocate_input().unwrap();
+    let mut point_to_point_source = point_to_point_plan.allocate_input().unwrap();
+    fill_input(&mut alltoallv_source, seed);
+    fill_input(&mut point_to_point_source, seed);
+    let mut alltoallv_output = alltoallv_plan.allocate_output().unwrap();
+    let mut point_to_point_output = point_to_point_plan.allocate_output().unwrap();
+    let mut alltoallv_inverse = alltoallv_plan.allocate_input().unwrap();
+    let mut point_to_point_inverse = point_to_point_plan.allocate_input().unwrap();
+    let mut alltoallv_workspace = alltoallv_plan.allocate_out_of_place_workspace().unwrap();
+    let mut point_to_point_workspace = point_to_point_plan
+        .allocate_out_of_place_workspace()
+        .unwrap();
+    let (mut alltoallv_array, mut alltoallv_in_place_workspace) =
+        fresh_in_place(&alltoallv_plan, seed + 1.0);
+    let (mut point_to_point_array, mut point_to_point_in_place_workspace) =
+        fresh_in_place(&point_to_point_plan, seed + 1.0);
+
+    let alltoallv_resources_before = format!(
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        alltoallv_source.as_slice(),
+        alltoallv_output.as_slice(),
+        alltoallv_inverse.as_slice(),
+        alltoallv_workspace,
+        alltoallv_array,
+        alltoallv_in_place_workspace,
+    );
+    let point_to_point_resources_before = format!(
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        point_to_point_source.as_slice(),
+        point_to_point_output.as_slice(),
+        point_to_point_inverse.as_slice(),
+        point_to_point_workspace,
+        point_to_point_array,
+        point_to_point_in_place_workspace,
+    );
+    let constructor_mismatch = if use_point_to_point {
+        C2cPlan::<f64, N, M>::from_shape_with_method(
+            Arc::clone(topology),
+            global_shape,
+            ExtraShape::scalar(),
+            TransposeMethod::PointToPoint,
+        )
+    } else {
+        C2cPlan::<f64, N, M>::from_shape_with_method(
+            Arc::clone(topology),
+            global_shape,
+            ExtraShape::scalar(),
+            TransposeMethod::AllToAllv,
+        )
+    };
+    assert!(matches!(
+        constructor_mismatch,
+        Err(FftError::CollectiveDescriptorMismatch)
+    ));
+    assert_eq!(
+        format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            alltoallv_source.as_slice(),
+            alltoallv_output.as_slice(),
+            alltoallv_inverse.as_slice(),
+            alltoallv_workspace,
+            alltoallv_array,
+            alltoallv_in_place_workspace,
+        ),
+        alltoallv_resources_before
+    );
+    assert_eq!(
+        format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            point_to_point_source.as_slice(),
+            point_to_point_output.as_slice(),
+            point_to_point_inverse.as_slice(),
+            point_to_point_workspace,
+            point_to_point_array,
+            point_to_point_in_place_workspace,
+        ),
+        point_to_point_resources_before
+    );
+    world.barrier();
+
+    // Reuse both valid plans after the constructor rejection.
+    alltoallv_plan
+        .forward(
+            &alltoallv_source,
+            &mut alltoallv_output,
+            &mut alltoallv_workspace,
+        )
+        .unwrap();
+    point_to_point_plan
+        .forward(
+            &point_to_point_source,
+            &mut point_to_point_output,
+            &mut point_to_point_workspace,
+        )
+        .unwrap();
+    world.barrier();
+
+    assert_mixed_transport_oop(
+        use_point_to_point,
+        false,
+        OopTransport {
+            plan: &alltoallv_plan,
+            source: &alltoallv_source,
+            destination: &mut alltoallv_output,
+            workspace: &mut alltoallv_workspace,
+        },
+        OopTransport {
+            plan: &point_to_point_plan,
+            source: &point_to_point_source,
+            destination: &mut point_to_point_output,
+            workspace: &mut point_to_point_workspace,
+        },
+    );
+    alltoallv_plan
+        .forward(
+            &alltoallv_source,
+            &mut alltoallv_output,
+            &mut alltoallv_workspace,
+        )
+        .unwrap();
+    point_to_point_plan
+        .forward(
+            &point_to_point_source,
+            &mut point_to_point_output,
+            &mut point_to_point_workspace,
+        )
+        .unwrap();
+    world.barrier();
+
+    assert_mixed_transport_oop(
+        use_point_to_point,
+        true,
+        OopTransport {
+            plan: &alltoallv_plan,
+            source: &alltoallv_output,
+            destination: &mut alltoallv_inverse,
+            workspace: &mut alltoallv_workspace,
+        },
+        OopTransport {
+            plan: &point_to_point_plan,
+            source: &point_to_point_output,
+            destination: &mut point_to_point_inverse,
+            workspace: &mut point_to_point_workspace,
+        },
+    );
+    alltoallv_plan
+        .inverse(
+            &alltoallv_output,
+            &mut alltoallv_inverse,
+            &mut alltoallv_workspace,
+        )
+        .unwrap();
+    point_to_point_plan
+        .inverse(
+            &point_to_point_output,
+            &mut point_to_point_inverse,
+            &mut point_to_point_workspace,
+        )
+        .unwrap();
+    world.barrier();
+
+    assert_mixed_transport_in_place(
+        use_point_to_point,
+        false,
+        InPlaceTransport {
+            plan: &alltoallv_plan,
+            array: &mut alltoallv_array,
+            workspace: &mut alltoallv_in_place_workspace,
+        },
+        InPlaceTransport {
+            plan: &point_to_point_plan,
+            array: &mut point_to_point_array,
+            workspace: &mut point_to_point_in_place_workspace,
+        },
+    );
+    alltoallv_plan
+        .forward_in_place(&mut alltoallv_array, &mut alltoallv_in_place_workspace)
+        .unwrap();
+    point_to_point_plan
+        .forward_in_place(
+            &mut point_to_point_array,
+            &mut point_to_point_in_place_workspace,
+        )
+        .unwrap();
+    world.barrier();
+
+    assert_mixed_transport_in_place(
+        use_point_to_point,
+        true,
+        InPlaceTransport {
+            plan: &alltoallv_plan,
+            array: &mut alltoallv_array,
+            workspace: &mut alltoallv_in_place_workspace,
+        },
+        InPlaceTransport {
+            plan: &point_to_point_plan,
+            array: &mut point_to_point_array,
+            workspace: &mut point_to_point_in_place_workspace,
+        },
+    );
+    alltoallv_plan
+        .inverse_in_place(&mut alltoallv_array, &mut alltoallv_in_place_workspace)
+        .unwrap();
+    point_to_point_plan
+        .inverse_in_place(
+            &mut point_to_point_array,
+            &mut point_to_point_in_place_workspace,
+        )
+        .unwrap();
+    world.barrier();
 }
 
 fn negative_collective_cases(
@@ -1075,19 +1562,27 @@ fn negative_collective_cases(
         world.barrier();
     }
 
-    negative_in_place_cases(world, topology_1d, topology_2d);
+    negative_transport_cases(world, topology_1d, topology_2d);
+    for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
+        negative_in_place_cases(world, topology_1d, topology_2d, method);
+    }
 }
 
 fn negative_in_place_cases(
     world: &mpi::topology::SimpleCommunicator,
     topology_1d: &Arc<MpiTopology<1>>,
     topology_2d: &Arc<MpiTopology<2>>,
+    method: TransposeMethod,
 ) {
     let rank = world.rank();
     let size = world.size();
-    let plan =
-        C2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology_1d), [3, 4], ExtraShape::scalar())
-            .unwrap();
+    let plan = C2cPlan::<f64, 2, 1>::from_shape_with_method(
+        Arc::clone(topology_1d),
+        [3, 4],
+        ExtraShape::scalar(),
+        method,
+    )
+    .unwrap();
 
     // The wrong direction is rejected collectively without changing the
     // initial input state.
@@ -1193,9 +1688,13 @@ fn negative_in_place_cases(
 
     // Same-layout arrays from a separately constructed plan are still foreign
     // because plan identity is an Arc contract, not just a layout comparison.
-    let foreign_plan =
-        C2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology_1d), [3, 4], ExtraShape::scalar())
-            .unwrap();
+    let foreign_plan = C2cPlan::<f64, 2, 1>::from_shape_with_method(
+        Arc::clone(topology_1d),
+        [3, 4],
+        ExtraShape::scalar(),
+        method,
+    )
+    .unwrap();
     let (mut valid_array, mut valid_workspace) = fresh_in_place(&plan, 52.0);
     let mut foreign_array = foreign_plan.allocate_in_place().unwrap();
     fill_in_place(&mut foreign_array, 52.0, false);
@@ -1285,8 +1784,12 @@ fn negative_in_place_cases(
     let constructor_array_before = format!("{constructor_array:?}");
     let constructor_workspace_before = format!("{constructor_workspace:?}");
     let result = if rank == 0 {
-        C2cPlan::<f64, 2, 1>::from_pencil(Arc::clone(plan.input_pencil()), ExtraShape::scalar())
-            .map(|_| ())
+        C2cPlan::<f64, 2, 1>::from_pencil_with_method(
+            Arc::clone(plan.input_pencil()),
+            ExtraShape::scalar(),
+            method,
+        )
+        .map(|_| ())
     } else {
         plan.forward_in_place(&mut constructor_array, &mut constructor_workspace)
     };
@@ -1364,16 +1867,18 @@ fn negative_in_place_cases(
     // zero. Full-Cartesian preflight must catch its foreign array before any
     // rank starts a transition.
     if size == 6 {
-        let plan_2d = C2cPlan::<f64, 4, 2>::from_shape(
+        let plan_2d = C2cPlan::<f64, 4, 2>::from_shape_with_method(
             Arc::clone(topology_2d),
             [3, 1, 3, 4],
             ExtraShape::scalar(),
+            method,
         )
         .unwrap();
-        let foreign_plan_2d = C2cPlan::<f64, 4, 2>::from_shape(
+        let foreign_plan_2d = C2cPlan::<f64, 4, 2>::from_shape_with_method(
             Arc::clone(topology_2d),
             [3, 1, 3, 4],
             ExtraShape::scalar(),
+            method,
         )
         .unwrap();
         let (mut array_2d, mut workspace_2d) = fresh_in_place(&plan_2d, 57.0);
