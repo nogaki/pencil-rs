@@ -1,7 +1,7 @@
 # PencilArrays / PencilFFTs Rust移植 設計仕様
 
 日付: 2026-09-11  
-状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R、分散C2C FFT out/in-placeは実装済み。分散R2C/C2Rは後続実装。
+状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R、Alltoallv/P2P分散C2C FFT out/in-placeは実装済み。分散R2C/C2Rは後続実装。
 対象: CPU + MPIによる任意次元分散配列基盤と分散FFT基盤
 
 ## 1. 参照実装
@@ -2158,6 +2158,18 @@ transport/backend abstractionは行わない。
   rank-local preflightとAPI混在を追加した。private transaction helperの実際のErr/panic
   経路はfeature付きunit testでcatch_unwindを外側から使ってPoisonedとview gateを確認する。
   README、public doctest、privacy compile-fail、CI suite名も反映した。
+
+#### Milestone 7第三PR追補（2026-09-18、分散C2C PointToPoint）
+
+実装計画: [分散C2C PointToPoint計画](../plans/2026-09-18-distributed-c2c-point-to-point-implementation.md)。
+
+第一・第二PRのlocal C2C、route、in-place状態契約、共有workspaceを維持し、分散edgeのtransportだけを選択可能にした。新しいpublic backend trait、factory、workspace型、P2P request処理の複製は追加しない。
+
+- `distributed` featureに`TransposeMethod::{AllToAllv, PointToPoint}`を追加した。既存の`from_pencil`、`from_array`、`from_shape`はAlltoallvへ委譲し、`*_with_method`の3 constructorが明示選択を受ける。入力保全、inverseの各spatial軸正規化、`N >= 2`、`1 <= M < N`、extra shape、array/workspaceのplan identityは不変である。
+- 既存の固定5語headerとoperation 7--11は変更しない。最小payloadは従来の`global_shape[N]`、`process_grid[M]`、extra rank/dimensions、scalar widthへmethod word（Alltoallv=0、PointToPoint=1）を末尾追加し、checked長を`N + M + 3 + extra_rank`とする。constructorと全4実行のdescriptorがmethodをnative FFT、destination/workspace書込み、in-place poisonより前に合意するため、rank-localな有効method選択は全rankで`CollectiveDescriptorMismatch`となる。
+- 分散edgeは選択methodの既存`AllToAllvTransposePlan`または`PointToPointTransposePlan`のforward/backward pairを保持する。各edgeのforward作成後とbackward作成後に、既存のcollective requirement agreementを行い、最大send/receive長と既存`TransposeWorkspace`を共有する。local transition、FFT scratch、OOP/IP loopは変更しない。
+- P2Pのchanged-axis topology context、固定`0x5054` tag、receive-before-send、wait-all、request metadata reservation、MPI failure/panic/process-lossの回復不能契約はarray crateから継承する。同一context上の未完了transposeを重ねず、成功時はnative requestを完了して返る。allocation-free executionやglobal rollbackは約束しない。
+- 既存の一つのMPI integration binary/top-level testを両methodで実行し、f32/f64、N=2/3/4、M=1/2、非均等・empty local、extra/zero extra、逆順communicator、direct DFT、OOP/IP parity、入力保全、pointer stability、constructor default、transport parityを確認する。constructorとOOP/IP forward/inverseのrank-local method mismatchは全workspace・state・dataをsnapshotして再利用まで検証し、6-rank multi-axisのchanged-axis subgroup外rankも含める。private one-rank poison testは両methodのErr/panicとpost-start native errorを確認する。
 
 
 ### Milestone 8: Distributed R2C/C2R

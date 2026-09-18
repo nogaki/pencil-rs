@@ -9,7 +9,8 @@ RealFFT, FFTW, and any FFT-specific API. The local `pencil-fft` path accepts
 flat slices, uses RustFFT/RealFFT, and is independent of MPI and
 `pencil-array`. Local C2C and out-of-place R2C/C2R are available. An opt-in
 `pencil-fft/distributed` feature adds out-of-place, input-preserving and
-single-buffer in-place distributed C2C FFTs over checked Alltoallv transitions.
+single-buffer in-place distributed C2C FFTs over checked Alltoallv or
+point-to-point transitions.
 
 `Pencil` describes spatial distribution. `PencilArray` owns one layout and
 one local buffer. `ManyPencilArray` owns a buffer large enough for several
@@ -21,7 +22,10 @@ process-local memory-axis permutations. `AllToAllvTransposePlan` and
 out-of-place views and shared-storage in-place execution. The optional
 `pencil-fft/distributed` feature composes these checked transitions into
 out-of-place and in-place distributed C2C transforms; it does not change the
-MPI-free local FFT default.
+MPI-free local FFT default. `C2cPlan::from_pencil_with_method`,
+`from_array_with_method`, and `from_shape_with_method` select
+`TransposeMethod::AllToAllv` or `TransposeMethod::PointToPoint`. The legacy
+constructors retain the Alltoallv default.
 
 Alltoallv and point-to-point construction and execution are collective: every
 rank must use the same source communicator context, API, order, `T`, and
@@ -55,13 +59,20 @@ Enable the feature in this workspace with
 pencils, normalized inverse transforms, exact extra shapes, reusable
 plan-bound `C2cOutOfPlaceWorkspace`, and input-preserving forward/inverse
 execution. Construction and execution are collective on the topology's
-Cartesian communicator; every rank must call matching operations in order.
-Each rank checks its actual source and destination against the plan before a
-full-Cartesian preflight agreement, and no data is changed before that initial
-agreement. Once execution starts, a resource failure or later Alltoallv
-metadata failure may mutate the workspace; no general allocation-free
-rollback is promised. The distributed API uses the array crate's checked
-Alltoallv and local-transpose plans and is not enabled by default.
+Cartesian communicator; every rank must call matching operations in order and
+select the same `TransposeMethod`. The selected method is appended to the
+minimal checked C2C descriptor (after global shape, process grid, extra shape,
+and scalar width), so a rank-local method mismatch returns
+`FftError::CollectiveDescriptorMismatch` before native FFT, output, workspace,
+or in-place state changes. Each rank checks its actual source and destination
+against the plan before a full-Cartesian preflight agreement, and no data is
+changed before that initial agreement. Once execution starts, a resource or
+later transition metadata failure may mutate the workspace; no general
+allocation-free rollback is promised. Point-to-point uses the existing
+changed-axis topology context, fixed internal `0x5054` tag, receive-before-send,
+wait-all, and MPI failure contract; it reserves request metadata. Do not
+overlap unfinished point-to-point transposes on that context. The
+`distributed` API is not enabled by default.
 
 Plan construction and transform calls are collective. In-place array/workspace
 allocation and views are noncollective; callers must coordinate an allocation
@@ -153,3 +164,4 @@ all topologies and arrays before MPI finalizes.
 - [Local R2C/C2R implementation plan](docs/superpowers/plans/2026-09-17-local-r2c-implementation.md)
 - [Distributed C2C implementation plan](docs/superpowers/plans/2026-09-17-distributed-c2c-implementation.md)
 - [Distributed C2C in-place implementation plan](docs/superpowers/plans/2026-09-18-distributed-c2c-in-place-implementation.md)
+- [Distributed C2C point-to-point implementation plan](docs/superpowers/plans/2026-09-18-distributed-c2c-point-to-point-implementation.md)
