@@ -1,7 +1,7 @@
 using FFTW
 using Printf
 
-const REFERENCE_VERSION = 2
+const REFERENCE_VERSION = 3
 
 struct ReferenceCase
     name::String
@@ -140,12 +140,14 @@ function r2c_values(::Type{T}, item::ReferenceCase) where {T}
     inverse_work = copy(inverse_input_recorded)
     @assert inverse_work == inverse_input_recorded
     inverse = inverse_plan * inverse_work
+    backward = FFTW.brfft(copy(inverse_input_recorded), item.spatial[end], dims)
     forward = forward_plan * input
     @assert size(inverse) == expected_input_shape
+    @assert size(backward) == expected_input_shape
     @assert size(forward) == expected_output_shape
     @assert inverse_input == inverse_input_recorded
     @assert input == input_before
-    return input, inverse_input_recorded, forward, inverse
+    return input, inverse_input_recorded, forward, inverse, backward
 end
 
 function print_header(io, item::ReferenceCase, ::Type{T}, provider, native_version) where {T}
@@ -192,11 +194,12 @@ function write_case(output_directory::String, item::ReferenceCase, ::Type{T}, pr
             print_complex_section(io, "inverse_expected", inverse)
             print_complex_section(io, "backward_expected", backward)
         else
-            input, inverse_input, forward, inverse = r2c_values(T, item)
+            input, inverse_input, forward, inverse, backward = r2c_values(T, item)
             print_real_section(io, "input", input)
             print_complex_section(io, "inverse_input", inverse_input)
             print_complex_section(io, "forward_expected", forward)
             print_real_section(io, "inverse_expected", inverse)
+            print_real_section(io, "backward_expected", backward)
         end
     end
 end

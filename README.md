@@ -11,8 +11,9 @@ flat slices, uses RustFFT/RealFFT, and is independent of MPI and
 `backward` transforms plus normalized `inverse`. An opt-in
 `pencil-fft/distributed` feature adds out-of-place, input-preserving and
 single-buffer in-place distributed C2C FFTs, including raw positive-sign
-`backward`, and out-of-place distributed R2C/C2R over checked Alltoallv or
-point-to-point transitions. Local out-of-place R2C/C2R are also available.
+`backward`, and out-of-place distributed R2C/C2R forward, normalized inverse,
+and raw backward over checked Alltoallv or point-to-point transitions. Local
+out-of-place R2C/C2R are also available.
 
 `Pencil` describes spatial distribution. `PencilArray` owns one layout and
 one local buffer. `ManyPencilArray` owns a buffer large enough for several
@@ -64,8 +65,9 @@ final output uses `[1..=M]` and reversed spatial memory order. Other axes,
 process-grid choices, and extra dimensions are retained. `allocate_workspace`
 is noncollective; coordinate any local allocation failure before the next
 collective. It owns one reduced-complex intermediate, checked transpose
-storage, native scratch, and one real/complex line buffer. Only `forward` and
-`inverse` are exposed—there is no real in-place API. The constructors and
+storage, native scratch, and one real/complex line buffer. `forward`,
+normalized `inverse`, and unnormalized positive-sign `backward` are exposed—
+there is no real in-place API. The constructors and
 operations require the same communicator context, API/order, scalar type,
 method, and layouts on every rank. Legacy constructors use Alltoallv;
 point-to-point uses the fixed `0x5054` tag and must not overlap unfinished
@@ -83,7 +85,12 @@ even lengths also constrain Nyquist, and interior bins have no blanket finite
 policy. Nonfinite or materially non-real constrained planes return
 `R2cError::InvalidSpectrum` before any real destination write; the workspace
 may already have changed on that post-start error path, while source and
-destination remain unchanged.
+destination remain unchanged. `backward` uses the same relative endpoint
+criterion, but its componentwise absolute threshold is the inverse threshold
+times the product of the original transverse extents, excluding the real axis
+and extra dimensions. That finite-positive factor is collectively validated at
+plan construction. A forward/backward pair scales by the product of all
+original spatial extents.
 
 ## Distributed C2C FFT
 
@@ -178,7 +185,7 @@ cargo doc --workspace --no-deps --locked
 cargo doc -p pencil-fft --features distributed --no-deps --locked
 cargo test --workspace --doc --locked -- --show-output
 cargo test -p pencil-fft --features distributed --doc --locked -- --show-output
-# The existing suite binary covers distributed C2C forward/inverse/backward and R2C/C2R over Alltoallv/P2P; only C2C has in-place APIs.
+# The existing suite binary covers distributed C2C forward/inverse/backward and R2C/C2R forward/inverse/backward over Alltoallv/P2P; only C2C has in-place APIs.
 for n in 1 4 6; do
   timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
     cargo test -p pencil-fft --features distributed --test distributed_c2c \
@@ -191,8 +198,9 @@ restrictions. `LocalR2cPlan` preserves its source by copying one line at a time
 into caller-owned initialized storage, uses caller-owned complex scratch, and
 provides no real in-place API. It exposes the original real length `n`, the
 reduced complex length `n/2+1`, and the shared native scratch requirement;
-forward is unscaled and inverse divides each line by `n`. Its inverse accepts
-only strict-zero DC and, for even lengths, Nyquist imaginary components; for
+forward and backward are unscaled and inverse divides each line by `n`. Its
+inverse and backward accept only strict-zero DC and, for even lengths, Nyquist
+imaginary components; for
 odd lengths greater than one, the final-bin imaginary component is
 unconstrained, while `n = 1` DC remains constrained. Ordinary validation
 errors preserve data and workspace, while backend/resource panics are not

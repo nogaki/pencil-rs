@@ -7,14 +7,15 @@
 //! complex lines. [`LocalR2cPlan`] does the same for real-to-half-complex and
 //! half-complex-to-real transforms. Plans own immutable backend plans, while
 //! callers own initialized line buffers, scratch storage, and data buffers.
-//! Local C2C forward and backward transforms are unnormalized; backward uses
-//! the positive-sign convention. Local C2C inverse and R2C/C2R inverse divide
-//! by the line length: the complex length for C2C, or the original real length
-//! for R2C/C2R.
+//! Local C2C and local R2C/C2R forward and backward transforms are
+//! unnormalized; backward uses the positive-sign convention. Local C2C
+//! inverse and R2C/C2R inverse divide by the line length: the complex length
+//! for C2C, or the original real length for R2C/C2R.
 //!
 //! With the opt-in `distributed` feature, `C2cPlan` and its workspaces provide
 //! input-preserving distributed C2C transforms, while `R2cPlan` provides
-//! input-preserving out-of-place R2C/C2R with a reduced final complex axis.
+//! input-preserving out-of-place R2C/C2R forward, normalized inverse, and raw
+//! backward with a reduced final complex axis.
 //! C2C also retains its state-checked single-buffer API; distributed R2C has
 //! no real in-place API. Both support `N >= 2`, `1 <= M < N`, and checked
 //! Alltoallv or receive-before-send point-to-point transitions; legacy

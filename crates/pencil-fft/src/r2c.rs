@@ -207,6 +207,34 @@ impl<R: FftReal> LocalR2cPlan<R> {
         complex_line: &mut [Complex<R>],
         scratch: &mut [Complex<R>],
     ) -> Result<(), LocalR2cError> {
+        self.execute_inverse(src, dst, complex_line, scratch, true)
+    }
+
+    /// Computes an unnormalized positive-sign backward half-complex-to-real
+    /// FFT for every line in `src`.
+    ///
+    /// This is the raw local C2R transform: it does not divide each result by
+    /// [`Self::real_len`]. Validation, endpoint checks, source preservation,
+    /// line and scratch buffer requirements, and oversized-tail behavior are
+    /// the same as for [`Self::inverse`].
+    pub fn backward(
+        &self,
+        src: &[Complex<R>],
+        dst: &mut [R],
+        complex_line: &mut [Complex<R>],
+        scratch: &mut [Complex<R>],
+    ) -> Result<(), LocalR2cError> {
+        self.execute_inverse(src, dst, complex_line, scratch, false)
+    }
+
+    fn execute_inverse(
+        &self,
+        src: &[Complex<R>],
+        dst: &mut [R],
+        complex_line: &mut [Complex<R>],
+        scratch: &mut [Complex<R>],
+        normalize: bool,
+    ) -> Result<(), LocalR2cError> {
         self.validate_inverse(src.len(), dst.len(), complex_line.len(), scratch.len())?;
         // RealFFT reports endpoint errors after writing; preflight the entire batch.
         self.validate_endpoints(src)?;
@@ -215,8 +243,14 @@ impl<R: FftReal> LocalR2cPlan<R> {
         }
 
         let native_scratch_len = self.inverse.get_scratch_len();
-        let scale = R::one()
-            / R::from_usize(self.real_len).expect("f32/f64 represent the validated length");
+        let scale = if normalize {
+            Some(
+                R::one()
+                    / R::from_usize(self.real_len).expect("f32/f64 represent the validated length"),
+            )
+        } else {
+            None
+        };
         for (source_line, destination_line) in src
             .chunks_exact(self.complex_len)
             .zip(dst.chunks_exact_mut(self.real_len))
@@ -229,8 +263,10 @@ impl<R: FftReal> LocalR2cPlan<R> {
                     &mut scratch[..native_scratch_len],
                 )
                 .expect("validated RealFFT inverse buffers must be accepted");
-            for value in destination_line {
-                *value = *value * scale;
+            if let Some(scale) = scale {
+                for value in destination_line {
+                    *value = *value * scale;
+                }
             }
         }
         Ok(())
@@ -425,7 +461,7 @@ mod tests {
             .collect()
     }
 
-    fn dft_inverse<R: TestReal>(input: &[Complex<R>], real_len: usize) -> Vec<R> {
+    fn dft_inverse<R: TestReal>(input: &[Complex<R>], real_len: usize, normalize: bool) -> Vec<R> {
         input
             .chunks_exact(real_len / 2 + 1)
             .flat_map(|line| {
@@ -439,7 +475,10 @@ mod tests {
                             value += spectrum.re.as_f64() * cosine - spectrum.im.as_f64() * sine;
                         }
                     }
-                    R::convert(value / real_len as f64)
+                    if normalize {
+                        value /= real_len as f64;
+                    }
+                    R::convert(value)
                 })
             })
             .collect()
@@ -550,6 +589,30 @@ mod tests {
             &scratch_before[plan.scratch_len()..]
         );
 
+        let mut raw_recovered = vec![R::convert(29.0); source.len()];
+        dirty_complex(&mut complex_line, 41.0);
+        dirty_complex(&mut scratch, 43.0);
+        let complex_line_tail_before = complex_line[plan.complex_len()..].to_vec();
+        let scratch_tail_before = scratch[plan.scratch_len()..].to_vec();
+        plan.backward(
+            &spectrum,
+            &mut raw_recovered,
+            &mut complex_line,
+            &mut scratch,
+        )
+        .unwrap();
+        let raw_expected = source_before
+            .iter()
+            .map(|value| R::convert(value.as_f64() * real_len as f64))
+            .collect::<Vec<_>>();
+        assert_eq!(spectrum, spectrum_before_inverse);
+        assert_real_close(&raw_recovered, &raw_expected);
+        assert_eq!(
+            &complex_line[plan.complex_len()..],
+            &complex_line_tail_before
+        );
+        assert_eq!(&scratch[plan.scratch_len()..], &scratch_tail_before);
+
         let mut arbitrary = (0..plan.complex_len() * batch_count)
             .map(|index| {
                 Complex::new(
@@ -576,7 +639,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(arbitrary, arbitrary_before);
-        assert_real_close(&arbitrary_output, &dft_inverse(&arbitrary, real_len));
+        assert_real_close(&arbitrary_output, &dft_inverse(&arbitrary, real_len, true));
+
+        let mut arbitrary_raw_output = vec![R::convert(0.0); real_len * batch_count];
+        plan.backward(
+            &arbitrary,
+            &mut arbitrary_raw_output,
+            &mut complex_line,
+            &mut scratch,
+        )
+        .unwrap();
+        let arbitrary_raw_expected = dft_inverse(&arbitrary, real_len, false);
+        assert_eq!(arbitrary, arbitrary_before);
+        assert_real_close(&arbitrary_raw_output, &arbitrary_raw_expected);
     }
 
     #[test]
@@ -628,6 +703,15 @@ mod tests {
         plan.inverse(&spectrum, &mut output, &mut complex_line, &mut scratch)
             .unwrap();
         assert_real_close(&output, &dc);
+
+        let mut raw_output = vec![R::convert(0.0); real_len];
+        plan.backward(&spectrum, &mut raw_output, &mut complex_line, &mut scratch)
+            .unwrap();
+        let raw_expected = dc
+            .iter()
+            .map(|value| R::convert(value.as_f64() * real_len as f64))
+            .collect::<Vec<_>>();
+        assert_real_close(&raw_output, &raw_expected);
     }
 
     #[test]
@@ -645,8 +729,10 @@ mod tests {
         let invalid_endpoints = [
             (0, 0, R::convert(1.0)),
             (2, 0, R::convert(f64::NAN)),
+            (1, 0, R::convert(3.0)),
             (0, plan.complex_len() - 1, R::convert(-2.0)),
             (2, plan.complex_len() - 1, R::convert(f64::NAN)),
+            (1, plan.complex_len() - 1, R::convert(4.0)),
         ];
         for &(batch, index, imaginary) in &invalid_endpoints {
             let mut source =
@@ -662,6 +748,18 @@ mod tests {
 
             assert_eq!(
                 plan.inverse(&source, &mut destination, &mut line, &mut scratch),
+                Err(LocalR2cError::InvalidSpectrumEndpoint { batch, index })
+            );
+            assert!(source.iter().zip(&source_before).all(|(actual, expected)| {
+                actual.re.as_f64().to_bits() == expected.re.as_f64().to_bits()
+                    && actual.im.as_f64().to_bits() == expected.im.as_f64().to_bits()
+            }));
+            assert_eq!(destination, destination_before);
+            assert_eq!(line, line_before);
+            assert_eq!(scratch, scratch_before);
+
+            assert_eq!(
+                plan.backward(&source, &mut destination, &mut line, &mut scratch),
                 Err(LocalR2cError::InvalidSpectrumEndpoint { batch, index })
             );
             assert!(source.iter().zip(&source_before).all(|(actual, expected)| {
@@ -699,6 +797,14 @@ mod tests {
             actual.re.as_f64().to_bits() == expected.re.as_f64().to_bits()
                 && actual.im.as_f64().to_bits() == expected.im.as_f64().to_bits()
         }));
+        assert_eq!(
+            plan.backward(&source, &mut destination, &mut line, &mut scratch),
+            Ok(())
+        );
+        assert!(source.iter().zip(&source_before).all(|(actual, expected)| {
+            actual.re.as_f64().to_bits() == expected.re.as_f64().to_bits()
+                && actual.im.as_f64().to_bits() == expected.im.as_f64().to_bits()
+        }));
 
         let plan = LocalR2cPlan::<R>::new(1).unwrap();
         let source = [Complex::new(R::convert(0.0), R::convert(1.0))];
@@ -711,6 +817,21 @@ mod tests {
         let scratch_before = scratch.clone();
         assert_eq!(
             plan.inverse(&source, &mut destination, &mut line, &mut scratch),
+            Err(LocalR2cError::InvalidSpectrumEndpoint { batch: 0, index: 0 })
+        );
+        assert_eq!(
+            source[0].re.as_f64().to_bits(),
+            source_before[0].re.as_f64().to_bits()
+        );
+        assert_eq!(
+            source[0].im.as_f64().to_bits(),
+            source_before[0].im.as_f64().to_bits()
+        );
+        assert_eq!(destination, destination_before);
+        assert_eq!(line, line_before);
+        assert_eq!(scratch, scratch_before);
+        assert_eq!(
+            plan.backward(&source, &mut destination, &mut line, &mut scratch),
             Err(LocalR2cError::InvalidSpectrumEndpoint { batch: 0, index: 0 })
         );
         assert_eq!(
@@ -757,6 +878,12 @@ mod tests {
         assert_eq!(scratch, scratch_before);
         assert_eq!(
             plan.inverse(&spectrum, &mut Vec::new(), &mut complex_line, &mut scratch),
+            Ok(())
+        );
+        assert_eq!(complex_line, complex_line_before);
+        assert_eq!(scratch, scratch_before);
+        assert_eq!(
+            plan.backward(&spectrum, &mut Vec::new(), &mut complex_line, &mut scratch),
             Ok(())
         );
         assert_eq!(complex_line, complex_line_before);
@@ -833,6 +960,14 @@ mod tests {
             assert_eq!(destination, destination_before);
             assert_eq!(line, line_before);
             assert_eq!(scratch, scratch_before);
+            assert_eq!(
+                plan.backward(&source, &mut destination, &mut line, &mut scratch),
+                Err(LocalR2cError::NonIntegralBatch)
+            );
+            assert_eq!(source, source_before);
+            assert_eq!(destination, destination_before);
+            assert_eq!(line, line_before);
+            assert_eq!(scratch, scratch_before);
         }
 
         let mut source = initialized_complex::<f64>(plan.complex_len(), 10.0);
@@ -847,6 +982,17 @@ mod tests {
         let scratch_before = scratch.clone();
         assert_eq!(
             plan.inverse(&source, &mut destination, &mut line, &mut scratch),
+            Err(LocalR2cError::BatchCountMismatch {
+                source_count: 1,
+                destination_count: 0,
+            })
+        );
+        assert_eq!(source, source_before);
+        assert_eq!(destination, destination_before);
+        assert_eq!(line, line_before);
+        assert_eq!(scratch, scratch_before);
+        assert_eq!(
+            plan.backward(&source, &mut destination, &mut line, &mut scratch),
             Err(LocalR2cError::BatchCountMismatch {
                 source_count: 1,
                 destination_count: 0,
@@ -930,6 +1076,22 @@ mod tests {
             assert_eq!(output, output_before);
             assert_eq!(complex_line, complex_line_before);
             assert_eq!(scratch, scratch_before);
+            assert_eq!(
+                plan.backward(
+                    &inverse_source,
+                    &mut output,
+                    &mut complex_line,
+                    &mut scratch,
+                ),
+                Err(LocalR2cError::ComplexLineTooSmall {
+                    required: plan.complex_len(),
+                    actual: plan.complex_len() - 1,
+                })
+            );
+            assert_eq!(inverse_source, inverse_source_before);
+            assert_eq!(output, output_before);
+            assert_eq!(complex_line, complex_line_before);
+            assert_eq!(scratch, scratch_before);
 
             let mut output = vec![0.0; plan.real_len() * batch_count];
             let output_before = output.clone();
@@ -939,6 +1101,22 @@ mod tests {
             let short_scratch_before = short_scratch.clone();
             assert_eq!(
                 plan.inverse(
+                    &inverse_source,
+                    &mut output,
+                    &mut full_complex_line,
+                    &mut short_scratch,
+                ),
+                Err(LocalR2cError::ScratchTooSmall {
+                    required: plan.scratch_len(),
+                    actual: plan.scratch_len() - 1,
+                })
+            );
+            assert_eq!(inverse_source, inverse_source_before);
+            assert_eq!(output, output_before);
+            assert_eq!(full_complex_line, full_complex_line_before);
+            assert_eq!(short_scratch, short_scratch_before);
+            assert_eq!(
+                plan.backward(
                     &inverse_source,
                     &mut output,
                     &mut full_complex_line,

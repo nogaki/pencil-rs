@@ -57,6 +57,7 @@ const OPERATION_R2C_FORWARD: u64 = 13;
 const OPERATION_R2C_INVERSE: u64 = 14;
 const OPERATION_BACKWARD: u64 = 15;
 const OPERATION_BACKWARD_IN_PLACE: u64 = 16;
+const OPERATION_R2C_BACKWARD: u64 = 17;
 const INVALID_WORD: u64 = u64::MAX;
 const METHOD_ALL_TO_ALLV: u64 = 0;
 const METHOD_POINT_TO_POINT: u64 = 1;
@@ -1789,9 +1790,9 @@ mod tests {
         C2cInPlaceArray, C2cInPlaceWorkspace, C2cPlan, C2cState, C2cTransition, Complex, Direction,
         ExtraShape, FftError, LocalC2cError, LocalC2cPlan, OPERATION_BACKWARD,
         OPERATION_BACKWARD_IN_PLACE, OPERATION_FORWARD, OPERATION_FORWARD_IN_PLACE,
-        OPERATION_INVERSE, OPERATION_INVERSE_IN_PLACE, OPERATION_PLAN, OPERATION_R2C_FORWARD,
-        OPERATION_R2C_INVERSE, OPERATION_R2C_PLAN, TransposeMethod, descriptor_len,
-        run_in_place_transaction,
+        OPERATION_INVERSE, OPERATION_INVERSE_IN_PLACE, OPERATION_PLAN, OPERATION_R2C_BACKWARD,
+        OPERATION_R2C_FORWARD, OPERATION_R2C_INVERSE, OPERATION_R2C_PLAN, TransposeMethod,
+        descriptor_len, run_in_place_transaction,
     };
     use mpi::topology::Communicator;
     use pencil_array::{MpiTopology, TransposeWorkspace};
@@ -1838,8 +1839,9 @@ mod tests {
                 OPERATION_R2C_INVERSE,
                 OPERATION_BACKWARD,
                 OPERATION_BACKWARD_IN_PLACE,
+                OPERATION_R2C_BACKWARD,
             ),
-            (12, 13, 14, 15, 16)
+            (12, 13, 14, 15, 16, 17)
         );
     }
 

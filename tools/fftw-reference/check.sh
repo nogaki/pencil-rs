@@ -131,14 +131,15 @@ for corrupt_directory in "$CORRUPT_FORWARD" "$CORRUPT_BACKWARD"; do
 done
 corrupt_backward_file=
 for candidate in "$CORRUPT_BACKWARD"/*.txt; do
-    if grep -Fq 'section backward_expected ' "$candidate"; then
+    if grep -Fxq 'kind r2c' "$candidate" \
+        && grep -Fq 'section backward_expected real ' "$candidate"; then
         corrupt_backward_file=$candidate
         break
     fi
 done
 corrupt_forward_file="$CORRUPT_FORWARD/$(basename "$corrupt_backward_file")"
 [[ -n "$corrupt_backward_file" && -f "$corrupt_forward_file" ]] || {
-    printf 'no C2C fixture with backward_expected was generated\n' >&2
+    printf 'no R2C fixture with real backward_expected was generated\n' >&2
     exit 1
 }
 "$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" -e '
@@ -199,5 +200,5 @@ if run_reference 1 "$CORRUPT_BACKWARD" "$BACKWARD_CORRUPT_LOG"; then
     printf 'checker accepted a deliberately corrupted backward_expected value\n' >&2
     exit 1
 fi
-check_corruption_log "$BACKWARD_CORRUPT_LOG" 'OOP backward'
+check_corruption_log "$BACKWARD_CORRUPT_LOG" 'R2C backward'
 printf 'corrupted backward_expected rejected as intended\n'
