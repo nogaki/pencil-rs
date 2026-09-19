@@ -116,6 +116,17 @@ workspace; once execution begins, the array is poisoned before its first write,
 and any later failure or panic leaves it `Poisoned`, so callers reallocate it.
 A mutable output view may contain arbitrary spectral data for inverse execution.
 
+## Local Julia/FFTW reference validation
+
+The opt-in Milestone 9 checker generates temporary Julia 1.12.6/FFTW.jl
+1.10.0 references and validates the existing distributed C2C and R2C/C2R APIs
+at 1, 4, and 6 MPI ranks with both transpose methods and both precisions. It
+covers 16 fixtures and 26 valid case/layout combinations per method and rank.
+The external comparison is explicitly opt-in; normal Rust tests need no Julia.
+See [`tools/fftw-reference/README.md`](tools/fftw-reference/README.md) and run
+`tools/fftw-reference/check.sh` only when Julia, FFTW.jl, and MPI are locally
+available.
+
 ## Prerequisites
 
 - Rust stable, with a minimum supported Rust version of 1.85
@@ -197,3 +208,4 @@ all topologies and arrays before MPI finalizes.
 - [Distributed C2C in-place implementation plan](docs/superpowers/plans/2026-09-18-distributed-c2c-in-place-implementation.md)
 - [Distributed C2C point-to-point implementation plan](docs/superpowers/plans/2026-09-18-distributed-c2c-point-to-point-implementation.md)
 - [Distributed R2C/C2R implementation plan](docs/superpowers/plans/2026-09-18-distributed-r2c-implementation.md)
+- [Julia/FFTW cross-validation plan](docs/superpowers/plans/2026-09-19-fftw-cross-validation.md)

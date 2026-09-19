@@ -1,0 +1,934 @@
+use std::{
+    env, fs,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use mpi::{
+    collective::{CommunicatorCollectives, SystemOperation},
+    datatype::Equivalence,
+    traits::*,
+};
+use pencil_array::{ExtraShape, MpiTopology, Pencil, SpatialAxis};
+use pencil_fft::{C2cPlan, Complex, FftReal, R2cPlan, TransposeMethod};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    C2c,
+    R2c,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Precision {
+    F32,
+    F64,
+}
+
+struct Fixture {
+    case: String,
+    kind: Kind,
+    precision: Precision,
+    shape: Vec<usize>,
+    extra: Vec<usize>,
+    input: Vec<Complex<f64>>,
+    inverse_input: Vec<Complex<f64>>,
+    forward: Vec<Complex<f64>>,
+    inverse: Vec<Complex<f64>>,
+}
+
+fn next<'a>(lines: &[&'a str], cursor: &mut usize, field: &str) -> Result<&'a str, String> {
+    let line = lines
+        .get(*cursor)
+        .copied()
+        .ok_or_else(|| format!("missing {field}"))?;
+    *cursor += 1;
+    Ok(line)
+}
+
+fn field<'a>(line: &'a str, name: &str) -> Result<&'a str, String> {
+    let words: Vec<_> = line.split_whitespace().collect();
+    (words.len() == 2 && words[0] == name)
+        .then(|| words[1])
+        .ok_or_else(|| format!("expected {name} VALUE, got {line:?}"))
+}
+
+fn usize_list(words: &[&str], name: &str) -> Result<Vec<usize>, String> {
+    words
+        .iter()
+        .map(|word| {
+            word.parse()
+                .map_err(|error| format!("{name}: invalid usize {word:?}: {error}"))
+        })
+        .collect()
+}
+
+fn product(values: &[usize], name: &str) -> Result<usize, String> {
+    values.iter().try_fold(1usize, |total, &value| {
+        total
+            .checked_mul(value)
+            .ok_or_else(|| format!("{name}: product overflow"))
+    })
+}
+
+fn shape(line: &str, name: &str) -> Result<Vec<usize>, String> {
+    let words: Vec<_> = line.split_whitespace().collect();
+    if words.first().copied() != Some(name) {
+        return Err(format!("expected {name} ..., got {line:?}"));
+    }
+    let shape = usize_list(&words[1..], name)?;
+    if shape.contains(&0) {
+        return Err(format!("{name}: zero extent is not allowed"));
+    }
+    Ok(shape)
+}
+
+fn finite(word: &str, name: &str) -> Result<f64, String> {
+    let value = word
+        .parse::<f64>()
+        .map_err(|error| format!("{name}: invalid number {word:?}: {error}"))?;
+    value
+        .is_finite()
+        .then_some(value)
+        .ok_or_else(|| format!("{name}: non-finite number {word:?}"))
+}
+
+fn runtime_value<'a>(word: &'a str, name: &str) -> Result<&'a str, String> {
+    word.strip_prefix(&format!("{name}="))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("runtime: expected {name}=VALUE"))
+}
+
+fn section(
+    lines: &[&str],
+    cursor: &mut usize,
+    name: &str,
+    kind: &str,
+    expected: usize,
+) -> Result<Vec<Complex<f64>>, String> {
+    let header = next(lines, cursor, name)?;
+    let words: Vec<_> = header.split_whitespace().collect();
+    if words.len() != 4 || words[0] != "section" || words[1] != name || words[2] != kind {
+        return Err(format!(
+            "expected section {name} {kind} COUNT, got {header:?}"
+        ));
+    }
+    let count: usize = words[3]
+        .parse()
+        .map_err(|error| format!("section count: invalid usize: {error}"))?;
+    if count != expected {
+        return Err(format!(
+            "section {name}: count {count} does not match expected {expected}"
+        ));
+    }
+    if count >= lines.len().saturating_sub(*cursor) {
+        return Err(format!("section {name}: not enough value/end lines"));
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| format!("section {name}: count allocation failed"))?;
+    for index in 0..count {
+        let line = next(lines, cursor, &format!("{name} value"))?;
+        let words: Vec<_> = line.split_whitespace().collect();
+        let value = match (kind, words.as_slice()) {
+            ("real", [real]) => Complex::new(finite(real, name)?, 0.0),
+            ("complex", [real, imaginary]) => {
+                Complex::new(finite(real, name)?, finite(imaginary, name)?)
+            }
+            ("real", _) => {
+                return Err(format!(
+                    "section {name}: real value {index} must have one number"
+                ));
+            }
+            ("complex", _) => {
+                return Err(format!(
+                    "section {name}: complex value {index} must have two numbers"
+                ));
+            }
+            _ => return Err(format!("invalid section kind {kind:?}")),
+        };
+        values.push(value);
+    }
+    if next(lines, cursor, &format!("{name} end"))? != "end" {
+        return Err(format!("section {name}: expected end"));
+    }
+    Ok(values)
+}
+
+fn reduced(kind: Kind, shape: &[usize]) -> Vec<usize> {
+    let mut result = shape.to_vec();
+    if kind == Kind::R2c {
+        let last = result.len() - 1;
+        result[last] = result[last] / 2 + 1;
+    }
+    result
+}
+
+fn parse_fixture(text: &str) -> Result<Fixture, String> {
+    let mut lines: Vec<_> = text.lines().map(str::trim).collect();
+    while lines.last().copied() == Some("") {
+        lines.pop();
+    }
+    let mut cursor = 0;
+    if next(&lines, &mut cursor, "version")? != "PENCIL_FFTW_REFERENCE 1" {
+        return Err("invalid reference version header".into());
+    }
+
+    let runtime: Vec<_> = next(&lines, &mut cursor, "runtime")?
+        .split_whitespace()
+        .collect();
+    if runtime.len() != 5 || runtime[0] != "runtime" {
+        return Err("malformed runtime line".into());
+    }
+    let julia = runtime_value(runtime[1], "julia")?;
+    let fftw_jl = runtime_value(runtime[2], "fftw_jl")?;
+    let native = runtime_value(runtime[3], "native")?;
+    let provider = runtime_value(runtime[4], "provider")?;
+    if julia != "1.12.6" || fftw_jl != "1.10.0" || native.is_empty() || provider != "fftw" {
+        return Err("reference runtime metadata is not the pinned FFTW setup".into());
+    }
+
+    let case = field(next(&lines, &mut cursor, "case")?, "case")?.to_owned();
+    let kind = match field(next(&lines, &mut cursor, "kind")?, "kind")? {
+        "c2c" => Kind::C2c,
+        "r2c" => Kind::R2c,
+        other => return Err(format!("invalid kind {other:?}")),
+    };
+    let precision = match field(next(&lines, &mut cursor, "precision")?, "precision")? {
+        "f32" => Precision::F32,
+        "f64" => Precision::F64,
+        other => return Err(format!("invalid precision {other:?}")),
+    };
+    let original_shape = shape(
+        next(&lines, &mut cursor, "original_shape")?,
+        "original_shape",
+    )?;
+    if !(2..=4).contains(&original_shape.len()) {
+        return Err("original_shape: expected 2 to 4 dimensions".into());
+    }
+    let extra = shape(next(&lines, &mut cursor, "extra_shape")?, "extra_shape")?;
+    let mut input_shape = extra.clone();
+    input_shape.extend(&original_shape);
+    let mut output_shape = extra.clone();
+    output_shape.extend(reduced(kind, &original_shape));
+    let input_count = product(&input_shape, "input shape")?;
+    let output_count = product(&output_shape, "output shape")?;
+    let input_kind = if kind == Kind::C2c { "complex" } else { "real" };
+    let input = section(&lines, &mut cursor, "input", input_kind, input_count)?;
+    let inverse_input = section(
+        &lines,
+        &mut cursor,
+        "inverse_input",
+        "complex",
+        output_count,
+    )?;
+    let forward = section(
+        &lines,
+        &mut cursor,
+        "forward_expected",
+        "complex",
+        output_count,
+    )?;
+    let inverse = section(
+        &lines,
+        &mut cursor,
+        "inverse_expected",
+        input_kind,
+        input_count,
+    )?;
+    if cursor != lines.len() {
+        return Err(format!(
+            "trailing fixture tokens starting at {:?}",
+            lines[cursor]
+        ));
+    }
+    Ok(Fixture {
+        case,
+        kind,
+        precision,
+        shape: original_shape,
+        extra,
+        input,
+        inverse_input,
+        forward,
+        inverse,
+    })
+}
+
+fn joined(shape: &[usize]) -> String {
+    shape
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join("x")
+}
+
+fn expected_case(kind: Kind, precision: Precision, shape: &[usize], extra: &[usize]) -> String {
+    let mut name = format!(
+        "{}_{}d_{}",
+        if kind == Kind::C2c { "c2c" } else { "r2c" },
+        shape.len(),
+        joined(shape)
+    );
+    if kind == Kind::R2c && !extra.is_empty() {
+        name.push_str("_extra");
+        name.push_str(&joined(extra));
+    }
+    name.push('_');
+    name.push_str(if precision == Precision::F32 {
+        "f32"
+    } else {
+        "f64"
+    });
+    name
+}
+
+fn base_cases() -> Vec<(Kind, Vec<usize>, Vec<usize>)> {
+    vec![
+        (Kind::C2c, vec![3, 4], vec![]),
+        (Kind::C2c, vec![3, 2, 5], vec![2, 3]),
+        (Kind::C2c, vec![2, 1, 3, 4], vec![2]),
+        (Kind::R2c, vec![3, 1], vec![]),
+        (Kind::R2c, vec![3, 2], vec![]),
+        (Kind::R2c, vec![3, 1, 4], vec![2, 3]),
+        (Kind::R2c, vec![3, 1, 5], vec![2, 3]),
+        (Kind::R2c, vec![2, 1, 3, 3], vec![2]),
+    ]
+}
+
+fn fixtures(directory: &Path) -> Vec<Fixture> {
+    assert!(
+        directory.is_dir(),
+        "fixture directory does not exist: {directory:?}"
+    );
+    let mut paths: Vec<PathBuf> = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<_, _>>()
+        .unwrap();
+    paths.sort();
+    assert_eq!(paths.len(), 16, "fixture matrix must contain 16 files");
+    assert!(
+        paths.iter().all(|path| path.is_file()
+            && path.extension().and_then(|value| value.to_str()) == Some("txt")),
+        "fixture matrix has a non-txt or non-file entry"
+    );
+    let result = paths
+        .into_iter()
+        .map(|path| {
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("cannot read {path:?}: {error}"));
+            let fixture = parse_fixture(&text)
+                .unwrap_or_else(|error| panic!("invalid fixture {path:?}: {error}"));
+            assert_eq!(
+                fixture.case,
+                expected_case(
+                    fixture.kind,
+                    fixture.precision,
+                    &fixture.shape,
+                    &fixture.extra
+                )
+            );
+            fixture
+        })
+        .collect::<Vec<_>>();
+    for (kind, shape, extra) in base_cases() {
+        for precision in [Precision::F32, Precision::F64] {
+            assert_eq!(
+                result
+                    .iter()
+                    .filter(|fixture| fixture.kind == kind
+                        && fixture.precision == precision
+                        && fixture.shape == shape
+                        && fixture.extra == extra)
+                    .count(),
+                1,
+                "missing or duplicate fixture"
+            );
+        }
+    }
+    result
+}
+
+fn tolerance(precision: Precision) -> (f64, f64) {
+    if precision == Precision::F32 {
+        (2e-4, 2e-5)
+    } else {
+        (2e-10, 2e-12)
+    }
+}
+
+fn unravel(mut linear: usize, shape: &[usize]) -> Vec<usize> {
+    let mut result = vec![0; shape.len()];
+    for axis in (0..shape.len()).rev() {
+        result[axis] = linear % shape[axis];
+        linear /= shape[axis];
+    }
+    result
+}
+
+fn row_offset(shape: &[usize], indices: &[usize]) -> Result<usize, String> {
+    if shape.len() != indices.len() {
+        return Err("row-major rank mismatch".into());
+    }
+    shape
+        .iter()
+        .zip(indices)
+        .try_fold(0usize, |offset, (&extent, &index)| {
+            if index >= extent {
+                return Err(format!(
+                    "row-major index {index} is outside extent {extent}"
+                ));
+            }
+            offset
+                .checked_mul(extent)
+                .and_then(|value| value.checked_add(index))
+                .ok_or_else(|| "row-major offset overflow".into())
+        })
+}
+
+fn offsets<const N: usize>(
+    extra: &[usize],
+    global: [usize; N],
+    ranges: &[Range<usize>; N],
+    permutation: [usize; N],
+) -> Vec<usize> {
+    let local_shape: [usize; N] = std::array::from_fn(|axis| ranges[permutation[axis]].len());
+    let total = product(extra, "extra shape")
+        .unwrap()
+        .checked_mul(product(&local_shape, "local shape").unwrap())
+        .unwrap();
+    let mut physical_shape = extra.to_vec();
+    physical_shape.extend(local_shape);
+    let mut logical_shape = extra.to_vec();
+    logical_shape.extend(global);
+    let mut result = Vec::with_capacity(total);
+    for linear in 0..total {
+        let physical = unravel(linear, &physical_shape);
+        let mut index = physical[..extra.len()].to_vec();
+        let mut spatial = [0; N];
+        for (memory_axis, &logical_axis) in permutation.iter().enumerate() {
+            spatial[logical_axis] =
+                ranges[logical_axis].start + physical[extra.len() + memory_axis];
+        }
+        index.extend(spatial);
+        result.push(row_offset(&logical_shape, &index).unwrap());
+    }
+    result
+}
+
+#[derive(Debug)]
+struct Snapshot {
+    offsets: Vec<usize>,
+    global_count: usize,
+}
+
+fn identity<const N: usize>() -> [usize; N] {
+    std::array::from_fn(|axis| axis)
+}
+fn reverse<const N: usize>() -> [usize; N] {
+    std::array::from_fn(|axis| N - axis - 1)
+}
+fn input_decomp<const M: usize>() -> [usize; M] {
+    std::array::from_fn(|axis| axis)
+}
+fn output_decomp<const M: usize>() -> [usize; M] {
+    std::array::from_fn(|axis| axis + 1)
+}
+
+struct Layout<'a, const N: usize> {
+    input: [usize; N],
+    output: [usize; N],
+    extra: &'a [usize],
+}
+
+fn snapshot<const N: usize, const M: usize>(
+    pencil: &Pencil<N, M>,
+    extra: &ExtraShape,
+    layout: &Layout<N>,
+    output: bool,
+    length: usize,
+    label: &str,
+) -> Snapshot {
+    let (shape, permutation, decomposition) = if output {
+        (layout.output, reverse(), output_decomp())
+    } else {
+        (layout.input, identity(), input_decomp())
+    };
+    assert_eq!(*pencil.global_shape(), shape, "{label}: global shape");
+    assert_eq!(
+        pencil.permutation().axes().map(SpatialAxis::index),
+        permutation,
+        "{label}: permutation"
+    );
+    assert_eq!(
+        pencil.decomposition().map(SpatialAxis::index),
+        decomposition,
+        "{label}: decomposition"
+    );
+    assert_eq!(extra.dimensions(), layout.extra, "{label}: extra shape");
+    let offsets = offsets(layout.extra, shape, pencil.local_ranges(), permutation);
+    assert_eq!(offsets.len(), length, "{label}: raw storage length");
+    let mut full = layout.extra.to_vec();
+    full.extend(shape);
+    Snapshot {
+        offsets,
+        global_count: product(&full, "fixture global shape").unwrap(),
+    }
+}
+
+fn ownership<const N: usize, const M: usize>(
+    pencil: &Pencil<N, M>,
+    snapshot: &Snapshot,
+    label: &str,
+) {
+    let mut local = vec![0i32; snapshot.global_count];
+    for &offset in &snapshot.offsets {
+        assert!(offset < snapshot.global_count);
+        local[offset] += 1;
+    }
+    let mut global = vec![0i32; snapshot.global_count];
+    pencil.topology().communicator().all_reduce_into(
+        &local[..],
+        &mut global[..],
+        SystemOperation::sum(),
+    );
+    assert!(
+        global.iter().all(|&count| count == 1),
+        "{label}: ownership counts {global:?}"
+    );
+}
+
+trait Real: FftReal + Equivalence {
+    fn from_f64(value: f64) -> Self;
+    fn to_f64(value: Self) -> f64;
+}
+impl Real for f32 {
+    fn from_f64(value: f64) -> Self {
+        value as f32
+    }
+    fn to_f64(value: Self) -> f64 {
+        value as f64
+    }
+}
+impl Real for f64 {
+    fn from_f64(value: f64) -> Self {
+        value
+    }
+    fn to_f64(value: Self) -> f64 {
+        value
+    }
+}
+
+fn fill_complex<R: Real>(storage: &mut [Complex<R>], snapshot: &Snapshot, values: &[Complex<f64>]) {
+    assert_eq!(storage.len(), snapshot.offsets.len());
+    for (slot, &offset) in storage.iter_mut().zip(&snapshot.offsets) {
+        let value = values[offset];
+        *slot = Complex::new(
+            <R as Real>::from_f64(value.re),
+            <R as Real>::from_f64(value.im),
+        );
+    }
+}
+fn fill_real<R: Real>(storage: &mut [R], snapshot: &Snapshot, values: &[Complex<f64>]) {
+    assert_eq!(storage.len(), snapshot.offsets.len());
+    for (slot, &offset) in storage.iter_mut().zip(&snapshot.offsets) {
+        let value = values[offset];
+        assert_eq!(value.im, 0.0);
+        *slot = <R as Real>::from_f64(value.re);
+    }
+}
+
+fn compare(actual: f64, expected: f64, abs: f64, relative: f64, label: &str) -> Result<(), String> {
+    if !actual.is_finite() || !expected.is_finite() {
+        return Err(format!(
+            "{label}: non-finite comparison value actual={actual:?} expected={expected:?}"
+        ));
+    }
+    let bound = abs + relative * actual.abs().max(expected.abs());
+    if (actual - expected).abs() > bound {
+        return Err(format!(
+            "{label}: actual={actual:.17e} expected={expected:.17e} error={:.3e} bound={bound:.3e}",
+            (actual - expected).abs()
+        ));
+    }
+    Ok(())
+}
+
+fn check_complex<R: Real>(
+    storage: &[Complex<R>],
+    snapshot: &Snapshot,
+    expected: &[Complex<f64>],
+    precision: Precision,
+    label: &str,
+) {
+    assert_eq!(storage.len(), snapshot.offsets.len());
+    let (abs, relative) = tolerance(precision);
+    for (value, &offset) in storage.iter().zip(&snapshot.offsets) {
+        let expected = expected[offset];
+        compare(
+            R::to_f64(value.re),
+            expected.re,
+            abs,
+            relative,
+            &format!("{label} offset={offset} real"),
+        )
+        .unwrap();
+        compare(
+            R::to_f64(value.im),
+            expected.im,
+            abs,
+            relative,
+            &format!("{label} offset={offset} imaginary"),
+        )
+        .unwrap();
+    }
+}
+fn check_real<R: Real>(
+    storage: &[R],
+    snapshot: &Snapshot,
+    expected: &[Complex<f64>],
+    precision: Precision,
+    label: &str,
+) {
+    assert_eq!(storage.len(), snapshot.offsets.len());
+    let (abs, relative) = tolerance(precision);
+    for (value, &offset) in storage.iter().zip(&snapshot.offsets) {
+        compare(
+            R::to_f64(*value),
+            expected[offset].re,
+            abs,
+            relative,
+            &format!("{label} offset={offset}"),
+        )
+        .unwrap();
+    }
+}
+
+macro_rules! snap {
+    ($layout:expr, $array:expr, $output:expr, $label:expr) => {
+        snapshot(
+            $array.pencil(),
+            $array.extra_shape(),
+            &$layout,
+            $output,
+            $array.len(),
+            $label,
+        )
+    };
+}
+macro_rules! check_c {
+    ($array:expr, $snapshot:expr, $expected:expr, $fixture:expr, $rank:expr, $method:expr, $label:expr) => {
+        check_complex(
+            $array,
+            $snapshot,
+            $expected,
+            $fixture.precision,
+            &format!("rank {} {} {:?} {}", $rank, $fixture.case, $method, $label),
+        )
+    };
+}
+macro_rules! check_r {
+    ($array:expr, $snapshot:expr, $expected:expr, $fixture:expr, $rank:expr, $method:expr, $label:expr) => {
+        check_real(
+            $array,
+            $snapshot,
+            $expected,
+            $fixture.precision,
+            &format!("rank {} {} {:?} {}", $rank, $fixture.case, $method, $label),
+        )
+    };
+}
+
+fn extra(fixture: &Fixture) -> ExtraShape {
+    ExtraShape::new(fixture.extra.clone().into_boxed_slice()).unwrap()
+}
+
+fn c2c_case<R: Real, const N: usize, const M: usize>(
+    fixture: &Fixture,
+    topology: &Arc<MpiTopology<M>>,
+    method: TransposeMethod,
+    rank: i32,
+) where
+    Complex<R>: Equivalence,
+{
+    let shape: [usize; N] = fixture.shape.as_slice().try_into().unwrap();
+    let extra = extra(fixture);
+    let layout = Layout {
+        input: shape,
+        output: shape,
+        extra: &fixture.extra,
+    };
+    let plan = C2cPlan::from_shape_with_method(Arc::clone(topology), shape, extra.clone(), method)
+        .unwrap();
+    let mut source = plan.allocate_input().unwrap();
+    let source_snapshot = snap!(layout, source, false, "C2C source");
+    ownership(source.pencil(), &source_snapshot, "C2C source");
+    fill_complex(source.as_mut_slice(), &source_snapshot, &fixture.input);
+    let source_before = source.as_slice().to_vec();
+    let mut output = plan.allocate_output().unwrap();
+    let output_snapshot = snap!(layout, output, true, "C2C output");
+    ownership(output.pencil(), &output_snapshot, "C2C output");
+    let mut workspace = plan.allocate_out_of_place_workspace().unwrap();
+    plan.forward(&source, &mut output, &mut workspace).unwrap();
+    assert_eq!(source.as_slice(), source_before.as_slice());
+    check_c!(
+        output.as_slice(),
+        &output_snapshot,
+        &fixture.forward,
+        fixture,
+        rank,
+        method,
+        "OOP forward"
+    );
+    let mut inverse_source = plan.allocate_output().unwrap();
+    let inverse_snapshot = snap!(layout, inverse_source, true, "C2C inverse source");
+    fill_complex(
+        inverse_source.as_mut_slice(),
+        &inverse_snapshot,
+        &fixture.inverse_input,
+    );
+    let inverse_before = inverse_source.as_slice().to_vec();
+    let mut recovered = plan.allocate_input().unwrap();
+    let recovered_snapshot = snap!(layout, recovered, false, "C2C recovered");
+    plan.inverse(&inverse_source, &mut recovered, &mut workspace)
+        .unwrap();
+    assert_eq!(inverse_source.as_slice(), inverse_before.as_slice());
+    check_c!(
+        recovered.as_slice(),
+        &recovered_snapshot,
+        &fixture.inverse,
+        fixture,
+        rank,
+        method,
+        "OOP inverse"
+    );
+    let mut inplace = plan.allocate_in_place().unwrap();
+    {
+        let mut view = inplace.view_mut().unwrap();
+        let snapshot = snap!(layout, view, false, "C2C in-place input");
+        fill_complex(view.as_mut_slice(), &snapshot, &fixture.input);
+    }
+    let mut inplace_workspace = plan.allocate_in_place_workspace().unwrap();
+    plan.forward_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    {
+        let view = inplace.view().unwrap();
+        let snapshot = snap!(layout, view, true, "C2C in-place output");
+        check_c!(
+            view.as_slice(),
+            &snapshot,
+            &fixture.forward,
+            fixture,
+            rank,
+            method,
+            "in-place forward"
+        );
+    }
+    {
+        let mut view = inplace.view_mut().unwrap();
+        let snapshot = snap!(layout, view, true, "C2C in-place inverse input");
+        fill_complex(view.as_mut_slice(), &snapshot, &fixture.inverse_input);
+    }
+    plan.inverse_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    let view = inplace.view().unwrap();
+    let snapshot = snap!(layout, view, false, "C2C in-place recovered");
+    check_c!(
+        view.as_slice(),
+        &snapshot,
+        &fixture.inverse,
+        fixture,
+        rank,
+        method,
+        "in-place inverse"
+    );
+}
+
+fn c2c_methods<R: Real, const N: usize, const M: usize>(
+    fixture: &Fixture,
+    topology: &Arc<MpiTopology<M>>,
+    rank: i32,
+) where
+    Complex<R>: Equivalence,
+{
+    for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
+        c2c_case::<R, N, M>(fixture, topology, method, rank);
+    }
+}
+
+fn r2c_case<R: Real, const N: usize, const M: usize>(
+    fixture: &Fixture,
+    topology: &Arc<MpiTopology<M>>,
+    method: TransposeMethod,
+    rank: i32,
+) where
+    Complex<R>: Equivalence,
+{
+    let input_shape: [usize; N] = fixture.shape.as_slice().try_into().unwrap();
+    let output_shape: [usize; N] = reduced(Kind::R2c, &fixture.shape)
+        .as_slice()
+        .try_into()
+        .unwrap();
+    let extra = extra(fixture);
+    let layout = Layout {
+        input: input_shape,
+        output: output_shape,
+        extra: &fixture.extra,
+    };
+    let plan =
+        R2cPlan::from_shape_with_method(Arc::clone(topology), input_shape, extra.clone(), method)
+            .unwrap();
+    let mut source = plan.allocate_input().unwrap();
+    let source_snapshot = snap!(layout, source, false, "R2C source");
+    ownership(source.pencil(), &source_snapshot, "R2C source");
+    fill_real(source.as_mut_slice(), &source_snapshot, &fixture.input);
+    let source_before = source.as_slice().to_vec();
+    let mut output = plan.allocate_output().unwrap();
+    let output_snapshot = snap!(layout, output, true, "R2C output");
+    ownership(output.pencil(), &output_snapshot, "R2C output");
+    let mut workspace = plan.allocate_workspace().unwrap();
+    plan.forward(&source, &mut output, &mut workspace).unwrap();
+    assert_eq!(source.as_slice(), source_before.as_slice());
+    check_c!(
+        output.as_slice(),
+        &output_snapshot,
+        &fixture.forward,
+        fixture,
+        rank,
+        method,
+        "R2C forward"
+    );
+    let mut inverse_source = plan.allocate_output().unwrap();
+    let inverse_snapshot = snap!(layout, inverse_source, true, "C2R inverse source");
+    fill_complex(
+        inverse_source.as_mut_slice(),
+        &inverse_snapshot,
+        &fixture.inverse_input,
+    );
+    let inverse_before = inverse_source.as_slice().to_vec();
+    let mut recovered = plan.allocate_input().unwrap();
+    let recovered_snapshot = snap!(layout, recovered, false, "C2R recovered");
+    plan.inverse(&inverse_source, &mut recovered, &mut workspace)
+        .unwrap();
+    assert_eq!(inverse_source.as_slice(), inverse_before.as_slice());
+    check_r!(
+        recovered.as_slice(),
+        &recovered_snapshot,
+        &fixture.inverse,
+        fixture,
+        rank,
+        method,
+        "C2R inverse"
+    );
+}
+
+fn r2c_methods<R: Real, const N: usize, const M: usize>(
+    fixture: &Fixture,
+    topology: &Arc<MpiTopology<M>>,
+    rank: i32,
+) where
+    Complex<R>: Equivalence,
+{
+    for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
+        r2c_case::<R, N, M>(fixture, topology, method, rank);
+    }
+}
+
+fn run_fixture(fixture: &Fixture, one: &Arc<MpiTopology<1>>, two: &Arc<MpiTopology<2>>, rank: i32) {
+    macro_rules! dispatch {
+        ($run:ident, $real:ty, $n:expr) => {
+            for m in 1..=std::cmp::min(2, $n - 1) {
+                match m {
+                    1 => $run::<$real, $n, 1>(fixture, one, rank),
+                    2 => $run::<$real, $n, 2>(fixture, two, rank),
+                    _ => unreachable!(),
+                }
+            }
+        };
+    }
+    match (fixture.kind, fixture.precision, fixture.shape.len()) {
+        (Kind::C2c, Precision::F32, 2) => dispatch!(c2c_methods, f32, 2),
+        (Kind::C2c, Precision::F64, 2) => dispatch!(c2c_methods, f64, 2),
+        (Kind::C2c, Precision::F32, 3) => dispatch!(c2c_methods, f32, 3),
+        (Kind::C2c, Precision::F64, 3) => dispatch!(c2c_methods, f64, 3),
+        (Kind::C2c, Precision::F32, 4) => dispatch!(c2c_methods, f32, 4),
+        (Kind::C2c, Precision::F64, 4) => dispatch!(c2c_methods, f64, 4),
+        (Kind::R2c, Precision::F32, 2) => dispatch!(r2c_methods, f32, 2),
+        (Kind::R2c, Precision::F64, 2) => dispatch!(r2c_methods, f64, 2),
+        (Kind::R2c, Precision::F32, 3) => dispatch!(r2c_methods, f32, 3),
+        (Kind::R2c, Precision::F64, 3) => dispatch!(r2c_methods, f64, 3),
+        (Kind::R2c, Precision::F32, 4) => dispatch!(r2c_methods, f32, 4),
+        (Kind::R2c, Precision::F64, 4) => dispatch!(r2c_methods, f64, 4),
+        _ => panic!("unsupported fixture"),
+    }
+}
+
+#[test]
+fn parser_and_offset_self_check() {
+    let values = "1 0\n2 0\n3 0\n4 0\n5 0\n6 0\n";
+    let section = |name: &str| format!("section {name} complex 6\n{values}end\n");
+    let valid = format!(
+        "PENCIL_FFTW_REFERENCE 1\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase c2c_2d_2x3_f64\nkind c2c\nprecision f64\noriginal_shape 2 3\nextra_shape\n{}{}{}{}",
+        section("input"),
+        section("inverse_input"),
+        section("forward_expected"),
+        section("inverse_expected")
+    );
+    assert_eq!(parse_fixture(&valid).unwrap().input.len(), 6);
+    for malformed in ["kind", "", "kind c2c trailing"] {
+        assert!(field(malformed, "kind").is_err());
+    }
+    assert!(parse_fixture(&valid.replacen("kind c2c\n", "kind\n", 1)).is_err());
+    assert_eq!(
+        offsets(&[2], [2, 3], &[0..2, 0..3], [1, 0]),
+        vec![0, 3, 1, 4, 2, 5, 6, 9, 7, 10, 8, 11]
+    );
+    assert!(parse_fixture(&valid.replacen("complex 6", "complex 7", 1)).is_err());
+    assert!(parse_fixture(&valid.replacen("1 0", "NaN 0", 1)).is_err());
+    assert!(parse_fixture(&valid.replacen("kind c2c\n", "kind c2c\nkind c2c\n", 1)).is_err());
+    assert!(parse_fixture(&format!("{valid}unexpected\n")).is_err());
+    assert!(compare(1.0, 1.0, 1e-6, 1e-6, "equal").is_ok());
+    assert!(compare(2.0, 1.0, 1e-6, 1e-6, "mismatch").is_err());
+    assert!(compare(f64::NAN, 1.0, 1e-6, 1e-6, "nonfinite").is_err());
+}
+
+#[test]
+#[ignore = "opt-in local Julia/FFTW cross-validation; run tools/fftw-reference/check.sh"]
+fn fftw_reference_matrix() {
+    let directory = env::var_os("PENCIL_FFTW_FIXTURES")
+        .map(PathBuf::from)
+        .expect("PENCIL_FFTW_FIXTURES is required for the opted-in reference test");
+    let fixtures = fixtures(&directory);
+    let universe = mpi::initialize().expect("MPI initialization failed");
+    let world = universe.world();
+    let size = usize::try_from(world.size()).unwrap();
+    assert!(matches!(size, 1 | 4 | 6));
+    let one = MpiTopology::<1>::new(&world, [size]).unwrap();
+    let grid = match size {
+        1 => [1, 1],
+        4 => [2, 2],
+        6 => [2, 3],
+        _ => unreachable!(),
+    };
+    let two = MpiTopology::<2>::new(&world, grid).unwrap();
+    assert_eq!(one.process_grid(), &[size]);
+    assert_eq!(two.process_grid(), &grid);
+    let layouts: usize = fixtures
+        .iter()
+        .map(|fixture| std::cmp::min(2, fixture.shape.len() - 1))
+        .sum();
+    assert_eq!(layouts, 26);
+    println!(
+        "PENCIL_FFTW_REFERENCE_MATRIX_STARTED fixtures={} layouts={layouts}",
+        fixtures.len()
+    );
+    for fixture in &fixtures {
+        run_fixture(fixture, &one, &two, world.rank());
+    }
+    println!(
+        "PENCIL_FFTW_REFERENCE_MATRIX_RAN fixtures={} layouts={layouts}",
+        fixtures.len()
+    );
+}

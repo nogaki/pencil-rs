@@ -2227,6 +2227,13 @@ full-spectrum gather are part of this API.
 
 ### Milestone 9: 交差検証と性能評価
 
+Julia/FFTW cross-validation tooling is implemented as an opt-in local check;
+its canonical command, locked Julia environment, 16 temporary fixtures, and
+26 valid case/layout combinations per method and rank are documented in
+[`tools/fftw-reference/README.md`](../../../tools/fftw-reference/README.md).
+It validates the existing distributed C2C and R2C/C2R APIs without changing
+production FFT code, tolerances, CI, or checked-in numeric data.
+
 - Julia reference driver
 - MPI test matrix
 - benchmarks

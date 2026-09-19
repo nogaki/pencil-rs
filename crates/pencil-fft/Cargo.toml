@@ -20,3 +20,8 @@ pencil-array = { path = "../pencil-array", optional = true }
 name = "distributed_c2c"
 path = "tests/distributed_c2c.rs"
 required-features = ["distributed"]
+
+[[test]]
+name = "fftw_reference"
+path = "tests/fftw_reference.rs"
+required-features = ["distributed"]
