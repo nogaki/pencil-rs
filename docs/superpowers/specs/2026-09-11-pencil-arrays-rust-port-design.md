@@ -1,7 +1,7 @@
 # PencilArrays / PencilFFTs Rust移植 設計仕様
 
 日付: 2026-09-11  
-状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R raw backward、AxisSelection付きAlltoallv/P2P分散C2C FFT out/in-place、AxisSelection付き分散R2C/C2R out-of-place raw backward、Julia format-4交差検証fixtureは実装済み。
+状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R raw backward、local R2R、AxisSelection付きAlltoallv/P2P分散C2C FFT out/in-place、AxisSelection付き分散R2C/C2R out-of-place raw backward、分散R2R out/in-place、Julia format-5交差検証fixture（52 fixture、82 layout）は実装済み。
 対象: CPU + MPIによる任意次元分散配列基盤と分散FFT基盤
 
 ## 1. 参照実装
@@ -22,7 +22,8 @@
 3. 同一データバッファ上でのin-place再分配
 4. 全空間軸または選択軸集合に対する分散C2C FFT
 5. 全空間軸または選択軸集合に対するout-of-place R2C/C2R FFT
-6. Julia実装と比較可能な正当性・性能評価基盤
+6. DCT/DST-I-IV分散R2R変換
+7. Julia実装と比較可能な正当性・性能評価基盤
 
 分散配列基盤とFFT層は別crateとし、一方向の依存関係にする。`pencil-array`はMPIに依存する
 一方でFFTライブラリには依存しない。`pencil-fft`のlocal pathはRustFFT/RealFFTに依存する
@@ -61,7 +62,8 @@ pencil-array
 - C2C分散FFTのout-of-place実行
 - C2C分散FFTのin-place実行
 - R2C/C2R分散FFTのout-of-place実行
-- `f32`および`f64`
+- DCT/DST-I-IV分散R2Rのout-of-placeおよびin-place実行
+- `f32`および`f64`ならびに対応する複素R2Rスカラー
 - CPUメモリ上の`Vec<T>`
 - RustFFTおよびRealFFTを用いたローカルFFT
 
@@ -70,7 +72,7 @@ pencil-array
 - in-place R2C/C2R
 - GPUストレージ
 - FFTWバックエンド
-- DCT、DST、Chebyshev変換
+- Chebyshev変換
 - runtime可変次元の`DynPencil`
 - MPI-IOおよびParallel HDF5
 - Julia版のbroadcast、reduction、global view、local grid、ODE連携の全面移植
@@ -2205,9 +2207,9 @@ R2C API、endpoint policy、projection、数理は変えない。
 
 独立positive-sign DFT、raw scaling、両transport、f32/f64、N/M、extra/zero batch、empty
 local、reordered communicator、OOP/IP、descriptor rejection、post-start poisoningを既存
-MPI suiteとunit transaction testで確認する。Julia/FFTWのformat 4はcanonical
-`selected_axes` metadataを持つ。C2CとR2Cの双方に`backward_expected`を持ち、C2Cは
-complex、R2Cはreal sectionとする。
+MPI suiteとunit transaction testで確認する。Julia/FFTWのformat 5はcanonical
+`selected_axes`、`element_kind`、`axis_kinds` metadataを持つ。C2C、R2C、R2Rすべてに
+`backward_expected`を持ち、R2Rはpaired kindのraw resultとする。
 
 
 ### Milestone 8: Distributed R2C/C2R
@@ -2275,13 +2277,11 @@ this API.
 ### Milestone 9: 交差検証と性能評価
 
 Julia/FFTW cross-validation tooling is implemented as an opt-in local check;
-its canonical command, locked Julia environment, 28 temporary fixtures (16
-full-axis plus 12 partial-axis), and 50 case/layout combinations per method
-and rank are documented in
-[`tools/fftw-reference/README.md`](../../../tools/fftw-reference/README.md).
-It validates distributed C2C forward/inverse/raw backward and R2C/C2R
-forward/inverse/raw backward without changing production tolerances, CI, or
-checked-in numeric data.
+its canonical command, locked Julia environment, exactly 52 temporary
+format-5 fixtures and 82 case/layout combinations per method and rank are
+documented in [`tools/fftw-reference/README.md`](../../../tools/fftw-reference/README.md).
+It validates distributed C2C, R2C/C2R, and R2R forward/inverse/raw backward
+without changing production tolerances, CI, or checked-in numeric data.
 
 - Julia reference driver
 - MPI test matrix
@@ -2305,7 +2305,8 @@ checked-in numeric data.
 - 全spatial軸または選択軸集合のC2C out-of-place
 - 全spatial軸または選択軸集合のC2C in-place
 - 全spatial軸または選択軸集合のR2C/C2R out-of-place
-- `f32`,`f64`
+- 全spatial軸のDCT/DST-I-IV R2R out-of-place/in-place
+- `f32`,`f64`および対応する複素R2Rスカラー
 - single-rankおよびmulti-rank参照結果と一致
 - Julia logical resultと一致
 - 入力保持契約と正規化規約が検証済み
@@ -2322,7 +2323,7 @@ checked-in numeric data.
 - GPU追加時も`Pencil`へbufferを持たせない
 - FFTW追加時もArray crateを変更しない
 - in-place R2C追加時も共通`TransformStage`を維持し、異種型共有storageだけを専用化する
-- DCT/DST追加時も局所transform variantとして追加し、配置列を再利用する
+- 追加のreal-to-real kindも局所transform variantとして追加し、配置列を再利用する
 - 部分FFTは公開`AxisSelection<N>`を入力にし、既存の全軸選択を既定値とする。実行routeは常に軸`N-1`から`0`までの`N`段・`N-1`遷移を保ち、未選択stageはnative FFTとscaleを持たないidentityとする。したがって空のC2Cは値を変えずにcanonical full routeの転置だけを行う。R2Cは選択集合の最大Rust軸をreal boundaryにし、その軸だけを`n/2+1`へreductionする。
 - I/O、reduction、global viewはArray crate上の独立モジュールとして追加する
 

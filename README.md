@@ -19,8 +19,9 @@ FFTW-compatible DCT/DST-I-IV kinds for real and complex `f32`/`f64`, with
 out-of-place and in-place execution. Its `forward`/`backward` operations use
 raw unnormalized FFTW conventions, while `inverse` is normalized by the
 logical transform factor. Each line uses at most `8n` complex embedding values
-plus queried native scratch; it adds no MPI dependency. Distributed R2R
-will follow separately.
+plus queried native scratch, using the existing RustFFT backend without MPI.
+Distributed R2R uses the same eight kinds per logical axis, with `None` identity
+stages, for real and complex `f32`/`f64` over the existing checked transports.
 
 `Pencil` describes spatial distribution. `PencilArray` owns one layout and
 one local buffer. `ManyPencilArray` owns a buffer large enough for several
@@ -140,10 +141,23 @@ wait-all, and MPI failure contract; it reserves request metadata. Do not
 overlap unfinished point-to-point transposes on that context. The
 `distributed` API is not enabled by default.
 
+## Distributed R2R DCT/DST
+
+`R2rPlan<T, N, M>` accepts `[Option<R2rKind>; N]` in logical-axis order;
+`None` keeps that canonical route stage as an identity. It preserves the
+original global shape, uses the same `N` stages and `N - 1` checked
+transitions, and produces the reversed output layout. `forward`, normalized
+paired `inverse`, and raw paired `backward` are input-preserving and support
+real or complex `f32`/`f64`. The in-place API uses a plan-bound
+`ManyPencilArray` and the shared `Input -> Poisoned -> Output` state contract;
+public `R2rState` reuses that completion-state enum. R2R descriptor agreement
+includes scalar value kind, underlying precision, all
+per-axis kind codes, and transport before local native planning or data writes.
+
 Plan construction and transform calls are collective. In-place array/workspace
 allocation and views are noncollective; callers must coordinate an allocation
-failure before the next collective call. `C2cPlan::allocate_in_place` returns
-an opaque `C2cInPlaceArray` and `allocate_in_place_workspace` returns its
+failure before the next collective call. `R2rPlan::allocate_in_place` returns
+an opaque `R2rInPlaceArray` and `allocate_in_place_workspace` returns its
 plan-bound scratch. The array exposes only `state`, `view`, and `view_mut`:
 `Input -> Poisoned -> Output` for forward and `Output -> Poisoned -> Input`
 for normalized inverse or raw backward. Initial collective preflight errors
@@ -155,10 +169,10 @@ arbitrary spectral data for either reverse operation.
 ## Local Julia/FFTW reference validation
 
 The opt-in Milestone 9 checker generates temporary Julia 1.12.6/FFTW.jl
-1.10.0 references and validates the distributed C2C forward/inverse/raw
-backward and R2C/C2R APIs at 1, 4, and 6 MPI ranks with both transpose methods
-and both precisions. It covers 28 fixtures (16 full-axis plus 12 partial-axis)
-and 50 valid case/layout combinations per method and rank.
+1.10.0 references and validates the distributed C2C, R2C/C2R, and R2R
+forward/inverse/raw backward APIs at 1, 4, and 6 MPI ranks with both
+transpose methods. It covers exactly 52 fixtures and 82 valid case/layout
+combinations per method and rank, including real/complex R2R `f32`/`f64`.
 The external comparison is explicitly opt-in; normal Rust tests need no Julia.
 See [`tools/fftw-reference/README.md`](tools/fftw-reference/README.md) and run
 `tools/fftw-reference/check.sh` only when Julia, FFTW.jl, and MPI are locally
@@ -186,6 +200,7 @@ cargo clippy -p pencil-fft --features distributed --all-targets --locked -- -D w
 cargo test --workspace --lib --locked
 cargo check -p pencil-fft --features distributed --all-targets --locked
 cargo test -p pencil-fft --features distributed --lib --locked
+cargo test -p pencil-fft --features distributed --lib distributed::r2r::tests::in_place_error_panic_backend_and_short_workspace_poison_contracts --locked -- --ignored --nocapture
 
 mpiexec -n 1 cargo test -p pencil-array --test topology --locked -- --nocapture --test-threads=1
 mpiexec -n 4 cargo test -p pencil-array --test topology --locked -- --nocapture --test-threads=1
@@ -206,10 +221,14 @@ cargo doc --workspace --no-deps --locked
 cargo doc -p pencil-fft --features distributed --no-deps --locked
 cargo test --workspace --doc --locked -- --show-output
 cargo test -p pencil-fft --features distributed --doc --locked -- --show-output
-# The existing suite binary covers distributed C2C forward/inverse/backward and R2C/C2R forward/inverse/backward over Alltoallv/P2P; local C2C and local R2C have in-place APIs.
+# The distributed suites cover C2C, R2C/C2R, and R2R over Alltoallv/P2P;
+# distributed C2C and R2R also have in-place APIs.
 for n in 1 4 6; do
   timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
     cargo test -p pencil-fft --features distributed --test distributed_c2c \
+      --locked -- --nocapture --test-threads=1 || exit 1
+  timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
+    cargo test -p pencil-fft --features distributed --test distributed_r2r \
       --locked -- --nocapture --test-threads=1 || exit 1
 done
 ```

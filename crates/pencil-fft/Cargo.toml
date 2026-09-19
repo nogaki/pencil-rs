@@ -24,6 +24,11 @@ path = "tests/distributed_c2c.rs"
 required-features = ["distributed"]
 
 [[test]]
+name = "distributed_r2r"
+path = "tests/distributed_r2r.rs"
+required-features = ["distributed"]
+
+[[test]]
 name = "fftw_reference"
 path = "tests/fftw_reference.rs"
 required-features = ["distributed"]

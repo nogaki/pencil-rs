@@ -1,7 +1,7 @@
 using FFTW
 using Printf
 
-const REFERENCE_VERSION = 4
+const REFERENCE_VERSION = 5
 
 struct ReferenceCase
     name::String
@@ -9,7 +9,26 @@ struct ReferenceCase
     spatial::Vector{Int}
     extra::Vector{Int}
     selected::Vector{Int}
+    axis_kinds::Vector{Union{Nothing, Symbol}}
 end
+
+ReferenceCase(name, kind, spatial, extra, selected) = ReferenceCase(
+    name,
+    kind,
+    spatial,
+    extra,
+    selected,
+    Union{Nothing, Symbol}[nothing for _ in spatial],
+)
+
+ReferenceCase(name, kind, spatial, extra, selected, axis_kinds::AbstractVector) = ReferenceCase(
+    name,
+    kind,
+    spatial,
+    extra,
+    selected,
+    Union{Nothing, Symbol}[axis_kinds...],
+)
 
 function full_cases()
     return [
@@ -35,8 +54,19 @@ function partial_cases()
     ]
 end
 
+function r2r_cases()
+    return [
+        ReferenceCase("r2r_2d_3x4_dcti-dctii", :r2r, [3, 4], Int[], [0, 1], [:dcti, :dctii]),
+        ReferenceCase("r2r_2d_3x4_dctiii-dctiv", :r2r, [3, 4], Int[], [0, 1], [:dctiii, :dctiv]),
+        ReferenceCase("r2r_2d_3x4_dsti-dstii", :r2r, [3, 4], Int[], [0, 1], [:dsti, :dstii]),
+        ReferenceCase("r2r_2d_3x4_dstiii-dstiv", :r2r, [3, 4], Int[], [0, 1], [:dstiii, :dstiv]),
+        ReferenceCase("r2r_3d_3x2x4_extra2x3_dctii-none-dstii", :r2r, [3, 2, 4], [2, 3], [0, 2], [:dctii, nothing, :dstii]),
+        ReferenceCase("r2r_4d_2x1x3x3_extra2_none-none-none-none", :r2r, [2, 1, 3, 3], [2], Int[], [nothing, nothing, nothing, nothing]),
+    ]
+end
+
 function reference_cases()
-    return vcat(full_cases(), partial_cases())
+    return vcat(full_cases(), partial_cases(), r2r_cases())
 end
 
 function precision_name(::Type{Float32})
@@ -46,6 +76,17 @@ end
 function precision_name(::Type{Float64})
     return "f64"
 end
+
+precision_name(::Type{Complex{T}}) where {T} = precision_name(T)
+
+element_kind(::Type{<:Complex}) = "complex"
+element_kind(::Type) = "real"
+
+function axis_kind_name(::Nothing)
+    return "none"
+end
+
+axis_kind_name(kind::Symbol) = String(kind)
 
 function logical_shape(item::ReferenceCase)
     shape = vcat(item.extra, item.spatial)
@@ -185,6 +226,85 @@ function r2c_values(::Type{T}, item::ReferenceCase) where {T}
     return input, inverse_input_recorded, forward, inverse, backward
 end
 
+function r2r_julia_kind(kind::Symbol)
+    return Dict(
+        :dcti => FFTW.REDFT00,
+        :dctii => FFTW.REDFT10,
+        :dctiii => FFTW.REDFT01,
+        :dctiv => FFTW.REDFT11,
+        :dsti => FFTW.RODFT00,
+        :dstii => FFTW.RODFT10,
+        :dstiii => FFTW.RODFT01,
+        :dstiv => FFTW.RODFT11,
+    )[kind]
+end
+
+function r2r_pair_kind(kind::Symbol)
+    kind in (:dcti, :dctiv, :dsti, :dstiv) && return kind
+    kind == :dctii && return :dctiii
+    kind == :dctiii && return :dctii
+    kind == :dstii && return :dstiii
+    kind == :dstiii && return :dstii
+    error("unknown R2R kind: ", kind)
+end
+
+function r2r_logical_factor(item::ReferenceCase)
+    factor = 1
+    for (axis, kind) in enumerate(item.axis_kinds)
+        kind === nothing && continue
+        n = item.spatial[axis]
+        factor *= if kind == :dcti
+            2 * (n - 1)
+        elseif kind == :dsti
+            2 * (n + 1)
+        else
+            2 * n
+        end
+    end
+    return factor
+end
+
+function r2r_values(::Type{T}, item::ReferenceCase) where {T}
+    input = if T <: Complex
+        fill_complex!(logical_array(T, item), 101.5)
+    else
+        fill_real!(logical_array(T, item), 101.5)
+    end
+    inverse_input = if T <: Complex
+        fill_complex!(logical_array(T, item), 203.75)
+    else
+        fill_real!(logical_array(T, item), 203.75)
+    end
+    expected_shape = Tuple(reverse(logical_shape(item)))
+    @assert size(input) == expected_shape
+    @assert size(inverse_input) == expected_shape
+    selected = findall(kind -> kind !== nothing, item.axis_kinds)
+    selected_dims_and_kinds = sort([
+        (length(item.spatial) - axis + 1, item.axis_kinds[axis]) for axis in selected
+    ]; by = first)
+    dims = [pair[1] for pair in selected_dims_and_kinds]
+    kinds = [r2r_julia_kind(pair[2]) for pair in selected_dims_and_kinds]
+    paired_kinds = [r2r_julia_kind(r2r_pair_kind(pair[2])) for pair in selected_dims_and_kinds]
+    input_before = copy(input)
+    inverse_input_before = copy(inverse_input)
+    if isempty(dims)
+        forward = copy(input)
+        backward = copy(inverse_input)
+    else
+        forward_plan = FFTW.plan_r2r(input, kinds, dims; flags = FFTW.ESTIMATE, num_threads = 1)
+        backward_plan = FFTW.plan_r2r(inverse_input, paired_kinds, dims; flags = FFTW.ESTIMATE, num_threads = 1)
+        forward = forward_plan * input
+        backward = backward_plan * inverse_input
+    end
+    inverse = backward ./ r2r_logical_factor(item)
+    @assert size(forward) == expected_shape
+    @assert size(inverse) == expected_shape
+    @assert size(backward) == expected_shape
+    @assert input == input_before
+    @assert inverse_input == inverse_input_before
+    return input, inverse_input, forward, inverse, backward
+end
+
 function print_header(io, item::ReferenceCase, ::Type{T}, provider, native_version) where {T}
     println(io, "PENCIL_FFTW_REFERENCE ", REFERENCE_VERSION)
     println(
@@ -196,9 +316,12 @@ function print_header(io, item::ReferenceCase, ::Type{T}, provider, native_versi
     )
     println(io, "case ", item.name, "_", precision_name(T))
     println(io, "kind ", item.kind)
+    fixture_element_kind = item.kind == :c2c ? "complex" : item.kind == :r2c ? "real" : element_kind(T)
+    println(io, "element_kind ", fixture_element_kind)
     println(io, "precision ", precision_name(T))
     println(io, "original_shape ", join(item.spatial, " "))
     println(io, "extra_shape", isempty(item.extra) ? "" : " " * join(item.extra, " "))
+    println(io, "axis_kinds", isempty(item.axis_kinds) ? "" : " " * join(axis_kind_name.(item.axis_kinds), " "))
     println(io, "selected_axes", isempty(item.selected) ? "" : " " * join(item.selected, " "))
 end
 
@@ -219,7 +342,8 @@ function print_complex_section(io, name::String, values)
 end
 
 function write_case(output_directory::String, item::ReferenceCase, ::Type{T}, provider, native_version) where {T}
-    filename = joinpath(output_directory, item.name * "_" * precision_name(T) * ".txt")
+    suffix = item.kind == :r2r ? "_" * element_kind(T) : ""
+    filename = joinpath(output_directory, item.name * suffix * "_" * precision_name(T) * ".txt")
     open(filename, "w") do io
         print_header(io, item, T, provider, native_version)
         if item.kind == :c2c
@@ -229,13 +353,28 @@ function write_case(output_directory::String, item::ReferenceCase, ::Type{T}, pr
             print_complex_section(io, "forward_expected", forward)
             print_complex_section(io, "inverse_expected", inverse)
             print_complex_section(io, "backward_expected", backward)
-        else
+        elseif item.kind == :r2c
             input, inverse_input, forward, inverse, backward = r2c_values(T, item)
             print_real_section(io, "input", input)
             print_complex_section(io, "inverse_input", inverse_input)
             print_complex_section(io, "forward_expected", forward)
             print_real_section(io, "inverse_expected", inverse)
             print_real_section(io, "backward_expected", backward)
+        else
+            input, inverse_input, forward, inverse, backward = r2r_values(T, item)
+            if T <: Complex
+                print_complex_section(io, "input", input)
+                print_complex_section(io, "inverse_input", inverse_input)
+                print_complex_section(io, "forward_expected", forward)
+                print_complex_section(io, "inverse_expected", inverse)
+                print_complex_section(io, "backward_expected", backward)
+            else
+                print_real_section(io, "input", input)
+                print_real_section(io, "inverse_input", inverse_input)
+                print_real_section(io, "forward_expected", forward)
+                print_real_section(io, "inverse_expected", inverse)
+                print_real_section(io, "backward_expected", backward)
+            end
         end
     end
 end
@@ -253,12 +392,17 @@ function main()
     native_version = string(FFTW.version)
     @info "generating Julia/FFTW reference fixtures" julia_version = VERSION fftw_jl_version = Base.pkgversion(FFTW) fftw_native_version = native_version provider = provider plan_flags = "ESTIMATE" threads = 1
 
-    for item in reference_cases()
+    for item in vcat(full_cases(), partial_cases())
         write_case(output_directory, item, Float32, provider, native_version)
         write_case(output_directory, item, Float64, provider, native_version)
     end
+    for item in r2r_cases()
+        for T in (Float32, Float64, Complex{Float32}, Complex{Float64})
+            write_case(output_directory, item, T, provider, native_version)
+        end
+    end
     files = filter(name -> endswith(name, ".txt"), readdir(output_directory))
-    expected = 28
+    expected = 52
     length(files) == expected || error("generated ", length(files), " fixtures, expected ", expected)
     println("generated ", length(files), " fixtures in ", output_directory)
 end

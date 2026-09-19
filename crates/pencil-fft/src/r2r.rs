@@ -35,6 +35,20 @@ pub enum R2rKind {
 }
 
 impl R2rKind {
+    #[cfg(feature = "distributed")]
+    pub(crate) const fn descriptor_code(self) -> u64 {
+        match self {
+            Self::DctI => 1,
+            Self::DctII => 2,
+            Self::DctIII => 3,
+            Self::DctIV => 4,
+            Self::DstI => 5,
+            Self::DstII => 6,
+            Self::DstIII => 7,
+            Self::DstIV => 8,
+        }
+    }
+
     /// Returns the kind used by [`LocalR2rPlan::backward`].
     pub const fn backward_kind(self) -> Self {
         match self {
@@ -81,6 +95,8 @@ mod private {
     use super::{Complex, R2rScalar};
 
     pub trait SealedR2rScalar {
+        const VALUE_KIND: u64;
+
         fn to_complex(self) -> Complex<<Self as R2rScalar>::Real>
         where
             Self: R2rScalar;
@@ -91,6 +107,8 @@ mod private {
     }
 
     impl SealedR2rScalar for f32 {
+        const VALUE_KIND: u64 = 1;
+
         fn to_complex(self) -> Complex<<Self as R2rScalar>::Real> {
             Complex::new(self, 0.0)
         }
@@ -101,6 +119,8 @@ mod private {
     }
 
     impl SealedR2rScalar for f64 {
+        const VALUE_KIND: u64 = 1;
+
         fn to_complex(self) -> Complex<<Self as R2rScalar>::Real> {
             Complex::new(self, 0.0)
         }
@@ -111,6 +131,8 @@ mod private {
     }
 
     impl SealedR2rScalar for Complex<f32> {
+        const VALUE_KIND: u64 = 2;
+
         fn to_complex(self) -> Complex<<Self as R2rScalar>::Real> {
             self
         }
@@ -121,6 +143,8 @@ mod private {
     }
 
     impl SealedR2rScalar for Complex<f64> {
+        const VALUE_KIND: u64 = 2;
+
         fn to_complex(self) -> Complex<<Self as R2rScalar>::Real> {
             self
         }
@@ -145,6 +169,19 @@ impl R2rScalar for Complex<f32> {
 
 impl R2rScalar for Complex<f64> {
     type Real = f64;
+}
+
+#[cfg(feature = "distributed")]
+pub(crate) fn r2r_value_kind<T: R2rScalar>() -> u64 {
+    <T as private::SealedR2rScalar>::VALUE_KIND
+}
+
+#[cfg(feature = "distributed")]
+pub(crate) fn r2r_zero<T: R2rScalar>() -> T {
+    T::from_complex(Complex::new(
+        rustfft::num_traits::Zero::zero(),
+        rustfft::num_traits::Zero::zero(),
+    ))
 }
 
 /// Errors returned by local DCT/DST plan construction and execution.

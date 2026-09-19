@@ -64,7 +64,7 @@ fi
 shopt -s nullglob
 fixture_entries=("$FIXTURES"/*)
 fixture_files=("$FIXTURES"/*.txt)
-expected_fixture_count=28
+expected_fixture_count=52
 [[ ${#fixture_entries[@]} -eq "$expected_fixture_count" && ${#fixture_files[@]} -eq "$expected_fixture_count" ]] || {
     printf 'expected exactly %s fixture files, found %s entries and %s txt files\n' \
         "$expected_fixture_count" "${#fixture_entries[@]}" "${#fixture_files[@]}" >&2
@@ -75,8 +75,16 @@ for fixture in "${fixture_files[@]}"; do
         printf 'empty fixture: %s\n' "$fixture" >&2
         exit 1
     }
-    grep -Fxq 'PENCIL_FFTW_REFERENCE 4' "$fixture" || {
-        printf 'fixture is missing mandatory format-4 metadata: %s\n' "$fixture" >&2
+    grep -Fxq 'PENCIL_FFTW_REFERENCE 5' "$fixture" || {
+        printf 'fixture is missing mandatory format-5 metadata: %s\n' "$fixture" >&2
+        exit 1
+    }
+    grep -Eq '^element_kind (real|complex)$' "$fixture" || {
+        printf 'fixture is missing mandatory element_kind metadata: %s\n' "$fixture" >&2
+        exit 1
+    }
+    grep -Eq '^axis_kinds( |$)' "$fixture" || {
+        printf 'fixture is missing mandatory axis_kinds metadata: %s\n' "$fixture" >&2
         exit 1
     }
     grep -Eq '^selected_axes( |$)' "$fixture" || {
@@ -126,29 +134,84 @@ for ranks in 1 4 6; do
     run_reference "$ranks" "$FIXTURES" "$WORK/reference-$ranks.log"
 done
 
-CORRUPT_FORWARD="$WORK/corrupt-forward-fixtures"
-CORRUPT_BACKWARD="$WORK/corrupt-backward-fixtures"
-mkdir -p "$CORRUPT_FORWARD" "$CORRUPT_BACKWARD"
-cp -- "${fixture_files[@]}" "$CORRUPT_FORWARD/"
-cp -- "${fixture_files[@]}" "$CORRUPT_BACKWARD/"
-for corrupt_directory in "$CORRUPT_FORWARD" "$CORRUPT_BACKWARD"; do
+CORRUPT_C2C_FORWARD="$WORK/corrupt-c2c-forward-fixtures"
+CORRUPT_C2C_BACKWARD="$WORK/corrupt-c2c-backward-fixtures"
+CORRUPT_R2C_FORWARD="$WORK/corrupt-r2c-forward-fixtures"
+CORRUPT_R2C_BACKWARD="$WORK/corrupt-r2c-backward-fixtures"
+CORRUPT_R2R_FORWARD="$WORK/corrupt-r2r-forward-fixtures"
+CORRUPT_R2R_BACKWARD="$WORK/corrupt-r2r-backward-fixtures"
+corrupt_directories=(
+    "$CORRUPT_C2C_FORWARD"
+    "$CORRUPT_C2C_BACKWARD"
+    "$CORRUPT_R2C_FORWARD"
+    "$CORRUPT_R2C_BACKWARD"
+    "$CORRUPT_R2R_FORWARD"
+    "$CORRUPT_R2R_BACKWARD"
+)
+mkdir -p "${corrupt_directories[@]}"
+for corrupt_directory in "${corrupt_directories[@]}"; do
+    cp -- "${fixture_files[@]}" "$corrupt_directory/"
     corrupt_files=("$corrupt_directory"/*.txt)
     [[ ${#corrupt_files[@]} -eq "$expected_fixture_count" ]] || {
         printf 'corrupted fixture copy is incomplete\n' >&2
         exit 1
     }
 done
-corrupt_backward_file=
-for candidate in "$CORRUPT_BACKWARD"/*.txt; do
-    if grep -Fxq 'kind r2c' "$candidate" \
-        && grep -Fq 'section backward_expected real ' "$candidate"; then
-        corrupt_backward_file=$candidate
+corrupt_c2c_forward_file=
+for candidate in "$CORRUPT_C2C_FORWARD"/*.txt; do
+    if grep -Fxq 'kind c2c' "$candidate" \
+        && grep -Fq 'section forward_expected complex ' "$candidate"; then
+        corrupt_c2c_forward_file=$candidate
         break
     fi
 done
-corrupt_forward_file="$CORRUPT_FORWARD/$(basename "$corrupt_backward_file")"
-[[ -n "$corrupt_backward_file" && -f "$corrupt_forward_file" ]] || {
-    printf 'no R2C fixture with real backward_expected was generated\n' >&2
+corrupt_c2c_backward_file=
+for candidate in "$CORRUPT_C2C_BACKWARD"/*.txt; do
+    if grep -Fxq 'kind c2c' "$candidate" \
+        && grep -Fq 'section backward_expected complex ' "$candidate"; then
+        corrupt_c2c_backward_file=$candidate
+        break
+    fi
+done
+corrupt_r2c_forward_file=
+for candidate in "$CORRUPT_R2C_FORWARD"/*.txt; do
+    if grep -Fxq 'kind r2c' "$candidate" \
+        && grep -Fq 'section forward_expected complex ' "$candidate"; then
+        corrupt_r2c_forward_file=$candidate
+        break
+    fi
+done
+corrupt_r2c_backward_file=
+for candidate in "$CORRUPT_R2C_BACKWARD"/*.txt; do
+    if grep -Fxq 'kind r2c' "$candidate" \
+        && grep -Fq 'section backward_expected real ' "$candidate"; then
+        corrupt_r2c_backward_file=$candidate
+        break
+    fi
+done
+corrupt_r2r_forward_file=
+for candidate in "$CORRUPT_R2R_FORWARD"/*.txt; do
+    if grep -Fxq 'kind r2r' "$candidate" \
+        && grep -Fq 'section forward_expected real ' "$candidate"; then
+        corrupt_r2r_forward_file=$candidate
+        break
+    fi
+done
+corrupt_r2r_backward_file=
+for candidate in "$CORRUPT_R2R_BACKWARD"/*.txt; do
+    if grep -Fxq 'kind r2r' "$candidate" \
+        && grep -Fq 'section backward_expected real ' "$candidate"; then
+        corrupt_r2r_backward_file=$candidate
+        break
+    fi
+done
+[[ -n "$corrupt_c2c_forward_file" \
+    && -n "$corrupt_c2c_backward_file" \
+    && -n "$corrupt_r2c_forward_file" \
+    && -n "$corrupt_r2c_backward_file" \
+    && -n "$corrupt_r2r_forward_file" \
+    && -n "$corrupt_r2r_backward_file" ]] || {
+    printf 'required C2C, R2C, and R2R corruption fixtures were not generated\n' >&2
     exit 1
 }
 "$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" -e '
@@ -174,7 +237,17 @@ function corrupt(path, section_name)
 end
 corrupt(ARGS[1], ARGS[2])
 corrupt(ARGS[3], ARGS[4])
-' "$corrupt_forward_file" forward_expected "$corrupt_backward_file" backward_expected
+corrupt(ARGS[5], ARGS[6])
+corrupt(ARGS[7], ARGS[8])
+corrupt(ARGS[9], ARGS[10])
+corrupt(ARGS[11], ARGS[12])
+' \
+    "$corrupt_c2c_forward_file" forward_expected \
+    "$corrupt_c2c_backward_file" backward_expected \
+    "$corrupt_r2c_forward_file" forward_expected \
+    "$corrupt_r2c_backward_file" backward_expected \
+    "$corrupt_r2r_forward_file" forward_expected \
+    "$corrupt_r2r_backward_file" backward_expected
 
 check_corruption_log() {
     local log_file=$1
@@ -194,20 +267,56 @@ check_corruption_log() {
     fi
 }
 
-printf '\n== corrupted forward_expected rejection ==\n'
-FORWARD_CORRUPT_LOG="$WORK/corrupted-forward.log"
-if run_reference 1 "$CORRUPT_FORWARD" "$FORWARD_CORRUPT_LOG"; then
-    printf 'checker accepted a deliberately corrupted forward_expected value\n' >&2
+printf '\n== corrupted C2C forward_expected rejection ==\n'
+C2C_FORWARD_CORRUPT_LOG="$WORK/corrupted-c2c-forward.log"
+if run_reference 1 "$CORRUPT_C2C_FORWARD" "$C2C_FORWARD_CORRUPT_LOG"; then
+    printf 'checker accepted a deliberately corrupted C2C forward_expected value\n' >&2
     exit 1
 fi
-check_corruption_log "$FORWARD_CORRUPT_LOG"
-printf 'corrupted forward_expected rejected as intended\n'
+check_corruption_log "$C2C_FORWARD_CORRUPT_LOG" 'C2C forward'
+printf 'corrupted C2C forward_expected rejected as intended\n'
 
-printf '\n== corrupted backward_expected rejection ==\n'
-BACKWARD_CORRUPT_LOG="$WORK/corrupted-backward.log"
-if run_reference 1 "$CORRUPT_BACKWARD" "$BACKWARD_CORRUPT_LOG"; then
-    printf 'checker accepted a deliberately corrupted backward_expected value\n' >&2
+printf '\n== corrupted C2C backward_expected rejection ==\n'
+C2C_BACKWARD_CORRUPT_LOG="$WORK/corrupted-c2c-backward.log"
+if run_reference 1 "$CORRUPT_C2C_BACKWARD" "$C2C_BACKWARD_CORRUPT_LOG"; then
+    printf 'checker accepted a deliberately corrupted C2C backward_expected value\n' >&2
     exit 1
 fi
-check_corruption_log "$BACKWARD_CORRUPT_LOG" 'R2C backward'
-printf 'corrupted backward_expected rejected as intended\n'
+check_corruption_log "$C2C_BACKWARD_CORRUPT_LOG" 'C2C backward'
+printf 'corrupted C2C backward_expected rejected as intended\n'
+
+printf '\n== corrupted R2C forward_expected rejection ==\n'
+R2C_FORWARD_CORRUPT_LOG="$WORK/corrupted-r2c-forward.log"
+if run_reference 1 "$CORRUPT_R2C_FORWARD" "$R2C_FORWARD_CORRUPT_LOG"; then
+    printf 'checker accepted a deliberately corrupted R2C forward_expected value\n' >&2
+    exit 1
+fi
+check_corruption_log "$R2C_FORWARD_CORRUPT_LOG" 'R2C forward'
+printf 'corrupted R2C forward_expected rejected as intended\n'
+
+printf '\n== corrupted R2C backward_expected rejection ==\n'
+R2C_BACKWARD_CORRUPT_LOG="$WORK/corrupted-r2c-backward.log"
+if run_reference 1 "$CORRUPT_R2C_BACKWARD" "$R2C_BACKWARD_CORRUPT_LOG"; then
+    printf 'checker accepted a deliberately corrupted R2C backward_expected value\n' >&2
+    exit 1
+fi
+check_corruption_log "$R2C_BACKWARD_CORRUPT_LOG" 'R2C backward'
+printf 'corrupted R2C backward_expected rejected as intended\n'
+
+printf '\n== corrupted R2R forward_expected rejection ==\n'
+R2R_FORWARD_CORRUPT_LOG="$WORK/corrupted-r2r-forward.log"
+if run_reference 1 "$CORRUPT_R2R_FORWARD" "$R2R_FORWARD_CORRUPT_LOG"; then
+    printf 'checker accepted a deliberately corrupted R2R forward_expected value\n' >&2
+    exit 1
+fi
+check_corruption_log "$R2R_FORWARD_CORRUPT_LOG" 'R2R forward'
+printf 'corrupted R2R forward_expected rejected as intended\n'
+
+printf '\n== corrupted R2R backward_expected rejection ==\n'
+R2R_BACKWARD_CORRUPT_LOG="$WORK/corrupted-r2r-backward.log"
+if run_reference 1 "$CORRUPT_R2R_BACKWARD" "$R2R_BACKWARD_CORRUPT_LOG"; then
+    printf 'checker accepted a deliberately corrupted R2R backward_expected value\n' >&2
+    exit 1
+fi
+check_corruption_log "$R2R_BACKWARD_CORRUPT_LOG" 'R2R backward'
+printf 'corrupted R2R backward_expected rejected as intended\n'
