@@ -2034,8 +2034,10 @@ rankごとの最大時間を主要指標とする。
 - `forward`/`inverse`は同じlengthの連続batch sliceを受けるout-of-place API、
  `forward_in_place`/`inverse_in_place`は最小のin-place APIとする。forwardは無正規化、
  inverseは各lineの`n`だけで除算し、batch数は含めない。
-- local C2Cでは、正符号・無正規化の`backward`/`backward_in_place`を追加する。
-  これはlocal C2C専用で、distributed C2CおよびR2C/C2RのAPIは変更しない。
+- このMilestone 6時点では、local C2Cへ正符号・無正規化の
+  `backward`/`backward_in_place`を追加した。これは当時のlocal-only境界を記録した
+  記述であり、後続のMilestone 7第四PR追補がdistributed C2Cのraw backward APIを
+  追加してこの範囲を更新する。R2C/C2RのAPIは変更しない。
 - planはimmutableなforward/inverse計画とlength/scratch metadataだけを持ち、
  scratchはcaller-ownedの初期化済みslice/Vecとする。RustFFTの
  `get_immutable_scratch_len()`および`get_inplace_scratch_len()`を正逆計画について
@@ -2130,6 +2132,7 @@ featureは空のままなので、`cargo test -p pencil-fft --no-default-feature
 - common stage/path generation
 - one-intermediate out-of-place execution (第一PRで実装)
 - normalized distributed C2C inverse (第一PRで実装)
+- unnormalized positive-sign distributed C2C backward (第四PRで実装)
 - `C2cInPlaceArray` and in-place execution (第二PRで実装済み)
 
 #### Milestone 7第二PR追補（2026-09-18、基点 `cbd1c17`）
@@ -2168,10 +2171,31 @@ transport/backend abstractionは行わない。
 第一・第二PRのlocal C2C、route、in-place状態契約、共有workspaceを維持し、分散edgeのtransportだけを選択可能にした。新しいpublic backend trait、factory、workspace型、P2P request処理の複製は追加しない。
 
 - `distributed` featureに`TransposeMethod::{AllToAllv, PointToPoint}`を追加した。既存の`from_pencil`、`from_array`、`from_shape`はAlltoallvへ委譲し、`*_with_method`の3 constructorが明示選択を受ける。入力保全、inverseの各spatial軸正規化、`N >= 2`、`1 <= M < N`、extra shape、array/workspaceのplan identityは不変である。
-- 既存の固定5語headerとoperation 7--11は変更しない。最小payloadは従来の`global_shape[N]`、`process_grid[M]`、extra rank/dimensions、scalar widthへmethod word（Alltoallv=0、PointToPoint=1）を末尾追加し、checked長を`N + M + 3 + extra_rank`とする。constructorと全4実行のdescriptorがmethodをnative FFT、destination/workspace書込み、in-place poisonより前に合意するため、rank-localな有効method選択は全rankで`CollectiveDescriptorMismatch`となる。
+- 第三PR時点の固定5語headerとoperation 7--11は変更しない。最小payloadは従来の`global_shape[N]`、`process_grid[M]`、extra rank/dimensions、scalar widthへmethod word（Alltoallv=0、PointToPoint=1）を末尾追加し、checked長を`N + M + 3 + extra_rank`とする。constructorと全4実行のdescriptorがmethodをnative FFT、destination/workspace書込み、in-place poisonより前に合意するため、rank-localな有効method選択は全rankで`CollectiveDescriptorMismatch`となる。
 - 分散edgeは選択methodの既存`AllToAllvTransposePlan`または`PointToPointTransposePlan`のforward/backward pairを保持する。各edgeのforward作成後とbackward作成後に、既存のcollective requirement agreementを行い、最大send/receive長と既存`TransposeWorkspace`を共有する。local transition、FFT scratch、OOP/IP loopは変更しない。
 - P2Pのchanged-axis topology context、固定`0x5054` tag、receive-before-send、wait-all、request metadata reservation、MPI failure/panic/process-lossの回復不能契約はarray crateから継承する。同一context上の未完了transposeを重ねず、成功時はnative requestを完了して返る。allocation-free executionやglobal rollbackは約束しない。
 - 既存の一つのMPI integration binary/top-level testを両methodで実行し、f32/f64、N=2/3/4、M=1/2、非均等・empty local、extra/zero extra、逆順communicator、direct DFT、OOP/IP parity、入力保全、pointer stability、constructor default、transport parityを確認する。constructorとOOP/IP forward/inverseのrank-local method mismatchは全workspace・state・dataをsnapshotして再利用まで検証し、6-rank multi-axisのchanged-axis subgroup外rankも含める。private one-rank poison testは両methodのErr/panicとpost-start native errorを確認する。
+
+#### Milestone 7第四PR追補（distributed C2C raw backward）
+
+既存route、Alltoallv/PointToPoint transition pair、workspace、in-place transactionを共有し、
+`C2cPlan::backward`と`backward_in_place`を追加する。両APIはreversed output layoutを
+source、canonical input layoutをdestinationとし、正符号の無正規化local backwardを全stageで
+呼ぶ。`inverse`は従来どおり各stageで正規化し、raw forward/backward roundtripだけが
+global spatial extentの積（extra dimensionsを除く）を掛ける。
+
+固定5語headerの既存schema=1、descriptor長、operation 1--14は変更しない。C2C raw
+out-of-place/in-placeにはoperation 15/16を割り当て、raw/normalized、raw/forward、
+OOP/in-placeの取り違えをfull Cartesian headerでnative FFT、payload、workspace、
+state変更より先に拒否する。逆routeのOutput -> Poisoned -> Inputはinverseとbackwardで
+共通であり、初期失敗では全resourceを保持し、開始後のin-place Err/panicではPoisonedを
+維持する。共有complex tailのR2C inverse callerは既存の正規化指定を明示するだけで、
+R2C API、endpoint policy、projection、数理は変えない。
+
+独立positive-sign DFT、raw scaling、両transport、f32/f64、N/M、extra/zero batch、empty
+local、reordered communicator、OOP/IP、descriptor rejection、post-start poisoningを既存
+MPI suiteとunit transaction testで確認する。Julia/FFTWのformat 2はC2Cだけに
+`backward_expected`を追加し、R2Cの既存4 sectionは保持する。
 
 
 ### Milestone 8: Distributed R2C/C2R
@@ -2233,8 +2257,8 @@ Julia/FFTW cross-validation tooling is implemented as an opt-in local check;
 its canonical command, locked Julia environment, 16 temporary fixtures, and
 26 valid case/layout combinations per method and rank are documented in
 [`tools/fftw-reference/README.md`](../../../tools/fftw-reference/README.md).
-It validates the existing distributed C2C and R2C/C2R APIs without changing
-production FFT code, tolerances, CI, or checked-in numeric data.
+It validates distributed C2C forward/inverse/raw backward and R2C/C2R without
+changing production tolerances, CI, or checked-in numeric data.
 
 - Julia reference driver
 - MPI test matrix

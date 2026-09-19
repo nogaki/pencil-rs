@@ -35,6 +35,7 @@ struct Fixture {
     inverse_input: Vec<Complex<f64>>,
     forward: Vec<Complex<f64>>,
     inverse: Vec<Complex<f64>>,
+    backward: Vec<Complex<f64>>,
 }
 
 fn next<'a>(lines: &[&'a str], cursor: &mut usize, field: &str) -> Result<&'a str, String> {
@@ -171,7 +172,7 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
         lines.pop();
     }
     let mut cursor = 0;
-    if next(&lines, &mut cursor, "version")? != "PENCIL_FFTW_REFERENCE 1" {
+    if next(&lines, &mut cursor, "version")? != "PENCIL_FFTW_REFERENCE 2" {
         return Err("invalid reference version header".into());
     }
 
@@ -237,6 +238,17 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
         input_kind,
         input_count,
     )?;
+    let backward = if kind == Kind::C2c {
+        section(
+            &lines,
+            &mut cursor,
+            "backward_expected",
+            "complex",
+            input_count,
+        )?
+    } else {
+        Vec::new()
+    };
     if cursor != lines.len() {
         return Err(format!(
             "trailing fixture tokens starting at {:?}",
@@ -253,6 +265,7 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
         inverse_input,
         forward,
         inverse,
+        backward,
     })
 }
 
@@ -704,6 +717,21 @@ fn c2c_case<R: Real, const N: usize, const M: usize>(
         method,
         "OOP inverse"
     );
+    let mut backward = plan.allocate_input().unwrap();
+    let backward_snapshot = snap!(layout, backward, false, "C2C backward");
+    ownership(backward.pencil(), &backward_snapshot, "C2C backward");
+    plan.backward(&inverse_source, &mut backward, &mut workspace)
+        .unwrap();
+    assert_eq!(inverse_source.as_slice(), inverse_before.as_slice());
+    check_c!(
+        backward.as_slice(),
+        &backward_snapshot,
+        &fixture.backward,
+        fixture,
+        rank,
+        method,
+        "OOP backward"
+    );
     let mut inplace = plan.allocate_in_place().unwrap();
     {
         let mut view = inplace.view_mut().unwrap();
@@ -743,6 +771,26 @@ fn c2c_case<R: Real, const N: usize, const M: usize>(
         rank,
         method,
         "in-place inverse"
+    );
+    plan.forward_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    {
+        let mut view = inplace.view_mut().unwrap();
+        let snapshot = snap!(layout, view, true, "C2C in-place backward input");
+        fill_complex(view.as_mut_slice(), &snapshot, &fixture.inverse_input);
+    }
+    plan.backward_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    let view = inplace.view().unwrap();
+    let snapshot = snap!(layout, view, false, "C2C in-place backward");
+    check_c!(
+        view.as_slice(),
+        &snapshot,
+        &fixture.backward,
+        fixture,
+        rank,
+        method,
+        "in-place backward"
     );
 }
 
@@ -869,14 +917,36 @@ fn run_fixture(fixture: &Fixture, one: &Arc<MpiTopology<1>>, two: &Arc<MpiTopolo
 fn parser_and_offset_self_check() {
     let values = "1 0\n2 0\n3 0\n4 0\n5 0\n6 0\n";
     let section = |name: &str| format!("section {name} complex 6\n{values}end\n");
+    let backward_section = section("backward_expected");
     let valid = format!(
-        "PENCIL_FFTW_REFERENCE 1\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase c2c_2d_2x3_f64\nkind c2c\nprecision f64\noriginal_shape 2 3\nextra_shape\n{}{}{}{}",
+        "PENCIL_FFTW_REFERENCE 2\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase c2c_2d_2x3_f64\nkind c2c\nprecision f64\noriginal_shape 2 3\nextra_shape\n{}{}{}{}{}",
         section("input"),
         section("inverse_input"),
         section("forward_expected"),
-        section("inverse_expected")
+        section("inverse_expected"),
+        backward_section
     );
     assert_eq!(parse_fixture(&valid).unwrap().input.len(), 6);
+    assert_eq!(parse_fixture(&valid).unwrap().backward.len(), 6);
+    assert!(
+        parse_fixture(&valid.replacen("PENCIL_FFTW_REFERENCE 2", "PENCIL_FFTW_REFERENCE 1", 1,))
+            .is_err()
+    );
+
+    let r2c_section = |name: &str, kind: &str, count: usize, values: &str| {
+        format!("section {name} {kind} {count}\n{values}end\n")
+    };
+    let r2c = format!(
+        "PENCIL_FFTW_REFERENCE 2\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase r2c_2d_2x3_f64\nkind r2c\nprecision f64\noriginal_shape 2 3\nextra_shape\n{}{}{}{}",
+        r2c_section("input", "real", 6, "1\n2\n3\n4\n5\n6\n"),
+        r2c_section("inverse_input", "complex", 4, "1 0\n2 0\n3 0\n4 0\n"),
+        r2c_section("forward_expected", "complex", 4, "1 0\n2 0\n3 0\n4 0\n"),
+        r2c_section("inverse_expected", "real", 6, "1\n2\n3\n4\n5\n6\n"),
+    );
+    let parsed_r2c = parse_fixture(&r2c).unwrap();
+    assert_eq!(parsed_r2c.kind, Kind::R2c);
+    assert!(parsed_r2c.backward.is_empty());
+    assert!(parse_fixture(&format!("{r2c}{backward_section}")).is_err());
     for malformed in ["kind", "", "kind c2c trailing"] {
         assert!(field(malformed, "kind").is_err());
     }
@@ -888,6 +958,31 @@ fn parser_and_offset_self_check() {
     assert!(parse_fixture(&valid.replacen("complex 6", "complex 7", 1)).is_err());
     assert!(parse_fixture(&valid.replacen("1 0", "NaN 0", 1)).is_err());
     assert!(parse_fixture(&valid.replacen("kind c2c\n", "kind c2c\nkind c2c\n", 1)).is_err());
+    assert!(parse_fixture(&valid.replacen(&backward_section, "", 1)).is_err());
+    assert!(
+        parse_fixture(&valid.replacen(
+            "section backward_expected complex 6",
+            "section backward_expected real 6",
+            1,
+        ))
+        .is_err()
+    );
+    assert!(
+        parse_fixture(&valid.replacen(
+            "section backward_expected complex 6",
+            "section backward_expected complex 7",
+            1,
+        ))
+        .is_err()
+    );
+    assert!(
+        parse_fixture(&valid.replacen(
+            "section backward_expected complex 6\n1 0",
+            "section backward_expected complex 6\nNaN 0",
+            1,
+        ))
+        .is_err()
+    );
     assert!(parse_fixture(&format!("{valid}unexpected\n")).is_err());
     assert!(compare(1.0, 1.0, 1e-6, 1e-6, "equal").is_ok());
     assert!(compare(2.0, 1.0, 1e-6, 1e-6, "mismatch").is_err());

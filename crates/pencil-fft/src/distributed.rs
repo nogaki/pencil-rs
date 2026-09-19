@@ -8,9 +8,10 @@
 //! legacy constructors select Alltoallv; the `_with_method` constructors can
 //! select the checked point-to-point transport as well. The out-of-place
 //! forward transform consumes the canonical input layout and produces the
-//! reversed output layout; [`C2cPlan::inverse`] consumes those layouts in
-//! reverse and applies the complete normalization. In-place execution uses the
-//! same route and state-checks its single buffer.
+//! reversed output layout; [`C2cPlan::inverse`] and [`C2cPlan::backward`]
+//! consume those layouts in reverse, with `inverse` normalized and `backward`
+//! left unnormalized. In-place execution uses the same route and state-checks
+//! its single buffer.
 //!
 //! The fixed C2C descriptor includes the selected transport before native FFT,
 //! output, workspace, or in-place state changes. Descriptor and initial
@@ -54,6 +55,8 @@ const OPERATION_INVERSE_IN_PLACE: u64 = 11;
 const OPERATION_R2C_PLAN: u64 = 12;
 const OPERATION_R2C_FORWARD: u64 = 13;
 const OPERATION_R2C_INVERSE: u64 = 14;
+const OPERATION_BACKWARD: u64 = 15;
+const OPERATION_BACKWARD_IN_PLACE: u64 = 16;
 const INVALID_WORD: u64 = u64::MAX;
 const METHOD_ALL_TO_ALLV: u64 = 0;
 const METHOD_POINT_TO_POINT: u64 = 1;
@@ -207,9 +210,13 @@ impl TransposeMethod {
 /// input must use the identity permutation and decomposition `[0, ..., M)`;
 /// this feature supports `N >= 2` and `1 <= M < N`. The derived output uses
 /// decomposition `[1, ..., M]` and reversed spatial memory order. The
-/// [`Self::forward`] and [`Self::inverse`] methods are out of place and input
-/// preserving; [`Self::forward_in_place`] and [`Self::inverse_in_place`] use
-/// one state-checked buffer.
+/// [`Self::forward`], [`Self::inverse`], and [`Self::backward`] methods are
+/// out of place and input preserving; their source is respectively the
+/// canonical input, reversed output, and reversed output layout. `inverse` is
+/// normalized, while `backward` is the positive-sign raw transform and scales
+/// a forward result by the product of the global spatial extents. The
+/// [`Self::forward_in_place`], [`Self::inverse_in_place`], and
+/// [`Self::backward_in_place`] methods use one state-checked buffer.
 ///
 /// # Example
 ///
@@ -248,6 +255,13 @@ impl TransposeMethod {
 ///         for (actual, expected) in recovered.as_slice().iter().zip(&original) {
 ///             assert!((actual.re - expected.re).abs() < 1e-9);
 ///             assert!((actual.im - expected.im).abs() < 1e-9);
+///         }
+///         let mut raw = plan.allocate_input()?;
+///         plan.backward(&transformed, &mut raw, &mut workspace)?;
+///         let scale = (2 * world_size * 3) as f64;
+///         for (actual, expected) in raw.as_slice().iter().zip(&original) {
+///             assert!((actual.re - expected.re * scale).abs() < 1e-7 * scale);
+///             assert!((actual.im - expected.im * scale).abs() < 1e-7 * scale);
 ///         }
 ///         Ok::<(), Box<dyn std::error::Error>>(())
 ///     };
@@ -324,6 +338,8 @@ pub struct C2cOutOfPlaceWorkspace<R: FftReal, const N: usize, const M: usize> {
 /// }
 /// ```
 ///
+/// Both [`C2cPlan::inverse_in_place`] and [`C2cPlan::backward_in_place`]
+/// consume `Output` and return `Input`; only the former applies normalization.
 /// The backing `ManyPencilArray` and raw slices are intentionally private:
 ///
 /// ```compile_fail
@@ -430,6 +446,7 @@ struct StagePreparation<R: FftReal, const N: usize, const M: usize> {
 enum Direction {
     Forward,
     Inverse,
+    Backward,
 }
 
 impl<R: FftReal, const N: usize, const M: usize> C2cPlan<R, N, M>
@@ -568,7 +585,7 @@ where
         })
     }
 
-    /// Allocates reusable scratch for in-place forward and inverse execution.
+    /// Allocates reusable scratch for in-place forward, inverse, and backward execution.
     ///
     /// This method is noncollective. If allocation fails on one rank, callers
     /// must coordinate that failure before the next collective call.
@@ -583,7 +600,7 @@ where
         })
     }
 
-    /// Allocates a reusable workspace for out-of-place forward and inverse execution.
+    /// Allocates a reusable workspace for out-of-place forward, inverse, and backward execution.
     pub fn allocate_out_of_place_workspace(
         &self,
     ) -> Result<C2cOutOfPlaceWorkspace<R, N, M>, FftError> {
@@ -645,6 +662,24 @@ where
         self.execute(Direction::Inverse, source, destination, workspace)
     }
 
+    /// Computes an unnormalized positive-sign backward distributed C2C transform.
+    ///
+    /// The source uses the forward output layout and the destination uses the
+    /// canonical input layout. Unlike [`Self::inverse`], this raw backward
+    /// transform does not divide by any spatial extent. A forward transform
+    /// followed by this method therefore scales each value by the product of
+    /// the global spatial extents; extra batch dimensions are not included.
+    /// Initial descriptor/preflight errors preserve source, destination, and
+    /// workspace, with the same post-start guarantees as [`Self::inverse`].
+    pub fn backward(
+        &self,
+        source: &PencilArray<Complex<R>, N, M>,
+        destination: &mut PencilArray<Complex<R>, N, M>,
+        workspace: &mut C2cOutOfPlaceWorkspace<R, N, M>,
+    ) -> Result<(), FftError> {
+        self.execute(Direction::Backward, source, destination, workspace)
+    }
+
     /// Computes an unnormalized forward transform in the array's single buffer.
     ///
     /// The array must be in [`C2cState::Input`]. Initial collective
@@ -679,6 +714,22 @@ where
         workspace: &mut C2cInPlaceWorkspace<R, N, M>,
     ) -> Result<(), FftError> {
         self.execute_in_place(Direction::Inverse, array, workspace)
+    }
+
+    /// Computes an unnormalized positive-sign backward transform in the array's
+    /// single buffer.
+    ///
+    /// The array must be in [`C2cState::Output`]. The route ends in the
+    /// canonical input layout and does not divide by spatial extents, so a
+    /// forward/backward pair scales by their product. It has the same
+    /// collective preflight, poisoning, and MPI failure contract as
+    /// [`Self::inverse_in_place`].
+    pub fn backward_in_place(
+        &self,
+        array: &mut C2cInPlaceArray<R, N, M>,
+        workspace: &mut C2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<(), FftError> {
+        self.execute_in_place(Direction::Backward, array, workspace)
     }
 
     fn construct(
@@ -748,6 +799,7 @@ where
         let operation = match direction {
             Direction::Forward => OPERATION_FORWARD,
             Direction::Inverse => OPERATION_INVERSE,
+            Direction::Backward => OPERATION_BACKWARD,
         };
         agree_execution_descriptor(communicator, operation, &self.core)?;
 
@@ -759,9 +811,16 @@ where
         }
         local_preflight.expect("collective distributed C2C preflight succeeded");
 
+        let normalize_inverse = matches!(direction, Direction::Inverse);
         match direction {
             Direction::Forward => execute_forward(&self.core, source, destination, workspace),
-            Direction::Inverse => execute_inverse(&self.core, source, destination, workspace),
+            Direction::Inverse | Direction::Backward => execute_inverse(
+                &self.core,
+                source,
+                destination,
+                workspace,
+                normalize_inverse,
+            ),
         }
     }
 
@@ -797,6 +856,7 @@ where
         let operation = match direction {
             Direction::Forward => OPERATION_FORWARD_IN_PLACE,
             Direction::Inverse => OPERATION_INVERSE_IN_PLACE,
+            Direction::Backward => OPERATION_BACKWARD_IN_PLACE,
         };
         agree_execution_descriptor(communicator, operation, &self.core)?;
 
@@ -808,9 +868,10 @@ where
         }
         local_preflight.expect("collective distributed C2C in-place preflight succeeded");
 
+        let normalize_inverse = matches!(direction, Direction::Inverse);
         let target = match direction {
             Direction::Forward => C2cState::Output,
-            Direction::Inverse => C2cState::Input,
+            Direction::Inverse | Direction::Backward => C2cState::Input,
         };
         run_in_place_transaction(
             array,
@@ -823,11 +884,12 @@ where
                     &mut workspace.transpose,
                     &mut workspace.fft_scratch,
                 ),
-                Direction::Inverse => execute_inverse_in_place(
+                Direction::Inverse | Direction::Backward => execute_inverse_in_place(
                     &self.core,
                     &mut array.array,
                     &mut workspace.transpose,
                     &mut workspace.fft_scratch,
+                    normalize_inverse,
                 ),
             },
         )
@@ -848,7 +910,7 @@ where
 
         let expected_state = match direction {
             Direction::Forward => C2cState::Input,
-            Direction::Inverse => C2cState::Output,
+            Direction::Inverse | Direction::Backward => C2cState::Output,
         };
         match array.state {
             C2cState::Poisoned => return Err(FftError::Array(ArrayError::Poisoned)),
@@ -862,7 +924,7 @@ where
 
         let expected_pencil = match direction {
             Direction::Forward => self.input_pencil(),
-            Direction::Inverse => self.output_pencil(),
+            Direction::Inverse | Direction::Backward => self.output_pencil(),
         };
         let active = array.array.active_pencil().map_err(FftError::Array)?;
         if !active.same_layout(expected_pencil.as_ref()) {
@@ -1218,6 +1280,7 @@ fn execute_inverse<R: FftReal, const N: usize, const M: usize>(
     source: &PencilArray<Complex<R>, N, M>,
     destination: &mut PencilArray<Complex<R>, N, M>,
     workspace: &mut C2cOutOfPlaceWorkspace<R, N, M>,
+    normalize_inverse: bool,
 ) -> Result<(), FftError>
 where
     Complex<R>: Equivalence,
@@ -1229,22 +1292,26 @@ where
         &mut workspace.intermediate,
         &mut workspace.transpose,
         &mut workspace.fft_scratch,
+        normalize_inverse,
     )?;
+    let execute_local = if normalize_inverse {
+        LocalC2cPlan::<R>::inverse
+    } else {
+        LocalC2cPlan::<R>::backward
+    };
     let stage = &core.stages[0];
     let active = workspace
         .intermediate
         .active_view()
         .expect("distributed C2C inverse final active layout was preflighted");
     let mut destination_view = destination.view_mut();
-    stage
-        .local
-        .complex()
-        .inverse(
-            active.as_slice(),
-            destination_view.as_mut_slice(),
-            &mut workspace.fft_scratch,
-        )
-        .expect("distributed C2C final inverse stage was preflighted");
+    execute_local(
+        stage.local.complex(),
+        active.as_slice(),
+        destination_view.as_mut_slice(),
+        &mut workspace.fft_scratch,
+    )
+    .expect("distributed C2C final inverse stage was preflighted");
     Ok(())
 }
 
@@ -1298,20 +1365,33 @@ fn execute_inverse_complex_tail<R: FftReal, const N: usize, const M: usize>(
     intermediate: &mut ManyPencilArray<Complex<R>, N, M>,
     transpose: &mut TransposeWorkspace<Complex<R>>,
     fft_scratch: &mut [Complex<R>],
+    normalize_inverse: bool,
 ) -> Result<(), FftError>
 where
     Complex<R>: Equivalence,
 {
+    let execute_local = if normalize_inverse {
+        LocalC2cPlan::<R>::inverse
+    } else {
+        LocalC2cPlan::<R>::backward
+    };
+    let execute_local_in_place = if normalize_inverse {
+        LocalC2cPlan::<R>::inverse_in_place
+    } else {
+        LocalC2cPlan::<R>::backward_in_place
+    };
     let source_view = source.view();
     {
         let stage = &stages[N - 1];
         intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
-                stage
-                    .local
-                    .complex()
-                    .inverse(source_view.as_slice(), target.as_mut_slice(), fft_scratch)
-                    .expect("complex tail first inverse stage was preflighted");
+                execute_local(
+                    stage.local.complex(),
+                    source_view.as_slice(),
+                    target.as_mut_slice(),
+                    fft_scratch,
+                )
+                .expect("complex tail first inverse stage was preflighted");
                 Ok::<_, ()>(())
             })
             .expect("complex tail inverse overwrite was preflighted");
@@ -1323,10 +1403,7 @@ where
             let mut active = intermediate
                 .active_view_mut()
                 .expect("complex tail inverse middle layout was preflighted");
-            stage
-                .local
-                .complex()
-                .inverse_in_place(active.as_mut_slice(), fft_scratch)
+            execute_local_in_place(stage.local.complex(), active.as_mut_slice(), fft_scratch)
                 .expect("complex tail middle inverse stage was preflighted");
         }
     }
@@ -1368,27 +1445,27 @@ fn execute_inverse_in_place<R: FftReal, const N: usize, const M: usize>(
     array: &mut ManyPencilArray<Complex<R>, N, M>,
     transpose: &mut TransposeWorkspace<Complex<R>>,
     fft_scratch: &mut [Complex<R>],
+    normalize_inverse: bool,
 ) -> Result<(), FftError>
 where
     Complex<R>: Equivalence,
 {
+    let execute_local_in_place = if normalize_inverse {
+        LocalC2cPlan::<R>::inverse_in_place
+    } else {
+        LocalC2cPlan::<R>::backward_in_place
+    };
     {
         let stage = &core.stages[N - 1];
         let mut active = array.active_view_mut().map_err(FftError::Array)?;
-        stage
-            .local
-            .complex()
-            .inverse_in_place(active.as_mut_slice(), fft_scratch)?;
+        execute_local_in_place(stage.local.complex(), active.as_mut_slice(), fft_scratch)?;
     }
 
     for index in (0..N - 1).rev() {
         execute_transition(&core.transitions[index].backward, array, transpose)?;
         let stage = &core.stages[index];
         let mut active = array.active_view_mut().map_err(FftError::Array)?;
-        stage
-            .local
-            .complex()
-            .inverse_in_place(active.as_mut_slice(), fft_scratch)?;
+        execute_local_in_place(stage.local.complex(), active.as_mut_slice(), fft_scratch)?;
     }
     Ok(())
 }
@@ -1573,7 +1650,7 @@ fn validate_out_of_place<R: FftReal, T, U, const N: usize, const M: usize>(
         .output;
     let (expected_source, expected_destination) = match direction {
         Direction::Forward => (input, output),
-        Direction::Inverse => (output, input),
+        Direction::Inverse | Direction::Backward => (output, input),
     };
     if !source.pencil().same_layout(expected_source.as_ref()) {
         return Err(FftError::InputLayoutMismatch);
@@ -1710,10 +1787,11 @@ mod tests {
 
     use super::{
         C2cInPlaceArray, C2cInPlaceWorkspace, C2cPlan, C2cState, C2cTransition, Complex, Direction,
-        ExtraShape, FftError, LocalC2cError, LocalC2cPlan, OPERATION_FORWARD,
-        OPERATION_FORWARD_IN_PLACE, OPERATION_INVERSE, OPERATION_INVERSE_IN_PLACE, OPERATION_PLAN,
-        OPERATION_R2C_FORWARD, OPERATION_R2C_INVERSE, OPERATION_R2C_PLAN, TransposeMethod,
-        descriptor_len, run_in_place_transaction,
+        ExtraShape, FftError, LocalC2cError, LocalC2cPlan, OPERATION_BACKWARD,
+        OPERATION_BACKWARD_IN_PLACE, OPERATION_FORWARD, OPERATION_FORWARD_IN_PLACE,
+        OPERATION_INVERSE, OPERATION_INVERSE_IN_PLACE, OPERATION_PLAN, OPERATION_R2C_FORWARD,
+        OPERATION_R2C_INVERSE, OPERATION_R2C_PLAN, TransposeMethod, descriptor_len,
+        run_in_place_transaction,
     };
     use mpi::topology::Communicator;
     use pencil_array::{MpiTopology, TransposeWorkspace};
@@ -1757,9 +1835,11 @@ mod tests {
             (
                 OPERATION_R2C_PLAN,
                 OPERATION_R2C_FORWARD,
-                OPERATION_R2C_INVERSE
+                OPERATION_R2C_INVERSE,
+                OPERATION_BACKWARD,
+                OPERATION_BACKWARD_IN_PLACE,
             ),
-            (12, 13, 14)
+            (12, 13, 14, 15, 16)
         );
     }
 
@@ -1822,17 +1902,17 @@ mod tests {
                 assert_eq!(format!("{short_array:?}"), short_array_before);
                 assert_eq!(format!("{short_workspace:?}"), short_workspace_before);
 
-                for direction in [Direction::Forward, Direction::Inverse] {
+                for direction in [Direction::Forward, Direction::Inverse, Direction::Backward] {
                     for panic_failure in [false, true] {
                         let mut array = plan.allocate_in_place().unwrap();
                         let mut workspace = plan.allocate_in_place_workspace().unwrap();
-                        if matches!(direction, Direction::Inverse) {
+                        if matches!(direction, Direction::Inverse | Direction::Backward) {
                             plan.forward_in_place(&mut array, &mut workspace).unwrap();
                             assert_eq!(array.state(), C2cState::Output);
                         }
                         let target = match direction {
                             Direction::Forward => C2cState::Output,
-                            Direction::Inverse => C2cState::Input,
+                            Direction::Inverse | Direction::Backward => C2cState::Input,
                         };
                         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                             run_in_place_transaction(
@@ -1893,6 +1973,52 @@ mod tests {
                 ));
                 assert_eq!(array.state(), C2cState::Poisoned);
                 assert_poisoned_views_and_retries(&corrupted_plan, &mut array, &mut workspace);
+
+                // For raw backward, corrupt only the final stage in the
+                // reverse route. The first raw stage and backward transition
+                // run before stage zero returns NonIntegralBatch.
+                let mut corrupted_backward_plan = C2cPlan::<f64, 2, 1>::from_shape_with_method(
+                    Arc::clone(&topology),
+                    [2, 3],
+                    ExtraShape::scalar(),
+                    method,
+                )
+                .unwrap();
+                Arc::get_mut(&mut corrupted_backward_plan.core)
+                    .expect("the separate backward plan core has no other owners")
+                    .stages
+                    .first_mut()
+                    .expect("the C2C route has an initial stage")
+                    .local = super::LocalTransform::Complex(LocalC2cPlan::new(4).unwrap());
+                let mut backward_array = corrupted_backward_plan.allocate_in_place().unwrap();
+                backward_array
+                    .array
+                    .overwrite_with(
+                        corrupted_backward_plan.output_pencil().as_ref(),
+                        |mut view| {
+                            for (index, value) in view.as_mut_slice().iter_mut().enumerate() {
+                                *value = Complex::new(index as f64 + 1.0, -(index as f64));
+                            }
+                            Ok::<_, ()>(())
+                        },
+                    )
+                    .unwrap();
+                backward_array.state = C2cState::Output;
+                let mut backward_workspace = corrupted_backward_plan
+                    .allocate_in_place_workspace()
+                    .unwrap();
+                let result = corrupted_backward_plan
+                    .backward_in_place(&mut backward_array, &mut backward_workspace);
+                assert!(matches!(
+                    result,
+                    Err(FftError::LocalC2c(LocalC2cError::NonIntegralBatch))
+                ));
+                assert_eq!(backward_array.state(), C2cState::Poisoned);
+                assert_poisoned_views_and_retries(
+                    &corrupted_backward_plan,
+                    &mut backward_array,
+                    &mut backward_workspace,
+                );
             }
 
             Ok::<(), ()>(())
@@ -1939,12 +2065,13 @@ mod tests {
             array.view_mut(),
             Err(FftError::Array(pencil_array::ArrayError::Poisoned))
         ));
-        for direction in [Direction::Forward, Direction::Inverse] {
+        for direction in [Direction::Forward, Direction::Inverse, Direction::Backward] {
             let array_before = format!("{array:?}");
             let workspace_before = format!("{workspace:?}");
             let result = match direction {
                 Direction::Forward => plan.forward_in_place(array, workspace),
                 Direction::Inverse => plan.inverse_in_place(array, workspace),
+                Direction::Backward => plan.backward_in_place(array, workspace),
             };
             assert!(matches!(
                 result,
