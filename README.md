@@ -7,8 +7,10 @@ The workspace contains the `pencil-array` core crate and the local FFT
 `pencil-fft` crate. `pencil-array` is intentionally independent of RustFFT,
 RealFFT, FFTW, and any FFT-specific API. The local `pencil-fft` path accepts
 flat slices, uses RustFFT/RealFFT, and is independent of MPI and
-`pencil-array`. Local C2C and out-of-place R2C/C2R are available. An opt-in
-`pencil-fft/distributed` feature adds out-of-place, input-preserving and
+`pencil-array`. Local C2C provides unnormalized forward and positive-sign
+`backward` transforms plus normalized `inverse`; `backward` is local C2C only,
+not a distributed or R2C API. Local out-of-place R2C/C2R are also available.
+An opt-in `pencil-fft/distributed` feature adds out-of-place, input-preserving and
 single-buffer in-place distributed C2C FFTs and out-of-place distributed
 R2C/C2R over checked Alltoallv or point-to-point transitions.
 
