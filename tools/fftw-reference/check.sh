@@ -64,14 +64,23 @@ fi
 shopt -s nullglob
 fixture_entries=("$FIXTURES"/*)
 fixture_files=("$FIXTURES"/*.txt)
-[[ ${#fixture_entries[@]} -eq 16 && ${#fixture_files[@]} -eq 16 ]] || {
-    printf 'expected exactly 16 fixture files, found %s entries and %s txt files\n' \
-        "${#fixture_entries[@]}" "${#fixture_files[@]}" >&2
+expected_fixture_count=28
+[[ ${#fixture_entries[@]} -eq "$expected_fixture_count" && ${#fixture_files[@]} -eq "$expected_fixture_count" ]] || {
+    printf 'expected exactly %s fixture files, found %s entries and %s txt files\n' \
+        "$expected_fixture_count" "${#fixture_entries[@]}" "${#fixture_files[@]}" >&2
     exit 1
 }
 for fixture in "${fixture_files[@]}"; do
     [[ -s "$fixture" ]] || {
         printf 'empty fixture: %s\n' "$fixture" >&2
+        exit 1
+    }
+    grep -Fxq 'PENCIL_FFTW_REFERENCE 4' "$fixture" || {
+        printf 'fixture is missing mandatory format-4 metadata: %s\n' "$fixture" >&2
+        exit 1
+    }
+    grep -Eq '^selected_axes( |$)' "$fixture" || {
+        printf 'fixture is missing mandatory selected_axes metadata: %s\n' "$fixture" >&2
         exit 1
     }
 done
@@ -124,7 +133,7 @@ cp -- "${fixture_files[@]}" "$CORRUPT_FORWARD/"
 cp -- "${fixture_files[@]}" "$CORRUPT_BACKWARD/"
 for corrupt_directory in "$CORRUPT_FORWARD" "$CORRUPT_BACKWARD"; do
     corrupt_files=("$corrupt_directory"/*.txt)
-    [[ ${#corrupt_files[@]} -eq 16 ]] || {
+    [[ ${#corrupt_files[@]} -eq "$expected_fixture_count" ]] || {
         printf 'corrupted fixture copy is incomplete\n' >&2
         exit 1
     }

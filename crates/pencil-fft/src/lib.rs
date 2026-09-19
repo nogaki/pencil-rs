@@ -19,8 +19,9 @@
 //! With the opt-in `distributed` feature, `C2cPlan` and its workspaces provide
 //! input-preserving distributed C2C transforms, while `R2cPlan` provides
 //! input-preserving out-of-place R2C/C2R forward, normalized inverse, and raw
-//! backward with a reduced final complex axis.
-//! C2C also retains its state-checked single-buffer API; distributed R2C has
+//! backward with a selected-axis reduction. `AxisSelection` keeps the full
+//! canonical route while making unselected stages identities; C2C also retains
+//! its state-checked single-buffer API; distributed R2C has
 //! no real in-place API. Both support `N >= 2`, `1 <= M < N`, and checked
 //! Alltoallv or receive-before-send point-to-point transitions; legacy
 //! constructors default to Alltoallv. Plan construction and transform calls
@@ -115,6 +116,15 @@ pub use rustfft::num_complex::Complex;
 mod private {
     use super::Complex;
 
+    #[cfg(feature = "distributed")]
+    pub trait DistributedReal: mpi::datatype::Equivalence {}
+
+    #[cfg(not(feature = "distributed"))]
+    pub trait DistributedReal {}
+
+    impl DistributedReal for f32 {}
+    impl DistributedReal for f64 {}
+
     pub trait Sealed: rustfft::FftNum {
         fn normalize_inverse(values: &mut [Complex<Self>], line_len: usize);
         fn pencil_fft_as_f64(self) -> f64;
@@ -170,7 +180,10 @@ mod private {
 /// A real scalar supported by the local FFT plans.
 ///
 /// This trait is sealed and is implemented only for `f32` and `f64`.
-pub trait FftReal: private::Sealed + Copy + Send + Sync + 'static {}
+pub trait FftReal:
+    private::Sealed + private::DistributedReal + Copy + Send + Sync + 'static
+{
+}
 
 impl FftReal for f32 {}
 impl FftReal for f64 {}
@@ -186,8 +199,9 @@ mod distributed;
 
 #[cfg(feature = "distributed")]
 pub use distributed::{
-    C2cInPlaceArray, C2cInPlaceWorkspace, C2cOutOfPlaceWorkspace, C2cPlan, C2cState, FftError,
-    R2cError, R2cPlan, R2cWorkspace, TransposeMethod,
+    AxisSelection, AxisSelectionError, C2cInPlaceArray, C2cInPlaceWorkspace,
+    C2cOutOfPlaceWorkspace, C2cPlan, C2cState, FftError, R2cError, R2cPlan, R2cWorkspace,
+    TransposeMethod,
 };
 
 /// Errors returned by local C2C plan construction and execution.

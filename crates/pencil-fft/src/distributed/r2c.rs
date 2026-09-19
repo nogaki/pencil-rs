@@ -1,35 +1,38 @@
 //! Distributed real-to-half-complex and half-complex-to-real transforms.
 
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
 use mpi::{
     collective::{CommunicatorCollectives, SystemOperation},
     datatype::Equivalence,
 };
 use pencil_array::{
-    ExtraShape, ManyPencilArray, MpiTopology, Pencil, PencilArray, TransposeWorkspace,
+    ExtraShape, ManyPencilArray, MpiTopology, OverwriteError, Pencil, PencilArray,
+    TransposeWorkspace,
 };
 
 use super::{
-    DESCRIPTOR_SCHEMA, Direction, FftError, INVALID_WORD, LocalTransform, OPERATION_R2C_BACKWARD,
-    OPERATION_R2C_FORWARD, OPERATION_R2C_INVERSE, OPERATION_R2C_PLAN, R2cError, TransformPlanCore,
-    TransformStage, TransposeMethod, agree_execution_descriptor_ref, agree_header, agree_result,
-    build_descriptor, build_route, build_transitions, collective_valid, descriptor_len,
-    initialized_vec, map_array_allocation, prepare_stages, registered_stage_pencils,
-    validate_out_of_place, zero_complex,
+    AxisSelection, DESCRIPTOR_SCHEMA, Direction, FftError, INVALID_WORD, LocalTransform,
+    OPERATION_R2C_BACKWARD, OPERATION_R2C_FORWARD, OPERATION_R2C_INVERSE, OPERATION_R2C_PLAN,
+    R2cError, StagePreparation, TransformPlanCore, TransformStage, TransposeMethod, VALUE_KIND_R2C,
+    agree_execution_descriptor_ref, agree_header, agree_result, build_descriptor, build_route,
+    build_transitions, collective_valid, descriptor_len, initialized_vec, map_array_allocation,
+    prepare_complex_stage, registered_stage_pencils, validate_out_of_place,
+    validate_workspace_lengths_values, zero_complex,
 };
-use crate::{Complex, FftReal, LocalR2cPlan};
+use crate::{Complex, FftReal, LocalR2cError, LocalR2cPlan};
 
 /// An immutable, checked distributed real-to-half-complex FFT plan.
 ///
 /// This API requires `N >= 2` and `1 <= M < N`. The input uses identity
 /// permutation and decomposition `[0..M)` with the original real global shape.
-/// If the original final extent is `n`, the final complex output has extent
-/// `n / 2 + 1`; the other extents are unchanged. The initial reduced-complex
-/// stage keeps the input decomposition `[0..M)`, but it is not the final
-/// output. The final output uses decomposition `[1..=M]` and reversed
-/// spatial memory order. Its first local stage is real-to-half-complex; later
-/// stages are homogeneous complex transforms over the other `N - 1` axes.
+/// A non-empty [`AxisSelection`] chooses the largest selected axis as the
+/// real-to-half-complex boundary. Its extent `n` becomes `n / 2 + 1`; selected
+/// lower axes are complex stages and unselected axes are identity stages. The
+/// route still contains all `N` stages and `N - 1` transitions, including
+/// real-prefix transposes before a non-last boundary. The final output uses
+/// decomposition `[1..=M]` and reversed spatial memory order. Empty selections
+/// are collectively rejected before native planning.
 ///
 /// Constructors and `forward`/`inverse`/`backward` are collective. Every rank must use
 /// the same communicator context, API and call order, scalar type, transport
@@ -41,12 +44,13 @@ use crate::{Complex, FftReal, LocalR2cPlan};
 /// must coordinate a local allocation failure before the next collective.
 /// There is intentionally no distributed real in-place API.
 ///
-/// `inverse` is normalized by the product of the original spatial extents;
+/// `inverse` is normalized by the product of the selected spatial extents;
 /// `backward` uses the same positive-sign C2R transform without that
 /// normalization. Both reverse operations preserve their complex source.
-/// Backward endpoint acceptance uses the same relative threshold as inverse
-/// and an absolute threshold multiplied by the product of the original
-/// transverse extents (excluding the real axis and extra dimensions).
+/// Only selected spatial axes contribute to normalization. Backward endpoint
+/// acceptance uses the same relative threshold as inverse and an absolute
+/// threshold multiplied by the product of selected complex-tail extents;
+/// extra dimensions and identity axes do not contribute.
 ///
 /// # Example
 ///
@@ -102,13 +106,13 @@ use crate::{Complex, FftReal, LocalR2cPlan};
 /// `||Im z||_2 <= relative_R * ||Re z||_2`, with the exact fixed policy
 ///
 /// ```text
-/// D = 1 + sum_{a=0..N-2} ceil(log2(n_a))
+/// D = 1 + sum over selected complex-tail axes a of ceil(log2(n_a))
 /// relative_R = 128 * epsilon_R * D
 /// absolute_R = 128 * min_subnormal_R * D
 /// ```
 ///
-/// Here `n_a` are the original spatial extents before the real axis, and a
-/// length-one axis contributes zero. DC is constrained for every `n`; the
+/// Here `n_a` are the original extents of selected spatial axes below the
+/// real axis, and a length-one axis contributes zero. DC is constrained for every `n`; the
 /// Nyquist plane is additionally constrained only for even `n`. For odd
 /// `n > 1`, the final complex bin is not constrained; for `n == 1` it is DC
 /// and is constrained. Signed zero is accepted. This is an explicit
@@ -119,22 +123,42 @@ use crate::{Complex, FftReal, LocalR2cPlan};
 /// finite-or-real requirement.
 ///
 /// `backward` uses the same endpoint policy, except that its absolute
-/// threshold is `absolute_inverse * product(n_0..n_{N-2})`; the factor is
-/// finite and positive-validated collectively while constructing the plan.
+/// threshold is `absolute_inverse * product(selected complex-tail n_a)`; the
+/// factor is finite and positive-validated collectively while constructing the
+/// plan.
 ///
 /// Descriptor and initial preflight errors are collectively returned before
 /// source, destination, or workspace writes and preserve all three. A
 /// materially invalid endpoint returns [`R2cError::InvalidSpectrum`] after
 /// the transverse stages have used the workspace: the source and real
 /// destination remain unchanged, but workspace mutation is permitted. The
-/// inverse is normalized by the product of the original spatial extents;
-/// extra dimensions and the reduced complex extent are not normalization
-/// factors.
+/// inverse is normalized by the product of selected spatial extents;
+/// identity axes, extra dimensions, and the reduced complex extent are not
+/// normalization factors.
 ///
 /// ```compile_fail
 /// use pencil_fft::R2cPlan;
 ///
 /// let _ = R2cPlan::<f64, 2, 1>::forward_in_place;
+/// ```
+///
+/// Existing generic callers only need their original bounds:
+///
+/// ```
+/// use std::sync::Arc;
+/// use mpi::datatype::Equivalence;
+/// use pencil_array::{ExtraShape, MpiTopology};
+/// use pencil_fft::{Complex, FftReal, R2cPlan};
+///
+/// fn old_generic<R, const N: usize, const M: usize>(
+///     topology: Arc<MpiTopology<M>>,
+///     shape: [usize; N],
+/// ) where
+///     R: FftReal,
+///     Complex<R>: Equivalence,
+/// {
+///     let _ = R2cPlan::<R, N, M>::from_shape(topology, shape, ExtraShape::scalar());
+/// }
 /// ```
 #[derive(Debug)]
 pub struct R2cPlan<R: FftReal, const N: usize, const M: usize> {
@@ -153,6 +177,8 @@ pub struct R2cWorkspace<R: FftReal, const N: usize, const M: usize> {
     core: Arc<TransformPlanCore<R, N, M>>,
     intermediate: ManyPencilArray<Complex<R>, N, M>,
     transpose: TransposeWorkspace<Complex<R>>,
+    real_intermediate: Option<ManyPencilArray<R, N, M>>,
+    real_transpose: Option<TransposeWorkspace<R>>,
     fft_scratch: Vec<Complex<R>>,
     real_line: Vec<R>,
     complex_line: Vec<Complex<R>>,
@@ -167,7 +193,45 @@ where
         input: Arc<Pencil<N, M>>,
         extra_shape: ExtraShape,
     ) -> Result<Self, R2cError> {
-        Self::from_pencil_with_method(input, extra_shape, TransposeMethod::AllToAllv)
+        Self::from_pencil_with_selection_and_method(
+            input,
+            extra_shape,
+            AxisSelection::all(),
+            TransposeMethod::AllToAllv,
+        )
+    }
+
+    /// Collectively builds an Alltoallv plan for a validated axis selection.
+    pub fn from_pencil_with_selection(
+        input: Arc<Pencil<N, M>>,
+        extra_shape: ExtraShape,
+        selection: AxisSelection<N>,
+    ) -> Result<Self, R2cError> {
+        Self::from_pencil_with_selection_and_method(
+            input,
+            extra_shape,
+            selection,
+            TransposeMethod::AllToAllv,
+        )
+    }
+
+    /// Collectively builds a plan from a canonical real pencil and selection.
+    pub fn from_pencil_with_selection_and_method(
+        input: Arc<Pencil<N, M>>,
+        extra_shape: ExtraShape,
+        selection: AxisSelection<N>,
+        method: TransposeMethod,
+    ) -> Result<Self, R2cError> {
+        let topology = Arc::clone(input.topology());
+        let global_shape = *input.global_shape();
+        Self::construct(
+            topology,
+            global_shape,
+            extra_shape,
+            Ok(input),
+            selection,
+            method,
+        )
     }
 
     /// Collectively builds a plan from a canonical real pencil and transport.
@@ -176,19 +240,35 @@ where
         extra_shape: ExtraShape,
         method: TransposeMethod,
     ) -> Result<Self, R2cError> {
-        let topology = Arc::clone(input.topology());
-        let global_shape = *input.global_shape();
-        Self::construct(topology, global_shape, extra_shape, Ok(input), method)
+        Self::from_pencil_with_selection_and_method(
+            input,
+            extra_shape,
+            AxisSelection::all(),
+            method,
+        )
     }
 
     /// Collectively builds an Alltoallv plan from a canonical real array.
     pub fn from_array(input: &PencilArray<R, N, M>) -> Result<Self, R2cError> {
-        Self::from_array_with_method(input, TransposeMethod::AllToAllv)
+        Self::from_array_with_selection_and_method(
+            input,
+            AxisSelection::all(),
+            TransposeMethod::AllToAllv,
+        )
     }
 
-    /// Collectively builds a plan from a canonical real array and transport.
-    pub fn from_array_with_method(
+    /// Collectively builds an Alltoallv plan for a validated axis selection.
+    pub fn from_array_with_selection(
         input: &PencilArray<R, N, M>,
+        selection: AxisSelection<N>,
+    ) -> Result<Self, R2cError> {
+        Self::from_array_with_selection_and_method(input, selection, TransposeMethod::AllToAllv)
+    }
+
+    /// Collectively builds a plan from a canonical real array and selection.
+    pub fn from_array_with_selection_and_method(
+        input: &PencilArray<R, N, M>,
+        selection: AxisSelection<N>,
         method: TransposeMethod,
     ) -> Result<Self, R2cError> {
         let topology = Arc::clone(input.pencil().topology());
@@ -198,8 +278,17 @@ where
             global_shape,
             input.extra_shape().clone(),
             Ok(Arc::clone(input.pencil())),
+            selection,
             method,
         )
+    }
+
+    /// Collectively builds a plan from a canonical real array and transport.
+    pub fn from_array_with_method(
+        input: &PencilArray<R, N, M>,
+        method: TransposeMethod,
+    ) -> Result<Self, R2cError> {
+        Self::from_array_with_selection_and_method(input, AxisSelection::all(), method)
     }
 
     /// Collectively builds an Alltoallv plan from topology and shape.
@@ -208,10 +297,11 @@ where
         global_shape: [usize; N],
         extra_shape: ExtraShape,
     ) -> Result<Self, R2cError> {
-        Self::from_shape_with_method(
+        Self::from_shape_with_selection_and_method(
             topology,
             global_shape,
             extra_shape,
+            AxisSelection::all(),
             TransposeMethod::AllToAllv,
         )
     }
@@ -224,13 +314,53 @@ where
         extra_shape: ExtraShape,
         method: TransposeMethod,
     ) -> Result<Self, R2cError> {
+        Self::from_shape_with_selection_and_method(
+            topology,
+            global_shape,
+            extra_shape,
+            AxisSelection::all(),
+            method,
+        )
+    }
+
+    /// Collectively builds an Alltoallv plan for a validated axis selection.
+    pub fn from_shape_with_selection(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        selection: AxisSelection<N>,
+    ) -> Result<Self, R2cError> {
+        Self::from_shape_with_selection_and_method(
+            topology,
+            global_shape,
+            extra_shape,
+            selection,
+            TransposeMethod::AllToAllv,
+        )
+    }
+
+    /// Collectively builds a plan from topology, shape, selection, and method.
+    pub fn from_shape_with_selection_and_method(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        selection: AxisSelection<N>,
+        method: TransposeMethod,
+    ) -> Result<Self, R2cError> {
         let input = Pencil::new(
             Arc::clone(&topology),
             global_shape,
             std::array::from_fn(|axis| axis),
         )
         .map_err(FftError::Pencil);
-        Self::construct(topology, global_shape, extra_shape, input, method)
+        Self::construct(
+            topology,
+            global_shape,
+            extra_shape,
+            input,
+            selection,
+            method,
+        )
     }
 
     /// Returns the canonical real input pencil.
@@ -275,18 +405,43 @@ where
 
     /// Allocates reusable noncollective forward/inverse/backward workspace.
     pub fn allocate_workspace(&self) -> Result<R2cWorkspace<R, N, M>, R2cError> {
+        let boundary = self
+            .core
+            .real_stage_index
+            .expect("R2C core has a real boundary stage");
         let (real_len, complex_len) = r2c_lengths(&self.core);
         let intermediate = ManyPencilArray::from_elem(
-            registered_stage_pencils(&self.core.stages)?,
+            registered_stage_pencils(&self.core.stages[boundary..])?,
             0,
             self.core.extra_shape.clone(),
             zero_complex::<R>(),
         )
         .map_err(map_array_allocation)?;
+        let real_intermediate = if boundary == 0 {
+            None
+        } else {
+            Some(
+                ManyPencilArray::from_elem(
+                    registered_real_stage_pencils(&self.core.stages, boundary)?,
+                    0,
+                    self.core.extra_shape.clone(),
+                    R::zero(),
+                )
+                .map_err(map_array_allocation)?,
+            )
+        };
         let transpose = TransposeWorkspace::from_vecs(
             initialized_vec(self.core.transpose_send_len, zero_complex::<R>())?,
             initialized_vec(self.core.transpose_receive_len, zero_complex::<R>())?,
         );
+        let real_transpose = if boundary == 0 {
+            None
+        } else {
+            Some(TransposeWorkspace::from_vecs(
+                initialized_vec(self.core.real_transpose_send_len, R::zero())?,
+                initialized_vec(self.core.real_transpose_receive_len, R::zero())?,
+            ))
+        };
         let fft_scratch = initialized_vec(self.core.fft_scratch_len, zero_complex::<R>())?;
         let real_line = initialized_vec(real_len, R::zero())?;
         let complex_line = initialized_vec(complex_len, zero_complex::<R>())?;
@@ -294,6 +449,8 @@ where
             core: Arc::clone(&self.core),
             intermediate,
             transpose,
+            real_intermediate,
+            real_transpose,
             fft_scratch,
             real_line,
             complex_line,
@@ -317,7 +474,7 @@ where
     /// original shape `n_a`,
     ///
     /// ```text
-    /// D = 1 + sum_{a=0..N-2} ceil(log2(n_a))
+    /// D = 1 + sum over selected complex-tail axes a of ceil(log2(n_a))
     /// relative_R = 128 * epsilon_R * D
     /// absolute_R = 128 * min_subnormal_R * D
     /// ```
@@ -348,9 +505,10 @@ where
     ///
     /// The source uses the reduced complex output layout and the destination
     /// uses the canonical real input layout. Unlike [`Self::inverse`], this
-    /// method does not normalize by the product of the original spatial
-    /// extents, so a forward/backward pair scales by that product. Extra
-    /// dimensions and the reduced real-axis extent are not factors. Initial
+    /// method does not normalize by the product of the selected spatial
+    /// extents, so a forward/backward pair scales by that product. Identity
+    /// axes, extra dimensions, and the reduced real-axis extent are not
+    /// factors. Initial
     /// descriptor and preflight errors preserve source, destination, and
     /// workspace; a post-tail invalid boundary preserves source and
     /// destination while the workspace may already have changed.
@@ -368,12 +526,21 @@ where
         global_shape: [usize; N],
         extra_shape: ExtraShape,
         input: Result<Arc<Pencil<N, M>>, FftError>,
+        selection: AxisSelection<N>,
         method: TransposeMethod,
     ) -> Result<Self, R2cError> {
         let communicator = topology.communicator();
         let expected_len = descriptor_len::<N, M>(&extra_shape);
         let descriptor = expected_len.and_then(|_| {
-            build_descriptor::<R, N, M>(&topology, global_shape, &extra_shape, method).ok()
+            build_descriptor::<R, N, M>(
+                &topology,
+                global_shape,
+                &extra_shape,
+                selection,
+                VALUE_KIND_R2C,
+                method,
+            )
+            .ok()
         });
         let descriptor_len_word = expected_len
             .and_then(|length| u64::try_from(length).ok())
@@ -389,19 +556,33 @@ where
             return Err(R2cError::Fft(FftError::CollectiveDescriptorMismatch));
         }
         let descriptor = super::collective_descriptor(communicator, descriptor, expected_len)?;
+        if !collective_valid(communicator, !selection.is_empty()) {
+            return Err(R2cError::Fft(FftError::InvalidDimensions));
+        }
+        let reduction_axis = selection
+            .mask()
+            .iter()
+            .rposition(|&selected| selected)
+            .expect("collectively accepted R2C selection is nonempty");
+        let boundary = N - 1 - reduction_axis;
         let input_pencil = agree_result(
             communicator,
             super::validate_input(input, &topology, global_shape),
         )?;
         let raw_absolute_threshold = agree_result(
             communicator,
-            raw_absolute_threshold_for_shape::<R, N>(global_shape).map_err(R2cError::Fft),
+            raw_absolute_threshold_for_shape::<R, N>(global_shape, selection, reduction_axis)
+                .map_err(R2cError::Fft),
         )?;
-        let real_len = global_shape[N - 1];
+        let real_len = global_shape[reduction_axis];
         let complex_len = real_len / 2 + 1;
         let mut reduced_shape = global_shape;
-        reduced_shape[N - 1] = complex_len;
+        reduced_shape[reduction_axis] = complex_len;
 
+        let original_route = agree_result(
+            communicator,
+            build_route(Ok(Arc::clone(&input_pencil)), &topology, global_shape),
+        )?;
         let reduced_input = Pencil::new(
             Arc::clone(&topology),
             reduced_shape,
@@ -413,41 +594,146 @@ where
             communicator,
             build_route(Ok(Arc::clone(&reduced_input)), &topology, reduced_shape),
         )?;
-
-        let real_plan = agree_result(
-            communicator,
-            LocalR2cPlan::new(real_len).map_err(R2cError::LocalR2c),
-        )?;
-        let first = TransformStage {
-            input: input_pencil,
-            output: reduced_input,
-            local: LocalTransform::RealComplex(real_plan),
-        };
         let stages = agree_result(
             communicator,
-            prepare_stages(&reduced_route, reduced_shape, Some(first)),
+            prepare_r2c_stages::<R, N, M>(
+                &original_route,
+                &reduced_route,
+                global_shape,
+                reduced_shape,
+                reduction_axis,
+                selection,
+                real_len,
+            ),
         )?;
-        let (transitions, transpose_send_len, transpose_receive_len) = build_transitions::<R, N, M>(
+        if original_route.distributed.len() != reduced_route.distributed.len()
+            || original_route.distributed.len() != N.saturating_sub(1)
+        {
+            return Err(R2cError::Fft(FftError::PreparationFailed));
+        }
+        let transition_count = original_route.distributed.len();
+        let mut distributed = Vec::new();
+        agree_result(
+            communicator,
+            distributed
+                .try_reserve_exact(transition_count)
+                .map_err(|_| FftError::AllocationFailed {
+                    required: transition_count,
+                }),
+        )?;
+        for index in 0..transition_count {
+            distributed.push(if index < boundary {
+                original_route.distributed[index]
+            } else {
+                reduced_route.distributed[index]
+            });
+        }
+        let (
+            transitions,
+            transpose_send_len,
+            transpose_receive_len,
+            real_transpose_send_len,
+            real_transpose_receive_len,
+        ) = build_transitions::<R, N, M>(
             communicator,
             &stages,
-            &reduced_route.distributed,
+            &distributed,
             &extra_shape,
             method,
+            boundary,
         )?;
         let core = TransformPlanCore {
             stages: stages.stages,
             transitions: transitions.into_boxed_slice(),
             extra_shape,
+            selection,
+            real_stage_index: Some(boundary),
             descriptor: descriptor.into_boxed_slice(),
             fft_scratch_len: stages.fft_scratch_len,
             transpose_send_len,
             transpose_receive_len,
+            real_transpose_send_len,
+            real_transpose_receive_len,
         };
         Ok(Self {
             core: Arc::new(core),
             raw_absolute_threshold,
         })
     }
+}
+
+fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
+    original_route: &super::RouteCandidate<N, M>,
+    reduced_route: &super::RouteCandidate<N, M>,
+    original_shape: [usize; N],
+    reduced_shape: [usize; N],
+    reduction_axis: usize,
+    selection: AxisSelection<N>,
+    real_len: usize,
+) -> Result<StagePreparation<R, N, M>, R2cError> {
+    let boundary = N - 1 - reduction_axis;
+    if original_route.stages.len() != N || reduced_route.stages.len() != N {
+        return Err(R2cError::Fft(FftError::PreparationFailed));
+    }
+    let mut stages = Vec::new();
+    stages
+        .try_reserve_exact(N)
+        .map_err(|_| FftError::AllocationFailed { required: N })?;
+    let mut fft_scratch_len = 0usize;
+    for index in 0..N {
+        let axis = N - 1 - index;
+        let stage = match index.cmp(&boundary) {
+            Ordering::Less => {
+                prepare_complex_stage(&original_route.stages[index], original_shape, axis, false)?
+            }
+            Ordering::Equal => {
+                let pencil = &original_route.stages[index];
+                if pencil.permutation().axes()[N - 1].index() != reduction_axis
+                    || pencil
+                        .decomposition()
+                        .iter()
+                        .any(|distributed| distributed.index() == reduction_axis)
+                    || pencil.local_shape_logical()[reduction_axis] != real_len
+                {
+                    return Err(R2cError::Fft(FftError::PreparationFailed));
+                }
+                let real = LocalR2cPlan::new(real_len).map_err(R2cError::LocalR2c)?;
+                TransformStage {
+                    input: Arc::clone(&original_route.stages[index]),
+                    output: Arc::clone(&reduced_route.stages[index]),
+                    local: LocalTransform::RealComplex(real),
+                }
+            }
+            Ordering::Greater => prepare_complex_stage(
+                &reduced_route.stages[index],
+                reduced_shape,
+                axis,
+                selection.contains(axis),
+            )?,
+        };
+        fft_scratch_len = fft_scratch_len.max(stage.local.scratch_len());
+        stages.push(stage);
+    }
+    Ok(StagePreparation {
+        stages: stages.into_boxed_slice(),
+        fft_scratch_len,
+    })
+}
+
+fn registered_real_stage_pencils<R: FftReal, const N: usize, const M: usize>(
+    stages: &[TransformStage<R, N, M>],
+    boundary: usize,
+) -> Result<Box<[Arc<Pencil<N, M>>]>, FftError> {
+    let count = boundary.checked_add(1).ok_or(FftError::PreparationFailed)?;
+    if count > stages.len() {
+        return Err(FftError::PreparationFailed);
+    }
+    let mut pencils = Vec::new();
+    pencils
+        .try_reserve_exact(count)
+        .map_err(|_| FftError::AllocationFailed { required: count })?;
+    pencils.extend(stages[..count].iter().map(|stage| Arc::clone(&stage.input)));
+    Ok(pencils.into_boxed_slice())
 }
 
 impl<R: FftReal, const N: usize, const M: usize> R2cPlan<R, N, M>
@@ -545,6 +831,36 @@ where
                 workspace.transpose.receive_len(),
             ),
         )?;
+        let boundary = self
+            .core
+            .real_stage_index
+            .ok_or(FftError::PreparationFailed)?;
+        if boundary > 0 {
+            let real_intermediate = workspace
+                .real_intermediate
+                .as_ref()
+                .ok_or(FftError::WorkspaceMismatch)?;
+            if real_intermediate.extra_shape() != &self.core.extra_shape
+                || !real_intermediate
+                    .pencils()
+                    .iter()
+                    .any(|pencil| pencil.same_layout(self.core.stages[boundary].input.as_ref()))
+            {
+                return Err(FftError::WorkspaceMismatch.into());
+            }
+            let real_transpose = workspace
+                .real_transpose
+                .as_ref()
+                .ok_or(FftError::WorkspaceMismatch)?;
+            validate_workspace_lengths_values(
+                workspace.fft_scratch.len(),
+                self.core.fft_scratch_len,
+                real_transpose.send_len(),
+                self.core.real_transpose_send_len,
+                real_transpose.receive_len(),
+                self.core.real_transpose_receive_len,
+            )?;
+        }
         let (real_len, complex_len) = r2c_lengths(&self.core);
         if workspace.real_line.len() < real_len {
             return Err(FftError::WorkspaceTooSmall {
@@ -575,9 +891,10 @@ fn execute_forward<R: FftReal, const N: usize, const M: usize>(
 where
     Complex<R>: Equivalence,
 {
+    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
     let source_view = source.view();
-    {
-        let stage = &core.stages[0];
+    if boundary == 0 {
+        let stage = &core.stages[boundary];
         let real_line = &mut workspace.real_line;
         let fft_scratch = &mut workspace.fft_scratch;
         workspace
@@ -596,11 +913,62 @@ where
                 Ok::<_, ()>(())
             })
             .expect("distributed R2C stage-zero overwrite was preflighted");
+    } else {
+        let real_intermediate = workspace
+            .real_intermediate
+            .as_mut()
+            .ok_or(FftError::WorkspaceMismatch)?;
+        real_intermediate
+            .overwrite_with(core.stages[0].output.as_ref(), |mut target| {
+                if target.as_mut_slice().len() != source_view.as_slice().len() {
+                    return Err(());
+                }
+                target
+                    .as_mut_slice()
+                    .copy_from_slice(source_view.as_slice());
+                Ok::<_, ()>(())
+            })
+            .expect("distributed R2C real-prefix overwrite was preflighted");
+        {
+            let real_transpose = workspace
+                .real_transpose
+                .as_mut()
+                .ok_or(FftError::WorkspaceMismatch)?;
+            for index in 0..boundary {
+                super::execute_transition(
+                    &core.transitions[index].forward,
+                    real_intermediate,
+                    real_transpose,
+                )?;
+            }
+        }
+        let active = real_intermediate.active_view().map_err(FftError::Array)?;
+        let stage = &core.stages[boundary];
+        let real_line = &mut workspace.real_line;
+        let fft_scratch = &mut workspace.fft_scratch;
+        workspace
+            .intermediate
+            .overwrite_with(stage.output.as_ref(), |mut target| {
+                stage
+                    .local
+                    .real_complex()
+                    .forward(
+                        active.as_slice(),
+                        target.as_mut_slice(),
+                        real_line,
+                        fft_scratch,
+                    )
+                    .expect("distributed R2C forward real boundary was preflighted");
+                Ok::<_, ()>(())
+            })
+            .expect("distributed R2C boundary overwrite was preflighted");
     }
 
+    let tail = &core.stages[boundary..];
+    let tail_transitions = &core.transitions[boundary..];
     super::execute_forward_complex_tail(
-        &core.stages,
-        &core.transitions,
+        tail,
+        tail_transitions,
         &mut workspace.intermediate,
         &mut workspace.transpose,
         destination,
@@ -620,9 +988,10 @@ fn execute_inverse<R: FftReal, const N: usize, const M: usize>(
 where
     Complex<R>: Equivalence,
 {
+    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
     super::execute_inverse_complex_tail(
-        &core.stages,
-        &core.transitions,
+        &core.stages[boundary..],
+        &core.transitions[boundary..],
         source,
         &mut workspace.intermediate,
         &mut workspace.transpose,
@@ -636,34 +1005,89 @@ where
         raw_absolute_threshold,
     )?;
     zero_accepted_boundary(core, &mut workspace.intermediate)?;
-    let stage = &core.stages[0];
+    let stage = &core.stages[boundary];
     let active = workspace
         .intermediate
         .active_view()
-        .expect("distributed R2C canonical active layout was validated");
-    let mut destination_view = destination.view_mut();
-    if normalize_inverse {
-        stage.local.real_complex().inverse(
-            active.as_slice(),
-            destination_view.as_mut_slice(),
-            &mut workspace.complex_line,
-            &mut workspace.fft_scratch,
-        )?;
-    } else {
-        stage.local.real_complex().backward(
-            active.as_slice(),
-            destination_view.as_mut_slice(),
-            &mut workspace.complex_line,
-            &mut workspace.fft_scratch,
-        )?;
+        .expect("distributed R2C boundary active layout was validated");
+    if boundary == 0 {
+        let mut destination_view = destination.view_mut();
+        if normalize_inverse {
+            stage.local.real_complex().inverse(
+                active.as_slice(),
+                destination_view.as_mut_slice(),
+                &mut workspace.complex_line,
+                &mut workspace.fft_scratch,
+            )?;
+        } else {
+            stage.local.real_complex().backward(
+                active.as_slice(),
+                destination_view.as_mut_slice(),
+                &mut workspace.complex_line,
+                &mut workspace.fft_scratch,
+            )?;
+        }
+        return Ok(());
     }
+
+    let real_intermediate = workspace
+        .real_intermediate
+        .as_mut()
+        .ok_or(FftError::WorkspaceMismatch)?;
+    real_intermediate
+        .overwrite_with(stage.input.as_ref(), |mut target| {
+            if normalize_inverse {
+                stage.local.real_complex().inverse(
+                    active.as_slice(),
+                    target.as_mut_slice(),
+                    &mut workspace.complex_line,
+                    &mut workspace.fft_scratch,
+                )?;
+            } else {
+                stage.local.real_complex().backward(
+                    active.as_slice(),
+                    target.as_mut_slice(),
+                    &mut workspace.complex_line,
+                    &mut workspace.fft_scratch,
+                )?;
+            }
+            Ok::<_, LocalR2cError>(())
+        })
+        .map_err(|error| match error {
+            OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
+            OverwriteError::Writer(error) => R2cError::LocalR2c(error),
+        })?;
+    {
+        let real_transpose = workspace
+            .real_transpose
+            .as_mut()
+            .ok_or(FftError::WorkspaceMismatch)?;
+        for index in (0..boundary).rev() {
+            super::execute_transition(
+                &core.transitions[index].backward,
+                real_intermediate,
+                real_transpose,
+            )?;
+        }
+    }
+    let active = real_intermediate.active_view().map_err(FftError::Array)?;
+    let mut destination_view = destination.view_mut();
+    if active.as_slice().len() != destination_view.as_slice().len() {
+        return Err(FftError::PreparationFailed.into());
+    }
+    destination_view
+        .as_mut_slice()
+        .copy_from_slice(active.as_slice());
     Ok(())
 }
 
 fn r2c_lengths<R: FftReal, const N: usize, const M: usize>(
     core: &TransformPlanCore<R, N, M>,
 ) -> (usize, usize) {
-    let plan = core.stages[0].local.real_complex();
+    let boundary = core
+        .real_stage_index
+        .expect("R2C core has a real boundary stage");
+    let plan = core.stages[boundary].local.real_complex();
     (plan.real_len(), plan.complex_len())
 }
 
@@ -680,7 +1104,17 @@ where
     let view = intermediate.active_view().map_err(FftError::Array)?;
     let local_len = view.pencil().local_len();
     let (real_len, complex_len) = r2c_lengths(core);
-    let depth = normalization_depth(*core.stages[0].input.global_shape());
+    let reduction_axis = core
+        .selection
+        .mask()
+        .iter()
+        .rposition(|&selected| selected)
+        .expect("R2C core has a selected reduction axis");
+    let depth = normalization_depth(
+        *core.stages[0].input.global_shape(),
+        core.selection,
+        reduction_axis,
+    );
     let plane_count = if real_len % 2 == 0 { 2 } else { 1 };
     let relative = 128.0 * <R as crate::private::Sealed>::pencil_fft_epsilon_f64() * depth;
     let absolute = if normalize_inverse {
@@ -792,10 +1226,14 @@ fn zero_accepted_boundary<R: FftReal, const N: usize, const M: usize>(
     Ok(())
 }
 
-fn normalization_depth<const N: usize>(shape: [usize; N]) -> f64 {
+fn normalization_depth<const N: usize>(
+    shape: [usize; N],
+    selection: AxisSelection<N>,
+    reduction_axis: usize,
+) -> f64 {
     let mut depth = 1.0_f64;
-    for length in shape.into_iter().take(N.saturating_sub(1)) {
-        if length > 1 {
+    for (axis, length) in shape.into_iter().enumerate() {
+        if axis < reduction_axis && selection.contains(axis) && length > 1 {
             depth += (usize::BITS - (length - 1).leading_zeros()) as f64;
         }
     }
@@ -804,17 +1242,21 @@ fn normalization_depth<const N: usize>(shape: [usize; N]) -> f64 {
 
 fn raw_absolute_threshold_for_shape<R: FftReal, const N: usize>(
     shape: [usize; N],
+    selection: AxisSelection<N>,
+    reduction_axis: usize,
 ) -> Result<f64, FftError> {
     let mut transverse = 1.0_f64;
-    for length in shape.into_iter().take(N.saturating_sub(1)) {
-        transverse *= length as f64;
-        if !transverse.is_finite() || transverse <= 0.0 {
-            return Err(FftError::PreparationFailed);
+    for (axis, length) in shape.into_iter().enumerate() {
+        if axis < reduction_axis && selection.contains(axis) {
+            transverse *= length as f64;
+            if !transverse.is_finite() || transverse <= 0.0 {
+                return Err(FftError::PreparationFailed);
+            }
         }
     }
     let inverse_absolute = 128.0
         * <R as crate::private::Sealed>::pencil_fft_min_subnormal_f64()
-        * normalization_depth(shape);
+        * normalization_depth(shape, selection, reduction_axis);
     let raw_absolute = inverse_absolute * transverse;
     if raw_absolute.is_finite() && raw_absolute > 0.0 {
         Ok(raw_absolute)

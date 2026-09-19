@@ -1,26 +1,42 @@
 using FFTW
 using Printf
 
-const REFERENCE_VERSION = 3
+const REFERENCE_VERSION = 4
 
 struct ReferenceCase
     name::String
     kind::Symbol
     spatial::Vector{Int}
     extra::Vector{Int}
+    selected::Vector{Int}
+end
+
+function full_cases()
+    return [
+        ReferenceCase("c2c_2d_3x4", :c2c, [3, 4], Int[], [0, 1]),
+        ReferenceCase("c2c_3d_3x2x5", :c2c, [3, 2, 5], [2, 3], [0, 1, 2]),
+        ReferenceCase("c2c_4d_2x1x3x4", :c2c, [2, 1, 3, 4], [2], [0, 1, 2, 3]),
+        ReferenceCase("r2c_2d_3x1", :r2c, [3, 1], Int[], [0, 1]),
+        ReferenceCase("r2c_2d_3x2", :r2c, [3, 2], Int[], [0, 1]),
+        ReferenceCase("r2c_3d_3x1x4_extra2x3", :r2c, [3, 1, 4], [2, 3], [0, 1, 2]),
+        ReferenceCase("r2c_3d_3x1x5_extra2x3", :r2c, [3, 1, 5], [2, 3], [0, 1, 2]),
+        ReferenceCase("r2c_4d_2x1x3x3_extra2", :r2c, [2, 1, 3, 3], [2], [0, 1, 2, 3]),
+    ]
+end
+
+function partial_cases()
+    return [
+        ReferenceCase("c2c_4d_2x3x2x3_selnone", :c2c, [2, 3, 2, 3], Int[], Int[]),
+        ReferenceCase("c2c_4d_2x3x2x3_sel0-3", :c2c, [2, 3, 2, 3], Int[], [0, 3]),
+        ReferenceCase("r2c_4d_2x3x2x3_sel0", :r2c, [2, 3, 2, 3], Int[], [0]),
+        ReferenceCase("r2c_4d_2x3x2x3_sel0-2", :r2c, [2, 3, 2, 3], Int[], [0, 2]),
+        ReferenceCase("r2c_4d_2x3x2x3_sel0-3", :r2c, [2, 3, 2, 3], Int[], [0, 3]),
+        ReferenceCase("r2c_3d_2x3x4_extra2_sel0-2", :r2c, [2, 3, 4], [2], [0, 2]),
+    ]
 end
 
 function reference_cases()
-    return [
-        ReferenceCase("c2c_2d_3x4", :c2c, [3, 4], Int[]),
-        ReferenceCase("c2c_3d_3x2x5", :c2c, [3, 2, 5], [2, 3]),
-        ReferenceCase("c2c_4d_2x1x3x4", :c2c, [2, 1, 3, 4], [2]),
-        ReferenceCase("r2c_2d_3x1", :r2c, [3, 1], Int[]),
-        ReferenceCase("r2c_2d_3x2", :r2c, [3, 2], Int[]),
-        ReferenceCase("r2c_3d_3x1x4_extra2x3", :r2c, [3, 1, 4], [2, 3]),
-        ReferenceCase("r2c_3d_3x1x5_extra2x3", :r2c, [3, 1, 5], [2, 3]),
-        ReferenceCase("r2c_4d_2x1x3x3_extra2", :r2c, [2, 1, 3, 3], [2]),
-    ]
+    return vcat(full_cases(), partial_cases())
 end
 
 function precision_name(::Type{Float32})
@@ -91,20 +107,36 @@ function fill_real!(array, seed::Float64)
     return array
 end
 
+function selected_julia_dims(item::ReferenceCase)
+    return sort([length(item.spatial) - axis for axis in item.selected])
+end
+
+function reduction_rust_axis(item::ReferenceCase)
+    item.kind == :r2c || error("only R2C cases have a reduction axis")
+    isempty(item.selected) && error("R2C selection must be nonempty")
+    return maximum(item.selected)
+end
+
 function c2c_values(::Type{T}, item::ReferenceCase) where {T}
     input = fill_complex!(logical_array(Complex{T}, item), 1.25)
     inverse_input = fill_complex!(logical_array(Complex{T}, item), 23.75)
     expected_input_shape = Tuple(reverse(logical_shape(item)))
     @assert size(input) == expected_input_shape
     @assert size(inverse_input) == expected_input_shape
-    dims = 1:length(item.spatial)
+    dims = selected_julia_dims(item)
     input_before = copy(input)
     inverse_input_before = copy(inverse_input)
-    forward_plan = FFTW.plan_fft(input, dims; flags = FFTW.ESTIMATE, num_threads = 1)
-    inverse_plan = FFTW.plan_ifft(inverse_input, dims; flags = FFTW.ESTIMATE, num_threads = 1)
-    forward = forward_plan * input
-    inverse = inverse_plan * inverse_input
-    backward = FFTW.bfft(copy(inverse_input), dims)
+    if isempty(dims)
+        forward = copy(input)
+        inverse = copy(inverse_input)
+        backward = copy(inverse_input)
+    else
+        forward_plan = FFTW.plan_fft(input, dims; flags = FFTW.ESTIMATE, num_threads = 1)
+        inverse_plan = FFTW.plan_ifft(inverse_input, dims; flags = FFTW.ESTIMATE, num_threads = 1)
+        forward = forward_plan * input
+        inverse = inverse_plan * inverse_input
+        backward = FFTW.bfft(copy(inverse_input), dims)
+    end
     @assert size(forward) == expected_input_shape
     @assert size(inverse) == expected_input_shape
     @assert size(backward) == expected_input_shape
@@ -119,12 +151,15 @@ function r2c_values(::Type{T}, item::ReferenceCase) where {T}
     expected_input_shape = Tuple(reverse(logical_shape(item)))
     @assert size(input) == expected_input_shape
     @assert size(inverse_real_input) == expected_input_shape
-    dims = 1:length(item.spatial)
+    dims = selected_julia_dims(item)
+    isempty(dims) && error("R2C selection must be nonempty")
+    real_axis = reduction_rust_axis(item)
+    real_n = item.spatial[real_axis + 1]
     input_before = copy(input)
     forward_plan = FFTW.plan_rfft(input, dims; flags = FFTW.ESTIMATE, num_threads = 1)
     inverse_input = forward_plan * inverse_real_input
     reduced_spatial = copy(item.spatial)
-    reduced_spatial[end] = reduced_spatial[end] ÷ 2 + 1
+    reduced_spatial[real_axis + 1] = real_n ÷ 2 + 1
     expected_output_shape = Tuple(reverse(vcat(item.extra, reduced_spatial)))
     @assert size(inverse_input) == expected_output_shape
     inverse_input_recorded = copy(inverse_input)
@@ -132,7 +167,7 @@ function r2c_values(::Type{T}, item::ReferenceCase) where {T}
     @assert inverse_plan_input == inverse_input_recorded
     inverse_plan = FFTW.plan_irfft(
         inverse_plan_input,
-        item.spatial[end],
+        real_n,
         dims;
         flags = FFTW.ESTIMATE,
         num_threads = 1,
@@ -140,7 +175,7 @@ function r2c_values(::Type{T}, item::ReferenceCase) where {T}
     inverse_work = copy(inverse_input_recorded)
     @assert inverse_work == inverse_input_recorded
     inverse = inverse_plan * inverse_work
-    backward = FFTW.brfft(copy(inverse_input_recorded), item.spatial[end], dims)
+    backward = FFTW.brfft(copy(inverse_input_recorded), real_n, dims)
     forward = forward_plan * input
     @assert size(inverse) == expected_input_shape
     @assert size(backward) == expected_input_shape
@@ -164,6 +199,7 @@ function print_header(io, item::ReferenceCase, ::Type{T}, provider, native_versi
     println(io, "precision ", precision_name(T))
     println(io, "original_shape ", join(item.spatial, " "))
     println(io, "extra_shape", isempty(item.extra) ? "" : " " * join(item.extra, " "))
+    println(io, "selected_axes", isempty(item.selected) ? "" : " " * join(item.selected, " "))
 end
 
 function print_real_section(io, name::String, values)
@@ -222,7 +258,8 @@ function main()
         write_case(output_directory, item, Float64, provider, native_version)
     end
     files = filter(name -> endswith(name, ".txt"), readdir(output_directory))
-    length(files) == 16 || error("generated ", length(files), " fixtures, expected 16")
+    expected = 28
+    length(files) == expected || error("generated ", length(files), " fixtures, expected ", expected)
     println("generated ", length(files), " fixtures in ", output_directory)
 end
 
