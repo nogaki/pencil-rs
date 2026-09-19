@@ -13,7 +13,13 @@ flat slices, uses RustFFT/RealFFT, and is independent of MPI and
 single-buffer in-place distributed C2C FFTs, including raw positive-sign
 `backward`, and out-of-place distributed R2C/C2R forward, normalized inverse,
 and raw backward over checked Alltoallv or point-to-point transitions. Local
-out-of-place R2C/C2R are also available.
+out-of-place R2C/C2R are also available. `LocalR2rPlan` provides all eight
+FFTW-compatible DCT/DST-I-IV kinds for real and complex `f32`/`f64`, with
+out-of-place and in-place execution. Its `forward`/`backward` operations use
+raw unnormalized FFTW conventions, while `inverse` is normalized by the
+logical transform factor. Each line uses at most `8n` complex embedding values
+plus queried native scratch; it adds no MPI or new dependencies. Distributed R2R
+will follow separately.
 
 `Pencil` describes spatial distribution. `PencilArray` owns one layout and
 one local buffer. `ManyPencilArray` owns a buffer large enough for several
