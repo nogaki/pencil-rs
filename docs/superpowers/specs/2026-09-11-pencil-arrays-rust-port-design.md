@@ -1,7 +1,7 @@
 # PencilArrays / PencilFFTs Rust移植 設計仕様
 
 日付: 2026-09-11  
-状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R、Alltoallv/P2P分散C2C FFT out/in-place、分散R2C/C2R out-of-placeは実装済み。
+状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R raw backward、Alltoallv/P2P分散C2C FFT out/in-place、分散R2C/C2R out-of-place raw backwardは実装済み。
 対象: CPU + MPIによる任意次元分散配列基盤と分散FFT基盤
 
 ## 1. 参照実装
@@ -1647,10 +1647,18 @@ where
         destination: &mut PencilArray<R, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
     ) -> Result<(), FftError>;
+
+    pub fn backward(
+        &self,
+        source: &PencilArray<Complex<R>, N, M>,
+        destination: &mut PencilArray<R, N, M>,
+        workspace: &mut R2cWorkspace<R, N, M>,
+    ) -> Result<(), FftError>;
 }
 ```
 
-in-place APIは初期版に存在しない。
+`inverse`は正規化済み、`backward`は正符号・無正規化である。in-place APIは
+初期版に存在しない。
 
 元の実数長をplanへ必ず保存する。複素長だけでは偶数・奇数の元長を一意に復元できない。
 
@@ -1670,7 +1678,9 @@ extra dimensionsは含めない。
 
 R2C/C2Rでもreduced complex shapeではなく、元の実数shapeの積を使う。
 
-無正規化逆変換`backward_unscaled`は初期版には含めない。主要APIは`forward`と正規化済み`inverse`とする。
+`forward`は無正規化、`inverse`は正規化済み、`backward`は正符号の無正規化である。
+R2C/C2Rの`backward`は元の実数長を含む全spatial長の積だけをforward結果に掛け、
+extra次元とreduced complex長は正規化係数に含めない。
 
 ## 28. FFT workspace
 
@@ -2194,8 +2204,8 @@ R2C API、endpoint policy、projection、数理は変えない。
 
 独立positive-sign DFT、raw scaling、両transport、f32/f64、N/M、extra/zero batch、empty
 local、reordered communicator、OOP/IP、descriptor rejection、post-start poisoningを既存
-MPI suiteとunit transaction testで確認する。Julia/FFTWのformat 2はC2Cだけに
-`backward_expected`を追加し、R2Cの既存4 sectionは保持する。
+MPI suiteとunit transaction testで確認する。Julia/FFTWのformat 3はC2CとR2Cの
+双方に`backward_expected`を持ち、C2Cはcomplex、R2Cはreal sectionとする。
 
 
 ### Milestone 8: Distributed R2C/C2R
@@ -2204,7 +2214,7 @@ MPI suiteとunit transaction testで確認する。Julia/FFTWのformat 2はC2C�
 - reduced shape path（実装済み）
 - one complex intermediate（実装済み）
 - even/odd lengths（実装済み）
-- out-of-place forward/inverse over Alltoallv and PointToPoint（実装済み）
+- out-of-place forward/inverse/backward over Alltoallv and PointToPoint（実装済み）
 
 #### Milestone 8追補（2026-09-18、分散R2C/C2R out-of-place実装済み）
 
@@ -2218,8 +2228,8 @@ input keeps its original last extent `n`; the complex output has last extent
 `m = n/2+1`. Constructors mirror `C2cPlan`, including both checked transports,
 and allocation is noncollective. There is no real in-place API.
 
-The first stage is `LocalR2cPlan::forward` or `inverse`; all remaining stages
-are complex FFTs over the other `N - 1` axes. The reduced canonical pencil is
+The first stage is `LocalR2cPlan::forward`, `inverse`, or `backward`; all
+remaining stages are complex FFTs over the other `N - 1` axes. The reduced canonical pencil is
 never passed through a full C2C plan, so its last axis is not transformed
 again. A workspace owns one reduced-complex `ManyPencilArray`, shared
 transpose storage, the maximum native complex scratch, and one real line plus
@@ -2240,12 +2250,17 @@ excluded from MAX/SUM but set a validity flag. Every rank completes all
 reductions, including empty ranks, and one final MIN-valid reduction occurs
 before any real destination write. Invalid boundaries return
 `R2cError::InvalidSpectrum`; the source and destination stay unchanged, while
-workspace mutation is permitted after execution has started. Accepted endpoint
-imaginary values are zeroed only in the private intermediate before the
-unchanged strict local C2R call.
+workspace mutation is permitted after execution has started. Accepted endpoint imaginary values are zeroed only in the private
+intermediate before the strict local C2R operation. `backward` uses the same
+relative criterion
+and finite endpoint requirement, but its absolute threshold is the inverse
+threshold multiplied by `T = product(n_0..n_{N-2})`; the real axis and extra
+dimensions are excluded. `T` and the resulting finite-positive raw threshold
+are collectively validated during plan construction before native planning.
+Normalized inverse threshold arithmetic is unchanged.
 
-Collective operation words 12, 13, and 14 are R2C construction, forward, and
-inverse. The five-word header and words 1--11 remain unchanged. The exact
+Collective operation words 12, 13, 14, and 17 are R2C construction, forward,
+inverse, and raw backward. The five-word header and words 1--11 remain unchanged. The exact
 R2C descriptor records the original real shape, process grid, extra rank and
 extents, scalar width, and transport method, distinguishing even and odd
 shapes that share `m`. No public tolerance knobs, offender-ID reductions, or
@@ -2257,8 +2272,9 @@ Julia/FFTW cross-validation tooling is implemented as an opt-in local check;
 its canonical command, locked Julia environment, 16 temporary fixtures, and
 26 valid case/layout combinations per method and rank are documented in
 [`tools/fftw-reference/README.md`](../../../tools/fftw-reference/README.md).
-It validates distributed C2C forward/inverse/raw backward and R2C/C2R without
-changing production tolerances, CI, or checked-in numeric data.
+It validates distributed C2C forward/inverse/raw backward and R2C/C2R
+forward/inverse/raw backward without changing production tolerances, CI, or
+checked-in numeric data.
 
 - Julia reference driver
 - MPI test matrix

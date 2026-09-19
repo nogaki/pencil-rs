@@ -3,7 +3,7 @@
 - Date: 2026-09-18
 - Base: `d617ac7774e90aa224fbcc4d023b24a9e9761b15`
 - Status: implemented and independently reviewed.
-- Scope: feature-gated, out-of-place distributed R2C/C2R only.
+- Scope: feature-gated, out-of-place distributed R2C/C2R, including raw backward.
 - Constraints: `N >= 2`, `1 <= M < N`, canonical identity input with
   decomposition `[0..M)`, `f32`/`f64`, Alltoallv or PointToPoint, no unsafe
   code or new dependencies. Preserve `FftError`, local R2C behavior, the
@@ -39,7 +39,8 @@
 - The real input is `core.stages[0].input`; the original real and reduced
   complex line lengths come from the first `LocalR2cPlan` when an operation
   needs them. Inverse boundary depth is computed cheaply from that input's
-  original shape, not retained as another core field.
+  original shape, not retained as another core field. The R2C plan stores only
+  the prevalidated raw absolute endpoint threshold needed by `backward`.
 
 ## Construction and execution
 
@@ -70,13 +71,13 @@
 ## R2C/C2R math and error boundary
 
 - Forward performs local R2C on each original last-axis line, then the shared
-  complex tail; the real source is preserved. Inverse reverses the complex
-  tail first, validates constrained planes, zeroes accepted endpoint
-  imaginary parts only in the private intermediate, and calls the unchanged
-  strict local C2R operation. Inverse normalization is exactly once per
-  original spatial axis; extra dimensions and `m = n/2+1` are excluded.
+  complex tail; the real source is preserved. Inverse and raw backward reverse
+  the complex tail first, validate constrained planes, zero accepted endpoint
+  imaginary parts only in the private intermediate, and call the strict local
+  C2R operation. Only inverse applies normalization, exactly once per original
+  spatial axis; extra dimensions and `m = n/2+1` are excluded.
 - For every extra batch and constrained plane `z(x)`, all endpoint real and
-  imaginary values must be finite. Acceptance is exactly:
+  imaginary values must be finite. Normalized inverse acceptance is exactly:
 
   ```text
   D = 1 + sum_{a=0..N-2} ceil(log2(n_a))
@@ -87,7 +88,11 @@
   ```
 
   `n_a` are original axes before the real axis; length one contributes zero.
-  DC is always constrained. Nyquist is constrained only for even `n`; for odd
+  Raw backward keeps the relative threshold and uses
+  `absolute_raw = absolute_inverse * product(n_0..n_{N-2})`, excluding the
+  real axis and extras. That factor and threshold are finite-positive
+  collectively validated during construction before native planning. DC is
+  always constrained. Nyquist is constrained only for even `n`; for odd
   `n > 1` the final bin is unconstrained, while `n == 1` has only DC. This is
   the approved explicit componentwise-absolute/normwise-relative policy, not
   a formal RustFFT error bound. Interior bins have no blanket finite policy.
@@ -101,14 +106,17 @@
 
 ## Protocol and documentation status
 
-- R2C construction/forward/inverse use operation words 12/13/14. The existing
-  five-word header and words 1--11 stay unchanged. The descriptor records the
+- R2C construction/forward/inverse/raw backward use operation words
+  12/13/14/17. The existing five-word header and words 1--11 stay unchanged.
+  Raw and normalized reverse calls, forward, C2C operations, and out-of-place/
+  in-place operations therefore remain distinct in the full Cartesian header.
+  The descriptor records the
   original real shape, process grid, extra rank/extents, scalar width, and
   method, so even and odd shapes sharing `n/2+1` remain distinct.
 - Public docs state that the reduced canonical stage initially keeps
   decomposition `[0..M)`, while final output uses `[1..=M]` and reversed
   memory order. They include a runnable MPI example with an odd length,
-  forward/inverse roundtrip, shape queries, and source preservation, plus the
+  forward/inverse/raw-backward coverage, shape queries, and source preservation, plus the
   exact endpoint policy and compile-fail associated-method lookup.
 - The main design spec records this implementation in a dated Milestone 8
   section; README links this plan but not a separate addendum. CI job count and

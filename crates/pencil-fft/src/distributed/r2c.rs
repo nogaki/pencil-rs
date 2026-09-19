@@ -11,12 +11,12 @@ use pencil_array::{
 };
 
 use super::{
-    DESCRIPTOR_SCHEMA, Direction, FftError, INVALID_WORD, LocalTransform, OPERATION_R2C_FORWARD,
-    OPERATION_R2C_INVERSE, OPERATION_R2C_PLAN, R2cError, TransformPlanCore, TransformStage,
-    TransposeMethod, agree_execution_descriptor_ref, agree_header, agree_result, build_descriptor,
-    build_route, build_transitions, collective_valid, descriptor_len, initialized_vec,
-    map_array_allocation, prepare_stages, registered_stage_pencils, validate_out_of_place,
-    zero_complex,
+    DESCRIPTOR_SCHEMA, Direction, FftError, INVALID_WORD, LocalTransform, OPERATION_R2C_BACKWARD,
+    OPERATION_R2C_FORWARD, OPERATION_R2C_INVERSE, OPERATION_R2C_PLAN, R2cError, TransformPlanCore,
+    TransformStage, TransposeMethod, agree_execution_descriptor_ref, agree_header, agree_result,
+    build_descriptor, build_route, build_transitions, collective_valid, descriptor_len,
+    initialized_vec, map_array_allocation, prepare_stages, registered_stage_pencils,
+    validate_out_of_place, zero_complex,
 };
 use crate::{Complex, FftReal, LocalR2cPlan};
 
@@ -31,7 +31,7 @@ use crate::{Complex, FftReal, LocalR2cPlan};
 /// spatial memory order. Its first local stage is real-to-half-complex; later
 /// stages are homogeneous complex transforms over the other `N - 1` axes.
 ///
-/// Constructors and `forward`/`inverse` are collective. Every rank must use
+/// Constructors and `forward`/`inverse`/`backward` are collective. Every rank must use
 /// the same communicator context, API and call order, scalar type, transport
 /// method, and matching layouts. The legacy constructors select
 /// [`TransposeMethod::AllToAllv`]; the `_with_method` constructors can select
@@ -40,6 +40,13 @@ use crate::{Complex, FftReal, LocalR2cPlan};
 /// overlap on that context. Allocation methods are noncollective; callers
 /// must coordinate a local allocation failure before the next collective.
 /// There is intentionally no distributed real in-place API.
+///
+/// `inverse` is normalized by the product of the original spatial extents;
+/// `backward` uses the same positive-sign C2R transform without that
+/// normalization. Both reverse operations preserve their complex source.
+/// Backward endpoint acceptance uses the same relative threshold as inverse
+/// and an absolute threshold multiplied by the product of the original
+/// transverse extents (excluding the real axis and extra dimensions).
 ///
 /// # Example
 ///
@@ -111,6 +118,10 @@ use crate::{Complex, FftReal, LocalR2cPlan};
 /// the complex source is never projected. Interior bins have no blanket
 /// finite-or-real requirement.
 ///
+/// `backward` uses the same endpoint policy, except that its absolute
+/// threshold is `absolute_inverse * product(n_0..n_{N-2})`; the factor is
+/// finite and positive-validated collectively while constructing the plan.
+///
 /// Descriptor and initial preflight errors are collectively returned before
 /// source, destination, or workspace writes and preserve all three. A
 /// materially invalid endpoint returns [`R2cError::InvalidSpectrum`] after
@@ -128,9 +139,10 @@ use crate::{Complex, FftReal, LocalR2cPlan};
 #[derive(Debug)]
 pub struct R2cPlan<R: FftReal, const N: usize, const M: usize> {
     core: Arc<TransformPlanCore<R, N, M>>,
+    raw_absolute_threshold: f64,
 }
 
-/// Reusable storage for [`R2cPlan`] forward and inverse execution.
+/// Reusable storage for [`R2cPlan`] forward, inverse, and backward execution.
 ///
 /// The workspace is private to the exact plan that allocated it. It contains
 /// one registered reduced-complex intermediate, shared transpose buffers,
@@ -261,7 +273,7 @@ where
         .map_err(FftError::Array)?)
     }
 
-    /// Allocates reusable noncollective forward/inverse workspace.
+    /// Allocates reusable noncollective forward/inverse/backward workspace.
     pub fn allocate_workspace(&self) -> Result<R2cWorkspace<R, N, M>, R2cError> {
         let (real_len, complex_len) = r2c_lengths(&self.core);
         let intermediate = ManyPencilArray::from_elem(
@@ -328,7 +340,27 @@ where
         destination: &mut PencilArray<R, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
     ) -> Result<(), R2cError> {
-        self.execute_inverse(source, destination, workspace)
+        self.execute_reverse(source, destination, workspace, true)
+    }
+
+    /// Computes an unnormalized positive-sign backward half-complex-to-real
+    /// transform.
+    ///
+    /// The source uses the reduced complex output layout and the destination
+    /// uses the canonical real input layout. Unlike [`Self::inverse`], this
+    /// method does not normalize by the product of the original spatial
+    /// extents, so a forward/backward pair scales by that product. Extra
+    /// dimensions and the reduced real-axis extent are not factors. Initial
+    /// descriptor and preflight errors preserve source, destination, and
+    /// workspace; a post-tail invalid boundary preserves source and
+    /// destination while the workspace may already have changed.
+    pub fn backward(
+        &self,
+        source: &PencilArray<Complex<R>, N, M>,
+        destination: &mut PencilArray<R, N, M>,
+        workspace: &mut R2cWorkspace<R, N, M>,
+    ) -> Result<(), R2cError> {
+        self.execute_reverse(source, destination, workspace, false)
     }
 
     fn construct(
@@ -360,6 +392,10 @@ where
         let input_pencil = agree_result(
             communicator,
             super::validate_input(input, &topology, global_shape),
+        )?;
+        let raw_absolute_threshold = agree_result(
+            communicator,
+            raw_absolute_threshold_for_shape::<R, N>(global_shape).map_err(R2cError::Fft),
         )?;
         let real_len = global_shape[N - 1];
         let complex_len = real_len / 2 + 1;
@@ -409,6 +445,7 @@ where
         };
         Ok(Self {
             core: Arc::new(core),
+            raw_absolute_threshold,
         })
     }
 }
@@ -439,26 +476,35 @@ where
         execute_forward(&self.core, source, destination, workspace)
     }
 
-    fn execute_inverse(
+    fn execute_reverse(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
         destination: &mut PencilArray<R, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
+        normalize_inverse: bool,
     ) -> Result<(), R2cError> {
         let communicator = self.input_pencil().topology().communicator();
-        agree_execution_descriptor_ref::<N, M>(
-            communicator,
-            OPERATION_R2C_INVERSE,
-            &self.core.descriptor,
-        )?;
+        let operation = if normalize_inverse {
+            OPERATION_R2C_INVERSE
+        } else {
+            OPERATION_R2C_BACKWARD
+        };
+        agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
         let preflight = self.preflight_inverse(source, destination, workspace);
         if !collective_valid(communicator, preflight.is_ok()) {
             return Err(preflight
                 .err()
                 .unwrap_or(R2cError::Fft(FftError::CollectivePreconditionFailed)));
         }
-        preflight.expect("distributed R2C inverse preflight succeeded");
-        execute_inverse(&self.core, source, destination, workspace)
+        preflight.expect("distributed R2C reverse preflight succeeded");
+        execute_inverse(
+            &self.core,
+            source,
+            destination,
+            workspace,
+            normalize_inverse,
+            self.raw_absolute_threshold,
+        )
     }
 
     fn preflight_forward(
@@ -568,6 +614,8 @@ fn execute_inverse<R: FftReal, const N: usize, const M: usize>(
     source: &PencilArray<Complex<R>, N, M>,
     destination: &mut PencilArray<R, N, M>,
     workspace: &mut R2cWorkspace<R, N, M>,
+    normalize_inverse: bool,
+    raw_absolute_threshold: f64,
 ) -> Result<(), R2cError>
 where
     Complex<R>: Equivalence,
@@ -579,9 +627,14 @@ where
         &mut workspace.intermediate,
         &mut workspace.transpose,
         &mut workspace.fft_scratch,
-        true,
+        normalize_inverse,
     )?;
-    validate_boundary(core, &workspace.intermediate)?;
+    validate_boundary(
+        core,
+        &workspace.intermediate,
+        normalize_inverse,
+        raw_absolute_threshold,
+    )?;
     zero_accepted_boundary(core, &mut workspace.intermediate)?;
     let stage = &core.stages[0];
     let active = workspace
@@ -589,12 +642,21 @@ where
         .active_view()
         .expect("distributed R2C canonical active layout was validated");
     let mut destination_view = destination.view_mut();
-    stage.local.real_complex().inverse(
-        active.as_slice(),
-        destination_view.as_mut_slice(),
-        &mut workspace.complex_line,
-        &mut workspace.fft_scratch,
-    )?;
+    if normalize_inverse {
+        stage.local.real_complex().inverse(
+            active.as_slice(),
+            destination_view.as_mut_slice(),
+            &mut workspace.complex_line,
+            &mut workspace.fft_scratch,
+        )?;
+    } else {
+        stage.local.real_complex().backward(
+            active.as_slice(),
+            destination_view.as_mut_slice(),
+            &mut workspace.complex_line,
+            &mut workspace.fft_scratch,
+        )?;
+    }
     Ok(())
 }
 
@@ -608,6 +670,8 @@ fn r2c_lengths<R: FftReal, const N: usize, const M: usize>(
 fn validate_boundary<R: FftReal, const N: usize, const M: usize>(
     core: &TransformPlanCore<R, N, M>,
     intermediate: &ManyPencilArray<Complex<R>, N, M>,
+    normalize_inverse: bool,
+    raw_absolute_threshold: f64,
 ) -> Result<(), R2cError>
 where
     Complex<R>: Equivalence,
@@ -619,7 +683,11 @@ where
     let depth = normalization_depth(*core.stages[0].input.global_shape());
     let plane_count = if real_len % 2 == 0 { 2 } else { 1 };
     let relative = 128.0 * <R as crate::private::Sealed>::pencil_fft_epsilon_f64() * depth;
-    let absolute = 128.0 * <R as crate::private::Sealed>::pencil_fft_min_subnormal_f64() * depth;
+    let absolute = if normalize_inverse {
+        128.0 * <R as crate::private::Sealed>::pencil_fft_min_subnormal_f64() * depth
+    } else {
+        raw_absolute_threshold
+    };
     let mut invalid = false;
 
     // ponytail: two full-Cartesian reductions per batch keep the four-word
@@ -732,4 +800,25 @@ fn normalization_depth<const N: usize>(shape: [usize; N]) -> f64 {
         }
     }
     depth
+}
+
+fn raw_absolute_threshold_for_shape<R: FftReal, const N: usize>(
+    shape: [usize; N],
+) -> Result<f64, FftError> {
+    let mut transverse = 1.0_f64;
+    for length in shape.into_iter().take(N.saturating_sub(1)) {
+        transverse *= length as f64;
+        if !transverse.is_finite() || transverse <= 0.0 {
+            return Err(FftError::PreparationFailed);
+        }
+    }
+    let inverse_absolute = 128.0
+        * <R as crate::private::Sealed>::pencil_fft_min_subnormal_f64()
+        * normalization_depth(shape);
+    let raw_absolute = inverse_absolute * transverse;
+    if raw_absolute.is_finite() && raw_absolute > 0.0 {
+        Ok(raw_absolute)
+    } else {
+        Err(FftError::PreparationFailed)
+    }
 }

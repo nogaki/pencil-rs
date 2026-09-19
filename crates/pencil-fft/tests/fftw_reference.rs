@@ -172,7 +172,7 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
         lines.pop();
     }
     let mut cursor = 0;
-    if next(&lines, &mut cursor, "version")? != "PENCIL_FFTW_REFERENCE 2" {
+    if next(&lines, &mut cursor, "version")? != "PENCIL_FFTW_REFERENCE 3" {
         return Err("invalid reference version header".into());
     }
 
@@ -238,17 +238,13 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
         input_kind,
         input_count,
     )?;
-    let backward = if kind == Kind::C2c {
-        section(
-            &lines,
-            &mut cursor,
-            "backward_expected",
-            "complex",
-            input_count,
-        )?
-    } else {
-        Vec::new()
-    };
+    let backward = section(
+        &lines,
+        &mut cursor,
+        "backward_expected",
+        if kind == Kind::C2c { "complex" } else { "real" },
+        input_count,
+    )?;
     if cursor != lines.len() {
         return Err(format!(
             "trailing fixture tokens starting at {:?}",
@@ -870,6 +866,20 @@ fn r2c_case<R: Real, const N: usize, const M: usize>(
         method,
         "C2R inverse"
     );
+    let mut backward = plan.allocate_input().unwrap();
+    let backward_snapshot = snap!(layout, backward, false, "C2R backward");
+    plan.backward(&inverse_source, &mut backward, &mut workspace)
+        .unwrap();
+    assert_eq!(inverse_source.as_slice(), inverse_before.as_slice());
+    check_r!(
+        backward.as_slice(),
+        &backward_snapshot,
+        &fixture.backward,
+        fixture,
+        rank,
+        method,
+        "R2C backward"
+    );
 }
 
 fn r2c_methods<R: Real, const N: usize, const M: usize>(
@@ -919,7 +929,7 @@ fn parser_and_offset_self_check() {
     let section = |name: &str| format!("section {name} complex 6\n{values}end\n");
     let backward_section = section("backward_expected");
     let valid = format!(
-        "PENCIL_FFTW_REFERENCE 2\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase c2c_2d_2x3_f64\nkind c2c\nprecision f64\noriginal_shape 2 3\nextra_shape\n{}{}{}{}{}",
+        "PENCIL_FFTW_REFERENCE 3\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase c2c_2d_2x3_f64\nkind c2c\nprecision f64\noriginal_shape 2 3\nextra_shape\n{}{}{}{}{}",
         section("input"),
         section("inverse_input"),
         section("forward_expected"),
@@ -929,7 +939,7 @@ fn parser_and_offset_self_check() {
     assert_eq!(parse_fixture(&valid).unwrap().input.len(), 6);
     assert_eq!(parse_fixture(&valid).unwrap().backward.len(), 6);
     assert!(
-        parse_fixture(&valid.replacen("PENCIL_FFTW_REFERENCE 2", "PENCIL_FFTW_REFERENCE 1", 1,))
+        parse_fixture(&valid.replacen("PENCIL_FFTW_REFERENCE 3", "PENCIL_FFTW_REFERENCE 2", 1,))
             .is_err()
     );
 
@@ -937,16 +947,39 @@ fn parser_and_offset_self_check() {
         format!("section {name} {kind} {count}\n{values}end\n")
     };
     let r2c = format!(
-        "PENCIL_FFTW_REFERENCE 2\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase r2c_2d_2x3_f64\nkind r2c\nprecision f64\noriginal_shape 2 3\nextra_shape\n{}{}{}{}",
+        "PENCIL_FFTW_REFERENCE 3\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase r2c_2d_2x3_f64\nkind r2c\nprecision f64\noriginal_shape 2 3\nextra_shape\n{}{}{}{}{}",
         r2c_section("input", "real", 6, "1\n2\n3\n4\n5\n6\n"),
         r2c_section("inverse_input", "complex", 4, "1 0\n2 0\n3 0\n4 0\n"),
         r2c_section("forward_expected", "complex", 4, "1 0\n2 0\n3 0\n4 0\n"),
         r2c_section("inverse_expected", "real", 6, "1\n2\n3\n4\n5\n6\n"),
+        r2c_section("backward_expected", "real", 6, "1\n2\n3\n4\n5\n6\n"),
     );
     let parsed_r2c = parse_fixture(&r2c).unwrap();
     assert_eq!(parsed_r2c.kind, Kind::R2c);
-    assert!(parsed_r2c.backward.is_empty());
+    assert_eq!(parsed_r2c.backward.len(), 6);
+    let r2c_without_backward = r2c.replacen(
+        &r2c_section("backward_expected", "real", 6, "1\n2\n3\n4\n5\n6\n"),
+        "",
+        1,
+    );
+    assert!(parse_fixture(&r2c_without_backward).is_err());
     assert!(parse_fixture(&format!("{r2c}{backward_section}")).is_err());
+    assert!(
+        parse_fixture(&r2c.replacen(
+            "section backward_expected real 6",
+            "section backward_expected real 7",
+            1,
+        ))
+        .is_err()
+    );
+    assert!(
+        parse_fixture(&r2c.replacen(
+            "section backward_expected real 6\n1",
+            "section backward_expected real 6\nNaN",
+            1,
+        ))
+        .is_err()
+    );
     for malformed in ["kind", "", "kind c2c trailing"] {
         assert!(field(malformed, "kind").is_err());
     }
