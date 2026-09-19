@@ -2034,6 +2034,8 @@ rankごとの最大時間を主要指標とする。
 - `forward`/`inverse`は同じlengthの連続batch sliceを受けるout-of-place API、
  `forward_in_place`/`inverse_in_place`は最小のin-place APIとする。forwardは無正規化、
  inverseは各lineの`n`だけで除算し、batch数は含めない。
+- local C2Cでは、正符号・無正規化の`backward`/`backward_in_place`を追加する。
+  これはlocal C2C専用で、distributed C2CおよびR2C/C2RのAPIは変更しない。
 - planはimmutableなforward/inverse計画とlength/scratch metadataだけを持ち、
  scratchはcaller-ownedの初期化済みslice/Vecとする。RustFFTの
  `get_immutable_scratch_len()`および`get_inplace_scratch_len()`を正逆計画について

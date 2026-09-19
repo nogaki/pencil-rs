@@ -7,8 +7,10 @@
 //! complex lines. [`LocalR2cPlan`] does the same for real-to-half-complex and
 //! half-complex-to-real transforms. Plans own immutable backend plans, while
 //! callers own initialized line buffers, scratch storage, and data buffers.
-//! Forward transforms are unnormalized. Inverse transforms divide by the line
-//! length: the complex length for C2C, or the original real length for R2C/C2R.
+//! Local C2C forward and backward transforms are unnormalized; backward uses
+//! the positive-sign convention. Local C2C inverse and R2C/C2R inverse divide
+//! by the line length: the complex length for C2C, or the original real length
+//! for R2C/C2R.
 //!
 //! With the opt-in `distributed` feature, `C2cPlan` and its workspaces provide
 //! input-preserving distributed C2C transforms, while `R2cPlan` provides
@@ -39,6 +41,13 @@
 //!     let mut scratch = vec![Complex::new(0.0, 0.0); plan.scratch_len()];
 //!
 //!     plan.forward(&source, &mut transformed, &mut scratch)?;
+//!     let mut raw_backward = vec![Complex::new(0.0, 0.0); source.len()];
+//!     plan.backward(&transformed, &mut raw_backward, &mut scratch)?;
+//!     assert!(raw_backward.iter().zip(&source).all(|(actual, expected)| {
+//!         (actual.re - 4.0 * expected.re).abs() < 1e-10
+//!             && (actual.im - 4.0 * expected.im).abs() < 1e-10
+//!     }));
+//!
 //!     let mut recovered = vec![Complex::new(0.0, 0.0); source.len()];
 //!     plan.inverse(&transformed, &mut recovered, &mut scratch)?;
 //!     assert!(recovered.iter().zip(&source).all(|(actual, expected)| {
@@ -254,7 +263,7 @@ impl<R: FftReal> LocalC2cPlan<R> {
     }
 
     /// Returns the minimum initialized scratch-slice length accepted by all
-    /// forward/inverse and out-of-place/in-place operations.
+    /// forward/backward/inverse and out-of-place/in-place operations.
     pub fn scratch_len(&self) -> usize {
         self.scratch_len
     }
@@ -282,12 +291,13 @@ impl<R: FftReal> LocalC2cPlan<R> {
         Ok(())
     }
 
-    /// Computes an inverse FFT for every line in `src`, dividing each output
-    /// line by [`Self::line_len`].
+    /// Computes an unnormalized positive-sign backward FFT for every line in
+    /// `src`.
     ///
-    /// The source is preserved. Validation and scratch behavior are the same
-    /// as for [`Self::forward`].
-    pub fn inverse(
+    /// This is the raw local C2C backward transform: it does not divide by
+    /// [`Self::line_len`]. The source is preserved. Validation and scratch
+    /// behavior are the same as for [`Self::forward`].
+    pub fn backward(
         &self,
         src: &[Complex<R>],
         dst: &mut [Complex<R>],
@@ -300,6 +310,23 @@ impl<R: FftReal> LocalC2cPlan<R> {
 
         self.inverse
             .process_immutable_with_scratch(src, dst, scratch);
+        Ok(())
+    }
+
+    /// Computes a normalized positive-sign inverse FFT for every line in
+    /// `src`, dividing each output line by [`Self::line_len`].
+    ///
+    /// This is the normalized local C2C inverse; [`Self::backward`] exposes the
+    /// same positive-sign transform without this division. The source is
+    /// preserved. Validation and scratch behavior are the same as for
+    /// [`Self::forward`].
+    pub fn inverse(
+        &self,
+        src: &[Complex<R>],
+        dst: &mut [Complex<R>],
+        scratch: &mut [Complex<R>],
+    ) -> Result<(), LocalC2cError> {
+        self.backward(src, dst, scratch)?;
         R::normalize_inverse(dst, self.line_len);
         Ok(())
     }
@@ -323,12 +350,12 @@ impl<R: FftReal> LocalC2cPlan<R> {
         Ok(())
     }
 
-    /// Computes an inverse FFT in place for every line in `data`, dividing
-    /// each output line by [`Self::line_len`].
+    /// Computes an unnormalized positive-sign backward FFT in place for every
+    /// line in `data`.
     ///
-    /// Validation and scratch behavior are the same as for
-    /// [`Self::forward_in_place`].
-    pub fn inverse_in_place(
+    /// The result is not divided by [`Self::line_len`]. Validation and scratch
+    /// behavior are the same as for [`Self::forward_in_place`].
+    pub fn backward_in_place(
         &self,
         data: &mut [Complex<R>],
         scratch: &mut [Complex<R>],
@@ -339,6 +366,21 @@ impl<R: FftReal> LocalC2cPlan<R> {
         }
 
         self.inverse.process_with_scratch(data, scratch);
+        Ok(())
+    }
+
+    /// Computes a normalized positive-sign inverse FFT in place for every line
+    /// in `data`, dividing each output line by [`Self::line_len`].
+    ///
+    /// This is the normalized local C2C inverse; [`Self::backward_in_place`]
+    /// exposes the same transform without this division. Validation and
+    /// scratch behavior are the same as for [`Self::forward_in_place`].
+    pub fn inverse_in_place(
+        &self,
+        data: &mut [Complex<R>],
+        scratch: &mut [Complex<R>],
+    ) -> Result<(), LocalC2cError> {
+        self.backward_in_place(data, scratch)?;
         R::normalize_inverse(data, self.line_len);
         Ok(())
     }
@@ -433,6 +475,23 @@ mod tests {
         }
     }
 
+    type OutOfPlace = fn(
+        &LocalC2cPlan<f64>,
+        &[Complex<f64>],
+        &mut [Complex<f64>],
+        &mut [Complex<f64>],
+    ) -> Result<(), LocalC2cError>;
+    type InPlace = fn(
+        &LocalC2cPlan<f64>,
+        &mut [Complex<f64>],
+        &mut [Complex<f64>],
+    ) -> Result<(), LocalC2cError>;
+    const OPERATIONS: [(OutOfPlace, InPlace); 3] = [
+        (LocalC2cPlan::forward, LocalC2cPlan::forward_in_place),
+        (LocalC2cPlan::backward, LocalC2cPlan::backward_in_place),
+        (LocalC2cPlan::inverse, LocalC2cPlan::inverse_in_place),
+    ];
+
     fn native_scratch_len<R: FftReal>(line_len: usize) -> usize {
         let mut planner = FftPlanner::<R>::new();
         let forward = planner.plan_fft_forward(line_len);
@@ -479,10 +538,9 @@ mod tests {
     fn dft_oracle<R: TestReal>(
         input: &[Complex<R>],
         line_len: usize,
-        inverse: bool,
+        sign: f64,
+        scale: f64,
     ) -> Vec<Complex<R>> {
-        let sign = if inverse { 1.0 } else { -1.0 };
-        let scale = if inverse { 1.0 / line_len as f64 } else { 1.0 };
         input
             .chunks_exact(line_len)
             .flat_map(|line| {
@@ -525,19 +583,46 @@ mod tests {
 
         let source = sample_input::<R>(line_len, batch_count);
         let source_before_transforms = source.clone();
+        let scratch_len = plan.scratch_len();
         let mut forward = vec![Complex::new(R::convert(13.0), R::convert(-9.0)); source.len()];
-        let mut scratch = initialized_scratch::<R>(plan.scratch_len());
+        let mut scratch = initialized_scratch::<R>(scratch_len);
         plan.forward(&source, &mut forward, &mut scratch).unwrap();
         assert_eq!(source, source_before_transforms);
-        assert_close(&forward, &dft_oracle(&source, line_len, false));
+        assert_close(&forward, &dft_oracle(&source, line_len, -1.0, 1.0));
+
+        let mut backward = vec![Complex::new(R::convert(-4.0), R::convert(8.0)); source.len()];
+        dirty_scratch(&mut scratch);
+        plan.backward(&source, &mut backward, &mut scratch).unwrap();
+        assert_eq!(source, source_before_transforms);
+        assert_close(&backward, &dft_oracle(&source, line_len, 1.0, 1.0));
 
         let mut inverse = vec![Complex::new(R::convert(-4.0), R::convert(8.0)); source.len()];
         dirty_scratch(&mut scratch);
         plan.inverse(&source, &mut inverse, &mut scratch).unwrap();
         assert_eq!(source, source_before_transforms);
-        assert_close(&inverse, &dft_oracle(&source, line_len, true));
+        assert_close(
+            &inverse,
+            &dft_oracle(&source, line_len, 1.0, 1.0 / line_len as f64),
+        );
 
         let forward_before_roundtrip = forward.clone();
+        let mut backward_roundtrip =
+            vec![Complex::new(R::convert(0.0), R::convert(0.0)); source.len()];
+        dirty_scratch(&mut scratch);
+        plan.backward(&forward, &mut backward_roundtrip, &mut scratch)
+            .unwrap();
+        assert_eq!(forward, forward_before_roundtrip);
+        let expected_backward_roundtrip: Vec<_> = source_before_transforms
+            .iter()
+            .map(|value| {
+                Complex::new(
+                    R::convert(value.re.as_f64() * line_len as f64),
+                    R::convert(value.im.as_f64() * line_len as f64),
+                )
+            })
+            .collect();
+        assert_close(&backward_roundtrip, &expected_backward_roundtrip);
+
         let mut roundtrip = vec![Complex::new(R::convert(0.0), R::convert(0.0)); source.len()];
         dirty_scratch(&mut scratch);
         plan.inverse(&forward, &mut roundtrip, &mut scratch)
@@ -562,11 +647,18 @@ mod tests {
             .unwrap();
         assert_close(&forward_in_place, &forward);
 
+        let mut backward_in_place = source.clone();
+        dirty_scratch(&mut scratch);
+        plan.backward_in_place(&mut backward_in_place, &mut scratch)
+            .unwrap();
+        assert_close(&backward_in_place, &dft_oracle(&source, line_len, 1.0, 1.0));
+
         let mut inverse_in_place = forward.clone();
         dirty_scratch(&mut scratch);
         plan.inverse_in_place(&mut inverse_in_place, &mut scratch)
             .unwrap();
         assert_close(&inverse_in_place, &source);
+        assert_eq!(plan.scratch_len(), scratch_len);
     }
 
     #[test]
@@ -638,21 +730,18 @@ mod tests {
     }
 
     #[test]
-    fn zero_batch_is_checked_for_both_directions_and_modes() {
+    fn zero_batch_is_checked_for_all_directions_and_modes() {
         let plan = LocalC2cPlan::<f64>::new(1).unwrap();
+        let scratch_len = plan.scratch_len();
 
-        for inverse in [false, true] {
+        for &(out_of_place, in_place) in &OPERATIONS {
             let source: Vec<Complex<f64>> = Vec::new();
             let source_before = source.clone();
             let mut destination = Vec::new();
-            let mut scratch = initialized_scratch::<f64>(plan.scratch_len().max(1));
+            let mut scratch = initialized_scratch::<f64>(scratch_len.max(1));
             dirty_scratch(&mut scratch);
             let scratch_before = scratch.clone();
-            let result = if inverse {
-                plan.inverse(&source, &mut destination, &mut scratch)
-            } else {
-                plan.forward(&source, &mut destination, &mut scratch)
-            };
+            let result = out_of_place(&plan, &source, &mut destination, &mut scratch);
             assert_eq!(result, Ok(()));
             assert_eq!(source, source_before);
             assert!(destination.is_empty());
@@ -660,33 +749,26 @@ mod tests {
 
             let mut destination = vec![Complex::new(31.0, -17.0)];
             let destination_before = destination.clone();
-            let mut scratch = initialized_scratch::<f64>(plan.scratch_len().max(1));
+            let mut scratch = initialized_scratch::<f64>(scratch_len.max(1));
             dirty_scratch(&mut scratch);
             let scratch_before = scratch.clone();
-            let result = if inverse {
-                plan.inverse(&source, &mut destination, &mut scratch)
-            } else {
-                plan.forward(&source, &mut destination, &mut scratch)
-            };
+            let result = out_of_place(&plan, &source, &mut destination, &mut scratch);
             assert_eq!(result, Err(LocalC2cError::BufferLengthMismatch));
             assert_eq!(source, source_before);
             assert_eq!(destination, destination_before);
             assert_eq!(scratch, scratch_before);
 
             let mut data = Vec::new();
-            let mut scratch = initialized_scratch::<f64>(plan.scratch_len().max(1));
+            let mut scratch = initialized_scratch::<f64>(scratch_len.max(1));
             dirty_scratch(&mut scratch);
             let scratch_before = scratch.clone();
-            let result = if inverse {
-                plan.inverse_in_place(&mut data, &mut scratch)
-            } else {
-                plan.forward_in_place(&mut data, &mut scratch)
-            };
+            let result = in_place(&plan, &mut data, &mut scratch);
             assert_eq!(result, Ok(()));
             assert!(data.is_empty());
             assert_eq!(scratch, scratch_before);
         }
 
+        assert_eq!(plan.scratch_len(), scratch_len);
         assert!(matches!(
             LocalC2cPlan::<f64>::new(0),
             Err(LocalC2cError::InvalidLength)
@@ -697,44 +779,65 @@ mod tests {
     fn invalid_buffers_are_rejected_before_any_buffer_changes() {
         let plan = LocalC2cPlan::<f64>::new(4).unwrap();
 
-        let source = sample_input::<f64>(4, 1);
-        let source_before = source.clone();
-        let mut destination = vec![Complex::new(31.0, -17.0); 3];
-        let destination_before = destination.clone();
-        let mut scratch = initialized_scratch::<f64>(plan.scratch_len());
-        let scratch_before = scratch.clone();
-        assert_eq!(
-            plan.forward(&source, &mut destination, &mut scratch),
-            Err(LocalC2cError::BufferLengthMismatch)
-        );
-        assert_eq!(source, source_before);
-        assert_eq!(destination, destination_before);
-        assert_eq!(scratch, scratch_before);
+        for (operation, destination_value) in [
+            (
+                LocalC2cPlan::<f64>::forward as OutOfPlace,
+                Complex::new(31.0, -17.0),
+            ),
+            (LocalC2cPlan::<f64>::backward, Complex::new(23.0, -19.0)),
+        ] {
+            let source = sample_input::<f64>(4, 1);
+            let source_before = source.clone();
+            let mut destination = vec![destination_value; 3];
+            let destination_before = destination.clone();
+            let mut scratch = initialized_scratch::<f64>(plan.scratch_len());
+            let scratch_before = scratch.clone();
+            assert_eq!(
+                operation(&plan, &source, &mut destination, &mut scratch),
+                Err(LocalC2cError::BufferLengthMismatch)
+            );
+            assert_eq!(source, source_before);
+            assert_eq!(destination, destination_before);
+            assert_eq!(scratch, scratch_before);
+        }
 
-        let source = sample_input::<f64>(5, 1);
-        let source_before = source.clone();
-        let mut destination = vec![Complex::new(29.0, 13.0); 5];
-        let destination_before = destination.clone();
-        let mut scratch = initialized_scratch::<f64>(plan.scratch_len());
-        let scratch_before = scratch.clone();
-        assert_eq!(
-            plan.forward(&source, &mut destination, &mut scratch),
-            Err(LocalC2cError::NonIntegralBatch)
-        );
-        assert_eq!(source, source_before);
-        assert_eq!(destination, destination_before);
-        assert_eq!(scratch, scratch_before);
+        for (operation, destination_value) in [
+            (
+                LocalC2cPlan::<f64>::forward as OutOfPlace,
+                Complex::new(29.0, 13.0),
+            ),
+            (LocalC2cPlan::<f64>::backward, Complex::new(17.0, -31.0)),
+        ] {
+            let source = sample_input::<f64>(5, 1);
+            let source_before = source.clone();
+            let mut destination = vec![destination_value; 5];
+            let destination_before = destination.clone();
+            let mut scratch = initialized_scratch::<f64>(plan.scratch_len());
+            let scratch_before = scratch.clone();
+            assert_eq!(
+                operation(&plan, &source, &mut destination, &mut scratch),
+                Err(LocalC2cError::NonIntegralBatch)
+            );
+            assert_eq!(source, source_before);
+            assert_eq!(destination, destination_before);
+            assert_eq!(scratch, scratch_before);
+        }
 
-        let mut data = sample_input::<f64>(5, 1);
-        let data_before = data.clone();
-        let mut scratch = initialized_scratch::<f64>(plan.scratch_len());
-        let scratch_before = scratch.clone();
-        assert_eq!(
-            plan.inverse_in_place(&mut data, &mut scratch),
-            Err(LocalC2cError::NonIntegralBatch)
-        );
-        assert_eq!(data, data_before);
-        assert_eq!(scratch, scratch_before);
+        for operation in [
+            LocalC2cPlan::<f64>::inverse_in_place as InPlace,
+            LocalC2cPlan::<f64>::backward_in_place,
+        ] {
+            let mut data = sample_input::<f64>(5, 1);
+            let data_before = data.clone();
+            let mut scratch = initialized_scratch::<f64>(plan.scratch_len());
+            let scratch_before = scratch.clone();
+            assert_eq!(
+                operation(&plan, &mut data, &mut scratch),
+                Err(LocalC2cError::NonIntegralBatch)
+            );
+            assert_eq!(data, data_before);
+            assert_eq!(scratch, scratch_before);
+        }
     }
 
     #[test]
@@ -754,7 +857,7 @@ mod tests {
         let plan = LocalC2cPlan::<f64>::new(line_len).unwrap();
         assert_eq!(plan.scratch_len(), native_required);
 
-        for inverse in [false, true] {
+        for &(out_of_place, in_place) in &OPERATIONS {
             let source: Vec<Complex<f64>> = Vec::new();
             let source_before = source.clone();
             let mut destination = Vec::new();
@@ -762,11 +865,7 @@ mod tests {
             let mut scratch = initialized_scratch::<f64>(native_required - 1);
             dirty_scratch(&mut scratch);
             let scratch_before = scratch.clone();
-            let result = if inverse {
-                plan.inverse(&source, &mut destination, &mut scratch)
-            } else {
-                plan.forward(&source, &mut destination, &mut scratch)
-            };
+            let result = out_of_place(&plan, &source, &mut destination, &mut scratch);
             assert_eq!(
                 result,
                 Err(LocalC2cError::ScratchTooSmall {
@@ -783,11 +882,7 @@ mod tests {
             let mut scratch = initialized_scratch::<f64>(native_required - 1);
             dirty_scratch(&mut scratch);
             let scratch_before = scratch.clone();
-            let result = if inverse {
-                plan.inverse_in_place(&mut data, &mut scratch)
-            } else {
-                plan.forward_in_place(&mut data, &mut scratch)
-            };
+            let result = in_place(&plan, &mut data, &mut scratch);
             assert_eq!(
                 result,
                 Err(LocalC2cError::ScratchTooSmall {
@@ -799,36 +894,49 @@ mod tests {
             assert_eq!(scratch, scratch_before);
         }
 
-        let source = sample_input::<f64>(line_len, 1);
-        let source_before = source.clone();
-        let mut destination = vec![Complex::new(7.0, -11.0); line_len];
-        let destination_before = destination.clone();
-        let mut scratch = initialized_scratch::<f64>(native_required - 1);
-        let scratch_before = scratch.clone();
-        assert_eq!(
-            plan.forward(&source, &mut destination, &mut scratch),
-            Err(LocalC2cError::ScratchTooSmall {
-                required: native_required,
-                actual: native_required - 1,
-            })
-        );
-        assert_eq!(source, source_before);
-        assert_eq!(destination, destination_before);
-        assert_eq!(scratch, scratch_before);
+        for (operation, destination_value) in [
+            (
+                LocalC2cPlan::<f64>::forward as OutOfPlace,
+                Complex::new(7.0, -11.0),
+            ),
+            (LocalC2cPlan::<f64>::backward, Complex::new(19.0, -23.0)),
+        ] {
+            let source = sample_input::<f64>(line_len, 1);
+            let source_before = source.clone();
+            let mut destination = vec![destination_value; line_len];
+            let destination_before = destination.clone();
+            let mut scratch = initialized_scratch::<f64>(native_required - 1);
+            let scratch_before = scratch.clone();
+            assert_eq!(
+                operation(&plan, &source, &mut destination, &mut scratch),
+                Err(LocalC2cError::ScratchTooSmall {
+                    required: native_required,
+                    actual: native_required - 1,
+                })
+            );
+            assert_eq!(source, source_before);
+            assert_eq!(destination, destination_before);
+            assert_eq!(scratch, scratch_before);
+        }
 
-        let mut data = source.clone();
-        let data_before = data.clone();
-        let mut scratch = initialized_scratch::<f64>(native_required - 1);
-        let scratch_before = scratch.clone();
-        assert_eq!(
-            plan.forward_in_place(&mut data, &mut scratch),
-            Err(LocalC2cError::ScratchTooSmall {
-                required: native_required,
-                actual: native_required - 1,
-            })
-        );
-        assert_eq!(data, data_before);
-        assert_eq!(scratch, scratch_before);
+        for operation in [
+            LocalC2cPlan::<f64>::forward_in_place as InPlace,
+            LocalC2cPlan::<f64>::backward_in_place,
+        ] {
+            let mut data = sample_input::<f64>(line_len, 1);
+            let data_before = data.clone();
+            let mut scratch = initialized_scratch::<f64>(native_required - 1);
+            let scratch_before = scratch.clone();
+            assert_eq!(
+                operation(&plan, &mut data, &mut scratch),
+                Err(LocalC2cError::ScratchTooSmall {
+                    required: native_required,
+                    actual: native_required - 1,
+                })
+            );
+            assert_eq!(data, data_before);
+            assert_eq!(scratch, scratch_before);
+        }
     }
 
     fn assert_line_len_boundary<R: FftReal>() {
