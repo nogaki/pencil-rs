@@ -13,12 +13,13 @@ flat slices, uses RustFFT/RealFFT, and is independent of MPI and
 single-buffer in-place distributed C2C FFTs, including raw positive-sign
 `backward`, and out-of-place distributed R2C/C2R forward, normalized inverse,
 and raw backward over checked Alltoallv or point-to-point transitions. Local
-out-of-place R2C/C2R are also available. `LocalR2rPlan` provides all eight
+out-of-place and packed single-allocation in-place R2C/C2R are also
+available. `LocalR2rPlan` provides all eight
 FFTW-compatible DCT/DST-I-IV kinds for real and complex `f32`/`f64`, with
 out-of-place and in-place execution. Its `forward`/`backward` operations use
 raw unnormalized FFTW conventions, while `inverse` is normalized by the
 logical transform factor. Each line uses at most `8n` complex embedding values
-plus queried native scratch; it adds no MPI or new dependencies. Distributed R2R
+plus queried native scratch; it adds no MPI dependency. Distributed R2R
 will follow separately.
 
 `Pencil` describes spatial distribution. `PencilArray` owns one layout and
@@ -31,7 +32,8 @@ process-local memory-axis permutations. `AllToAllvTransposePlan` and
 out-of-place views and shared-storage in-place execution. The optional
 `pencil-fft/distributed` feature composes these checked transitions into
 out-of-place and in-place distributed C2C forward/inverse/backward transforms
-and out-of-place R2C/C2R; it does not change the MPI-free local FFT default.
+and out-of-place R2C/C2R; distributed R2C has no in-place API, and this does
+not change the MPI-free local FFT default.
 `C2cPlan` and `R2cPlan` provide matching selection-aware shape, pencil, and
 array constructors through `AxisSelection<N>`, plus the existing
 `from_*_with_method` forms. `AxisSelection::all()` is the default; its
@@ -204,7 +206,7 @@ cargo doc --workspace --no-deps --locked
 cargo doc -p pencil-fft --features distributed --no-deps --locked
 cargo test --workspace --doc --locked -- --show-output
 cargo test -p pencil-fft --features distributed --doc --locked -- --show-output
-# The existing suite binary covers distributed C2C forward/inverse/backward and R2C/C2R forward/inverse/backward over Alltoallv/P2P; only C2C has in-place APIs.
+# The existing suite binary covers distributed C2C forward/inverse/backward and R2C/C2R forward/inverse/backward over Alltoallv/P2P; local C2C and local R2C have in-place APIs.
 for n in 1 4 6; do
   timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
     cargo test -p pencil-fft --features distributed --test distributed_c2c \
@@ -215,15 +217,16 @@ done
 Rustdoc tests cover usage examples and compile-time borrowing and visibility
 restrictions. `LocalR2cPlan` preserves its source by copying one line at a time
 into caller-owned initialized storage, uses caller-owned complex scratch, and
-provides no real in-place API. It exposes the original real length `n`, the
-reduced complex length `n/2+1`, and the shared native scratch requirement;
-forward and backward are unscaled and inverse divides each line by `n`. Its
-inverse and backward accept only strict-zero DC and, for even lengths, Nyquist
-imaginary components; for
-odd lengths greater than one, the final-bin imaginary component is
-unconstrained, while `n = 1` DC remains constrained. Ordinary validation
-errors preserve data and workspace, while backend/resource panics are not
-converted.
+provides a packed single-allocation in-place API. It exposes the original real
+length `n`, the reduced complex length `n/2+1`, and the shared native scratch
+requirement; forward and backward are unscaled and inverse divides each line by
+`n`. The in-place API owns one `Vec<Complex<R>>` and exposes only its
+initialized real or complex prefix for the current state. Its inverse and
+backward accept only strict-zero DC and, for even lengths, Nyquist imaginary
+components; for odd lengths greater than one, the final-bin imaginary
+component is unconstrained, while `n = 1` DC remains constrained. Ordinary
+validation errors preserve data and workspace, while backend/resource panics
+are not converted.
 
 The topology constructors are collective over an MPI intracommunicator. Run
 each integration-test binary with one MPI initialization per process, and drop

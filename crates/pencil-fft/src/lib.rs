@@ -5,7 +5,8 @@
 //!
 //! [`LocalC2cPlan`] treats each input slice as a row-major batch of contiguous
 //! complex lines. [`LocalR2cPlan`] does the same for real-to-half-complex and
-//! half-complex-to-real transforms. Plans own immutable backend plans, while
+//! half-complex-to-real transforms, and also provides a packed, state-checked
+//! single-allocation in-place API. Plans own immutable backend plans, while
 //! callers own initialized line buffers, scratch storage, and data buffers.
 //! Local C2C and local R2C/C2R forward and backward transforms are
 //! unnormalized; backward uses the positive-sign convention. Local C2C
@@ -76,8 +77,9 @@
 //! impl FftReal for ExternalReal {}
 //! ```
 //!
-//! A real transform is out of place and uses caller-owned buffers for the
-//! native line operation:
+//! An out-of-place real transform uses caller-owned buffers for the native
+//! line operation. The packed in-place API is available through
+//! [`LocalR2cPlan::allocate_in_place`]:
 //!
 //! ```
 //! use pencil_fft::{Complex, LocalR2cError, LocalR2cPlan};
@@ -109,9 +111,9 @@ use rustfft::{Fft, FftPlanner};
 
 /// The complex number type used by local FFT plans.
 ///
-/// This is the `num_complex::Complex` type re-exported by RustFFT. It is
+/// This is the `num_complex::Complex` type used by RustFFT. It is
 /// backend-neutral at this crate's public API boundary.
-pub use rustfft::num_complex::Complex;
+pub use num_complex::Complex;
 
 mod private {
     use super::Complex;
@@ -125,7 +127,7 @@ mod private {
     impl DistributedReal for f32 {}
     impl DistributedReal for f64 {}
 
-    pub trait Sealed: rustfft::FftNum {
+    pub trait Sealed: rustfft::FftNum + bytemuck::Pod {
         fn normalize_inverse(values: &mut [Complex<Self>], line_len: usize);
         fn pencil_fft_as_f64(self) -> f64;
         fn pencil_fft_epsilon_f64() -> f64;
@@ -191,7 +193,9 @@ impl FftReal for f64 {}
 mod r2c;
 mod r2r;
 
-pub use r2c::{LocalR2cError, LocalR2cPlan};
+pub use r2c::{
+    LocalR2cError, LocalR2cInPlaceArray, LocalR2cInPlaceWorkspace, LocalR2cPlan, R2cState,
+};
 pub use r2r::{LocalR2rError, LocalR2rPlan, R2rKind, R2rScalar};
 
 #[cfg(feature = "distributed")]

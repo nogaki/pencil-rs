@@ -10,6 +10,8 @@ default = []
 distributed = ["dep:mpi", "dep:pencil-array", "mpi/complex"]
 
 [dependencies]
+bytemuck = { version = "1.25.2", features = ["extern_crate_alloc"] }
+num-complex = { version = "0.4.6", features = ["bytemuck"] }
 realfft = "~3.5.0"
 rustfft = "~6.4.1"
 thiserror.workspace = true
