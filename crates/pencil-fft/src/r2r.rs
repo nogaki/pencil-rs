@@ -275,11 +275,6 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         })
     }
 
-    /// Builds a plan with the kind-first spelling for callers that prefer it.
-    pub fn from_kind(kind: R2rKind, line_len: usize) -> Result<Self, LocalR2rError> {
-        Self::new(line_len, kind)
-    }
-
     /// Returns the number of values in each logical input or output line.
     pub fn line_len(&self) -> usize {
         self.line_len
@@ -297,16 +292,6 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
 
     /// Returns the number of complex values required in the embedding line.
     pub fn embedding_len(&self) -> usize {
-        self.embedding_len
-    }
-
-    /// Returns the embedding-line length under the complex-workspace naming.
-    pub fn complex_line_len(&self) -> usize {
-        self.embedding_len
-    }
-
-    /// Returns the embedding-line length under the reduced-FFT naming.
-    pub fn complex_len(&self) -> usize {
         self.embedding_len
     }
 
