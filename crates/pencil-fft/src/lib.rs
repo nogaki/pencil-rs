@@ -12,6 +12,10 @@
 //! inverse and R2C/C2R inverse divide by the line length: the complex length
 //! for C2C, or the original real length for R2C/C2R.
 //!
+//! [`LocalR2rPlan`] adds the eight FFTW-compatible DCT/DST-I-IV kinds for the
+//! four supported scalar types, with component-wise complex transforms and raw
+//! paired backward plus normalized inverse operations.
+//!
 //! With the opt-in `distributed` feature, `C2cPlan` and its workspaces provide
 //! input-preserving distributed C2C transforms, while `R2cPlan` provides
 //! input-preserving out-of-place R2C/C2R forward, normalized inverse, and raw
@@ -172,8 +176,10 @@ impl FftReal for f32 {}
 impl FftReal for f64 {}
 
 mod r2c;
+mod r2r;
 
 pub use r2c::{LocalR2cError, LocalR2cPlan};
+pub use r2r::{LocalR2rError, LocalR2rPlan, R2rKind, R2rScalar};
 
 #[cfg(feature = "distributed")]
 mod distributed;
