@@ -8,11 +8,11 @@ The workspace contains the `pencil-array` core crate and the local FFT
 RealFFT, FFTW, and any FFT-specific API. The local `pencil-fft` path accepts
 flat slices, uses RustFFT/RealFFT, and is independent of MPI and
 `pencil-array`. Local C2C provides unnormalized forward and positive-sign
-`backward` transforms plus normalized `inverse`; `backward` is local C2C only,
-not a distributed or R2C API. Local out-of-place R2C/C2R are also available.
-An opt-in `pencil-fft/distributed` feature adds out-of-place, input-preserving and
-single-buffer in-place distributed C2C FFTs and out-of-place distributed
-R2C/C2R over checked Alltoallv or point-to-point transitions.
+`backward` transforms plus normalized `inverse`. An opt-in
+`pencil-fft/distributed` feature adds out-of-place, input-preserving and
+single-buffer in-place distributed C2C FFTs, including raw positive-sign
+`backward`, and out-of-place distributed R2C/C2R over checked Alltoallv or
+point-to-point transitions. Local out-of-place R2C/C2R are also available.
 
 `Pencil` describes spatial distribution. `PencilArray` owns one layout and
 one local buffer. `ManyPencilArray` owns a buffer large enough for several
@@ -23,8 +23,9 @@ process-local memory-axis permutations. `AllToAllvTransposePlan` and
 `PointToPointTransposePlan` provide checked distributed redistribution through
 out-of-place views and shared-storage in-place execution. The optional
 `pencil-fft/distributed` feature composes these checked transitions into
-out-of-place and in-place distributed C2C transforms and out-of-place
-R2C/C2R; it does not change the MPI-free local FFT default. `C2cPlan` and
+out-of-place and in-place distributed C2C forward/inverse/backward transforms
+and out-of-place R2C/C2R; it does not change the MPI-free local FFT default.
+`C2cPlan` and
 `R2cPlan` provide matching `from_pencil_with_method`,
 `from_array_with_method`, and `from_shape_with_method` constructors. The
 legacy constructors retain the Alltoallv default; R2C output uses the original
@@ -89,11 +90,15 @@ destination remain unchanged.
 Enable the feature in this workspace with
 `cargo check -p pencil-fft --features distributed --locked`. The public
 `C2cPlan` supports `N >= 2` and `1 <= M < N`, canonical identity input
-pencils, normalized inverse transforms, exact extra shapes, reusable
-plan-bound `C2cOutOfPlaceWorkspace`, and input-preserving forward/inverse
-execution. Construction and execution are collective on the topology's
-Cartesian communicator; every rank must call matching operations in order and
-select the same `TransposeMethod`. The selected method is appended to the
+pencils, exact extra shapes, reusable plan-bound
+`C2cOutOfPlaceWorkspace`, and input-preserving forward, normalized inverse,
+and raw positive-sign backward execution. Forward consumes the canonical input
+layout and produces the reversed output layout; both inverse and raw backward
+consume that output layout and produce canonical input. Raw backward does not
+normalize, so a forward/backward pair scales by the product of global spatial
+extents, excluding extra dimensions. Construction and execution are collective
+on the topology's Cartesian communicator; every rank must call matching
+operations in order and select the same `TransposeMethod`. The selected method is appended to the
 minimal checked C2C descriptor (after global shape, process grid, extra shape,
 and scalar width), so a rank-local method mismatch returns
 `FftError::CollectiveDescriptorMismatch` before native FFT, output, workspace,
@@ -113,16 +118,18 @@ failure before the next collective call. `C2cPlan::allocate_in_place` returns
 an opaque `C2cInPlaceArray` and `allocate_in_place_workspace` returns its
 plan-bound scratch. The array exposes only `state`, `view`, and `view_mut`:
 `Input -> Poisoned -> Output` for forward and `Output -> Poisoned -> Input`
-for inverse. Initial collective preflight errors preserve state, data, and
-workspace; once execution begins, the array is poisoned before its first write,
-and any later failure or panic leaves it `Poisoned`, so callers reallocate it.
-A mutable output view may contain arbitrary spectral data for inverse execution.
+for normalized inverse or raw backward. Initial collective preflight errors
+preserve state, data, and workspace; once execution begins, the array is
+poisoned before its first write, and any later failure or panic leaves it
+`Poisoned`, so callers reallocate it. A mutable output view may contain
+arbitrary spectral data for either reverse operation.
 
 ## Local Julia/FFTW reference validation
 
 The opt-in Milestone 9 checker generates temporary Julia 1.12.6/FFTW.jl
-1.10.0 references and validates the existing distributed C2C and R2C/C2R APIs
-at 1, 4, and 6 MPI ranks with both transpose methods and both precisions. It
+1.10.0 references and validates the distributed C2C forward/inverse/raw
+backward and R2C/C2R APIs at 1, 4, and 6 MPI ranks with both transpose methods
+and both precisions. It
 covers 16 fixtures and 26 valid case/layout combinations per method and rank.
 The external comparison is explicitly opt-in; normal Rust tests need no Julia.
 See [`tools/fftw-reference/README.md`](tools/fftw-reference/README.md) and run
@@ -171,7 +178,7 @@ cargo doc --workspace --no-deps --locked
 cargo doc -p pencil-fft --features distributed --no-deps --locked
 cargo test --workspace --doc --locked -- --show-output
 cargo test -p pencil-fft --features distributed --doc --locked -- --show-output
-# The existing suite binary covers distributed C2C/R2C/C2R over Alltoallv/P2P; only C2C has in-place APIs.
+# The existing suite binary covers distributed C2C forward/inverse/backward and R2C/C2R over Alltoallv/P2P; only C2C has in-place APIs.
 for n in 1 4 6; do
   timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
     cargo test -p pencil-fft --features distributed --test distributed_c2c \

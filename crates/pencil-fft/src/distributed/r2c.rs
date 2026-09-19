@@ -579,6 +579,7 @@ where
         &mut workspace.intermediate,
         &mut workspace.transpose,
         &mut workspace.fft_scratch,
+        true,
     )?;
     validate_boundary(core, &workspace.intermediate)?;
     zero_accepted_boundary(core, &mut workspace.intermediate)?;

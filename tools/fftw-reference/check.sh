@@ -117,50 +117,87 @@ for ranks in 1 4 6; do
     run_reference "$ranks" "$FIXTURES" "$WORK/reference-$ranks.log"
 done
 
-CORRUPT="$WORK/corrupt-fixtures"
-mkdir -p "$CORRUPT"
-cp -- "${fixture_files[@]}" "$CORRUPT/"
-corrupt_files=("$CORRUPT"/*.txt)
-[[ ${#corrupt_files[@]} -eq 16 ]] || {
-    printf 'corrupted fixture copy is incomplete\n' >&2
+CORRUPT_FORWARD="$WORK/corrupt-forward-fixtures"
+CORRUPT_BACKWARD="$WORK/corrupt-backward-fixtures"
+mkdir -p "$CORRUPT_FORWARD" "$CORRUPT_BACKWARD"
+cp -- "${fixture_files[@]}" "$CORRUPT_FORWARD/"
+cp -- "${fixture_files[@]}" "$CORRUPT_BACKWARD/"
+for corrupt_directory in "$CORRUPT_FORWARD" "$CORRUPT_BACKWARD"; do
+    corrupt_files=("$corrupt_directory"/*.txt)
+    [[ ${#corrupt_files[@]} -eq 16 ]] || {
+        printf 'corrupted fixture copy is incomplete\n' >&2
+        exit 1
+    }
+done
+corrupt_backward_file=
+for candidate in "$CORRUPT_BACKWARD"/*.txt; do
+    if grep -Fq 'section backward_expected ' "$candidate"; then
+        corrupt_backward_file=$candidate
+        break
+    fi
+done
+corrupt_forward_file="$CORRUPT_FORWARD/$(basename "$corrupt_backward_file")"
+[[ -n "$corrupt_backward_file" && -f "$corrupt_forward_file" ]] || {
+    printf 'no C2C fixture with backward_expected was generated\n' >&2
     exit 1
 }
-corrupt_file=${corrupt_files[0]}
 "$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" -e '
-function corrupt(path)
+function corrupt(path, section_name)
     lines = readlines(path)
     changed = false
+    marker = "section " * section_name * " "
     for index in eachindex(lines)
-        if startswith(lines[index], "section forward_expected ")
-            index < length(lines) || error("forward_expected section has no value")
+        if startswith(lines[index], marker)
+            index < length(lines) || error(section_name, " section has no value")
             tokens = split(lines[index + 1])
-            isempty(tokens) && error("forward_expected section has an empty value")
+            isempty(tokens) && error(section_name, " section has an empty value")
             tokens[1] = string(parse(Float64, tokens[1]) + 1.0)
             lines[index + 1] = join(tokens, " ")
             changed = true
             break
         end
     end
-    changed || error("forward_expected section not found")
+    changed || error(section_name, " section not found")
     open(path, "w") do io
         write(io, join(lines, "\n"), "\n")
     end
 end
-corrupt(ARGS[1])
-' "$corrupt_file"
+corrupt(ARGS[1], ARGS[2])
+corrupt(ARGS[3], ARGS[4])
+' "$corrupt_forward_file" forward_expected "$corrupt_backward_file" backward_expected
 
-printf '\n== corrupted-fixture rejection ==\n'
-CORRUPT_LOG="$WORK/corrupted-fixture.log"
-if run_reference 1 "$CORRUPT" "$CORRUPT_LOG"; then
-    printf 'checker accepted a deliberately corrupted expected value\n' >&2
+check_corruption_log() {
+    local log_file=$1
+    local context=${2:-}
+    if ! grep -Fq 'PENCIL_FFTW_REFERENCE_MATRIX_STARTED' "$log_file" \
+        || ! grep -Fq 'actual=' "$log_file" \
+        || ! grep -Fq 'expected=' "$log_file" \
+        || ! grep -Fq 'bound=' "$log_file"; then
+        cat "$log_file" >&2
+        printf 'corruption check failed without the expected comparison marker\n' >&2
+        return 1
+    fi
+    if [[ -n "$context" ]] && ! grep -Fq "$context" "$log_file"; then
+        cat "$log_file" >&2
+        printf 'corruption check failed without %s comparison context\n' "$context" >&2
+        return 1
+    fi
+}
+
+printf '\n== corrupted forward_expected rejection ==\n'
+FORWARD_CORRUPT_LOG="$WORK/corrupted-forward.log"
+if run_reference 1 "$CORRUPT_FORWARD" "$FORWARD_CORRUPT_LOG"; then
+    printf 'checker accepted a deliberately corrupted forward_expected value\n' >&2
     exit 1
 fi
-if ! grep -Fq 'PENCIL_FFTW_REFERENCE_MATRIX_STARTED' "$CORRUPT_LOG" \
-    || ! grep -Fq 'actual=' "$CORRUPT_LOG" \
-    || ! grep -Fq 'expected=' "$CORRUPT_LOG" \
-    || ! grep -Fq 'bound=' "$CORRUPT_LOG"; then
-    cat "$CORRUPT_LOG" >&2
-    printf 'corruption check failed without the expected comparison marker\n' >&2
+check_corruption_log "$FORWARD_CORRUPT_LOG"
+printf 'corrupted forward_expected rejected as intended\n'
+
+printf '\n== corrupted backward_expected rejection ==\n'
+BACKWARD_CORRUPT_LOG="$WORK/corrupted-backward.log"
+if run_reference 1 "$CORRUPT_BACKWARD" "$BACKWARD_CORRUPT_LOG"; then
+    printf 'checker accepted a deliberately corrupted backward_expected value\n' >&2
     exit 1
 fi
-printf 'corrupted expected value rejected as intended\n'
+check_corruption_log "$BACKWARD_CORRUPT_LOG" 'OOP backward'
+printf 'corrupted backward_expected rejected as intended\n'

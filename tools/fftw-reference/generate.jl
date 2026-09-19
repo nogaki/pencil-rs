@@ -1,7 +1,7 @@
 using FFTW
 using Printf
 
-const REFERENCE_VERSION = 1
+const REFERENCE_VERSION = 2
 
 struct ReferenceCase
     name::String
@@ -104,11 +104,13 @@ function c2c_values(::Type{T}, item::ReferenceCase) where {T}
     inverse_plan = FFTW.plan_ifft(inverse_input, dims; flags = FFTW.ESTIMATE, num_threads = 1)
     forward = forward_plan * input
     inverse = inverse_plan * inverse_input
+    backward = FFTW.bfft(copy(inverse_input), dims)
     @assert size(forward) == expected_input_shape
     @assert size(inverse) == expected_input_shape
+    @assert size(backward) == expected_input_shape
     @assert input == input_before
     @assert inverse_input == inverse_input_before
-    return input, inverse_input, forward, inverse
+    return input, inverse_input, forward, inverse, backward
 end
 
 function r2c_values(::Type{T}, item::ReferenceCase) where {T}
@@ -179,16 +181,18 @@ function print_complex_section(io, name::String, values)
 end
 
 function write_case(output_directory::String, item::ReferenceCase, ::Type{T}, provider, native_version) where {T}
-    input, inverse_input, forward, inverse = item.kind == :c2c ? c2c_values(T, item) : r2c_values(T, item)
     filename = joinpath(output_directory, item.name * "_" * precision_name(T) * ".txt")
     open(filename, "w") do io
         print_header(io, item, T, provider, native_version)
         if item.kind == :c2c
+            input, inverse_input, forward, inverse, backward = c2c_values(T, item)
             print_complex_section(io, "input", input)
             print_complex_section(io, "inverse_input", inverse_input)
             print_complex_section(io, "forward_expected", forward)
             print_complex_section(io, "inverse_expected", inverse)
+            print_complex_section(io, "backward_expected", backward)
         else
+            input, inverse_input, forward, inverse = r2c_values(T, item)
             print_real_section(io, "input", input)
             print_complex_section(io, "inverse_input", inverse_input)
             print_complex_section(io, "forward_expected", forward)

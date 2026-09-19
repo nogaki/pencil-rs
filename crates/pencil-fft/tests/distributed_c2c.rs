@@ -80,6 +80,8 @@ type ResultSnapshots<R> = (
     Vec<Complex<R>>,
     Vec<Complex<R>>,
     Vec<Complex<R>>,
+    Vec<Complex<R>>,
+    Vec<Complex<R>>,
 );
 
 struct OopTransport<'a, R: TestReal, const N: usize, const M: usize> {
@@ -93,6 +95,13 @@ struct InPlaceTransport<'a, R: TestReal, const N: usize, const M: usize> {
     plan: &'a C2cPlan<R, N, M>,
     array: &'a mut C2cInPlaceArray<R, N, M>,
     workspace: &'a mut C2cInPlaceWorkspace<R, N, M>,
+}
+
+#[derive(Clone, Copy)]
+enum C2cOperation {
+    Forward,
+    Inverse,
+    Backward,
 }
 
 #[test]
@@ -306,8 +315,27 @@ where
     plan.inverse(&arbitrary_spectrum, &mut inverse, &mut workspace)
         .unwrap();
     assert_eq!(arbitrary_spectrum.as_slice(), arbitrary_before.as_slice());
-    check_inverse(&inverse.view(), &extra_shape, global_shape, seed + 31.0);
+    check_inverse(
+        &inverse.view(),
+        &extra_shape,
+        global_shape,
+        seed + 31.0,
+        true,
+    );
     let oop_inverse_snapshot = inverse.as_slice().to_vec();
+
+    let mut backward = plan.allocate_input().unwrap();
+    plan.backward(&arbitrary_spectrum, &mut backward, &mut workspace)
+        .unwrap();
+    assert_eq!(arbitrary_spectrum.as_slice(), arbitrary_before.as_slice());
+    check_inverse(
+        &backward.view(),
+        &extra_shape,
+        global_shape,
+        seed + 31.0,
+        false,
+    );
+    let oop_backward_snapshot = backward.as_slice().to_vec();
 
     let mut roundtrip = plan.allocate_input().unwrap();
     plan.inverse(&spectrum, &mut roundtrip, &mut second_workspace)
@@ -315,6 +343,17 @@ where
     assert_eq!(spectrum.as_slice(), second_spectrum.as_slice());
     for (actual, expected) in roundtrip.as_slice().iter().zip(source_before.iter()) {
         assert_close(*actual, *expected);
+    }
+    let mut raw_roundtrip = plan.allocate_input().unwrap();
+    plan.backward(&spectrum, &mut raw_roundtrip, &mut second_workspace)
+        .unwrap();
+    let spatial_scale = global_shape.iter().product::<usize>() as f64;
+    for (actual, expected) in raw_roundtrip.as_slice().iter().zip(source_before.iter()) {
+        let expected = Complex::new(
+            <R as TestReal>::from_f64(R::to_f64(expected.re) * spatial_scale),
+            <R as TestReal>::from_f64(R::to_f64(expected.im) * spatial_scale),
+        );
+        assert_close(*actual, expected);
     }
 
     let mut in_place = plan.allocate_in_place().unwrap();
@@ -406,8 +445,75 @@ where
         &extra_shape,
         global_shape,
         seed + 31.0,
+        true,
     );
     let in_place_inverse_snapshot = in_place.view().unwrap().as_slice().to_vec();
+
+    // Raw backward uses the same output-to-input state route without local
+    // normalization, and preserves the single backing allocation.
+    plan.forward_in_place(&mut in_place, &mut in_place_workspace)
+        .unwrap();
+    fill_in_place(&mut in_place, seed + 31.0, true);
+    plan.backward_in_place(&mut in_place, &mut in_place_workspace)
+        .unwrap();
+    assert_eq!(in_place.state(), C2cState::Input);
+    assert_eq!(
+        in_place.view().unwrap().as_slice().as_ptr(),
+        in_place_storage
+    );
+    assert!(
+        in_place
+            .view()
+            .unwrap()
+            .pencil()
+            .same_layout(plan.input_pencil().as_ref())
+    );
+    for (actual, expected) in in_place
+        .view()
+        .unwrap()
+        .as_slice()
+        .iter()
+        .zip(&oop_backward_snapshot)
+    {
+        assert_close(*actual, *expected);
+    }
+    check_inverse(
+        &in_place.view().unwrap(),
+        &extra_shape,
+        global_shape,
+        seed + 31.0,
+        false,
+    );
+    let in_place_backward_snapshot = in_place.view().unwrap().as_slice().to_vec();
+
+    fill_in_place(&mut in_place, seed, false);
+    plan.forward_in_place(&mut in_place, &mut in_place_workspace)
+        .unwrap();
+    assert_eq!(in_place.state(), C2cState::Output);
+    assert_eq!(
+        in_place.view().unwrap().as_slice().as_ptr(),
+        in_place_storage
+    );
+    plan.backward_in_place(&mut in_place, &mut in_place_workspace)
+        .unwrap();
+    assert_eq!(in_place.state(), C2cState::Input);
+    assert_eq!(
+        in_place.view().unwrap().as_slice().as_ptr(),
+        in_place_storage
+    );
+    for (actual, expected) in in_place
+        .view()
+        .unwrap()
+        .as_slice()
+        .iter()
+        .zip(&in_place_original)
+    {
+        let expected = Complex::new(
+            <R as TestReal>::from_f64(R::to_f64(expected.re) * spatial_scale),
+            <R as TestReal>::from_f64(R::to_f64(expected.im) * spatial_scale),
+        );
+        assert_close(*actual, expected);
+    }
 
     // The same array and workspace can be used again after a successful pair.
     plan.forward_in_place(&mut in_place, &mut in_place_workspace)
@@ -429,8 +535,10 @@ where
     let snapshots = (
         oop_forward_snapshot,
         oop_inverse_snapshot,
+        oop_backward_snapshot,
         in_place_forward_snapshot,
         in_place_inverse_snapshot,
+        in_place_backward_snapshot,
     );
     topology_barrier(topology);
     snapshots
@@ -1604,8 +1712,14 @@ fn check_forward<R: TestReal, const N: usize, const M: usize>(
         for spatial_linear in 0..array.pencil().local_len() {
             let local = unravel_spatial(spatial_linear, local_shape);
             let wave_number = std::array::from_fn(|axis| ranges[axis].start + local[axis]);
-            let expected =
-                dft_value::<R, N>(&extra_indices, wave_number, global_shape, seed, false);
+            let expected = dft_value::<R, N>(
+                &extra_indices,
+                wave_number,
+                global_shape,
+                seed,
+                false,
+                false,
+            );
             let actual = *array
                 .get_local(&extra_indices, local)
                 .expect("checked forward index is local");
@@ -1619,6 +1733,7 @@ fn check_inverse<R: TestReal, const N: usize, const M: usize>(
     extra_shape: &ExtraShape,
     global_shape: [usize; N],
     seed: f64,
+    normalize_inverse: bool,
 ) {
     let local_shape = array.pencil().local_shape_logical();
     let ranges = array.pencil().local_ranges();
@@ -1627,7 +1742,14 @@ fn check_inverse<R: TestReal, const N: usize, const M: usize>(
         for spatial_linear in 0..array.pencil().local_len() {
             let local = unravel_spatial(spatial_linear, local_shape);
             let spatial = std::array::from_fn(|axis| ranges[axis].start + local[axis]);
-            let expected = dft_value::<R, N>(&extra_indices, spatial, global_shape, seed, true);
+            let expected = dft_value::<R, N>(
+                &extra_indices,
+                spatial,
+                global_shape,
+                seed,
+                true,
+                normalize_inverse,
+            );
             let actual = *array
                 .get_local(&extra_indices, local)
                 .expect("checked inverse index is local");
@@ -1642,6 +1764,7 @@ fn dft_value<R: TestReal, const N: usize>(
     global_shape: [usize; N],
     seed: f64,
     inverse: bool,
+    normalize_inverse: bool,
 ) -> Complex<R> {
     let sign = if inverse { 1.0 } else { -1.0 };
     let mut sum = Complex::new(0.0, 0.0);
@@ -1664,7 +1787,7 @@ fn dft_value<R: TestReal, const N: usize>(
             R::to_f64(value.re) * sin + R::to_f64(value.im) * cos,
         );
     }
-    if inverse {
+    if inverse && normalize_inverse {
         let scale = 1.0 / total as f64;
         sum.re *= scale;
         sum.im *= scale;
@@ -1776,6 +1899,33 @@ fn assert_c2c_rejected<R, const N: usize, const M: usize, F>(
     assert_eq!(format!("{workspace:?}"), workspace_before);
 }
 
+fn assert_c2c_rejected_exact<R, const N: usize, const M: usize, F, P>(
+    source: &PencilArray<Complex<R>, N, M>,
+    destination: &mut PencilArray<Complex<R>, N, M>,
+    workspace: &mut C2cOutOfPlaceWorkspace<R, N, M>,
+    execute: F,
+    predicate: P,
+) where
+    R: TestReal + std::fmt::Debug,
+    Complex<R>: mpi::datatype::Equivalence,
+    F: FnOnce(
+        &PencilArray<Complex<R>, N, M>,
+        &mut PencilArray<Complex<R>, N, M>,
+        &mut C2cOutOfPlaceWorkspace<R, N, M>,
+    ) -> Result<(), FftError>,
+    P: FnOnce(&FftError) -> bool,
+{
+    let source_before = source.as_slice().to_vec();
+    let destination_before = destination.as_slice().to_vec();
+    let workspace_before = format!("{workspace:?}");
+    let error =
+        execute(source, destination, workspace).expect_err("C2C call unexpectedly succeeded");
+    assert!(predicate(&error), "unexpected C2C error: {error:?}");
+    assert_eq!(source.as_slice(), source_before.as_slice());
+    assert_eq!(destination.as_slice(), destination_before.as_slice());
+    assert_eq!(format!("{workspace:?}"), workspace_before);
+}
+
 fn assert_in_place_rejected<R, const N: usize, const M: usize, F>(
     array: &mut C2cInPlaceArray<R, N, M>,
     workspace: &mut C2cInPlaceWorkspace<R, N, M>,
@@ -1821,9 +1971,115 @@ fn reuse_forward<R: TestReal, const N: usize, const M: usize>(
     plan.forward(source, &mut destination, workspace).unwrap();
 }
 
+fn reuse_backward<R: TestReal, const N: usize, const M: usize>(
+    plan: &C2cPlan<R, N, M>,
+    source: &PencilArray<Complex<R>, N, M>,
+    workspace: &mut C2cOutOfPlaceWorkspace<R, N, M>,
+) where
+    Complex<R>: mpi::datatype::Equivalence,
+{
+    let mut destination = plan.allocate_input().unwrap();
+    plan.backward(source, &mut destination, workspace).unwrap();
+}
+
+fn assert_mixed_direction_oop(
+    plan: &C2cPlan<f64, 2, 1>,
+    world: &mpi::topology::SimpleCommunicator,
+    root_operation: C2cOperation,
+    peer_operation: C2cOperation,
+    seed: f64,
+) {
+    let rank = world.rank();
+    let mut input = plan.allocate_input().unwrap();
+    fill_input(&mut input, seed);
+    let mut output = plan.allocate_output().unwrap();
+    fill_spectrum(&mut output, seed + 1.0);
+    let mut input_destination = plan.allocate_input().unwrap();
+    let mut output_destination = plan.allocate_output().unwrap();
+    let mut workspace = plan.allocate_out_of_place_workspace().unwrap();
+    let input_before = input.as_slice().to_vec();
+    let output_before = output.as_slice().to_vec();
+    let input_destination_before = input_destination.as_slice().to_vec();
+    let output_destination_before = output_destination.as_slice().to_vec();
+    let workspace_before = format!("{workspace:?}");
+    let operation = if rank == 0 {
+        root_operation
+    } else {
+        peer_operation
+    };
+    let result = match operation {
+        C2cOperation::Forward => plan.forward(&input, &mut output_destination, &mut workspace),
+        C2cOperation::Inverse => plan.inverse(&output, &mut input_destination, &mut workspace),
+        C2cOperation::Backward => plan.backward(&output, &mut input_destination, &mut workspace),
+    };
+    assert!(matches!(
+        result,
+        Err(FftError::CollectiveDescriptorMismatch)
+    ));
+    assert_eq!(input.as_slice(), input_before.as_slice());
+    assert_eq!(output.as_slice(), output_before.as_slice());
+    assert_eq!(
+        input_destination.as_slice(),
+        input_destination_before.as_slice()
+    );
+    assert_eq!(
+        output_destination.as_slice(),
+        output_destination_before.as_slice()
+    );
+    assert_eq!(format!("{workspace:?}"), workspace_before);
+
+    plan.forward(&input, &mut output_destination, &mut workspace)
+        .unwrap();
+    world.barrier();
+}
+
+fn assert_mixed_direction_in_place(
+    plan: &C2cPlan<f64, 2, 1>,
+    world: &mpi::topology::SimpleCommunicator,
+    root_operation: C2cOperation,
+    peer_operation: C2cOperation,
+    seed: f64,
+) {
+    let rank = world.rank();
+    let mut array = plan.allocate_in_place().unwrap();
+    fill_in_place(&mut array, seed, false);
+    let mut workspace = plan.allocate_in_place_workspace().unwrap();
+    plan.forward_in_place(&mut array, &mut workspace).unwrap();
+    let operation = if rank == 0 {
+        root_operation
+    } else {
+        peer_operation
+    };
+    if matches!(operation, C2cOperation::Forward) {
+        array = plan.allocate_in_place().unwrap();
+        fill_in_place(&mut array, seed, false);
+    }
+    let state_before = array.state();
+    let array_before = format!("{array:?}");
+    let workspace_before = format!("{workspace:?}");
+    let result = match operation {
+        C2cOperation::Forward => plan.forward_in_place(&mut array, &mut workspace),
+        C2cOperation::Inverse => plan.inverse_in_place(&mut array, &mut workspace),
+        C2cOperation::Backward => plan.backward_in_place(&mut array, &mut workspace),
+    };
+    assert!(matches!(
+        result,
+        Err(FftError::CollectiveDescriptorMismatch)
+    ));
+    assert_eq!(array.state(), state_before);
+    assert_eq!(format!("{array:?}"), array_before);
+    assert_eq!(format!("{workspace:?}"), workspace_before);
+
+    array = plan.allocate_in_place().unwrap();
+    fill_in_place(&mut array, seed, false);
+    plan.forward_in_place(&mut array, &mut workspace).unwrap();
+    plan.backward_in_place(&mut array, &mut workspace).unwrap();
+    world.barrier();
+}
+
 fn assert_mixed_transport_oop<R: TestReal + std::fmt::Debug, const N: usize, const M: usize>(
     use_point_to_point: bool,
-    inverse: bool,
+    operation: C2cOperation,
     alltoallv: OopTransport<'_, R, N, M>,
     point_to_point: OopTransport<'_, R, N, M>,
 ) where
@@ -1848,22 +2104,30 @@ fn assert_mixed_transport_oop<R: TestReal + std::fmt::Debug, const N: usize, con
     let point_to_point_destination_before = point_to_point_destination.as_slice().to_vec();
     let point_to_point_workspace_before = format!("{point_to_point_workspace:?}");
 
-    let result = match (use_point_to_point, inverse) {
-        (true, true) => point_to_point_plan.inverse(
+    let result = match (use_point_to_point, operation) {
+        (true, C2cOperation::Forward) => point_to_point_plan.forward(
             point_to_point_source,
             point_to_point_destination,
             point_to_point_workspace,
         ),
-        (true, false) => point_to_point_plan.forward(
+        (true, C2cOperation::Inverse) => point_to_point_plan.inverse(
             point_to_point_source,
             point_to_point_destination,
             point_to_point_workspace,
         ),
-        (false, true) => {
+        (true, C2cOperation::Backward) => point_to_point_plan.backward(
+            point_to_point_source,
+            point_to_point_destination,
+            point_to_point_workspace,
+        ),
+        (false, C2cOperation::Forward) => {
+            alltoallv_plan.forward(alltoallv_source, alltoallv_destination, alltoallv_workspace)
+        }
+        (false, C2cOperation::Inverse) => {
             alltoallv_plan.inverse(alltoallv_source, alltoallv_destination, alltoallv_workspace)
         }
-        (false, false) => {
-            alltoallv_plan.forward(alltoallv_source, alltoallv_destination, alltoallv_workspace)
+        (false, C2cOperation::Backward) => {
+            alltoallv_plan.backward(alltoallv_source, alltoallv_destination, alltoallv_workspace)
         }
     };
     assert!(matches!(
@@ -1898,7 +2162,7 @@ fn assert_mixed_transport_oop<R: TestReal + std::fmt::Debug, const N: usize, con
 
 fn assert_mixed_transport_in_place<R: TestReal + std::fmt::Debug, const N: usize, const M: usize>(
     use_point_to_point: bool,
-    inverse: bool,
+    operation: C2cOperation,
     alltoallv: InPlaceTransport<'_, R, N, M>,
     point_to_point: InPlaceTransport<'_, R, N, M>,
 ) where
@@ -1921,15 +2185,25 @@ fn assert_mixed_transport_in_place<R: TestReal + std::fmt::Debug, const N: usize
     let point_to_point_data = point_to_point_array.view().unwrap().as_slice().to_vec();
     let point_to_point_workspace_before = format!("{point_to_point_workspace:?}");
 
-    let result = match (use_point_to_point, inverse) {
-        (true, true) => {
-            point_to_point_plan.inverse_in_place(point_to_point_array, point_to_point_workspace)
-        }
-        (true, false) => {
+    let result = match (use_point_to_point, operation) {
+        (true, C2cOperation::Forward) => {
             point_to_point_plan.forward_in_place(point_to_point_array, point_to_point_workspace)
         }
-        (false, true) => alltoallv_plan.inverse_in_place(alltoallv_array, alltoallv_workspace),
-        (false, false) => alltoallv_plan.forward_in_place(alltoallv_array, alltoallv_workspace),
+        (true, C2cOperation::Inverse) => {
+            point_to_point_plan.inverse_in_place(point_to_point_array, point_to_point_workspace)
+        }
+        (true, C2cOperation::Backward) => {
+            point_to_point_plan.backward_in_place(point_to_point_array, point_to_point_workspace)
+        }
+        (false, C2cOperation::Forward) => {
+            alltoallv_plan.forward_in_place(alltoallv_array, alltoallv_workspace)
+        }
+        (false, C2cOperation::Inverse) => {
+            alltoallv_plan.inverse_in_place(alltoallv_array, alltoallv_workspace)
+        }
+        (false, C2cOperation::Backward) => {
+            alltoallv_plan.backward_in_place(alltoallv_array, alltoallv_workspace)
+        }
     };
     assert!(matches!(
         result,
@@ -2095,7 +2369,7 @@ fn negative_transport_layout<const N: usize, const M: usize>(
 
     assert_mixed_transport_oop(
         use_point_to_point,
-        false,
+        C2cOperation::Forward,
         OopTransport {
             plan: &alltoallv_plan,
             source: &alltoallv_source,
@@ -2127,7 +2401,7 @@ fn negative_transport_layout<const N: usize, const M: usize>(
 
     assert_mixed_transport_oop(
         use_point_to_point,
-        true,
+        C2cOperation::Inverse,
         OopTransport {
             plan: &alltoallv_plan,
             source: &alltoallv_output,
@@ -2157,9 +2431,41 @@ fn negative_transport_layout<const N: usize, const M: usize>(
         .unwrap();
     world.barrier();
 
+    assert_mixed_transport_oop(
+        use_point_to_point,
+        C2cOperation::Backward,
+        OopTransport {
+            plan: &alltoallv_plan,
+            source: &alltoallv_output,
+            destination: &mut alltoallv_inverse,
+            workspace: &mut alltoallv_workspace,
+        },
+        OopTransport {
+            plan: &point_to_point_plan,
+            source: &point_to_point_output,
+            destination: &mut point_to_point_inverse,
+            workspace: &mut point_to_point_workspace,
+        },
+    );
+    alltoallv_plan
+        .backward(
+            &alltoallv_output,
+            &mut alltoallv_inverse,
+            &mut alltoallv_workspace,
+        )
+        .unwrap();
+    point_to_point_plan
+        .backward(
+            &point_to_point_output,
+            &mut point_to_point_inverse,
+            &mut point_to_point_workspace,
+        )
+        .unwrap();
+    world.barrier();
+
     assert_mixed_transport_in_place(
         use_point_to_point,
-        false,
+        C2cOperation::Forward,
         InPlaceTransport {
             plan: &alltoallv_plan,
             array: &mut alltoallv_array,
@@ -2184,7 +2490,41 @@ fn negative_transport_layout<const N: usize, const M: usize>(
 
     assert_mixed_transport_in_place(
         use_point_to_point,
-        true,
+        C2cOperation::Backward,
+        InPlaceTransport {
+            plan: &alltoallv_plan,
+            array: &mut alltoallv_array,
+            workspace: &mut alltoallv_in_place_workspace,
+        },
+        InPlaceTransport {
+            plan: &point_to_point_plan,
+            array: &mut point_to_point_array,
+            workspace: &mut point_to_point_in_place_workspace,
+        },
+    );
+    alltoallv_plan
+        .backward_in_place(&mut alltoallv_array, &mut alltoallv_in_place_workspace)
+        .unwrap();
+    point_to_point_plan
+        .backward_in_place(
+            &mut point_to_point_array,
+            &mut point_to_point_in_place_workspace,
+        )
+        .unwrap();
+    alltoallv_plan
+        .forward_in_place(&mut alltoallv_array, &mut alltoallv_in_place_workspace)
+        .unwrap();
+    point_to_point_plan
+        .forward_in_place(
+            &mut point_to_point_array,
+            &mut point_to_point_in_place_workspace,
+        )
+        .unwrap();
+    world.barrier();
+
+    assert_mixed_transport_in_place(
+        use_point_to_point,
+        C2cOperation::Inverse,
         InPlaceTransport {
             plan: &alltoallv_plan,
             array: &mut alltoallv_array,
@@ -2298,7 +2638,7 @@ fn negative_collective_cases(
         .unwrap()
         .with_permutation(AxisPermutation::new([1, 0]).unwrap())
         .unwrap();
-    let foreign_source = PencilArray::from_elem(
+    let mut foreign_source = PencilArray::from_elem(
         Arc::clone(&foreign_input_pencil),
         ExtraShape::scalar(),
         Complex::new(17.0_f64, -17.0),
@@ -2317,6 +2657,10 @@ fn negative_collective_cases(
     let mut source = valid_plan.allocate_input().unwrap();
     fill_input(&mut source, 21.0);
     let mut workspace = valid_plan.allocate_out_of_place_workspace().unwrap();
+    let mut valid_output = valid_plan.allocate_output().unwrap();
+    valid_plan
+        .forward(&source, &mut valid_output, &mut workspace)
+        .unwrap();
 
     let wrong_source = valid_plan.allocate_output().unwrap();
     let mut source_layout_destination = valid_plan.allocate_output().unwrap();
@@ -2338,6 +2682,25 @@ fn negative_collective_cases(
     reuse_forward(&valid_plan, &source, &mut workspace);
     world.barrier();
 
+    let mut backward_layout_destination = valid_plan.allocate_input().unwrap();
+    if rank == 0 {
+        assert_c2c_rejected(
+            &source,
+            &mut backward_layout_destination,
+            &mut workspace,
+            |source, destination, workspace| valid_plan.backward(source, destination, workspace),
+        );
+    } else {
+        assert_c2c_rejected(
+            &valid_output,
+            &mut backward_layout_destination,
+            &mut workspace,
+            |source, destination, workspace| valid_plan.backward(source, destination, workspace),
+        );
+    }
+    reuse_backward(&valid_plan, &valid_output, &mut workspace);
+    world.barrier();
+
     let mut wrong_destination = valid_plan.allocate_input().unwrap();
     let mut destination_layout_destination = valid_plan.allocate_output().unwrap();
     if rank == 0 {
@@ -2356,6 +2719,24 @@ fn negative_collective_cases(
         );
     }
     reuse_forward(&valid_plan, &source, &mut workspace);
+    world.barrier();
+
+    if rank == 0 {
+        assert_c2c_rejected(
+            &valid_output,
+            &mut destination_layout_destination,
+            &mut workspace,
+            |source, destination, workspace| valid_plan.backward(source, destination, workspace),
+        );
+    } else {
+        assert_c2c_rejected(
+            &valid_output,
+            &mut backward_layout_destination,
+            &mut workspace,
+            |source, destination, workspace| valid_plan.backward(source, destination, workspace),
+        );
+    }
+    reuse_backward(&valid_plan, &valid_output, &mut workspace);
     world.barrier();
 
     let wrong_global_pencil = Pencil::<2, 1>::new(Arc::clone(topology_1d), [2, 6], [0]).unwrap();
@@ -2425,6 +2806,44 @@ fn negative_collective_cases(
     reuse_forward(&valid_plan, &source, &mut workspace);
     world.barrier();
 
+    let mut foreign_backward_destination = valid_plan.allocate_input().unwrap();
+    if rank == 0 {
+        assert_c2c_rejected(
+            &foreign_destination,
+            &mut foreign_backward_destination,
+            &mut workspace,
+            |source, destination, workspace| valid_plan.backward(source, destination, workspace),
+        );
+    } else {
+        assert_c2c_rejected(
+            &valid_output,
+            &mut foreign_backward_destination,
+            &mut workspace,
+            |source, destination, workspace| valid_plan.backward(source, destination, workspace),
+        );
+    }
+    reuse_backward(&valid_plan, &valid_output, &mut workspace);
+    world.barrier();
+
+    let foreign_backward_source = valid_plan.allocate_output().unwrap();
+    if rank == 0 {
+        assert_c2c_rejected(
+            &foreign_backward_source,
+            &mut foreign_source,
+            &mut workspace,
+            |source, destination, workspace| valid_plan.backward(source, destination, workspace),
+        );
+    } else {
+        assert_c2c_rejected(
+            &valid_output,
+            &mut foreign_backward_destination,
+            &mut workspace,
+            |source, destination, workspace| valid_plan.backward(source, destination, workspace),
+        );
+    }
+    reuse_backward(&valid_plan, &valid_output, &mut workspace);
+    world.barrier();
+
     let batch_extra = ExtraShape::new([2, 3]).unwrap();
     let batch_plan =
         C2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology_1d), [3, 4], batch_extra).unwrap();
@@ -2436,8 +2855,24 @@ fn negative_collective_cases(
         Complex::new(0.0_f64, 0.0),
     )
     .unwrap();
+    let wrong_backward_source = PencilArray::from_elem(
+        Arc::clone(batch_plan.output_pencil()),
+        wrong_extra.clone(),
+        Complex::new(0.0_f64, 0.0),
+    )
+    .unwrap();
+    let mut wrong_backward_destination = PencilArray::from_elem(
+        Arc::clone(batch_plan.input_pencil()),
+        wrong_extra.clone(),
+        Complex::new(0.0_f64, 0.0),
+    )
+    .unwrap();
     let mut source_extra_destination = batch_plan.allocate_output().unwrap();
+    let mut batch_output = batch_plan.allocate_output().unwrap();
     let mut batch_workspace = batch_plan.allocate_out_of_place_workspace().unwrap();
+    batch_plan
+        .forward(&batch_source, &mut batch_output, &mut batch_workspace)
+        .unwrap();
     if rank == 0 {
         assert_c2c_rejected(
             &wrong_extra_source,
@@ -2454,6 +2889,27 @@ fn negative_collective_cases(
         );
     }
     reuse_forward(&batch_plan, &batch_source, &mut batch_workspace);
+    world.barrier();
+
+    let mut batch_backward_destination = batch_plan.allocate_input().unwrap();
+    if rank == 0 {
+        assert_c2c_rejected_exact(
+            &wrong_backward_source,
+            &mut batch_backward_destination,
+            &mut batch_workspace,
+            |source, destination, workspace| batch_plan.backward(source, destination, workspace),
+            |error| matches!(error, FftError::ExtraShapeMismatch),
+        );
+    } else {
+        assert_c2c_rejected_exact(
+            &batch_output,
+            &mut batch_backward_destination,
+            &mut batch_workspace,
+            |source, destination, workspace| batch_plan.backward(source, destination, workspace),
+            |error| matches!(error, FftError::CollectivePreconditionFailed),
+        );
+    }
+    reuse_backward(&batch_plan, &batch_output, &mut batch_workspace);
     world.barrier();
 
     let mut wrong_extra_destination = PencilArray::from_elem(
@@ -2481,6 +2937,26 @@ fn negative_collective_cases(
     reuse_forward(&batch_plan, &batch_source, &mut batch_workspace);
     world.barrier();
 
+    if rank == 0 {
+        assert_c2c_rejected_exact(
+            &batch_output,
+            &mut wrong_backward_destination,
+            &mut batch_workspace,
+            |source, destination, workspace| batch_plan.backward(source, destination, workspace),
+            |error| matches!(error, FftError::ExtraShapeMismatch),
+        );
+    } else {
+        assert_c2c_rejected_exact(
+            &batch_output,
+            &mut batch_backward_destination,
+            &mut batch_workspace,
+            |source, destination, workspace| batch_plan.backward(source, destination, workspace),
+            |error| matches!(error, FftError::CollectivePreconditionFailed),
+        );
+    }
+    reuse_backward(&batch_plan, &batch_output, &mut batch_workspace);
+    world.barrier();
+
     let other_plan =
         C2cPlan::<f64, 2, 1>::from_shape(Arc::clone(topology_1d), [3, 4], ExtraShape::scalar())
             .unwrap();
@@ -2502,6 +2978,25 @@ fn negative_collective_cases(
         );
     }
     reuse_forward(&valid_plan, &source, &mut workspace);
+    world.barrier();
+
+    let mut backward_workspace_destination = valid_plan.allocate_input().unwrap();
+    if rank == 0 {
+        assert_c2c_rejected(
+            &valid_output,
+            &mut backward_workspace_destination,
+            &mut other_workspace,
+            |source, destination, workspace| valid_plan.backward(source, destination, workspace),
+        );
+    } else {
+        assert_c2c_rejected(
+            &valid_output,
+            &mut backward_workspace_destination,
+            &mut workspace,
+            |source, destination, workspace| valid_plan.backward(source, destination, workspace),
+        );
+    }
+    reuse_backward(&valid_plan, &valid_output, &mut workspace);
     world.barrier();
 
     if world_size > 1 {
@@ -2562,6 +3057,23 @@ fn negative_collective_cases(
         }
         reuse_forward(&valid_plan, &source, &mut direction_workspace);
         world.barrier();
+
+        // Distinct raw backward and normalized inverse/forward operation words
+        // reject at the full-Cartesian header before any buffer changes.
+        assert_mixed_direction_oop(
+            &valid_plan,
+            world,
+            C2cOperation::Backward,
+            C2cOperation::Inverse,
+            25.5,
+        );
+        assert_mixed_direction_oop(
+            &valid_plan,
+            world,
+            C2cOperation::Backward,
+            C2cOperation::Forward,
+            25.75,
+        );
 
         let transpose_plan = AllToAllvTransposePlan::new(
             Arc::clone(valid_plan.input_pencil()),
@@ -2710,9 +3222,18 @@ fn negative_in_place_cases(
         &mut wrong_state_workspace,
         |array, workspace| plan.inverse_in_place(array, workspace),
     );
+    assert_in_place_rejected(
+        &mut wrong_state,
+        &mut wrong_state_workspace,
+        |array, workspace| plan.backward_in_place(array, workspace),
+    );
     plan.forward_in_place(&mut wrong_state, &mut wrong_state_workspace)
         .unwrap();
     plan.inverse_in_place(&mut wrong_state, &mut wrong_state_workspace)
+        .unwrap();
+    plan.forward_in_place(&mut wrong_state, &mut wrong_state_workspace)
+        .unwrap();
+    plan.backward_in_place(&mut wrong_state, &mut wrong_state_workspace)
         .unwrap();
     world.barrier();
 
@@ -2759,6 +3280,21 @@ fn negative_in_place_cases(
         plan.inverse_in_place(&mut mixed_direction, &mut mixed_direction_workspace)
             .unwrap();
         world.barrier();
+
+        assert_mixed_direction_in_place(
+            &plan,
+            world,
+            C2cOperation::Backward,
+            C2cOperation::Inverse,
+            50.75,
+        );
+        assert_mixed_direction_in_place(
+            &plan,
+            world,
+            C2cOperation::Backward,
+            C2cOperation::Forward,
+            50.875,
+        );
     }
 
     // Replacing only rank zero after a successful collective creates a
@@ -2895,6 +3431,48 @@ fn negative_in_place_cases(
         .unwrap();
     plan.inverse_in_place(&mut mixed_array, &mut mixed_workspace)
         .unwrap();
+    world.barrier();
+
+    // Raw out-of-place and in-place calls also have distinct operation words.
+    let (mut raw_array, mut raw_in_place_workspace) = fresh_in_place(&plan, 54.5);
+    plan.forward_in_place(&mut raw_array, &mut raw_in_place_workspace)
+        .unwrap();
+    let mut raw_source = plan.allocate_output().unwrap();
+    fill_spectrum(&mut raw_source, 54.5);
+    let mut raw_destination = plan.allocate_input().unwrap();
+    let mut raw_oop_workspace = plan.allocate_out_of_place_workspace().unwrap();
+    let raw_array_before = format!("{raw_array:?}");
+    let raw_in_place_workspace_before = format!("{raw_in_place_workspace:?}");
+    let raw_source_before = raw_source.as_slice().to_vec();
+    let raw_destination_before = raw_destination.as_slice().to_vec();
+    let raw_oop_workspace_before = format!("{raw_oop_workspace:?}");
+    let result = if rank == 0 {
+        plan.backward(&raw_source, &mut raw_destination, &mut raw_oop_workspace)
+    } else {
+        plan.backward_in_place(&mut raw_array, &mut raw_in_place_workspace)
+    };
+    if size == 1 {
+        assert!(result.is_ok());
+    } else {
+        assert!(matches!(
+            result,
+            Err(FftError::CollectiveDescriptorMismatch)
+        ));
+        assert_eq!(raw_source.as_slice(), raw_source_before.as_slice());
+        assert_eq!(
+            raw_destination.as_slice(),
+            raw_destination_before.as_slice()
+        );
+        assert_eq!(format!("{raw_oop_workspace:?}"), raw_oop_workspace_before);
+    }
+    assert_eq!(format!("{raw_array:?}"), raw_array_before);
+    assert_eq!(
+        format!("{raw_in_place_workspace:?}"),
+        raw_in_place_workspace_before
+    );
+    plan.backward_in_place(&mut raw_array, &mut raw_in_place_workspace)
+        .unwrap();
+    assert_eq!(raw_array.state(), C2cState::Input);
     world.barrier();
 
     // A constructor cannot pair with an in-place execution on another rank.
