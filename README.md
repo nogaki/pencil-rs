@@ -32,11 +32,12 @@ out-of-place views and shared-storage in-place execution. The optional
 `pencil-fft/distributed` feature composes these checked transitions into
 out-of-place and in-place distributed C2C forward/inverse/backward transforms
 and out-of-place R2C/C2R; it does not change the MPI-free local FFT default.
-`C2cPlan` and
-`R2cPlan` provide matching `from_pencil_with_method`,
-`from_array_with_method`, and `from_shape_with_method` constructors. The
-legacy constructors retain the Alltoallv default; R2C output uses the original
-shape with its final extent reduced to `n/2+1`.
+`C2cPlan` and `R2cPlan` provide matching selection-aware shape, pencil, and
+array constructors through `AxisSelection<N>`, plus the existing
+`from_*_with_method` forms. `AxisSelection::all()` is the default; its
+`from_indices` input is validated for duplicates/out-of-bounds values and its
+order is ignored. The legacy constructors retain the Alltoallv default; R2C
+output reduces the selected reduction axis to `n/2+1`.
 
 Alltoallv and point-to-point construction and execution are collective: every
 rank must use the same source communicator context, API, order, `T`, and
@@ -64,26 +65,28 @@ an unfinished request scope may abort.
 
 ## Distributed R2C/C2R FFT
 
-`R2cPlan<R, N, M>` accepts a canonical real input pencil and returns a
-complex output pencil whose original final extent `n` is reduced to `n/2+1`.
-The initial reduced-complex stage keeps decomposition `[0..M)`, while the
-final output uses `[1..=M]` and reversed spatial memory order. Other axes,
-process-grid choices, and extra dimensions are retained. `allocate_workspace`
-is noncollective; coordinate any local allocation failure before the next
-collective. It owns one reduced-complex intermediate, checked transpose
-storage, native scratch, and one real/complex line buffer. `forward`,
-normalized `inverse`, and unnormalized positive-sign `backward` are exposed—
-there is no real in-place API. The constructors and
-operations require the same communicator context, API/order, scalar type,
-method, and layouts on every rank. Legacy constructors use Alltoallv;
-point-to-point uses the fixed `0x5054` tag and must not overlap unfinished
-transposes on its context.
+`R2cPlan<R, N, M>` accepts a canonical real input pencil and a non-empty
+`AxisSelection<N>`. The largest selected Rust axis `r` is the real-to-complex
+axis and its extent `n` is reduced to `n/2+1`; selected axes below `r` use
+complex FFTs and every unselected axis is an identity stage. The final output
+always uses decomposition `[1..=M]` and reversed spatial memory order. The
+route nevertheless always contains all `N` stages and `N-1` transitions, so
+unselected axes remain real-prefix or complex-suffix transposes rather than
+being skipped. `allocate_workspace` is noncollective; coordinate any local
+allocation failure before the next collective. Non-last real axes add an
+optional real intermediate and real transpose workspace. `forward`, normalized
+`inverse`, and unnormalized positive-sign `backward` are exposed—there is no
+real in-place API. Empty R2C selections are collectively rejected before
+planning. The constructors and operations require the same communicator
+context, API/order, scalar type, selection, method, and layouts on every rank.
+Legacy constructors use Alltoallv; point-to-point uses the fixed `0x5054` tag
+and must not overlap unfinished transposes on its context.
 
 The inverse performs the transverse complex inverse stages first, then
 validates each extra batch and constrained DC/Nyquist plane. It accepts a
 plane when either `max(abs(imaginary)) <= 128 * min_subnormal_R * D` or its
 imaginary L2 norm is at most `128 * epsilon_R * D` times its real L2 norm,
-where `D = 1 + sum(ceil(log2(n_a)))` over original axes before the real axis.
+where `D = 1 + sum(ceil(log2(n_a)))` over selected axes below the real axis.
 This is an explicit normwise-relative/componentwise-absolute acceptance
 policy, not a formal RustFFT error bound. All constrained endpoint values
 must be finite; odd lengths constrain DC only (for `n=1` the final bin is DC),
@@ -93,12 +96,21 @@ policy. Nonfinite or materially non-real constrained planes return
 may already have changed on that post-start error path, while source and
 destination remain unchanged. `backward` uses the same relative endpoint
 criterion, but its componentwise absolute threshold is the inverse threshold
-times the product of the original transverse extents, excluding the real axis
+times the product of the selected transverse extents, excluding the real axis
 and extra dimensions. That finite-positive factor is collectively validated at
 plan construction. A forward/backward pair scales by the product of all
-original spatial extents.
+selected spatial extents; identity axes do not contribute.
 
 ## Distributed C2C FFT
+
+A C2C plan also accepts `AxisSelection<N>`. It always follows the canonical
+full route from axis `N-1` through `0`, with one stage and transition per
+axis. A selected stage performs its local FFT; an unselected stage is an
+identity with no native plan or scaling. Thus an empty selection is a valid
+identity transform whose reversed-layout transposes still run. The output
+pencil remains the existing reversed permutation and decomposition
+`[1..=M]`, and inverse/raw-backward normalization includes only selected
+axes. `AxisSelection::all()` preserves the legacy transform exactly.
 
 Enable the feature in this workspace with
 `cargo check -p pencil-fft --features distributed --locked`. The public
@@ -108,12 +120,13 @@ pencils, exact extra shapes, reusable plan-bound
 and raw positive-sign backward execution. Forward consumes the canonical input
 layout and produces the reversed output layout; both inverse and raw backward
 consume that output layout and produce canonical input. Raw backward does not
-normalize, so a forward/backward pair scales by the product of global spatial
-extents, excluding extra dimensions. Construction and execution are collective
+normalize, so a forward/backward pair scales by the product of selected
+spatial extents; identity axes and extra dimensions do not contribute. Construction and execution are collective
 on the topology's Cartesian communicator; every rank must call matching
 operations in order and select the same `TransposeMethod`. The selected method is appended to the
 minimal checked C2C descriptor (after global shape, process grid, extra shape,
-and scalar width), so a rank-local method mismatch returns
+axis mask, value kind, precision width, and method), so a rank-local method
+mismatch returns
 `FftError::CollectiveDescriptorMismatch` before native FFT, output, workspace,
 or in-place state changes. Each rank checks its actual source and destination
 against the plan before a full-Cartesian preflight agreement, and no data is
@@ -142,8 +155,8 @@ arbitrary spectral data for either reverse operation.
 The opt-in Milestone 9 checker generates temporary Julia 1.12.6/FFTW.jl
 1.10.0 references and validates the distributed C2C forward/inverse/raw
 backward and R2C/C2R APIs at 1, 4, and 6 MPI ranks with both transpose methods
-and both precisions. It
-covers 16 fixtures and 26 valid case/layout combinations per method and rank.
+and both precisions. It covers 28 fixtures (16 full-axis plus 12 partial-axis)
+and 50 valid case/layout combinations per method and rank.
 The external comparison is explicitly opt-in; normal Rust tests need no Julia.
 See [`tools/fftw-reference/README.md`](tools/fftw-reference/README.md) and run
 `tools/fftw-reference/check.sh` only when Julia, FFTW.jl, and MPI are locally

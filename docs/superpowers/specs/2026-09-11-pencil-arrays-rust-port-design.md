@@ -1,7 +1,7 @@
 # PencilArrays / PencilFFTs Rust移植 設計仕様
 
 日付: 2026-09-11  
-状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R raw backward、Alltoallv/P2P分散C2C FFT out/in-place、分散R2C/C2R out-of-place raw backwardは実装済み。
+状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R raw backward、AxisSelection付きAlltoallv/P2P分散C2C FFT out/in-place、AxisSelection付き分散R2C/C2R out-of-place raw backward、Julia format-4交差検証fixtureは実装済み。
 対象: CPU + MPIによる任意次元分散配列基盤と分散FFT基盤
 
 ## 1. 参照実装
@@ -20,8 +20,8 @@
 1. MPIプロセス間に分散した任意次元配列の記述と操作
 2. 複数の分散配置間の再分配
 3. 同一データバッファ上でのin-place再分配
-4. 全空間軸に対する分散C2C FFT
-5. 全空間軸に対するout-of-place R2C/C2R FFT
+4. 全空間軸または選択軸集合に対する分散C2C FFT
+5. 全空間軸または選択軸集合に対するout-of-place R2C/C2R FFT
 6. Julia実装と比較可能な正当性・性能評価基盤
 
 分散配列基盤とFFT層は別crateとし、一方向の依存関係にする。`pencil-array`はMPIに依存する
@@ -71,7 +71,6 @@ pencil-array
 - GPUストレージ
 - FFTWバックエンド
 - DCT、DST、Chebyshev変換
-- 任意のspatial軸部分集合だけを変換する部分FFT
 - runtime可変次元の`DynPencil`
 - MPI-IOおよびParallel HDF5
 - Julia版のbroadcast、reduction、global view、local grid、ODE連携の全面移植
@@ -1378,7 +1377,8 @@ pub type R2cPlan<R, const N: usize, const M: usize> =
 
 ## 23. FFT対象軸と配置列
 
-初期版は全spatial軸を変換する。extra dimensionsは全てバッチ軸である。
+`AxisSelection<N>`で選択したspatial軸を変換し、未選択軸はidentity stageとして配置routeに
+残す。既存constructorは全軸選択を既定値とする。extra dimensionsは全てバッチ軸である。
 
 FFT axis順序はrow-majorに合わせ、後ろから前へ処理する。
 
@@ -1577,18 +1577,20 @@ Output -> Poisoned -> Input
 
 R2Cは一般的な`TransformStage`の`RealComplexFft` variantとして表す。専用の`R2cHeadStage`は作らない。
 
-row-majorの最後のspatial軸を最初にR2Cする。
+非空の`AxisSelection<N>`から最大Rust軸`r`を選び、その軸を最初にR2Cする。
+未選択軸はidentity stageとしてrouteには残し、選択された`r`だけを
+`n/2+1`へreductionする。
 
 実数global shape:
 
 ```text
-[N0, ..., N(N-1)]
+[N0, ..., Nr, ..., N(N-1)]
 ```
 
-複素global shape:
+複素global shape（`r`のみreduced）:
 
 ```text
-[N0, ..., floor(N(N-1)/2)+1]
+[N0, ..., floor(Nr/2)+1, ..., N(N-1)]
 ```
 
 最初のstage:
@@ -1668,19 +1670,18 @@ RealFFTが入力bufferをscratchとして変更するため、out-of-place API�
 
 順変換は無正規化。
 
-逆変換`inverse`は、全spatial軸の元の長さの積で除算する。
+逆変換`inverse`は、選択されたspatial軸の元の長さの積で除算する。
 
 ```text
-normalization = product(global spatial input shape)
+normalization = product(selected spatial input extents)
 ```
 
-extra dimensionsは含めない。
-
-R2C/C2Rでもreduced complex shapeではなく、元の実数shapeの積を使う。
+extra dimensions、identity軸、reduced complex extentは含めない。C2Cでも同じ規則を
+使い、空の選択はtransposeだけのidentityとなる。
 
 `forward`は無正規化、`inverse`は正規化済み、`backward`は正符号の無正規化である。
-R2C/C2Rの`backward`は元の実数長を含む全spatial長の積だけをforward結果に掛け、
-extra次元とreduced complex長は正規化係数に含めない。
+R2C/C2Rの`backward`は選択されたreal boundary長とcomplex tail長の積だけをforward結果に
+掛け、extra次元、identity軸、reduced complex長は正規化係数に含めない。
 
 ## 28. FFT workspace
 
@@ -2181,7 +2182,7 @@ transport/backend abstractionは行わない。
 第一・第二PRのlocal C2C、route、in-place状態契約、共有workspaceを維持し、分散edgeのtransportだけを選択可能にした。新しいpublic backend trait、factory、workspace型、P2P request処理の複製は追加しない。
 
 - `distributed` featureに`TransposeMethod::{AllToAllv, PointToPoint}`を追加した。既存の`from_pencil`、`from_array`、`from_shape`はAlltoallvへ委譲し、`*_with_method`の3 constructorが明示選択を受ける。入力保全、inverseの各spatial軸正規化、`N >= 2`、`1 <= M < N`、extra shape、array/workspaceのplan identityは不変である。
-- 第三PR時点の固定5語headerとoperation 7--11は変更しない。最小payloadは従来の`global_shape[N]`、`process_grid[M]`、extra rank/dimensions、scalar widthへmethod word（Alltoallv=0、PointToPoint=1）を末尾追加し、checked長を`N + M + 3 + extra_rank`とする。constructorと全4実行のdescriptorがmethodをnative FFT、destination/workspace書込み、in-place poisonより前に合意するため、rank-localな有効method選択は全rankで`CollectiveDescriptorMismatch`となる。
+- 固定5語headerとoperation 7--11を維持する。schema=2のpayloadは`global_shape[N]`、`process_grid[M]`、extra rank/dimensions、canonical axis mask[N]、value kind、scalar width、method word（Alltoallv=0、PointToPoint=1）を含み、checked長を`2*N + M + 4 + extra_rank`とする。constructorと全実行のdescriptorがselection、value kind、precision、methodをnative FFT、destination/workspace書込み、in-place poisonより前に合意するため、rank-localな不一致は全rankで`CollectiveDescriptorMismatch`となる。
 - 分散edgeは選択methodの既存`AllToAllvTransposePlan`または`PointToPointTransposePlan`のforward/backward pairを保持する。各edgeのforward作成後とbackward作成後に、既存のcollective requirement agreementを行い、最大send/receive長と既存`TransposeWorkspace`を共有する。local transition、FFT scratch、OOP/IP loopは変更しない。
 - P2Pのchanged-axis topology context、固定`0x5054` tag、receive-before-send、wait-all、request metadata reservation、MPI failure/panic/process-lossの回復不能契約はarray crateから継承する。同一context上の未完了transposeを重ねず、成功時はnative requestを完了して返る。allocation-free executionやglobal rollbackは約束しない。
 - 既存の一つのMPI integration binary/top-level testを両methodで実行し、f32/f64、N=2/3/4、M=1/2、非均等・empty local、extra/zero extra、逆順communicator、direct DFT、OOP/IP parity、入力保全、pointer stability、constructor default、transport parityを確認する。constructorとOOP/IP forward/inverseのrank-local method mismatchは全workspace・state・dataをsnapshotして再利用まで検証し、6-rank multi-axisのchanged-axis subgroup外rankも含める。private one-rank poison testは両methodのErr/panicとpost-start native errorを確認する。
@@ -2192,9 +2193,9 @@ transport/backend abstractionは行わない。
 `C2cPlan::backward`と`backward_in_place`を追加する。両APIはreversed output layoutを
 source、canonical input layoutをdestinationとし、正符号の無正規化local backwardを全stageで
 呼ぶ。`inverse`は従来どおり各stageで正規化し、raw forward/backward roundtripだけが
-global spatial extentの積（extra dimensionsを除く）を掛ける。
+selected spatial extentの積（identity軸とextra dimensionsを除く）を掛ける。
 
-固定5語headerの既存schema=1、descriptor長、operation 1--14は変更しない。C2C raw
+固定5語headerのschema=2、selection/value-kind/precisionを含むdescriptor、operation 1--14は維持する。C2C raw
 out-of-place/in-placeにはoperation 15/16を割り当て、raw/normalized、raw/forward、
 OOP/in-placeの取り違えをfull Cartesian headerでnative FFT、payload、workspace、
 state変更より先に拒否する。逆routeのOutput -> Poisoned -> Inputはinverseとbackwardで
@@ -2204,8 +2205,9 @@ R2C API、endpoint policy、projection、数理は変えない。
 
 独立positive-sign DFT、raw scaling、両transport、f32/f64、N/M、extra/zero batch、empty
 local、reordered communicator、OOP/IP、descriptor rejection、post-start poisoningを既存
-MPI suiteとunit transaction testで確認する。Julia/FFTWのformat 3はC2CとR2Cの
-双方に`backward_expected`を持ち、C2Cはcomplex、R2Cはreal sectionとする。
+MPI suiteとunit transaction testで確認する。Julia/FFTWのformat 4はcanonical
+`selected_axes` metadataを持つ。C2CとR2Cの双方に`backward_expected`を持ち、C2Cは
+complex、R2Cはreal sectionとする。
 
 
 ### Milestone 8: Distributed R2C/C2R
@@ -2223,18 +2225,20 @@ MPI suiteとunit transaction testで確認する。Julia/FFTWのformat 3はC2C�
 
 The distributed feature exposes `R2cPlan<R, N, M>`, `R2cWorkspace`, and
 `R2cError` only when `distributed` is enabled. `N >= 2`, `1 <= M < N`, and
-the input pencil is canonical identity with decomposition `[0..M)`. The real
-input keeps its original last extent `n`; the complex output has last extent
-`m = n/2+1`. Constructors mirror `C2cPlan`, including both checked transports,
-and allocation is noncollective. There is no real in-place API.
+the input pencil is canonical identity with decomposition `[0..M)`. A non-empty
+`AxisSelection<N>` chooses its largest Rust axis as the real boundary; only
+that selected extent `n` becomes `m = n/2+1`. Constructors mirror `C2cPlan`,
+including both checked transports, and allocation is noncollective. There is
+no real in-place API; an empty R2C selection is collectively rejected.
 
-The first stage is `LocalR2cPlan::forward`, `inverse`, or `backward`; all
-remaining stages are complex FFTs over the other `N - 1` axes. The reduced canonical pencil is
-never passed through a full C2C plan, so its last axis is not transformed
-again. A workspace owns one reduced-complex `ManyPencilArray`, shared
-transpose storage, the maximum native complex scratch, and one real line plus
-one complex line. Inverse scaling is exactly once per original spatial axis,
-including `n`; extra batch dimensions and `m` are never normalization factors.
+The selected boundary stage is `LocalR2cPlan::forward`, `inverse`, or
+`backward`; selected axes below it are complex FFTs and unselected stages are
+identities. The reduced canonical pencil is never passed through a full C2C
+plan at the boundary, so the reduced axis is not transformed again. A
+workspace owns one reduced-complex `ManyPencilArray`, shared transpose storage,
+the maximum native complex scratch, and one real line plus one complex line.
+Inverse scaling is exactly once per selected original spatial axis, including
+`n`; extra batch dimensions, identity axes, and `m` are never factors.
 
 Inverse boundary acceptance is post-tail and per extra batch/per constrained
 plane. DC is constrained always; Nyquist is constrained only for even `n`,
@@ -2242,9 +2246,9 @@ while an odd final bin is unconstrained. For each plane `z(x)`, all real and
 imaginary values must be finite and the plane is accepted when
 `max_x abs(Im z) <= 128*min_subnormal_R*D` or
 `||Im z||_2 <= 128*epsilon_R*D*||Re z||_2`, with
-`D = 1 + sum(ceil(log2(n_a)))` for original axes `a < N-1`. This is an
-explicit normwise-relative/componentwise-absolute policy, not a formal
-RustFFT error bound. Fixed four-word max and four-word sum arrays are reduced
+`D = 1 + sum(ceil(log2(n_a)))` for selected axes below the real boundary.
+This is an explicit normwise-relative/componentwise-absolute policy, not a
+formal RustFFT error bound. Fixed four-word max and four-word sum arrays are reduced
 across the full Cartesian communicator for each batch; nonfinite values are
 excluded from MAX/SUM but set a validity flag. Every rank completes all
 reductions, including empty ranks, and one final MIN-valid reduction occurs
@@ -2254,23 +2258,26 @@ workspace mutation is permitted after execution has started. Accepted endpoint i
 intermediate before the strict local C2R operation. `backward` uses the same
 relative criterion
 and finite endpoint requirement, but its absolute threshold is the inverse
-threshold multiplied by `T = product(n_0..n_{N-2})`; the real axis and extra
-dimensions are excluded. `T` and the resulting finite-positive raw threshold
-are collectively validated during plan construction before native planning.
+threshold multiplied by `T = product(selected complex-tail n_a)`; the real axis,
+identity axes, and extra dimensions are excluded. `T` and the resulting
+finite-positive raw threshold are collectively validated during plan
+construction before native planning.
 Normalized inverse threshold arithmetic is unchanged.
 
 Collective operation words 12, 13, 14, and 17 are R2C construction, forward,
-inverse, and raw backward. The five-word header and words 1--11 remain unchanged. The exact
+inverse, and raw backward. The five-word header and operation words remain fixed. The exact schema-2
 R2C descriptor records the original real shape, process grid, extra rank and
-extents, scalar width, and transport method, distinguishing even and odd
-shapes that share `m`. No public tolerance knobs, offender-ID reductions, or
-full-spectrum gather are part of this API.
+extents, canonical axis mask, value kind, scalar width, and transport method,
+distinguishing selection and even/odd shapes that share `m`. No public
+tolerance knobs, offender-ID reductions, or full-spectrum gather are part of
+this API.
 
 ### Milestone 9: 交差検証と性能評価
 
 Julia/FFTW cross-validation tooling is implemented as an opt-in local check;
-its canonical command, locked Julia environment, 16 temporary fixtures, and
-26 valid case/layout combinations per method and rank are documented in
+its canonical command, locked Julia environment, 28 temporary fixtures (16
+full-axis plus 12 partial-axis), and 50 case/layout combinations per method
+and rank are documented in
 [`tools/fftw-reference/README.md`](../../../tools/fftw-reference/README.md).
 It validates distributed C2C forward/inverse/raw backward and R2C/C2R
 forward/inverse/raw backward without changing production tolerances, CI, or
@@ -2295,9 +2302,9 @@ checked-in numeric data.
 
 ### FFT層
 
-- 全spatial軸のC2C out-of-place
-- 全spatial軸のC2C in-place
-- 全spatial軸のR2C/C2R out-of-place
+- 全spatial軸または選択軸集合のC2C out-of-place
+- 全spatial軸または選択軸集合のC2C in-place
+- 全spatial軸または選択軸集合のR2C/C2R out-of-place
 - `f32`,`f64`
 - single-rankおよびmulti-rank参照結果と一致
 - Julia logical resultと一致
@@ -2316,7 +2323,7 @@ checked-in numeric data.
 - FFTW追加時もArray crateを変更しない
 - in-place R2C追加時も共通`TransformStage`を維持し、異種型共有storageだけを専用化する
 - DCT/DST追加時も局所transform variantとして追加し、配置列を再利用する
-- 部分FFT追加時はtransform axis pathを公開入力にし、既存の全軸pathを既定値とする
+- 部分FFTは公開`AxisSelection<N>`を入力にし、既存の全軸選択を既定値とする。実行routeは常に軸`N-1`から`0`までの`N`段・`N-1`遷移を保ち、未選択stageはnative FFTとscaleを持たないidentityとする。したがって空のC2Cは値を変えずにcanonical full routeの転置だけを行う。R2Cは選択集合の最大Rust軸をreal boundaryにし、その軸だけを`n/2+1`へreductionする。
 - I/O、reduction、global viewはArray crate上の独立モジュールとして追加する
 
 ## 36. 設計上の要点

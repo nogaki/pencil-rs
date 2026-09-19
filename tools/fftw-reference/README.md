@@ -35,10 +35,13 @@ populate or precompile into its first entry. Startup files are disabled and
 user preferences are never edited. Open MPI/OpenRTE gets `--oversubscribe` unless
 `PENCIL_FFTW_NO_OVERSUBSCRIBE=1` is set.
 
-The runner generates 16 temporary, non-empty fixtures, builds the Rust test
-once with `cargo test --no-run`, runs its ordinary parser self-check, then
-runs the explicit ignored test through `cargo test -- --ignored` at 1, 4, and
-6 MPI ranks. All fixtures contain raw `backward_expected` values. It verifies
+The runner generates 28 temporary, non-empty fixtures by default: 16
+full-axis fixtures and 12 partial-axis fixtures. It builds the Rust test once
+with `cargo test --no-run`, runs its ordinary parser self-check, then runs the
+explicit ignored test through `cargo test -- --ignored` at 1, 4, and 6 MPI
+ranks. The partial cases cover empty and nonconsecutive C2C selections plus
+non-last/head-only and last-axis R2C boundaries. All fixtures contain raw
+`backward_expected` values. It verifies
 a test-run marker so a missing ignored test cannot pass silently. It also runs
 independent private pristine-fixture copies with `forward_expected` and
 `backward_expected` corruption; each must fail at one rank with a comparison
@@ -77,13 +80,14 @@ printed by every generation run and recorded in every fixture.
 Every file has this fixed order:
 
 ```text
-PENCIL_FFTW_REFERENCE 3
+PENCIL_FFTW_REFERENCE 4
 runtime julia=1.12.6 fftw_jl=1.10.0 native=... provider=fftw
 case CASE_ID
 kind c2c|r2c
 precision f32|f64
 original_shape N0 N1 ...
 extra_shape [optional positive extents]
+selected_axes [canonical ascending Rust zero-based axes]
 section input real|complex COUNT
 ... COUNT values ...
 end
@@ -116,23 +120,33 @@ non-finite, or incomplete data, zero dimensions, invalid ranks, overflowed
 products, and counts before reserving section storage.
 
 The serialized order is global logical Rust row-major `[extra..., spatial...]`.
-Julia allocates `reverse([extra..., spatial...])`, transforms only spatial
-axes, and asserts the actual input, reduced output, and result array sizes.
-C2C uses independent complex forward and inverse inputs; normalized inverse
-and raw backward both consume the latter. R2C creates the independent inverse
-spectrum from a real input, snapshots it before planning, and executes both
-C2R and raw `brfft` on private copies. FFTW `ESTIMATE`, one thread, the `fftw`
-provider, and native-version metadata remain explicit.
+`selected_axes` is canonical Rust zero-based metadata; Julia maps Rust axis `a`
+to Julia dimension `N-a`. Julia allocates `reverse([extra..., spatial...])`.
+C2C transforms the selected dimensions, or copies for an empty selection. R2C
+uses the first selected Julia dimension (the maximum selected Rust axis) as the
+real FFT boundary and takes its original real length for `rfft`/`brfft`; only
+that extent is reduced. C2C uses independent complex forward and inverse
+inputs; normalized inverse and raw backward both consume the latter. R2C
+creates the independent inverse spectrum from a real input, snapshots it before
+planning, and executes both C2R and raw `brfft` on private copies. FFTW
+`ESTIMATE`, one thread, the `fftw` provider, and native-version metadata remain
+explicit.
 
-There are eight base cases, both precisions, and therefore 16 files:
+There are eight full-axis base cases and six partial-axis cases. Both
+precisions therefore produce 28 files:
 
-- C2C: `[3,4]`, `[3,2,5]` with extras `[2,3]`, `[2,1,3,4]` with extra `[2]`.
-- R2C/C2R: `[3,1]`, `[3,2]`, `[3,1,4]` and `[3,1,5]` with extras `[2,3]`,
-  and `[2,1,3,3]` with extra `[2]`.
+- Full-axis C2C: `[3,4]`, `[3,2,5]` with extras `[2,3]`, `[2,1,3,4]`
+  with extra `[2]`.
+- Full-axis R2C/C2R: `[3,1]`, `[3,2]`, `[3,1,4]` and `[3,1,5]` with
+  extras `[2,3]`, and `[2,1,3,3]` with extra `[2]`.
+- Partial-axis C2C: `[2,3,2,3]` with selections `[]` and `[0,3]`.
+- Partial-axis R2C/C2R: `[2,3,2,3]` with `[0]`, `[0,2]`, and `[0,3]`, plus
+  `[2,3,4]` with extra `[2]` and `[0,2]`.
 
-No fixture topology is serialized. For every file Rust runs all valid `M=1`
-layouts for `N=2,3,4` and also `M=2` for `N=3,4`: 26 case/layout
-combinations per transpose method per rank. Both Alltoallv and point-to-point
+Each case is generated for f32 and f64. No fixture topology is serialized.
+For every file Rust runs all valid `M=1` layouts for `N=2,3,4` and also
+`M=2` for `N=3,4`: 50 case/layout combinations per transpose method per rank.
+Both Alltoallv and point-to-point
 are checked. Small leading axes deliberately create empty local ranges.
 
 The checker derives raw physical-local to global-logical offsets from each

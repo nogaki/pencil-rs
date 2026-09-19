@@ -11,7 +11,7 @@ use mpi::{
     traits::*,
 };
 use pencil_array::{ExtraShape, MpiTopology, Pencil, SpatialAxis};
-use pencil_fft::{C2cPlan, Complex, FftReal, R2cPlan, TransposeMethod};
+use pencil_fft::{AxisSelection, C2cPlan, Complex, FftReal, R2cPlan, TransposeMethod};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -31,6 +31,7 @@ struct Fixture {
     precision: Precision,
     shape: Vec<usize>,
     extra: Vec<usize>,
+    selection: Vec<usize>,
     input: Vec<Complex<f64>>,
     inverse_input: Vec<Complex<f64>>,
     forward: Vec<Complex<f64>>,
@@ -157,11 +158,29 @@ fn section(
     Ok(values)
 }
 
-fn reduced(kind: Kind, shape: &[usize]) -> Vec<usize> {
+fn selected_axes(line: &str, dimensions: usize) -> Result<Vec<usize>, String> {
+    let words: Vec<_> = line.split_whitespace().collect();
+    if words.first().copied() != Some("selected_axes") {
+        return Err(format!("expected selected_axes ..., got {line:?}"));
+    }
+    let axes = usize_list(&words[1..], "selected_axes")?;
+    if axes.iter().any(|&axis| axis >= dimensions) {
+        return Err("selected_axes: axis is out of bounds".into());
+    }
+    if axes.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err("selected_axes: axes must be strictly increasing".into());
+    }
+    Ok(axes)
+}
+
+fn reduced(kind: Kind, shape: &[usize], selection: &[usize]) -> Vec<usize> {
     let mut result = shape.to_vec();
     if kind == Kind::R2c {
-        let last = result.len() - 1;
-        result[last] = result[last] / 2 + 1;
+        let axis = *selection
+            .iter()
+            .max()
+            .expect("R2C reference selection is nonempty");
+        result[axis] = result[axis] / 2 + 1;
     }
     result
 }
@@ -172,7 +191,7 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
         lines.pop();
     }
     let mut cursor = 0;
-    if next(&lines, &mut cursor, "version")? != "PENCIL_FFTW_REFERENCE 3" {
+    if next(&lines, &mut cursor, "version")? != "PENCIL_FFTW_REFERENCE 4" {
         return Err("invalid reference version header".into());
     }
 
@@ -209,10 +228,17 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
         return Err("original_shape: expected 2 to 4 dimensions".into());
     }
     let extra = shape(next(&lines, &mut cursor, "extra_shape")?, "extra_shape")?;
+    let selection = selected_axes(
+        next(&lines, &mut cursor, "selected_axes")?,
+        original_shape.len(),
+    )?;
+    if kind == Kind::R2c && selection.is_empty() {
+        return Err("R2C selected_axes must be nonempty".into());
+    }
     let mut input_shape = extra.clone();
     input_shape.extend(&original_shape);
     let mut output_shape = extra.clone();
-    output_shape.extend(reduced(kind, &original_shape));
+    output_shape.extend(reduced(kind, &original_shape, &selection));
     let input_count = product(&input_shape, "input shape")?;
     let output_count = product(&output_shape, "output shape")?;
     let input_kind = if kind == Kind::C2c { "complex" } else { "real" };
@@ -257,6 +283,7 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
         precision,
         shape: original_shape,
         extra,
+        selection,
         input,
         inverse_input,
         forward,
@@ -273,7 +300,17 @@ fn joined(shape: &[usize]) -> String {
         .join("x")
 }
 
-fn expected_case(kind: Kind, precision: Precision, shape: &[usize], extra: &[usize]) -> String {
+fn all_axes(dimensions: usize) -> Vec<usize> {
+    (0..dimensions).collect()
+}
+
+fn expected_case(
+    kind: Kind,
+    precision: Precision,
+    shape: &[usize],
+    extra: &[usize],
+    selection: &[usize],
+) -> String {
     let mut name = format!(
         "{}_{}d_{}",
         if kind == Kind::C2c { "c2c" } else { "r2c" },
@@ -284,6 +321,20 @@ fn expected_case(kind: Kind, precision: Precision, shape: &[usize], extra: &[usi
         name.push_str("_extra");
         name.push_str(&joined(extra));
     }
+    if selection != all_axes(shape.len()).as_slice() {
+        name.push_str("_sel");
+        if selection.is_empty() {
+            name.push_str("none");
+        } else {
+            name.push_str(
+                &selection
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join("-"),
+            );
+        }
+    }
     name.push('_');
     name.push_str(if precision == Precision::F32 {
         "f32"
@@ -293,16 +344,29 @@ fn expected_case(kind: Kind, precision: Precision, shape: &[usize], extra: &[usi
     name
 }
 
-fn base_cases() -> Vec<(Kind, Vec<usize>, Vec<usize>)> {
+type CaseSpec = (Kind, Vec<usize>, Vec<usize>, Vec<usize>);
+
+fn base_cases() -> Vec<CaseSpec> {
     vec![
-        (Kind::C2c, vec![3, 4], vec![]),
-        (Kind::C2c, vec![3, 2, 5], vec![2, 3]),
-        (Kind::C2c, vec![2, 1, 3, 4], vec![2]),
-        (Kind::R2c, vec![3, 1], vec![]),
-        (Kind::R2c, vec![3, 2], vec![]),
-        (Kind::R2c, vec![3, 1, 4], vec![2, 3]),
-        (Kind::R2c, vec![3, 1, 5], vec![2, 3]),
-        (Kind::R2c, vec![2, 1, 3, 3], vec![2]),
+        (Kind::C2c, vec![3, 4], vec![], vec![0, 1]),
+        (Kind::C2c, vec![3, 2, 5], vec![2, 3], vec![0, 1, 2]),
+        (Kind::C2c, vec![2, 1, 3, 4], vec![2], vec![0, 1, 2, 3]),
+        (Kind::R2c, vec![3, 1], vec![], vec![0, 1]),
+        (Kind::R2c, vec![3, 2], vec![], vec![0, 1]),
+        (Kind::R2c, vec![3, 1, 4], vec![2, 3], vec![0, 1, 2]),
+        (Kind::R2c, vec![3, 1, 5], vec![2, 3], vec![0, 1, 2]),
+        (Kind::R2c, vec![2, 1, 3, 3], vec![2], vec![0, 1, 2, 3]),
+    ]
+}
+
+fn partial_cases() -> Vec<CaseSpec> {
+    vec![
+        (Kind::C2c, vec![2, 3, 2, 3], vec![], vec![]),
+        (Kind::C2c, vec![2, 3, 2, 3], vec![], vec![0, 3]),
+        (Kind::R2c, vec![2, 3, 2, 3], vec![], vec![0]),
+        (Kind::R2c, vec![2, 3, 2, 3], vec![], vec![0, 2]),
+        (Kind::R2c, vec![2, 3, 2, 3], vec![], vec![0, 3]),
+        (Kind::R2c, vec![2, 3, 4], vec![2], vec![0, 2]),
     ]
 }
 
@@ -317,7 +381,12 @@ fn fixtures(directory: &Path) -> Vec<Fixture> {
         .collect::<Result<_, _>>()
         .unwrap();
     paths.sort();
-    assert_eq!(paths.len(), 16, "fixture matrix must contain 16 files");
+    let expected_files = 28;
+    assert_eq!(
+        paths.len(),
+        expected_files,
+        "fixture matrix has an unexpected file count"
+    );
     assert!(
         paths.iter().all(|path| path.is_file()
             && path.extension().and_then(|value| value.to_str()) == Some("txt")),
@@ -336,13 +405,18 @@ fn fixtures(directory: &Path) -> Vec<Fixture> {
                     fixture.kind,
                     fixture.precision,
                     &fixture.shape,
-                    &fixture.extra
+                    &fixture.extra,
+                    &fixture.selection,
                 )
             );
             fixture
         })
         .collect::<Vec<_>>();
-    for (kind, shape, extra) in base_cases() {
+    let expected_cases = base_cases()
+        .into_iter()
+        .chain(partial_cases())
+        .collect::<Vec<_>>();
+    for (kind, shape, extra, selection) in expected_cases {
         for precision in [Precision::F32, Precision::F64] {
             assert_eq!(
                 result
@@ -350,7 +424,8 @@ fn fixtures(directory: &Path) -> Vec<Fixture> {
                     .filter(|fixture| fixture.kind == kind
                         && fixture.precision == precision
                         && fixture.shape == shape
-                        && fixture.extra == extra)
+                        && fixture.extra == extra
+                        && fixture.selection == selection)
                     .count(),
                 1,
                 "missing or duplicate fixture"
@@ -654,6 +729,10 @@ fn extra(fixture: &Fixture) -> ExtraShape {
     ExtraShape::new(fixture.extra.clone().into_boxed_slice()).unwrap()
 }
 
+fn axis_selection<const N: usize>(fixture: &Fixture) -> AxisSelection<N> {
+    AxisSelection::from_indices(fixture.selection.iter().copied()).unwrap()
+}
+
 fn c2c_case<R: Real, const N: usize, const M: usize>(
     fixture: &Fixture,
     topology: &Arc<MpiTopology<M>>,
@@ -669,8 +748,15 @@ fn c2c_case<R: Real, const N: usize, const M: usize>(
         output: shape,
         extra: &fixture.extra,
     };
-    let plan = C2cPlan::from_shape_with_method(Arc::clone(topology), shape, extra.clone(), method)
-        .unwrap();
+    let selection = axis_selection::<N>(fixture);
+    let plan = C2cPlan::from_shape_with_selection_and_method(
+        Arc::clone(topology),
+        shape,
+        extra.clone(),
+        selection,
+        method,
+    )
+    .unwrap();
     let mut source = plan.allocate_input().unwrap();
     let source_snapshot = snap!(layout, source, false, "C2C source");
     ownership(source.pencil(), &source_snapshot, "C2C source");
@@ -811,7 +897,8 @@ fn r2c_case<R: Real, const N: usize, const M: usize>(
     Complex<R>: Equivalence,
 {
     let input_shape: [usize; N] = fixture.shape.as_slice().try_into().unwrap();
-    let output_shape: [usize; N] = reduced(Kind::R2c, &fixture.shape)
+    let selection = axis_selection::<N>(fixture);
+    let output_shape: [usize; N] = reduced(Kind::R2c, &fixture.shape, &fixture.selection)
         .as_slice()
         .try_into()
         .unwrap();
@@ -821,9 +908,14 @@ fn r2c_case<R: Real, const N: usize, const M: usize>(
         output: output_shape,
         extra: &fixture.extra,
     };
-    let plan =
-        R2cPlan::from_shape_with_method(Arc::clone(topology), input_shape, extra.clone(), method)
-            .unwrap();
+    let plan = R2cPlan::from_shape_with_selection_and_method(
+        Arc::clone(topology),
+        input_shape,
+        extra.clone(),
+        selection,
+        method,
+    )
+    .unwrap();
     let mut source = plan.allocate_input().unwrap();
     let source_snapshot = snap!(layout, source, false, "R2C source");
     ownership(source.pencil(), &source_snapshot, "R2C source");
@@ -929,7 +1021,7 @@ fn parser_and_offset_self_check() {
     let section = |name: &str| format!("section {name} complex 6\n{values}end\n");
     let backward_section = section("backward_expected");
     let valid = format!(
-        "PENCIL_FFTW_REFERENCE 3\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase c2c_2d_2x3_f64\nkind c2c\nprecision f64\noriginal_shape 2 3\nextra_shape\n{}{}{}{}{}",
+        "PENCIL_FFTW_REFERENCE 4\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase c2c_2d_2x3_f64\nkind c2c\nprecision f64\noriginal_shape 2 3\nextra_shape\nselected_axes 0 1\n{}{}{}{}{}",
         section("input"),
         section("inverse_input"),
         section("forward_expected"),
@@ -939,15 +1031,17 @@ fn parser_and_offset_self_check() {
     assert_eq!(parse_fixture(&valid).unwrap().input.len(), 6);
     assert_eq!(parse_fixture(&valid).unwrap().backward.len(), 6);
     assert!(
-        parse_fixture(&valid.replacen("PENCIL_FFTW_REFERENCE 3", "PENCIL_FFTW_REFERENCE 2", 1,))
+        parse_fixture(&valid.replacen("PENCIL_FFTW_REFERENCE 4", "PENCIL_FFTW_REFERENCE 2", 1,))
             .is_err()
     );
+    assert!(parse_fixture(&valid.replacen("selected_axes 0 1", "selected_axes 1 0", 1)).is_err());
+    assert!(parse_fixture(&valid.replacen("selected_axes 0 1", "selected_axes 0 0", 1)).is_err());
 
     let r2c_section = |name: &str, kind: &str, count: usize, values: &str| {
         format!("section {name} {kind} {count}\n{values}end\n")
     };
     let r2c = format!(
-        "PENCIL_FFTW_REFERENCE 3\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase r2c_2d_2x3_f64\nkind r2c\nprecision f64\noriginal_shape 2 3\nextra_shape\n{}{}{}{}{}",
+        "PENCIL_FFTW_REFERENCE 4\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase r2c_2d_2x3_f64\nkind r2c\nprecision f64\noriginal_shape 2 3\nextra_shape\nselected_axes 0 1\n{}{}{}{}{}",
         r2c_section("input", "real", 6, "1\n2\n3\n4\n5\n6\n"),
         r2c_section("inverse_input", "complex", 4, "1 0\n2 0\n3 0\n4 0\n"),
         r2c_section("forward_expected", "complex", 4, "1 0\n2 0\n3 0\n4 0\n"),
@@ -956,6 +1050,7 @@ fn parser_and_offset_self_check() {
     );
     let parsed_r2c = parse_fixture(&r2c).unwrap();
     assert_eq!(parsed_r2c.kind, Kind::R2c);
+    assert!(parse_fixture(&r2c.replacen("selected_axes 0 1", "selected_axes", 1)).is_err());
     assert_eq!(parsed_r2c.backward.len(), 6);
     let r2c_without_backward = r2c.replacen(
         &r2c_section("backward_expected", "real", 6, "1\n2\n3\n4\n5\n6\n"),
@@ -1047,7 +1142,7 @@ fn fftw_reference_matrix() {
         .iter()
         .map(|fixture| std::cmp::min(2, fixture.shape.len() - 1))
         .sum();
-    assert_eq!(layouts, 26);
+    assert_eq!(layouts, 50);
     println!(
         "PENCIL_FFTW_REFERENCE_MATRIX_STARTED fixtures={} layouts={layouts}",
         fixtures.len()
