@@ -3,13 +3,13 @@
 A row-major, MPI-distributed multidimensional array foundation inspired by
 PencilArrays.jl, with a separately layered FFT implementation.
 
-The workspace contains the `pencil-array` core crate and the local FFT
-`pencil-fft` crate. `pencil-array` is intentionally independent of RustFFT,
-RealFFT, FFTW, and any FFT-specific API. The local `pencil-fft` path accepts
-flat slices, uses RustFFT/RealFFT, and is independent of MPI and
-`pencil-array`. Local C2C provides unnormalized forward and positive-sign
-`backward` transforms plus normalized `inverse`. An opt-in
-`pencil-fft/distributed` feature adds out-of-place, input-preserving and
+The workspace contains the `pencil-array` core crate, the local FFT
+`pencil-fft` crate, and the separate `pencil-io` crate. `pencil-array` is
+intentionally independent of RustFFT, RealFFT, FFTW, and any FFT-specific API.
+The local `pencil-fft` path accepts flat slices, uses RustFFT/RealFFT, and is
+independent of MPI and `pencil-array`. Local C2C provides unnormalized
+forward and positive-sign `backward` transforms plus normalized `inverse`. An
+opt-in `pencil-fft/distributed` feature adds out-of-place, input-preserving and
 single-buffer in-place distributed C2C FFTs, including raw positive-sign
 `backward`, and out-of-place distributed R2C/C2R forward, normalized inverse,
 and raw backward over checked Alltoallv or point-to-point transitions. Its
@@ -209,7 +209,8 @@ identity, `Fft` is a complex FFT, `R2r(AxisR2rKind::Fftw(...))` selects a DCT
 or DST, and `R2r(AxisR2rKind::Dht)` selects a Hartley transform. `MixedC2cPlan`
 rejects `Rfft`; `MixedR2cPlan` requires exactly one `Rfft`, permits only
 identity/R2R/DHT stages on the real prefix and identity/FFT/R2R stages on the
-complex suffix, and reduces only the boundary axis. Both plans provide
+complex suffix, and reduces only the boundary axis. It is not an arbitrary
+multi-RFFT/BRFFT graph API. Both plans provide
 input-preserving out-of-place forward/inverse/raw-backward operations,
 plan-bound workspaces, checked single-allocation in-place arrays, both
 Alltoallv and point-to-point transitions, and the same normalized/raw pairing
@@ -233,8 +234,9 @@ The opt-in Milestone 9 checker generates temporary Julia 1.12.6/FFTW.jl
 1.10.0 references and validates the distributed C2C, R2C/C2R, R2R, and DHT
 forward/inverse/raw backward APIs at 1, 4, and 6 MPI ranks with both
 transpose methods and both memory-layout policies. It covers exactly 82
-fixtures and 136 valid case/layout combinations per policy (272 with both
-policies), including mixed-axis C2C/R2C and real/complex R2R and DHT `f32`/`f64`.
+format-7 fixtures and 136 base case/layout configurations per memory-layout
+policy (272 with both policies), including mixed-axis C2C/R2C and real/complex
+R2R and DHT `f32`/`f64`.
 The external comparison is explicitly opt-in; normal Rust tests need no Julia.
 See [`tools/fftw-reference/README.md`](tools/fftw-reference/README.md) and run
 `tools/fftw-reference/check.sh` only when Julia, FFTW.jl, and MPI are locally
@@ -242,22 +244,26 @@ available.
 
 ## Native collective I/O
 
-`pencil-io` adds collective, decomposition-independent persistence for
-`PencilArray` views without changing `pencil-array` or `pencil-fft`. The native
-MPI-IO backend writes a versioned header and canonical little-endian row-major
-payload, and uses MPI byte-subarray file views; readers stage and validate the
-complete payload before mutating the destination. Writes use exclusive file
-creation and a flushed commit marker, so incomplete and committed states are
-reported separately. The format records type, width, logical shapes, writer
-process grid, and writer permutation; writer layout metadata is provenance,
-not a read-layout requirement.
+`pencil-io` is a separate crate that adds collective,
+decomposition-independent persistence for `PencilArray` views without changing
+`pencil-array` or `pencil-fft`. Its native MPI-IO backend writes one versioned
+header and canonical little-endian row-major payload per file, and uses MPI
+byte-subarray file views; readers stage and validate the complete payload before
+mutating the destination. Writes use exclusive file creation and a flushed commit
+marker, so incomplete and committed states are reported separately. The format
+records type, width, logical shapes, writer process grid, and writer permutation;
+writer layout metadata is provenance, not a read-layout requirement. Native
+cleanup failures that can leave an unrecoverable handle are fail-stop paths via
+MPI abort, not recoverable Rust errors.
 
 Enable the optional native parallel HDF5 backend with
-`pencil-io/parallel-hdf5`. It stores the same logical order and strict scalar
-or `{r,i}` compound little-endian type under `/pencil_io_v1/data`, with typed
-metadata attributes and the same incomplete/committed protocol. This feature
-requires a parallel HDF5 installation discoverable by `pkg-config` or
-`HDF5_DIR`; it is intentionally not enabled by default. Both APIs are
+`pencil-io/parallel-hdf5`. It stores one versioned dataset at
+`/pencil_io_v1/data` in the same logical order and strict scalar or `{r,i}`
+compound little-endian type, with typed metadata attributes and the same
+incomplete/committed protocol. This is a native self-describing representation,
+not Julia PencilIO wire compatibility. The feature requires a parallel HDF5
+installation discoverable by `pkg-config` or `HDF5_DIR`; it is intentionally not
+enabled by default. Both APIs are
 collective over the view's Cartesian communicator, and every rank must enter
 calls in the same order without overlapping another operation on that
 communicator. The HDF5 path explicitly creates a dataset-transfer property
@@ -343,7 +349,13 @@ cargo clippy -p pencil-fft --features distributed --all-targets --locked -- -D w
 cargo test --workspace --lib --locked
 cargo check -p pencil-fft --features distributed --all-targets --locked
 cargo test -p pencil-fft --features distributed --lib --locked
-cargo test -p pencil-fft --features distributed --lib distributed::r2r::tests::in_place_error_panic_backend_and_short_workspace_poison_contracts --locked -- --ignored --nocapture
+cargo test -p pencil-fft --features distributed --lib distributed::r2r::tests::in_place_error_panic_backend_and_short_workspace_poison_contracts --locked -- --ignored --exact --nocapture --test-threads=1
+for n in 1 4 6; do
+  timeout --foreground --kill-after=5s 120s mpiexec --oversubscribe -n "$n" \
+    cargo test -p pencil-fft --features distributed --lib --locked \
+      distributed::tests::in_place_transaction_poison_survives_error_and_panic \
+      -- --exact --nocapture --test-threads=1
+done
 
 mpiexec -n 1 cargo test -p pencil-array --test topology --locked -- --nocapture --test-threads=1
 mpiexec -n 4 cargo test -p pencil-array --test topology --locked -- --nocapture --test-threads=1
@@ -372,13 +384,13 @@ cargo test -p pencil-fft --features distributed --doc --locked -- --show-output
 # in-place APIs; local C2C
 # and local R2C also have in-place APIs.
 for n in 1 4 6; do
-  timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
+  timeout --foreground --kill-after=5s 120s mpiexec --oversubscribe -n "$n" \
     cargo test -p pencil-fft --features distributed --test distributed_c2c \
       --locked -- --nocapture --test-threads=1 || exit 1
-  timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
+  timeout --foreground --kill-after=5s 120s mpiexec --oversubscribe -n "$n" \
     cargo test -p pencil-fft --features distributed --test distributed_r2r \
       --locked -- --nocapture --test-threads=1 || exit 1
-  timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
+  timeout --foreground --kill-after=5s 120s mpiexec --oversubscribe -n "$n" \
     cargo test -p pencil-fft --features distributed --test distributed_mixed \
       --locked -- --nocapture --test-threads=1 || exit 1
 done

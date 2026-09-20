@@ -1,8 +1,15 @@
 # PencilArrays / PencilFFTs Rust移植 設計仕様
 
 日付: 2026-09-11  
-状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R out/in-place（raw backward含む）、local R2R、AxisSelection付きAlltoallv/P2P分散C2C FFT out/in-place、AxisSelection付き分散R2C/C2R out/in-place（raw backward含む）、分散R2R/DHT out/in-place、Julia format-6交差検証fixture（68 fixture、110 layout/policy、両方で220）は実装済み。
+状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R out/in-place（raw backward含む）、local R2R、AxisSelection付きAlltoallv/P2P分散C2C FFT out/in-place、AxisSelection付き分散R2C/C2R out/in-place（raw backward含む）、分散R2R/DHT out/in-place、MixedC2c/MixedR2c（real R2R prefix、exactly one RFFT、complex suffix）、arrayのglobal indexing/local grid/global reductions/gather、separate `pencil-io`（native MPI-IO、optional parallel HDF5、unrecoverable native cleanup fail-stop、versioned little-endian logical format）、Julia format-7交差検証fixture（82 fixture、136 base case/layout configurations、両方のlayout policyで272）は実装済み。
 対象: CPU + MPIによる任意次元分散配列基盤と分散FFT基盤
+
+## 現在の実装能力（current capability）
+
+- `MixedC2cPlan`はtyped per-axisのFFT/R2R/DHT/identityを組み合わせ、`MixedR2cPlan`はreal prefixのidentity/R2R、exactly one `Rfft` boundary、complex suffixのidentity/FFT/R2Rを提供する。後者は任意のmulti-RFFT/BRFFT graphを表すAPIではない。
+- Julia/FFTWのformat 7 checkerは82 temporary fixtures、136 base case/layout configurations、両方の`DistributedLayout::permute_dims` policyで272 configurationsを検証する。Alltoallv/P2P、C2C/R2C/R2R/DHT、mixed C2C/R2C、out-of-place/in-placeを対象とする。
+- `pencil-array`は`get_global`、`Pencil::local_grid`、global reductions（`global_sum`/`global_min`/`global_max`/`l2_norm`/`any`/`all`/`sum_by`/`norm_by`）とroot `gather`を提供する。
+- `pencil-io`はarray/FFTとは別crateで、native MPI-IOとoptional `parallel-hdf5`を持つ。MPI-IOはversioned little-endian row-major payload、HDF5は`/pencil_io_v1/data`のversioned little-endian one-dataset representationを使い、Julia PencilIOのwire compatibilityは約束しない。unrecoverable native cleanup failureはrecoverableなRust errorではなくfail-stopとなる。
 
 ## 1. 参照実装
 
@@ -2336,14 +2343,14 @@ this API.
 ### Milestone 9: 交差検証と性能評価
 
 Julia/FFTW cross-validation tooling is implemented as an opt-in local check;
-its canonical command, locked Julia environment, exactly 68 temporary
-format-6 fixtures and 110 case/layout combinations per transpose method and
-memory-layout policy (220 with both policies) are documented in
+its canonical command, locked Julia environment, exactly 82 temporary format-7
+fixtures and 136 base case/layout configurations per memory-layout policy (272
+with both policies) are documented in
 [`tools/fftw-reference/README.md`](../../../tools/fftw-reference/README.md).
-It validates distributed C2C, R2C/C2R, R2R, and DHT forward/inverse/raw
-backward through both out-of-place and single-allocation real in-place paths,
-with both layout policies, without changing production tolerances, CI, or
-checked-in numeric data.
+It validates distributed C2C, R2C/C2R, R2R, DHT, and mixed C2C/R2C
+forward/inverse/raw backward through both out-of-place and single-allocation
+real in-place paths, with both layout policies, without changing production
+tolerances, CI, or checked-in numeric data.
 
 - Julia reference driver
 - MPI test matrix

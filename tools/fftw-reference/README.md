@@ -6,7 +6,9 @@ unnormalized route from reversed output layout to canonical input layout; R2C
 backward is the corresponding raw C2R route; R2R backward applies the paired
 raw DCT/DST kind. It changes no production tolerances, CI, or checked-in
 numeric data. Mixed-axis plans compose these independent one-axis FFTW/R2R/DHT
-values in route order; their focused MPI coverage is kept separate in
+values in route order. Mixed R2C fixtures use exactly one `rfft` boundary;
+the format is not an arbitrary multi-RFFT/BRFFT graph description. Their
+focused MPI coverage is kept separate in
 `crates/pencil-fft/tests/distributed_mixed.rs` for focused state/layout
 coverage. The reusable Julia oracle is
 `tools/fftw-reference/mixed_reference.jl`; it accepts Rust-axis transform
@@ -184,9 +186,9 @@ total:
 The original and mixed cases are generated for f32 and f64. R2R and DHT cases
 are generated for real and complex f32 and f64. No fixture topology is serialized.
 For every file Rust runs all valid `M=1` layouts for `N=2,3,4` and also `M=2`
-for `N=3,4`: 136 case/layout combinations per transpose method and memory
-policy per rank. Both Alltoallv and point-to-point are checked with both
-`DistributedLayout::permute_dims` values, for 272 total policy/layout runs.
+for `N=3,4`: 136 base case/layout configurations per memory-layout policy per
+rank. Each configuration checks both Alltoallv and point-to-point, and both
+`DistributedLayout::permute_dims` values give 272 total policy/layout runs.
 Small leading axes (including the R2R `[2,1,3,3]` case) deliberately create
 empty local ranges.
 

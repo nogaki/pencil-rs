@@ -150,6 +150,42 @@ jobs:
       - name: Run distributed C2C/R2C/C2R FFT suite (Alltoallv/P2P) on six ranks
         run: timeout --foreground 120s mpiexec --oversubscribe -n 6 cargo test -p pencil-fft --features distributed --test distributed_c2c --locked -- --nocapture --test-threads=1
 
+      - name: Run R2R, mixed, and phase-failure tests with exact filters
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          trap 'rm -f "$log"' EXIT
+          run_one() {
+            if ! "$@" >"$log" 2>&1; then
+              cat "$log"
+              return 1
+            fi
+            cat "$log"
+            grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out' "$log"
+          }
+          for n in 1 4 6; do
+            run_one timeout --kill-after=5s 240s \
+              mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-fft --features distributed --test distributed_r2r \
+                --locked distributed_r2r_oracle_matrix_and_negative_contracts -- \
+                --exact --nocapture --test-threads=1
+            run_one timeout --kill-after=5s 240s \
+              mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-fft --features distributed --test distributed_mixed \
+                --locked mixed_tensor_oracles_and_collective_failures -- \
+                --exact --nocapture --test-threads=1
+            run_one timeout --kill-after=5s 240s \
+              mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-fft --features distributed --lib --locked \
+                distributed::tests::in_place_transaction_poison_survives_error_and_panic -- \
+                --exact --nocapture --test-threads=1
+          done
+          # MPI is initialized once in this separate one-rank test process.
+          run_one timeout --kill-after=5s 120s \
+            cargo test -p pencil-fft --features distributed --lib --locked \
+              distributed::r2r::tests::in_place_error_panic_backend_and_short_workspace_poison_contracts -- \
+              --ignored --exact --nocapture --test-threads=1
+
       - name: Run pencil-io MPI-IO tests
         run: |
           for n in 1 4 6; do
