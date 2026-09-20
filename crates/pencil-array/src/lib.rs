@@ -13,7 +13,10 @@
 //! `[extra..., spatial...]`. The row-major buffer uses memory order
 //! `[extra..., permuted spatial...]`; [`AxisPermutation`] changes only the
 //! spatial suffix. [`ExtraShape::scalar`] represents zero extra dimensions
-//! and contributes one element per local spatial point.
+//! and contributes one element per local spatial point. Global accessors are
+//! local-only: a valid global spatial index owned by another rank returns
+//! `None`. [`LocalGrid`] borrows caller-provided global coordinate axes and
+//! iterates this rank's spatial coordinates in physical memory order.
 //!
 //! Topology construction is collective and accepts only MPI
 //! intracommunicators. Every topology, pencil, array, and borrowed view must be
@@ -276,6 +279,7 @@ mod decomposition;
 mod error;
 mod extra_shape;
 mod geometry;
+mod grid;
 mod local_transpose;
 mod many;
 mod pencil;
@@ -288,9 +292,12 @@ pub use alltoallv_transpose::AllToAllvTransposePlan;
 pub use array::PencilArray;
 pub use axis::{AxisPermutation, SpatialAxis};
 pub use decomposition::Decomposition;
-pub use error::{ArrayError, AxisError, GeometryError, PencilError, ShapeError, TopologyError};
+pub use error::{
+    ArrayError, AxisError, GeometryError, LocalGridError, PencilError, ShapeError, TopologyError,
+};
 pub use extra_shape::ExtraShape;
 pub use geometry::partition_range;
+pub use grid::{LocalGrid, LocalGridIter};
 pub use local_transpose::{LocalTransposeError, LocalTransposePlan};
 pub use many::{ManyPencilArray, OverwriteError};
 pub use pencil::{Pencil, PencilConfig};

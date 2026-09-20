@@ -94,6 +94,25 @@ pub enum ShapeError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+/// Errors constructing a borrowed [`crate::LocalGrid`].
+pub enum LocalGridError {
+    /// A supplied global coordinate axis had the wrong length.
+    #[error("coordinate axis {axis} has length {actual}, expected global extent {expected}")]
+    AxisLengthMismatch {
+        /// The zero-based spatial axis with the mismatch.
+        axis: usize,
+        /// The expected global extent from the pencil.
+        expected: usize,
+        /// The supplied coordinate-axis length.
+        actual: usize,
+    },
+
+    /// The local coordinate-grid shape did not fit `usize`.
+    #[error("local coordinate-grid shape overflowed usize")]
+    SizeOverflow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 /// Errors constructing or accessing local array storage.
 pub enum ArrayError {
     /// The supplied storage did not have the required exact length.
