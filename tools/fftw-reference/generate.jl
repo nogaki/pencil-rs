@@ -1,7 +1,9 @@
 using FFTW
 using Printf
 
-const REFERENCE_VERSION = 6
+include(joinpath(@__DIR__, "mixed_reference.jl"))
+
+const REFERENCE_VERSION = 7
 
 struct ReferenceCase
     name::String
@@ -91,6 +93,67 @@ function dht_cases()
     ]
 end
 
+function mixed_cases()
+    return [
+        ReferenceCase(
+            "mixed_c2c_3d_3x2x4_extra2_fft-dctii-dht",
+            :mixed_c2c,
+            [3, 2, 4],
+            [2],
+            [0, 1, 2],
+            [:fft, :dctii, :dht],
+        ),
+        ReferenceCase(
+            "mixed_c2c_4d_2x3x2x3_none-fft-dctiv-dht",
+            :mixed_c2c,
+            [2, 3, 2, 3],
+            Int[],
+            [1, 2, 3],
+            [:none, :fft, :dctiv, :dht],
+        ),
+        ReferenceCase(
+            "mixed_c2c_4d_2x3x2x3_dcti-dstii-dctiii-dstiv",
+            :mixed_c2c,
+            [2, 3, 2, 3],
+            Int[],
+            [0, 1, 2, 3],
+            [:dcti, :dstii, :dctiii, :dstiv],
+        ),
+        ReferenceCase(
+            "mixed_c2c_4d_2x3x2x3_dctiv-dsti-dstiii-dctii",
+            :mixed_c2c,
+            [2, 3, 2, 3],
+            Int[],
+            [0, 1, 2, 3],
+            [:dctiv, :dsti, :dstiii, :dctii],
+        ),
+        ReferenceCase(
+            "mixed_r2c_3d_4x3x5_rfft-dctii-dht",
+            :mixed_r2c,
+            [4, 3, 5],
+            Int[],
+            [0, 1, 2],
+            [:rfft, :dctii, :dht],
+        ),
+        ReferenceCase(
+            "mixed_r2c_3d_3x4x5_extra2_fft-rfft-dht",
+            :mixed_r2c,
+            [3, 4, 5],
+            [2],
+            [0, 1, 2],
+            [:fft, :rfft, :dht],
+        ),
+        ReferenceCase(
+            "mixed_r2c_2d_3x4_rfft-dht",
+            :mixed_r2c,
+            [3, 4],
+            Int[],
+            [0, 1],
+            [:rfft, :dht],
+        ),
+    ]
+end
+
 function r2r_cases()
     return [
         ReferenceCase("r2r_2d_3x4_dcti-dctii", :r2r, [3, 4], Int[], [0, 1], [:dcti, :dctii]),
@@ -103,7 +166,7 @@ function r2r_cases()
 end
 
 function reference_cases()
-    return vcat(full_cases(), partial_cases(), r2r_cases(), dht_cases())
+    return vcat(full_cases(), partial_cases(), r2r_cases(), mixed_cases(), dht_cases())
 end
 
 function precision_name(::Type{Float32})
@@ -344,6 +407,37 @@ function dht_values(::Type{T}, item::ReferenceCase) where {T}
     return input, inverse_input, forward, inverse, backward
 end
 
+function mixed_c2c_values(::Type{T}, item::ReferenceCase) where {T}
+    input = fill_complex!(logical_array(Complex{T}, item), 501.5)
+    inverse_input = fill_complex!(logical_array(Complex{T}, item), 607.25)
+    forward = mixed_c2c_reference(input, item.axis_kinds)
+    inverse = mixed_c2c_reference(inverse_input, item.axis_kinds; inverse = true)
+    backward = mixed_c2c_reference(inverse_input, item.axis_kinds; backward = true)
+    return input, inverse_input, forward, inverse, backward
+end
+
+function mixed_r2c_values(::Type{T}, item::ReferenceCase) where {T}
+    input = fill_real!(logical_array(T, item), 701.5)
+    inverse_real_input = fill_real!(logical_array(T, item), 809.25)
+    reduction = findfirst(==( :rfft), item.axis_kinds)
+    real_n = item.spatial[reduction]
+    inverse_input = mixed_r2c_reference(inverse_real_input, item.axis_kinds)
+    forward = mixed_r2c_reference(input, item.axis_kinds)
+    inverse = mixed_r2c_reference(
+        inverse_input,
+        item.axis_kinds;
+        inverse = true,
+        real_n = real_n,
+    )
+    backward = mixed_r2c_reference(
+        inverse_input,
+        item.axis_kinds;
+        backward = true,
+        real_n = real_n,
+    )
+    return input, inverse_input, forward, inverse, backward
+end
+
 function r2r_values(::Type{T}, item::ReferenceCase) where {T}
     input = if T <: Complex
         fill_complex!(logical_array(T, item), 101.5)
@@ -396,13 +490,19 @@ function print_header(io, item::ReferenceCase, ::Type{T}, provider, native_versi
     )
     println(io, "case ", item.name, "_", precision_name(T))
     println(io, "kind ", item.kind)
-    fixture_element_kind = item.kind == :c2c ? "complex" : item.kind == :r2c ? "real" : element_kind(T)
+    fixture_element_kind = item.kind in (:c2c, :mixed_c2c) ? "complex" :
+        item.kind in (:r2c, :mixed_r2c) ? "real" : element_kind(T)
     println(io, "element_kind ", fixture_element_kind)
     println(io, "precision ", precision_name(T))
     println(io, "original_shape ", join(item.spatial, " "))
     println(io, "extra_shape", isempty(item.extra) ? "" : " " * join(item.extra, " "))
     println(io, "axis_kinds", isempty(item.axis_kinds) ? "" : " " * join(axis_kind_name.(item.axis_kinds), " "))
     println(io, "selected_axes", isempty(item.selected) ? "" : " " * join(item.selected, " "))
+    if item.kind == :mixed_r2c
+        reduction = findfirst(==( :rfft), item.axis_kinds)
+        reduction === nothing && error("mixed R2C case has no RFFT axis")
+        println(io, "original_n ", item.spatial[reduction])
+    end
 end
 
 function print_real_section(io, name::String, values)
@@ -426,15 +526,17 @@ function write_case(output_directory::String, item::ReferenceCase, ::Type{T}, pr
     filename = joinpath(output_directory, item.name * suffix * "_" * precision_name(T) * ".txt")
     open(filename, "w") do io
         print_header(io, item, T, provider, native_version)
-        if item.kind == :c2c
-            input, inverse_input, forward, inverse, backward = c2c_values(T, item)
+        if item.kind in (:c2c, :mixed_c2c)
+            values = item.kind == :c2c ? c2c_values(T, item) : mixed_c2c_values(T, item)
+            input, inverse_input, forward, inverse, backward = values
             print_complex_section(io, "input", input)
             print_complex_section(io, "inverse_input", inverse_input)
             print_complex_section(io, "forward_expected", forward)
             print_complex_section(io, "inverse_expected", inverse)
             print_complex_section(io, "backward_expected", backward)
-        elseif item.kind == :r2c
-            input, inverse_input, forward, inverse, backward = r2c_values(T, item)
+        elseif item.kind in (:r2c, :mixed_r2c)
+            values = item.kind == :r2c ? r2c_values(T, item) : mixed_r2c_values(T, item)
+            input, inverse_input, forward, inverse, backward = values
             print_real_section(io, "input", input)
             print_complex_section(io, "inverse_input", inverse_input)
             print_complex_section(io, "forward_expected", forward)
@@ -496,13 +598,19 @@ function main()
             write_case(output_directory, item, T, provider, native_version)
         end
     end
+    for item in mixed_cases()
+        for T in (Float32, Float64)
+            write_case(output_directory, item, T, provider, native_version)
+        end
+    end
     for item in dht_cases()
         for T in (Float32, Float64, Complex{Float32}, Complex{Float64})
             write_case(output_directory, item, T, provider, native_version)
         end
     end
     files = filter(name -> endswith(name, ".txt"), readdir(output_directory))
-    expected = 68
+    expected = 2 * (length(full_cases()) + length(partial_cases())) +
+        4 * length(r2r_cases()) + 2 * length(mixed_cases()) + 4 * length(dht_cases())
     length(files) == expected || error("generated ", length(files), " fixtures, expected ", expected)
     println("generated ", length(files), " fixtures in ", output_directory)
 end

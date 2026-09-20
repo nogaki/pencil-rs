@@ -204,11 +204,20 @@ pub use dht::LocalDhtPlan;
 pub use r2c::{
     LocalR2cError, LocalR2cInPlaceArray, LocalR2cInPlaceWorkspace, LocalR2cPlan, R2cState,
 };
+#[cfg(feature = "distributed")]
+pub use r2r::AxisR2rKind;
 pub use r2r::{LocalR2rError, LocalR2rPlan, R2rKind, R2rScalar};
 
 #[cfg(feature = "distributed")]
 mod distributed;
 
+#[cfg(feature = "distributed")]
+pub use distributed::mixed::{
+    AxisTransform, MixedC2cInPlaceArray, MixedC2cInPlaceWorkspace, MixedC2cOutOfPlaceWorkspace,
+    MixedC2cPlan, MixedC2cState, MixedC2cWorkspace, MixedError, MixedR2cInPlaceArray,
+    MixedR2cInPlaceWorkspace, MixedR2cOutOfPlaceWorkspace, MixedR2cPlan, MixedR2cState,
+    MixedR2cWorkspace,
+};
 #[cfg(feature = "distributed")]
 pub use distributed::{
     AxisSelection, AxisSelectionError, C2cInPlaceArray, C2cInPlaceWorkspace,

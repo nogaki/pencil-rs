@@ -64,7 +64,7 @@ fi
 shopt -s nullglob
 fixture_entries=("$FIXTURES"/*)
 fixture_files=("$FIXTURES"/*.txt)
-expected_fixture_count=68
+expected_fixture_count=82
 [[ ${#fixture_entries[@]} -eq "$expected_fixture_count" && ${#fixture_files[@]} -eq "$expected_fixture_count" ]] || {
     printf 'expected exactly %s fixture files, found %s entries and %s txt files\n' \
         "$expected_fixture_count" "${#fixture_entries[@]}" "${#fixture_files[@]}" >&2
@@ -75,8 +75,8 @@ for fixture in "${fixture_files[@]}"; do
         printf 'empty fixture: %s\n' "$fixture" >&2
         exit 1
     }
-    grep -Fxq 'PENCIL_FFTW_REFERENCE 6' "$fixture" || {
-        printf 'fixture is missing mandatory format-6 metadata: %s\n' "$fixture" >&2
+    grep -Fxq 'PENCIL_FFTW_REFERENCE 7' "$fixture" || {
+        printf 'fixture is missing mandatory format-7 metadata: %s\n' "$fixture" >&2
         exit 1
     }
     grep -Eq '^element_kind (real|complex)$' "$fixture" || {
@@ -91,6 +91,12 @@ for fixture in "${fixture_files[@]}"; do
         printf 'fixture is missing mandatory selected_axes metadata: %s\n' "$fixture" >&2
         exit 1
     }
+    if grep -Fxq 'kind mixed_r2c' "$fixture"; then
+        grep -Eq '^original_n [0-9]+$' "$fixture" || {
+            printf 'mixed R2C fixture is missing original_n metadata: %s\n' "$fixture" >&2
+            exit 1
+        }
+    fi
 done
 
 CARGO_TEST_ARGS=(
@@ -364,3 +370,67 @@ if run_reference 1 "$CORRUPT_DHT_BACKWARD" "$DHT_BACKWARD_CORRUPT_LOG"; then
 fi
 check_corruption_log "$DHT_BACKWARD_CORRUPT_LOG" 'DHT backward'
 printf 'corrupted DHT backward_expected rejected as intended\n'
+
+mixed_corruption_specs=(
+    'mixed-c2c-forward:mixed_c2c:forward_expected:mixed C2C forward'
+    'mixed-c2c-inverse:mixed_c2c:inverse_expected:mixed C2C inverse'
+    'mixed-c2c-backward:mixed_c2c:backward_expected:mixed C2C backward'
+    'mixed-c2c-forward-2:mixed_c2c:forward_expected:mixed C2C forward'
+    'mixed-c2c-inverse-2:mixed_c2c:inverse_expected:mixed C2C inverse'
+    'mixed-c2c-backward-2:mixed_c2c:backward_expected:mixed C2C backward'
+    'mixed-r2c-forward:mixed_r2c:forward_expected:mixed R2C forward'
+    'mixed-r2c-inverse:mixed_r2c:inverse_expected:mixed C2R inverse'
+    'mixed-r2c-backward:mixed_r2c:backward_expected:mixed R2C backward'
+    'mixed-r2c-forward-2:mixed_r2c:forward_expected:mixed R2C forward'
+    'mixed-r2c-inverse-2:mixed_r2c:inverse_expected:mixed C2R inverse'
+    'mixed-r2c-backward-2:mixed_r2c:backward_expected:mixed R2C backward'
+)
+for spec in "${mixed_corruption_specs[@]}"; do
+    IFS=: read -r name kind section context <<<"$spec"
+    directory="$WORK/corrupt-$name-fixtures"
+    mkdir -p "$directory"
+    cp -- "${fixture_files[@]}" "$directory/"
+    candidate=
+    candidate_skip=0
+    [[ $name == *-2 ]] && candidate_skip=1
+    for fixture in "$directory"/*.txt; do
+        if grep -Fxq "kind $kind" "$fixture" \
+            && grep -Fq "section $section " "$fixture"; then
+            if ((candidate_skip > 0)); then
+                ((candidate_skip--))
+                continue
+            fi
+            candidate=$fixture
+            break
+        fi
+    done
+    [[ -n "$candidate" ]] || {
+        printf 'missing mixed corruption candidate for %s\n' "$name" >&2
+        exit 1
+    }
+    "$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" -e '
+lines = readlines(ARGS[1])
+marker = "section " * ARGS[2] * " "
+for index in eachindex(lines)
+    if startswith(lines[index], marker)
+        index < length(lines) || error("section has no value")
+        tokens = split(lines[index + 1])
+        tokens[1] = string(parse(Float64, tokens[1]) + 1.0)
+        lines[index + 1] = join(tokens, " ")
+        open(ARGS[1], "w") do io
+            write(io, join(lines, "\n"), "\n")
+        end
+        exit()
+    end
+end
+error("section not found")
+' "$candidate" "$section"
+    log_file="$WORK/corrupted-$name.log"
+    printf '\n== corrupted %s rejection ==\n' "$context"
+    if run_reference 1 "$directory" "$log_file"; then
+        printf 'checker accepted a deliberately corrupted mixed %s value\n' "$context" >&2
+        exit 1
+    fi
+    check_corruption_log "$log_file" "$context"
+    printf 'corrupted mixed %s rejected as intended\n' "$context"
+done

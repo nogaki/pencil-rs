@@ -75,7 +75,7 @@ impl R2rKind {
 /// self-paired discrete Hartley transform without changing [`R2rKind`].
 #[cfg(feature = "distributed")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AxisR2rKind {
+pub enum AxisR2rKind {
     /// One of the legacy FFTW-compatible DCT/DST kinds.
     Fftw(R2rKind),
     /// The discrete Hartley transform.
@@ -115,7 +115,7 @@ pub trait R2rScalar: private::SealedR2rScalar + Copy + Send + Sync + 'static {
 }
 
 mod private {
-    use super::{Complex, R2rScalar};
+    use super::{Complex, FftReal, R2rScalar};
 
     pub trait SealedR2rScalar {
         const VALUE_KIND: u64;
@@ -129,11 +129,11 @@ mod private {
             Self: R2rScalar;
     }
 
-    impl SealedR2rScalar for f32 {
+    impl<R: FftReal> SealedR2rScalar for R {
         const VALUE_KIND: u64 = 1;
 
         fn to_complex(self) -> Complex<<Self as R2rScalar>::Real> {
-            Complex::new(self, 0.0)
+            Complex::new(self, rustfft::num_traits::Zero::zero())
         }
 
         fn from_complex(value: Complex<<Self as R2rScalar>::Real>) -> Self {
@@ -141,31 +141,7 @@ mod private {
         }
     }
 
-    impl SealedR2rScalar for f64 {
-        const VALUE_KIND: u64 = 1;
-
-        fn to_complex(self) -> Complex<<Self as R2rScalar>::Real> {
-            Complex::new(self, 0.0)
-        }
-
-        fn from_complex(value: Complex<<Self as R2rScalar>::Real>) -> Self {
-            value.re
-        }
-    }
-
-    impl SealedR2rScalar for Complex<f32> {
-        const VALUE_KIND: u64 = 2;
-
-        fn to_complex(self) -> Complex<<Self as R2rScalar>::Real> {
-            self
-        }
-
-        fn from_complex(value: Complex<<Self as R2rScalar>::Real>) -> Self {
-            value
-        }
-    }
-
-    impl SealedR2rScalar for Complex<f64> {
+    impl<R: FftReal> SealedR2rScalar for Complex<R> {
         const VALUE_KIND: u64 = 2;
 
         fn to_complex(self) -> Complex<<Self as R2rScalar>::Real> {
@@ -178,20 +154,15 @@ mod private {
     }
 }
 
-impl R2rScalar for f32 {
-    type Real = f32;
+// `FftReal` is sealed to `f32` and `f64`, so these blanket impls expose
+// exactly the legacy four scalar representations while letting the mixed
+// generic kernels name their real and complex endpoint types.
+impl<R: FftReal> R2rScalar for R {
+    type Real = R;
 }
 
-impl R2rScalar for f64 {
-    type Real = f64;
-}
-
-impl R2rScalar for Complex<f32> {
-    type Real = f32;
-}
-
-impl R2rScalar for Complex<f64> {
-    type Real = f64;
+impl<R: FftReal> R2rScalar for Complex<R> {
+    type Real = R;
 }
 
 pub(crate) fn r2r_to_complex<T: R2rScalar>(value: T) -> Complex<T::Real> {

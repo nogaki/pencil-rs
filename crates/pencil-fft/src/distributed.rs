@@ -89,6 +89,20 @@ const OPERATION_DHT_BACKWARD: u64 = 31;
 const OPERATION_DHT_FORWARD_IN_PLACE: u64 = 32;
 const OPERATION_DHT_INVERSE_IN_PLACE: u64 = 33;
 const OPERATION_DHT_BACKWARD_IN_PLACE: u64 = 34;
+const OPERATION_MIXED_C2C_PLAN: u64 = 35;
+const OPERATION_MIXED_C2C_FORWARD: u64 = 36;
+const OPERATION_MIXED_C2C_INVERSE: u64 = 37;
+const OPERATION_MIXED_C2C_BACKWARD: u64 = 38;
+const OPERATION_MIXED_C2C_FORWARD_IN_PLACE: u64 = 39;
+const OPERATION_MIXED_C2C_INVERSE_IN_PLACE: u64 = 40;
+const OPERATION_MIXED_C2C_BACKWARD_IN_PLACE: u64 = 41;
+const OPERATION_MIXED_R2C_PLAN: u64 = 42;
+const OPERATION_MIXED_R2C_FORWARD: u64 = 43;
+const OPERATION_MIXED_R2C_INVERSE: u64 = 44;
+const OPERATION_MIXED_R2C_BACKWARD: u64 = 45;
+const OPERATION_MIXED_R2C_FORWARD_IN_PLACE: u64 = 46;
+const OPERATION_MIXED_R2C_INVERSE_IN_PLACE: u64 = 47;
+const OPERATION_MIXED_R2C_BACKWARD_IN_PLACE: u64 = 48;
 const INVALID_WORD: u64 = u64::MAX;
 const METHOD_ALL_TO_ALLV: u64 = 0;
 const METHOD_POINT_TO_POINT: u64 = 1;
@@ -218,6 +232,7 @@ pub enum R2rError {
     LocalR2r(#[from] LocalR2rError),
 }
 
+pub mod mixed;
 mod r2c;
 mod r2r;
 
@@ -1609,19 +1624,17 @@ fn build_transitions<R: FftReal, const N: usize, const M: usize>(
         let destination = Arc::clone(&stages.stages[index + 1].input);
         let is_real = index < real_transition_count;
         if is_distributed {
-            let forward = build_distributed_transition(
-                Arc::clone(&source),
-                Arc::clone(&destination),
-                method,
+            let forward = agree_result(
+                communicator,
+                build_distributed_transition(Arc::clone(&source), Arc::clone(&destination), method),
             )?;
             let forward_requirements = agree_result(
                 communicator,
                 transition_workspace_requirements(&forward, extra_shape),
             )?;
-            let backward = build_distributed_transition(
-                Arc::clone(&destination),
-                Arc::clone(&source),
-                method,
+            let backward = agree_result(
+                communicator,
+                build_distributed_transition(Arc::clone(&destination), Arc::clone(&source), method),
             )?;
             let backward_requirements = agree_result(
                 communicator,
@@ -2726,7 +2739,9 @@ mod tests {
         OPERATION_R2R_INVERSE_IN_PLACE, OPERATION_R2R_PLAN, R2cError, R2cPlan, TransposeMethod,
         descriptor_len, run_in_place_transaction,
     };
-    use crate::{AxisSelection, R2cState};
+    use crate::{
+        AxisR2rKind, AxisSelection, AxisTransform, MixedC2cPlan, MixedError, MixedR2cPlan, R2cState,
+    };
     use mpi::topology::Communicator;
     use pencil_array::{ArrayError, MpiTopology, TransposeWorkspace};
 
@@ -3100,6 +3115,7 @@ mod tests {
             r2c_conversion_panic_cases(&topology);
             r2c_conversion_owner_failure_cases(&topology);
             r2c_preflight_corruption_cases(&topology);
+            mixed_in_place_error_cases(&topology);
 
             Ok::<(), ()>(())
         };
@@ -3331,6 +3347,191 @@ mod tests {
             format!("{complex_registry_workspace:?}"),
             complex_workspace_before
         );
+    }
+
+    fn mixed_in_place_error_cases(topology: &Arc<MpiTopology<1>>) {
+        let c2c_transforms = [AxisTransform::Fft, AxisTransform::R2r(AxisR2rKind::Dht)];
+        let mut c2c_allocation_plan = MixedC2cPlan::<f64, 2, 1>::from_shape(
+            Arc::clone(topology),
+            [2, 3],
+            ExtraShape::scalar(),
+            c2c_transforms,
+        )
+        .unwrap();
+        super::mixed::force_c2c_workspace_allocation_failure_for_test(&mut c2c_allocation_plan);
+        assert!(matches!(
+            c2c_allocation_plan.allocate_workspace(),
+            Err(MixedError::Fft(FftError::AllocationFailed { .. }))
+        ));
+        assert!(matches!(
+            c2c_allocation_plan.allocate_in_place_workspace(),
+            Err(MixedError::Fft(FftError::AllocationFailed { .. }))
+        ));
+
+        let c2c_plan = MixedC2cPlan::<f64, 2, 1>::from_shape(
+            Arc::clone(topology),
+            [2, 3],
+            ExtraShape::scalar(),
+            c2c_transforms,
+        )
+        .unwrap();
+        let mut c2c_source = c2c_plan.allocate_input().unwrap();
+        c2c_source.as_mut_slice().fill(1.0.into());
+        let c2c_source_before = c2c_source.as_slice().to_vec();
+        let mut c2c_output = c2c_plan.allocate_output().unwrap();
+        c2c_output.as_mut_slice().fill(2.0.into());
+        let c2c_output_before = c2c_output.as_slice().to_vec();
+        let mut c2c_workspace = c2c_plan.allocate_workspace().unwrap();
+        super::mixed::empty_c2c_workspace_for_test(&mut c2c_workspace);
+        let c2c_workspace_before = format!("{c2c_workspace:?}");
+        assert!(matches!(
+            c2c_plan.forward(&c2c_source, &mut c2c_output, &mut c2c_workspace),
+            Err(MixedError::Fft(FftError::WorkspaceTooSmall { .. }))
+        ));
+        assert_eq!(c2c_source.as_slice(), c2c_source_before.as_slice());
+        assert_eq!(c2c_output.as_slice(), c2c_output_before.as_slice());
+        assert_eq!(format!("{c2c_workspace:?}"), c2c_workspace_before);
+
+        let mut c2c_array = c2c_plan.allocate_in_place().unwrap();
+        let mut c2c_ip_workspace = c2c_plan.allocate_in_place_workspace().unwrap();
+        super::mixed::empty_c2c_in_place_workspace_for_test(&mut c2c_ip_workspace);
+        let c2c_array_before = format!("{c2c_array:?}");
+        let c2c_ip_workspace_before = format!("{c2c_ip_workspace:?}");
+        assert!(matches!(
+            c2c_plan.forward_in_place(&mut c2c_array, &mut c2c_ip_workspace),
+            Err(MixedError::Fft(FftError::WorkspaceTooSmall { .. }))
+        ));
+        assert_eq!(c2c_array.state(), C2cState::Input);
+        assert_eq!(format!("{c2c_array:?}"), c2c_array_before);
+        assert_eq!(format!("{c2c_ip_workspace:?}"), c2c_ip_workspace_before);
+
+        let mut c2c_panic_array = c2c_plan.allocate_in_place().unwrap();
+        let mut c2c_panic_workspace = c2c_plan.allocate_in_place_workspace().unwrap();
+        super::mixed::panic_after_start_for_c2c_test(&mut c2c_panic_array);
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                c2c_plan.forward_in_place(&mut c2c_panic_array, &mut c2c_panic_workspace)
+            }))
+            .is_err()
+        );
+        assert_eq!(c2c_panic_array.state(), C2cState::Poisoned);
+        assert!(matches!(
+            c2c_panic_array.view(),
+            Err(MixedError::Fft(FftError::Array(ArrayError::Poisoned)))
+        ));
+        assert!(matches!(
+            c2c_plan.forward_in_place(&mut c2c_panic_array, &mut c2c_panic_workspace),
+            Err(MixedError::Fft(FftError::Array(ArrayError::Poisoned)))
+        ));
+
+        let r2c_transforms = [AxisTransform::Fft, AxisTransform::Rfft];
+        let mut r2c_allocation_plan = MixedR2cPlan::<f64, 2, 1>::from_shape(
+            Arc::clone(topology),
+            [2, 3],
+            ExtraShape::scalar(),
+            r2c_transforms,
+        )
+        .unwrap();
+        super::mixed::force_r2c_workspace_allocation_failure_for_test(&mut r2c_allocation_plan);
+        assert!(matches!(
+            r2c_allocation_plan.allocate_workspace(),
+            Err(MixedError::Fft(FftError::AllocationFailed { .. }))
+        ));
+        assert!(matches!(
+            r2c_allocation_plan.allocate_in_place_workspace(),
+            Err(MixedError::Fft(FftError::AllocationFailed { .. }))
+        ));
+
+        let r2c_plan = MixedR2cPlan::<f64, 2, 1>::from_shape(
+            Arc::clone(topology),
+            [2, 3],
+            ExtraShape::scalar(),
+            r2c_transforms,
+        )
+        .unwrap();
+        let mut r2c_source = r2c_plan.allocate_input().unwrap();
+        r2c_source.as_mut_slice().fill(1.0);
+        let r2c_source_before = r2c_source.as_slice().to_vec();
+        let mut r2c_output = r2c_plan.allocate_output().unwrap();
+        r2c_output.as_mut_slice().fill(Complex::new(2.0, -1.0));
+        let r2c_output_before = r2c_output.as_slice().to_vec();
+        let mut r2c_workspace = r2c_plan.allocate_workspace().unwrap();
+        super::mixed::empty_r2c_workspace_for_test(&mut r2c_workspace);
+        let r2c_workspace_before = format!("{r2c_workspace:?}");
+        assert!(matches!(
+            r2c_plan.forward(&r2c_source, &mut r2c_output, &mut r2c_workspace),
+            Err(MixedError::Fft(FftError::WorkspaceTooSmall { .. }))
+        ));
+        assert_eq!(r2c_source.as_slice(), r2c_source_before.as_slice());
+        assert_eq!(r2c_output.as_slice(), r2c_output_before.as_slice());
+        assert_eq!(format!("{r2c_workspace:?}"), r2c_workspace_before);
+
+        let mut r2c_array = r2c_plan.allocate_in_place().unwrap();
+        let mut r2c_ip_workspace = r2c_plan.allocate_in_place_workspace().unwrap();
+        super::mixed::empty_r2c_in_place_workspace_for_test(&mut r2c_ip_workspace);
+        let r2c_array_before = format!("{r2c_array:?}");
+        let r2c_ip_workspace_before = format!("{r2c_ip_workspace:?}");
+        assert!(matches!(
+            r2c_plan.forward_in_place(&mut r2c_array, &mut r2c_ip_workspace),
+            Err(MixedError::Fft(FftError::WorkspaceTooSmall { .. }))
+        ));
+        assert_eq!(r2c_array.state(), R2cState::RealInput);
+        assert_eq!(format!("{r2c_array:?}"), r2c_array_before);
+        assert_eq!(format!("{r2c_ip_workspace:?}"), r2c_ip_workspace_before);
+
+        let mut r2c_panic_array = r2c_plan.allocate_in_place().unwrap();
+        let mut r2c_panic_workspace = r2c_plan.allocate_in_place_workspace().unwrap();
+        super::mixed::panic_after_start_for_r2c_test(&mut r2c_panic_array);
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                r2c_plan.forward_in_place(&mut r2c_panic_array, &mut r2c_panic_workspace)
+            }))
+            .is_err()
+        );
+        assert_eq!(r2c_panic_array.state(), R2cState::Poisoned);
+        assert!(matches!(
+            r2c_panic_array.real_view(),
+            Err(MixedError::Fft(FftError::Array(ArrayError::Poisoned)))
+        ));
+        assert!(matches!(
+            r2c_plan.forward_in_place(&mut r2c_panic_array, &mut r2c_panic_workspace),
+            Err(MixedError::Fft(FftError::Array(ArrayError::Poisoned)))
+        ));
+
+        let mut forward_detach_array = r2c_plan.allocate_in_place().unwrap();
+        let mut forward_detach_workspace = r2c_plan.allocate_in_place_workspace().unwrap();
+        super::mixed::panic_after_forward_detach_for_r2c_test(&mut forward_detach_array);
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                r2c_plan.forward_in_place(&mut forward_detach_array, &mut forward_detach_workspace)
+            }))
+            .is_err()
+        );
+        assert_eq!(forward_detach_array.state(), R2cState::Poisoned);
+        assert!(forward_detach_array.storage_capacity_bytes().is_none());
+        assert!(matches!(
+            forward_detach_array.real_view(),
+            Err(MixedError::Fft(FftError::Array(ArrayError::Poisoned)))
+        ));
+
+        let mut reverse_detach_array = r2c_plan.allocate_in_place().unwrap();
+        let mut reverse_detach_workspace = r2c_plan.allocate_in_place_workspace().unwrap();
+        r2c_plan
+            .forward_in_place(&mut reverse_detach_array, &mut reverse_detach_workspace)
+            .unwrap();
+        super::mixed::panic_after_reverse_detach_for_r2c_test(&mut reverse_detach_array);
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                r2c_plan.inverse_in_place(&mut reverse_detach_array, &mut reverse_detach_workspace)
+            }))
+            .is_err()
+        );
+        assert_eq!(reverse_detach_array.state(), R2cState::Poisoned);
+        assert!(reverse_detach_array.storage_capacity_bytes().is_none());
+        assert!(matches!(
+            reverse_detach_array.complex_view(),
+            Err(MixedError::Fft(FftError::Array(ArrayError::Poisoned)))
+        ));
     }
 
     fn assert_transition_method(plan: &C2cPlan<f64, 2, 1>, method: TransposeMethod) {
