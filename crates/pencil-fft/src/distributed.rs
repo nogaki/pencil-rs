@@ -8,9 +8,10 @@
 //! legacy constructors select Alltoallv; the `_with_method` constructors can
 //! select the checked point-to-point transport as well. The out-of-place
 //! forward transform consumes the canonical input layout and produces the
-//! reversed output layout; [`C2cPlan::inverse`] and [`C2cPlan::backward`]
-//! consume those layouts in reverse, with `inverse` normalized and `backward`
-//! left unnormalized. `AxisSelection` chooses which local stages perform FFTs,
+//! reversed output layout by default; [`DistributedLayout::permute_dims`] can
+//! keep every stage in identity memory order and use strided line kernels.
+//! [`C2cPlan::inverse`] and [`C2cPlan::backward`] consume the selected output
+//! layout in reverse, with `inverse` normalized and `backward` left unnormalized. `AxisSelection` chooses which local stages perform FFTs,
 //! but the canonical route still visits every axis in descending order so an
 //! unselected stage is an identity rather than a skipped transition. In-place
 //! execution uses the same route and state-checks its single buffer.
@@ -32,10 +33,12 @@
 //! implemented in the child module, which also provides a single-allocation
 //! real in-place API.
 //!
-//! [`R2rPlan`] keeps the original shape and uses a sibling generic core for
-//! real or complex DCT/DST data. Each logical axis has either one of the eight
-//! local kinds or an identity stage, while transitions and collective checks
-//! remain the existing implementations.
+//! [`R2rPlan`] keeps the original shape for real or complex DCT/DST data. Its
+//! public constructors accept only the legacy FFTW kind array; Hartley and
+//! mixed-axis construction stays separate from this legacy API and
+//! is handled by the private sibling core used by [`DhtPlan`].
+
+#![allow(clippy::too_many_arguments)]
 
 use std::{borrow::Borrow, mem::size_of, sync::Arc};
 
@@ -56,7 +59,7 @@ use crate::{
     Complex, FftReal, LocalC2cError, LocalC2cPlan, LocalR2cError, LocalR2cPlan, LocalR2rError,
 };
 
-const DESCRIPTOR_SCHEMA: u64 = 2;
+const DESCRIPTOR_SCHEMA: u64 = 3;
 const OPERATION_PLAN: u64 = 7;
 const OPERATION_FORWARD: u64 = 8;
 const OPERATION_INVERSE: u64 = 9;
@@ -79,6 +82,13 @@ const OPERATION_R2R_BACKWARD_IN_PLACE: u64 = 24;
 const OPERATION_R2C_FORWARD_IN_PLACE: u64 = 25;
 const OPERATION_R2C_INVERSE_IN_PLACE: u64 = 26;
 const OPERATION_R2C_BACKWARD_IN_PLACE: u64 = 27;
+const OPERATION_DHT_PLAN: u64 = 28;
+const OPERATION_DHT_FORWARD: u64 = 29;
+const OPERATION_DHT_INVERSE: u64 = 30;
+const OPERATION_DHT_BACKWARD: u64 = 31;
+const OPERATION_DHT_FORWARD_IN_PLACE: u64 = 32;
+const OPERATION_DHT_INVERSE_IN_PLACE: u64 = 33;
+const OPERATION_DHT_BACKWARD_IN_PLACE: u64 = 34;
 const INVALID_WORD: u64 = u64::MAX;
 const METHOD_ALL_TO_ALLV: u64 = 0;
 const METHOD_POINT_TO_POINT: u64 = 1;
@@ -91,7 +101,7 @@ const HEADER_WORDS: usize = 5;
 pub enum C2cState {
     /// The active buffer contains canonical spatial input data.
     Input,
-    /// The active buffer contains reversed-layout spectral data.
+    /// The active buffer contains the plan's output-layout spectral data.
     Output,
     /// An in-place execution started but did not complete.
     Poisoned,
@@ -196,7 +206,7 @@ pub enum R2cError {
     InvalidSpectrum,
 }
 
-/// Errors returned by the distributed DCT/DST API.
+/// Errors returned by the distributed DCT/DST/DHT real-to-real APIs.
 #[derive(Debug, Error)]
 pub enum R2rError {
     /// An existing distributed FFT or array/transpose validation failed.
@@ -216,7 +226,7 @@ pub(crate) static MPI_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
     std::sync::OnceLock::new();
 
 pub use r2c::{R2cInPlaceArray, R2cInPlaceWorkspace, R2cPlan, R2cWorkspace};
-pub use r2r::{R2rInPlaceArray, R2rInPlaceWorkspace, R2rPlan, R2rWorkspace};
+pub use r2r::{DhtPlan, R2rInPlaceArray, R2rInPlaceWorkspace, R2rPlan, R2rWorkspace};
 
 /// Selects the distributed transition transport used by [`C2cPlan`], [`R2cPlan`], and [`R2rPlan`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,6 +242,26 @@ impl TransposeMethod {
         match self {
             Self::AllToAllv => METHOD_ALL_TO_ALLV,
             Self::PointToPoint => METHOD_POINT_TO_POINT,
+        }
+    }
+}
+
+/// The transport and memory-layout policy for a distributed transform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DistributedLayout {
+    /// The checked MPI transport used for distributed transitions.
+    pub transpose_method: TransposeMethod,
+    /// Whether each canonical route stage moves its transform axis to the
+    /// last memory dimension. `false` keeps every stage in identity memory
+    /// order and uses strided local line kernels where required.
+    pub permute_dims: bool,
+}
+
+impl Default for DistributedLayout {
+    fn default() -> Self {
+        Self {
+            transpose_method: TransposeMethod::AllToAllv,
+            permute_dims: true,
         }
     }
 }
@@ -349,12 +379,13 @@ impl<const N: usize> AxisSelection<N> {
 /// [`AxisSelection`] controls which axes are transformed. The route always
 /// contains all `N` stages (`N - 1` transitions), from axis `N - 1` down to
 /// `0`; unselected stages are identities with no native FFT or scaling. The
-/// derived output uses decomposition `[1, ..., M]` and reversed spatial memory
-/// order, including for an empty selection. The [`Self::forward`],
+/// derived output uses decomposition `[1, ..., M]`; its spatial memory order
+/// is reversed when `layout.permute_dims` is true and identity otherwise,
+/// including for an empty selection. The [`Self::forward`],
 /// [`Self::inverse`], and [`Self::backward`] methods are
 /// out of place and input preserving; their source is respectively the
-/// canonical input, reversed output, and reversed output layout. `inverse` is
-/// normalized, while `backward` is the positive-sign raw transform and scales
+/// canonical input and the selected output layout. `inverse` is normalized,
+/// while `backward` is the positive-sign raw transform and scales
 /// a forward result by the product of the selected spatial extents. Identity
 /// axes do not contribute. The [`Self::forward_in_place`], [`Self::inverse_in_place`], and
 /// [`Self::backward_in_place`] methods use one state-checked buffer.
@@ -428,6 +459,8 @@ pub struct C2cOutOfPlaceWorkspace<R: FftReal, const N: usize, const M: usize> {
     intermediate: ManyPencilArray<Complex<R>, N, M>,
     transpose: TransposeWorkspace<Complex<R>>,
     fft_scratch: Vec<Complex<R>>,
+    /// Initialized line storage used only by non-unit-stride stages.
+    line_buffer: Vec<Complex<R>>,
 }
 
 /// An opaque single-buffer array for distributed C2C in-place execution.
@@ -509,6 +542,7 @@ pub struct C2cInPlaceWorkspace<R: FftReal, const N: usize, const M: usize> {
     core: Arc<TransformPlanCore<R, N, M>>,
     transpose: TransposeWorkspace<Complex<R>>,
     fft_scratch: Vec<Complex<R>>,
+    line_buffer: Vec<Complex<R>>,
 }
 
 /// The distributed R2R in-place API reuses the C2C completion states.
@@ -541,6 +575,7 @@ impl<R: FftReal> LocalTransform<R> {
 
 #[derive(Debug)]
 struct TransformStage<R: FftReal, const N: usize, const M: usize> {
+    axis: usize,
     input: Arc<Pencil<N, M>>,
     output: Arc<Pencil<N, M>>,
     local: LocalTransform<R>,
@@ -548,6 +583,8 @@ struct TransformStage<R: FftReal, const N: usize, const M: usize> {
 
 #[derive(Debug)]
 enum C2cTransition<const N: usize, const M: usize> {
+    /// The two adjacent stages already have the same registered layout.
+    Identity,
     Local(LocalTransposePlan<N, M>),
     AllToAllv(AllToAllvTransposePlan<N, M>),
     PointToPoint(PointToPointTransposePlan<N, M>),
@@ -565,9 +602,13 @@ struct TransformPlanCore<R: FftReal, const N: usize, const M: usize> {
     transitions: Box<[C2cStageTransition<N, M>]>,
     extra_shape: ExtraShape,
     selection: AxisSelection<N>,
+    layout: DistributedLayout,
     real_stage_index: Option<usize>,
     descriptor: Box<[u64]>,
     fft_scratch_len: usize,
+    /// The largest local complex line needed by a non-unit-stride stage.
+    /// This is zero for the legacy permuted route.
+    strided_line_len: usize,
     transpose_send_len: usize,
     transpose_receive_len: usize,
     real_transpose_send_len: usize,
@@ -602,11 +643,11 @@ where
         input: Arc<Pencil<N, M>>,
         extra_shape: ExtraShape,
     ) -> Result<Self, FftError> {
-        Self::from_pencil_with_selection_and_method(
+        Self::from_pencil_with_selection_and_layout(
             input,
             extra_shape,
             AxisSelection::all(),
-            TransposeMethod::AllToAllv,
+            DistributedLayout::default(),
         )
     }
 
@@ -616,11 +657,11 @@ where
         extra_shape: ExtraShape,
         selection: AxisSelection<N>,
     ) -> Result<Self, FftError> {
-        Self::from_pencil_with_selection_and_method(
+        Self::from_pencil_with_selection_and_layout(
             input,
             extra_shape,
             selection,
-            TransposeMethod::AllToAllv,
+            DistributedLayout::default(),
         )
     }
 
@@ -631,6 +672,38 @@ where
         selection: AxisSelection<N>,
         method: TransposeMethod,
     ) -> Result<Self, FftError> {
+        Self::from_pencil_with_selection_and_layout(
+            input,
+            extra_shape,
+            selection,
+            DistributedLayout {
+                transpose_method: method,
+                ..DistributedLayout::default()
+            },
+        )
+    }
+
+    /// Collectively builds a plan with an explicit transport and layout policy.
+    pub fn from_pencil_with_layout(
+        input: Arc<Pencil<N, M>>,
+        extra_shape: ExtraShape,
+        layout: DistributedLayout,
+    ) -> Result<Self, FftError> {
+        Self::from_pencil_with_selection_and_layout(
+            input,
+            extra_shape,
+            AxisSelection::all(),
+            layout,
+        )
+    }
+
+    /// Collectively builds a plan for a validated selection and layout policy.
+    pub fn from_pencil_with_selection_and_layout(
+        input: Arc<Pencil<N, M>>,
+        extra_shape: ExtraShape,
+        selection: AxisSelection<N>,
+        layout: DistributedLayout,
+    ) -> Result<Self, FftError> {
         let topology = Arc::clone(input.topology());
         let global_shape = *input.global_shape();
         Self::construct(
@@ -639,7 +712,7 @@ where
             extra_shape,
             Ok(input),
             selection,
-            method,
+            layout,
         )
     }
 
@@ -649,20 +722,23 @@ where
         extra_shape: ExtraShape,
         method: TransposeMethod,
     ) -> Result<Self, FftError> {
-        Self::from_pencil_with_selection_and_method(
+        Self::from_pencil_with_selection_and_layout(
             input,
             extra_shape,
             AxisSelection::all(),
-            method,
+            DistributedLayout {
+                transpose_method: method,
+                ..DistributedLayout::default()
+            },
         )
     }
 
     /// Collectively builds an Alltoallv plan from a canonical input array's layout.
     pub fn from_array(input: &PencilArray<Complex<R>, N, M>) -> Result<Self, FftError> {
-        Self::from_array_with_selection_and_method(
+        Self::from_array_with_selection_and_layout(
             input,
             AxisSelection::all(),
-            TransposeMethod::AllToAllv,
+            DistributedLayout::default(),
         )
     }
 
@@ -671,7 +747,7 @@ where
         input: &PencilArray<Complex<R>, N, M>,
         selection: AxisSelection<N>,
     ) -> Result<Self, FftError> {
-        Self::from_array_with_selection_and_method(input, selection, TransposeMethod::AllToAllv)
+        Self::from_array_with_selection_and_layout(input, selection, DistributedLayout::default())
     }
 
     /// Collectively builds a plan from a canonical input array's layout.
@@ -679,6 +755,30 @@ where
         input: &PencilArray<Complex<R>, N, M>,
         selection: AxisSelection<N>,
         method: TransposeMethod,
+    ) -> Result<Self, FftError> {
+        Self::from_array_with_selection_and_layout(
+            input,
+            selection,
+            DistributedLayout {
+                transpose_method: method,
+                ..DistributedLayout::default()
+            },
+        )
+    }
+
+    /// Collectively builds a plan with an explicit transport and layout policy.
+    pub fn from_array_with_layout(
+        input: &PencilArray<Complex<R>, N, M>,
+        layout: DistributedLayout,
+    ) -> Result<Self, FftError> {
+        Self::from_array_with_selection_and_layout(input, AxisSelection::all(), layout)
+    }
+
+    /// Collectively builds a plan for a validated selection and layout policy.
+    pub fn from_array_with_selection_and_layout(
+        input: &PencilArray<Complex<R>, N, M>,
+        selection: AxisSelection<N>,
+        layout: DistributedLayout,
     ) -> Result<Self, FftError> {
         let topology = Arc::clone(input.pencil().topology());
         let global_shape = *input.pencil().global_shape();
@@ -688,7 +788,7 @@ where
             input.extra_shape().clone(),
             Ok(Arc::clone(input.pencil())),
             selection,
-            method,
+            layout,
         )
     }
 
@@ -697,7 +797,14 @@ where
         input: &PencilArray<Complex<R>, N, M>,
         method: TransposeMethod,
     ) -> Result<Self, FftError> {
-        Self::from_array_with_selection_and_method(input, AxisSelection::all(), method)
+        Self::from_array_with_selection_and_layout(
+            input,
+            AxisSelection::all(),
+            DistributedLayout {
+                transpose_method: method,
+                ..DistributedLayout::default()
+            },
+        )
     }
 
     /// Collectively builds an Alltoallv plan from topology, global shape, and extra shape.
@@ -706,12 +813,12 @@ where
         global_shape: [usize; N],
         extra_shape: ExtraShape,
     ) -> Result<Self, FftError> {
-        Self::from_shape_with_selection_and_method(
+        Self::from_shape_with_selection_and_layout(
             topology,
             global_shape,
             extra_shape,
             AxisSelection::all(),
-            TransposeMethod::AllToAllv,
+            DistributedLayout::default(),
         )
     }
 
@@ -722,12 +829,12 @@ where
         extra_shape: ExtraShape,
         selection: AxisSelection<N>,
     ) -> Result<Self, FftError> {
-        Self::from_shape_with_selection_and_method(
+        Self::from_shape_with_selection_and_layout(
             topology,
             global_shape,
             extra_shape,
             selection,
-            TransposeMethod::AllToAllv,
+            DistributedLayout::default(),
         )
     }
 
@@ -738,6 +845,42 @@ where
         extra_shape: ExtraShape,
         selection: AxisSelection<N>,
         method: TransposeMethod,
+    ) -> Result<Self, FftError> {
+        Self::from_shape_with_selection_and_layout(
+            topology,
+            global_shape,
+            extra_shape,
+            selection,
+            DistributedLayout {
+                transpose_method: method,
+                ..DistributedLayout::default()
+            },
+        )
+    }
+
+    /// Collectively builds a plan with an explicit transport and layout policy.
+    pub fn from_shape_with_layout(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        layout: DistributedLayout,
+    ) -> Result<Self, FftError> {
+        Self::from_shape_with_selection_and_layout(
+            topology,
+            global_shape,
+            extra_shape,
+            AxisSelection::all(),
+            layout,
+        )
+    }
+
+    /// Collectively builds a plan for a validated selection and layout policy.
+    pub fn from_shape_with_selection_and_layout(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        selection: AxisSelection<N>,
+        layout: DistributedLayout,
     ) -> Result<Self, FftError> {
         let input = Pencil::new(
             Arc::clone(&topology),
@@ -751,7 +894,7 @@ where
             extra_shape,
             input,
             selection,
-            method,
+            layout,
         )
     }
 
@@ -762,12 +905,15 @@ where
         extra_shape: ExtraShape,
         method: TransposeMethod,
     ) -> Result<Self, FftError> {
-        Self::from_shape_with_selection_and_method(
+        Self::from_shape_with_selection_and_layout(
             topology,
             global_shape,
             extra_shape,
             AxisSelection::all(),
-            method,
+            DistributedLayout {
+                transpose_method: method,
+                ..DistributedLayout::default()
+            },
         )
     }
 
@@ -789,6 +935,11 @@ where
     /// Returns the exact extra shape required by this plan.
     pub fn extra_shape(&self) -> &ExtraShape {
         &self.core.extra_shape
+    }
+
+    /// Returns the transport and memory-layout policy used by this plan.
+    pub fn layout(&self) -> DistributedLayout {
+        self.core.layout
     }
 
     /// Allocates a zero-initialized local input array for this plan.
@@ -842,6 +993,7 @@ where
                 initialized_vec(self.core.transpose_receive_len, zero_complex::<R>())?,
             ),
             fft_scratch: initialized_vec(self.core.fft_scratch_len, zero_complex::<R>())?,
+            line_buffer: initialized_vec(self.core.strided_line_len, zero_complex::<R>())?,
         })
     }
 
@@ -862,11 +1014,13 @@ where
             initialized_vec(self.core.transpose_receive_len, zero_complex::<R>())?,
         );
         let fft_scratch = initialized_vec(self.core.fft_scratch_len, zero_complex::<R>())?;
+        let line_buffer = initialized_vec(self.core.strided_line_len, zero_complex::<R>())?;
         Ok(C2cOutOfPlaceWorkspace {
             core: Arc::clone(&self.core),
             intermediate,
             transpose,
             fft_scratch,
+            line_buffer,
         })
     }
 
@@ -986,7 +1140,7 @@ where
         extra_shape: ExtraShape,
         input: Result<Arc<Pencil<N, M>>, FftError>,
         selection: AxisSelection<N>,
-        method: TransposeMethod,
+        layout: DistributedLayout,
     ) -> Result<Self, FftError> {
         let communicator = topology.communicator();
         let expected_len = descriptor_len::<N, M>(&extra_shape);
@@ -997,7 +1151,7 @@ where
                 &extra_shape,
                 selection,
                 VALUE_KIND_C2C,
-                method,
+                layout,
             )
             .ok()
         });
@@ -1018,7 +1172,10 @@ where
         // planning. A rank-local selection mismatch therefore cannot enter a
         // different route; callers coordinate any local constructor result.
         let descriptor = collective_descriptor(communicator, descriptor, expected_len)?;
-        let route = agree_result(communicator, build_route(input, &topology, global_shape))?;
+        let route = agree_result(
+            communicator,
+            build_route(input, &topology, global_shape, layout.permute_dims),
+        )?;
         let stages = agree_result(
             communicator,
             prepare_stages::<R, N, M>(&route, global_shape, selection),
@@ -1035,18 +1192,21 @@ where
             &stages,
             &route.distributed,
             &extra_shape,
-            method,
+            layout.transpose_method,
             0,
         )?;
 
+        let strided_line_len = strided_complex_line_len(&stages.stages)?;
         let core = TransformPlanCore {
             stages: stages.stages,
             transitions: transitions.into_boxed_slice(),
             extra_shape,
             selection,
+            layout,
             real_stage_index: None,
             descriptor: descriptor.into_boxed_slice(),
             fft_scratch_len: stages.fft_scratch_len,
+            strided_line_len,
             transpose_send_len,
             transpose_receive_len,
             real_transpose_send_len,
@@ -1112,7 +1272,8 @@ where
                 workspace.transpose.send_len(),
                 workspace.transpose.receive_len(),
             ),
-        )
+        )?;
+        validate_strided_line_buffer(workspace.line_buffer.len(), self.core.strided_line_len)
     }
 
     fn execute_in_place(
@@ -1152,12 +1313,14 @@ where
                     &mut array.array,
                     &mut workspace.transpose,
                     &mut workspace.fft_scratch,
+                    &mut workspace.line_buffer,
                 ),
                 Direction::Inverse | Direction::Backward => execute_inverse_in_place(
                     &self.core,
                     &mut array.array,
                     &mut workspace.transpose,
                     &mut workspace.fft_scratch,
+                    &mut workspace.line_buffer,
                     normalize_inverse,
                 ),
             },
@@ -1206,6 +1369,7 @@ where
             workspace.transpose.send_len(),
             workspace.transpose.receive_len(),
         )?;
+        validate_strided_line_buffer(workspace.line_buffer.len(), self.core.strided_line_len)?;
         Ok(())
     }
 }
@@ -1249,7 +1413,14 @@ fn registered_stage_pencils<R: FftReal, const N: usize, const M: usize>(
         .map_err(|_| FftError::AllocationFailed {
             required: stages.len(),
         })?;
-    pencils.extend(stages.iter().map(|stage| Arc::clone(&stage.output)));
+    for stage in stages {
+        if !pencils
+            .iter()
+            .any(|registered: &Arc<Pencil<N, M>>| registered.same_layout(stage.output.as_ref()))
+        {
+            pencils.push(Arc::clone(&stage.output));
+        }
+    }
     Ok(pencils.into_boxed_slice())
 }
 
@@ -1285,6 +1456,7 @@ fn build_route<const N: usize, const M: usize>(
     input: Result<Arc<Pencil<N, M>>, FftError>,
     topology: &Arc<MpiTopology<M>>,
     global_shape: [usize; N],
+    permute_dims: bool,
 ) -> Result<RouteCandidate<N, M>, FftError> {
     let input = validate_input(input, topology, global_shape)?;
     let mut stages = Vec::new();
@@ -1312,9 +1484,13 @@ fn build_route<const N: usize, const M: usize>(
 
         let mut next_decomposition = current.decomposition().map(SpatialAxis::index);
         let is_distributed = advance_decomposition(&mut next_decomposition, axis);
-        let next_permutation = AxisPermutation::new(next_axes)
-            .map_err(PencilError::InvalidPermutation)
-            .map_err(FftError::Pencil)?;
+        let next_permutation = if permute_dims {
+            AxisPermutation::new(next_axes)
+                .map_err(PencilError::InvalidPermutation)
+                .map_err(FftError::Pencil)?
+        } else {
+            AxisPermutation::identity()
+        };
         let next = current
             .reconfigured(PencilConfig {
                 global_shape,
@@ -1329,7 +1505,11 @@ fn build_route<const N: usize, const M: usize>(
     }
 
     let expected_output = std::array::from_fn(|axis| axis + 1);
-    let expected_permutation = std::array::from_fn(|position| N - 1 - position);
+    let expected_permutation = if permute_dims {
+        std::array::from_fn(|position| N - 1 - position)
+    } else {
+        std::array::from_fn(|position| position)
+    };
     if current.decomposition().map(SpatialAxis::index) != expected_output
         || current.permutation().axes().map(SpatialAxis::index) != expected_permutation
     {
@@ -1356,11 +1536,10 @@ fn prepare_complex_stage<R: FftReal, const N: usize, const M: usize>(
     axis_index: usize,
     selected: bool,
 ) -> Result<TransformStage<R, N, M>, FftError> {
-    if pencil.permutation().axes()[N - 1].index() != axis_index
-        || pencil
-            .decomposition()
-            .iter()
-            .any(|distributed| distributed.index() == axis_index)
+    if pencil
+        .decomposition()
+        .iter()
+        .any(|distributed| distributed.index() == axis_index)
         || pencil.local_shape_logical()[axis_index] != global_shape[axis_index]
     {
         return Err(FftError::PreparationFailed);
@@ -1371,6 +1550,7 @@ fn prepare_complex_stage<R: FftReal, const N: usize, const M: usize>(
         LocalTransform::Identity
     };
     Ok(TransformStage {
+        axis: axis_index,
         input: Arc::clone(pencil),
         output: Arc::clone(pencil),
         local,
@@ -1461,6 +1641,12 @@ fn build_transitions<R: FftReal, const N: usize, const M: usize>(
                 transpose_receive_len = transpose_receive_len.max(receive_len);
             }
             transitions.push(C2cStageTransition { forward, backward });
+        } else if source.same_layout(destination.as_ref()) {
+            transitions.push(C2cStageTransition {
+                forward: C2cTransition::Identity,
+                backward: C2cTransition::Identity,
+            });
+            continue;
         } else {
             let local = (|| {
                 let forward =
@@ -1522,6 +1708,10 @@ fn transition_workspace_requirements<const N: usize, const M: usize>(
     extra_shape: &ExtraShape,
 ) -> Result<TransposeWorkspaceRequirements, FftError> {
     match transition {
+        C2cTransition::Identity => Ok(TransposeWorkspaceRequirements {
+            send_len: 0,
+            receive_len: 0,
+        }),
         C2cTransition::AllToAllv(plan) => plan
             .workspace_requirements(extra_shape)
             .map_err(FftError::Transpose),
@@ -1532,80 +1722,370 @@ fn transition_workspace_requirements<const N: usize, const M: usize>(
     }
 }
 
-fn execute_complex_forward<R: FftReal>(
-    local: &LocalTransform<R>,
+fn memory_stride<const N: usize, const M: usize>(
+    pencil: &Pencil<N, M>,
+    axis: usize,
+) -> Result<usize, FftError> {
+    let position = pencil
+        .permutation()
+        .axes()
+        .iter()
+        .position(|value| value.index() == axis)
+        .ok_or(FftError::PreparationFailed)?;
+    let shape = pencil.local_shape_memory();
+    let mut stride = 1usize;
+    for &extent in shape.iter().skip(position + 1) {
+        stride = stride
+            .checked_mul(extent)
+            .ok_or(FftError::PreparationFailed)?;
+    }
+    Ok(if pencil.local_len() == 0 { 0 } else { stride })
+}
+
+fn strided_line_count(data_len: usize, line_len: usize, stride: usize) -> Result<usize, FftError> {
+    if stride == 0 {
+        return if data_len == 0 {
+            Ok(0)
+        } else {
+            Err(FftError::PreparationFailed)
+        };
+    }
+    let block = line_len
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
+    if data_len % block != 0 {
+        return Err(LocalC2cError::NonIntegralBatch.into());
+    }
+    Ok(data_len / block)
+}
+
+fn strided_complex_line_len<R: FftReal, const N: usize, const M: usize>(
+    stages: &[TransformStage<R, N, M>],
+) -> Result<usize, FftError> {
+    let mut required = 0usize;
+    for stage in stages {
+        let LocalTransform::Complex(plan) = &stage.local else {
+            continue;
+        };
+        if memory_stride(stage.output.as_ref(), stage.axis)? > 1 {
+            required = required.max(plan.line_len());
+        }
+    }
+    Ok(required)
+}
+
+fn validate_strided_line_buffer(actual: usize, required: usize) -> Result<(), FftError> {
+    if actual < required {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "complex line",
+            required,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn execute_strided_complex_forward<R: FftReal, const N: usize, const M: usize>(
+    plan: &LocalC2cPlan<R>,
+    pencil: &Pencil<N, M>,
+    axis: usize,
     source: &[Complex<R>],
     destination: &mut [Complex<R>],
     scratch: &mut [Complex<R>],
+    line_buffer: &mut [Complex<R>],
 ) -> Result<(), FftError> {
-    match local {
-        LocalTransform::Identity => {
-            if source.len() != destination.len() {
-                return Err(FftError::PreparationFailed);
-            }
-            destination.copy_from_slice(source);
-            Ok(())
-        }
-        LocalTransform::Complex(plan) => plan
+    let stride = memory_stride(pencil, axis)?;
+    if stride <= 1 {
+        return plan
             .forward(source, destination, scratch)
-            .map_err(FftError::LocalC2c),
-        LocalTransform::RealComplex(_) => Err(FftError::PreparationFailed),
+            .map_err(FftError::LocalC2c);
     }
+    validate_strided_line_buffer(line_buffer.len(), plan.line_len())?;
+    let count = strided_line_count(source.len(), plan.line_len(), stride)?;
+    if destination.len() != source.len() {
+        return Err(FftError::LocalC2c(LocalC2cError::BufferLengthMismatch));
+    }
+    if source.is_empty() {
+        return plan
+            .forward(source, destination, scratch)
+            .map_err(FftError::LocalC2c);
+    }
+    let block = plan
+        .line_len()
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
+    for outer in 0..count {
+        let base = outer
+            .checked_mul(block)
+            .ok_or(FftError::PreparationFailed)?;
+        for inner in 0..stride {
+            for k in 0..plan.line_len() {
+                line_buffer[k] = source[base + k * stride + inner];
+            }
+            plan.forward_in_place(&mut line_buffer[..plan.line_len()], scratch)
+                .map_err(FftError::LocalC2c)?;
+            for k in 0..plan.line_len() {
+                destination[base + k * stride + inner] = line_buffer[k];
+            }
+        }
+    }
+    Ok(())
 }
 
-fn execute_complex_forward_in_place<R: FftReal>(
-    local: &LocalTransform<R>,
+fn execute_strided_complex_forward_in_place<R: FftReal, const N: usize, const M: usize>(
+    plan: &LocalC2cPlan<R>,
+    pencil: &Pencil<N, M>,
+    axis: usize,
     data: &mut [Complex<R>],
     scratch: &mut [Complex<R>],
+    line_buffer: &mut [Complex<R>],
 ) -> Result<(), FftError> {
-    match local {
-        LocalTransform::Identity => Ok(()),
-        LocalTransform::Complex(plan) => plan
+    let stride = memory_stride(pencil, axis)?;
+    if stride <= 1 {
+        return plan
             .forward_in_place(data, scratch)
-            .map_err(FftError::LocalC2c),
-        LocalTransform::RealComplex(_) => Err(FftError::PreparationFailed),
+            .map_err(FftError::LocalC2c);
     }
+    validate_strided_line_buffer(line_buffer.len(), plan.line_len())?;
+    let count = strided_line_count(data.len(), plan.line_len(), stride)?;
+    if data.is_empty() {
+        return plan
+            .forward_in_place(data, scratch)
+            .map_err(FftError::LocalC2c);
+    }
+    let block = plan
+        .line_len()
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
+    for outer in 0..count {
+        let base = outer
+            .checked_mul(block)
+            .ok_or(FftError::PreparationFailed)?;
+        for inner in 0..stride {
+            for k in 0..plan.line_len() {
+                line_buffer[k] = data[base + k * stride + inner];
+            }
+            plan.forward_in_place(&mut line_buffer[..plan.line_len()], scratch)
+                .map_err(FftError::LocalC2c)?;
+            for k in 0..plan.line_len() {
+                data[base + k * stride + inner] = line_buffer[k];
+            }
+        }
+    }
+    Ok(())
 }
 
-fn execute_complex_reverse<R: FftReal>(
-    local: &LocalTransform<R>,
+fn execute_strided_complex_reverse<R: FftReal, const N: usize, const M: usize>(
+    plan: &LocalC2cPlan<R>,
+    pencil: &Pencil<N, M>,
+    axis: usize,
     source: &[Complex<R>],
     destination: &mut [Complex<R>],
     scratch: &mut [Complex<R>],
+    line_buffer: &mut [Complex<R>],
     normalize: bool,
 ) -> Result<(), FftError> {
-    match local {
-        LocalTransform::Identity => {
-            if source.len() != destination.len() {
-                return Err(FftError::PreparationFailed);
-            }
-            destination.copy_from_slice(source);
-            Ok(())
-        }
-        LocalTransform::Complex(plan) => if normalize {
+    let stride = memory_stride(pencil, axis)?;
+    if stride <= 1 {
+        return if normalize {
             plan.inverse(source, destination, scratch)
         } else {
             plan.backward(source, destination, scratch)
         }
-        .map_err(FftError::LocalC2c),
-        LocalTransform::RealComplex(_) => Err(FftError::PreparationFailed),
+        .map_err(FftError::LocalC2c);
     }
+    validate_strided_line_buffer(line_buffer.len(), plan.line_len())?;
+    let count = strided_line_count(source.len(), plan.line_len(), stride)?;
+    if destination.len() != source.len() {
+        return Err(FftError::LocalC2c(LocalC2cError::BufferLengthMismatch));
+    }
+    if source.is_empty() {
+        return if normalize {
+            plan.inverse(source, destination, scratch)
+        } else {
+            plan.backward(source, destination, scratch)
+        }
+        .map_err(FftError::LocalC2c);
+    }
+    let block = plan
+        .line_len()
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
+    for outer in 0..count {
+        let base = outer
+            .checked_mul(block)
+            .ok_or(FftError::PreparationFailed)?;
+        for inner in 0..stride {
+            for k in 0..plan.line_len() {
+                line_buffer[k] = source[base + k * stride + inner];
+            }
+            if normalize {
+                plan.inverse_in_place(&mut line_buffer[..plan.line_len()], scratch)
+            } else {
+                plan.backward_in_place(&mut line_buffer[..plan.line_len()], scratch)
+            }
+            .map_err(FftError::LocalC2c)?;
+            for k in 0..plan.line_len() {
+                destination[base + k * stride + inner] = line_buffer[k];
+            }
+        }
+    }
+    Ok(())
 }
 
-fn execute_complex_reverse_in_place<R: FftReal>(
-    local: &LocalTransform<R>,
+fn execute_strided_complex_reverse_in_place<R: FftReal, const N: usize, const M: usize>(
+    plan: &LocalC2cPlan<R>,
+    pencil: &Pencil<N, M>,
+    axis: usize,
     data: &mut [Complex<R>],
     scratch: &mut [Complex<R>],
+    line_buffer: &mut [Complex<R>],
     normalize: bool,
 ) -> Result<(), FftError> {
-    match local {
-        LocalTransform::Identity => Ok(()),
-        LocalTransform::Complex(plan) => if normalize {
+    let stride = memory_stride(pencil, axis)?;
+    if stride <= 1 {
+        return if normalize {
             plan.inverse_in_place(data, scratch)
         } else {
             plan.backward_in_place(data, scratch)
         }
-        .map_err(FftError::LocalC2c),
+        .map_err(FftError::LocalC2c);
+    }
+    validate_strided_line_buffer(line_buffer.len(), plan.line_len())?;
+    let count = strided_line_count(data.len(), plan.line_len(), stride)?;
+    if data.is_empty() {
+        return if normalize {
+            plan.inverse_in_place(data, scratch)
+        } else {
+            plan.backward_in_place(data, scratch)
+        }
+        .map_err(FftError::LocalC2c);
+    }
+    let block = plan
+        .line_len()
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
+    for outer in 0..count {
+        let base = outer
+            .checked_mul(block)
+            .ok_or(FftError::PreparationFailed)?;
+        for inner in 0..stride {
+            for k in 0..plan.line_len() {
+                line_buffer[k] = data[base + k * stride + inner];
+            }
+            if normalize {
+                plan.inverse_in_place(&mut line_buffer[..plan.line_len()], scratch)
+            } else {
+                plan.backward_in_place(&mut line_buffer[..plan.line_len()], scratch)
+            }
+            .map_err(FftError::LocalC2c)?;
+            for k in 0..plan.line_len() {
+                data[base + k * stride + inner] = line_buffer[k];
+            }
+        }
+    }
+    Ok(())
+}
+
+fn execute_complex_forward<R: FftReal, const N: usize, const M: usize>(
+    local: &LocalTransform<R>,
+    pencil: &Pencil<N, M>,
+    axis: usize,
+    source: &[Complex<R>],
+    destination: &mut [Complex<R>],
+    scratch: &mut [Complex<R>],
+    line_buffer: &mut [Complex<R>],
+) -> Result<(), FftError> {
+    match local {
+        LocalTransform::Identity => {
+            if source.len() != destination.len() {
+                return Err(FftError::PreparationFailed);
+            }
+            destination.copy_from_slice(source);
+            Ok(())
+        }
+        LocalTransform::Complex(plan) => execute_strided_complex_forward(
+            plan,
+            pencil,
+            axis,
+            source,
+            destination,
+            scratch,
+            line_buffer,
+        ),
+        LocalTransform::RealComplex(_) => Err(FftError::PreparationFailed),
+    }
+}
+
+fn execute_complex_forward_in_place<R: FftReal, const N: usize, const M: usize>(
+    local: &LocalTransform<R>,
+    pencil: &Pencil<N, M>,
+    axis: usize,
+    data: &mut [Complex<R>],
+    scratch: &mut [Complex<R>],
+    line_buffer: &mut [Complex<R>],
+) -> Result<(), FftError> {
+    match local {
+        LocalTransform::Identity => Ok(()),
+        LocalTransform::Complex(plan) => {
+            execute_strided_complex_forward_in_place(plan, pencil, axis, data, scratch, line_buffer)
+        }
+        LocalTransform::RealComplex(_) => Err(FftError::PreparationFailed),
+    }
+}
+
+fn execute_complex_reverse<R: FftReal, const N: usize, const M: usize>(
+    local: &LocalTransform<R>,
+    pencil: &Pencil<N, M>,
+    axis: usize,
+    source: &[Complex<R>],
+    destination: &mut [Complex<R>],
+    scratch: &mut [Complex<R>],
+    line_buffer: &mut [Complex<R>],
+    normalize: bool,
+) -> Result<(), FftError> {
+    match local {
+        LocalTransform::Identity => {
+            if source.len() != destination.len() {
+                return Err(FftError::PreparationFailed);
+            }
+            destination.copy_from_slice(source);
+            Ok(())
+        }
+        LocalTransform::Complex(plan) => execute_strided_complex_reverse(
+            plan,
+            pencil,
+            axis,
+            source,
+            destination,
+            scratch,
+            line_buffer,
+            normalize,
+        ),
+        LocalTransform::RealComplex(_) => Err(FftError::PreparationFailed),
+    }
+}
+
+fn execute_complex_reverse_in_place<R: FftReal, const N: usize, const M: usize>(
+    local: &LocalTransform<R>,
+    pencil: &Pencil<N, M>,
+    axis: usize,
+    data: &mut [Complex<R>],
+    scratch: &mut [Complex<R>],
+    line_buffer: &mut [Complex<R>],
+    normalize: bool,
+) -> Result<(), FftError> {
+    match local {
+        LocalTransform::Identity => Ok(()),
+        LocalTransform::Complex(plan) => execute_strided_complex_reverse_in_place(
+            plan,
+            pencil,
+            axis,
+            data,
+            scratch,
+            line_buffer,
+            normalize,
+        ),
         LocalTransform::RealComplex(_) => Err(FftError::PreparationFailed),
     }
 }
@@ -1623,14 +2103,18 @@ where
     {
         let stage = &core.stages[0];
         let fft_scratch = &mut workspace.fft_scratch;
+        let line_buffer = &mut workspace.line_buffer;
         workspace
             .intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
                 execute_complex_forward(
                     &stage.local,
+                    stage.output.as_ref(),
+                    stage.axis,
                     source_view.as_slice(),
                     target.as_mut_slice(),
                     fft_scratch,
+                    line_buffer,
                 )
                 .expect("distributed C2C forward preflight validated stage zero");
                 Ok::<_, ()>(())
@@ -1645,6 +2129,7 @@ where
         &mut workspace.transpose,
         destination,
         &mut workspace.fft_scratch,
+        &mut workspace.line_buffer,
     )
 }
 
@@ -1665,6 +2150,7 @@ where
         &mut workspace.intermediate,
         &mut workspace.transpose,
         &mut workspace.fft_scratch,
+        &mut workspace.line_buffer,
         normalize_inverse,
     )?;
     let stage = &core.stages[0];
@@ -1675,9 +2161,12 @@ where
     let mut destination_view = destination.view_mut();
     execute_complex_reverse(
         &stage.local,
+        stage.input.as_ref(),
+        stage.axis,
         active.as_slice(),
         destination_view.as_mut_slice(),
         &mut workspace.fft_scratch,
+        &mut workspace.line_buffer,
         normalize_inverse,
     )
     .expect("distributed C2C final inverse stage was preflighted");
@@ -1691,6 +2180,7 @@ fn execute_forward_complex_tail<R: FftReal, const N: usize, const M: usize>(
     transpose: &mut TransposeWorkspace<Complex<R>>,
     destination: &mut PencilArray<Complex<R>, N, M>,
     fft_scratch: &mut [Complex<R>],
+    line_buffer: &mut [Complex<R>],
 ) -> Result<(), FftError>
 where
     Complex<R>: Equivalence,
@@ -1722,17 +2212,27 @@ where
             let mut destination_view = destination.view_mut();
             execute_complex_forward(
                 &stage.local,
+                stage.output.as_ref(),
+                stage.axis,
                 active.as_slice(),
                 destination_view.as_mut_slice(),
                 fft_scratch,
+                line_buffer,
             )
             .expect("complex tail final forward stage was preflighted");
         } else {
             let mut active = intermediate
                 .active_view_mut()
                 .expect("complex tail middle active layout was preflighted");
-            execute_complex_forward_in_place(&stage.local, active.as_mut_slice(), fft_scratch)
-                .expect("complex tail middle forward stage was preflighted");
+            execute_complex_forward_in_place(
+                &stage.local,
+                stage.output.as_ref(),
+                stage.axis,
+                active.as_mut_slice(),
+                fft_scratch,
+                line_buffer,
+            )
+            .expect("complex tail middle forward stage was preflighted");
         }
     }
     Ok(())
@@ -1745,6 +2245,7 @@ fn execute_inverse_complex_tail<R: FftReal, const N: usize, const M: usize>(
     intermediate: &mut ManyPencilArray<Complex<R>, N, M>,
     transpose: &mut TransposeWorkspace<Complex<R>>,
     fft_scratch: &mut [Complex<R>],
+    line_buffer: &mut [Complex<R>],
     normalize_inverse: bool,
 ) -> Result<(), FftError>
 where
@@ -1771,9 +2272,12 @@ where
                 }
                 execute_complex_reverse(
                     &stage.local,
+                    stage.input.as_ref(),
+                    stage.axis,
                     source_view.as_slice(),
                     target.as_mut_slice(),
                     fft_scratch,
+                    line_buffer,
                     normalize_inverse,
                 )
                 .expect("complex tail first inverse stage was preflighted");
@@ -1790,8 +2294,11 @@ where
                 .expect("complex tail inverse middle layout was preflighted");
             execute_complex_reverse_in_place(
                 &stage.local,
+                stage.input.as_ref(),
+                stage.axis,
                 active.as_mut_slice(),
                 fft_scratch,
+                line_buffer,
                 normalize_inverse,
             )
             .expect("complex tail middle inverse stage was preflighted");
@@ -1805,6 +2312,7 @@ fn execute_forward_in_place<R: FftReal, const N: usize, const M: usize>(
     array: &mut ManyPencilArray<Complex<R>, N, M>,
     transpose: &mut TransposeWorkspace<Complex<R>>,
     fft_scratch: &mut [Complex<R>],
+    line_buffer: &mut [Complex<R>],
 ) -> Result<(), FftError>
 where
     Complex<R>: Equivalence,
@@ -1812,14 +2320,28 @@ where
     {
         let stage = &core.stages[0];
         let mut active = array.active_view_mut().map_err(FftError::Array)?;
-        execute_complex_forward_in_place(&stage.local, active.as_mut_slice(), fft_scratch)?;
+        execute_complex_forward_in_place(
+            &stage.local,
+            stage.output.as_ref(),
+            stage.axis,
+            active.as_mut_slice(),
+            fft_scratch,
+            line_buffer,
+        )?;
     }
 
     for (index, transition) in core.transitions.iter().enumerate() {
         execute_transition(&transition.forward, array, transpose)?;
         let stage = &core.stages[index + 1];
         let mut active = array.active_view_mut().map_err(FftError::Array)?;
-        execute_complex_forward_in_place(&stage.local, active.as_mut_slice(), fft_scratch)?;
+        execute_complex_forward_in_place(
+            &stage.local,
+            stage.output.as_ref(),
+            stage.axis,
+            active.as_mut_slice(),
+            fft_scratch,
+            line_buffer,
+        )?;
     }
     Ok(())
 }
@@ -1829,6 +2351,7 @@ fn execute_inverse_in_place<R: FftReal, const N: usize, const M: usize>(
     array: &mut ManyPencilArray<Complex<R>, N, M>,
     transpose: &mut TransposeWorkspace<Complex<R>>,
     fft_scratch: &mut [Complex<R>],
+    line_buffer: &mut [Complex<R>],
     normalize_inverse: bool,
 ) -> Result<(), FftError>
 where
@@ -1840,8 +2363,11 @@ where
         let mut active = array.active_view_mut().map_err(FftError::Array)?;
         execute_complex_reverse_in_place(
             &stage.local,
+            stage.input.as_ref(),
+            stage.axis,
             active.as_mut_slice(),
             fft_scratch,
+            line_buffer,
             normalize_inverse,
         )?;
     }
@@ -1852,8 +2378,11 @@ where
         let mut active = array.active_view_mut().map_err(FftError::Array)?;
         execute_complex_reverse_in_place(
             &stage.local,
+            stage.input.as_ref(),
+            stage.axis,
             active.as_mut_slice(),
             fft_scratch,
+            line_buffer,
             normalize_inverse,
         )?;
     }
@@ -1886,6 +2415,7 @@ fn execute_transition<T: Equivalence + Copy + Clone, const N: usize, const M: us
     workspace: &mut TransposeWorkspace<T>,
 ) -> Result<(), FftError> {
     match transition {
+        C2cTransition::Identity => Ok(()),
         C2cTransition::Local(plan) => {
             plan.execute_in_place_with_transpose_workspace(intermediate, workspace)
                 .expect("distributed C2C local transition was preflighted");
@@ -1905,7 +2435,7 @@ fn descriptor_len<const N: usize, const M: usize>(extra_shape: &ExtraShape) -> O
         .checked_add(3)?
         .checked_add(extra_shape.dimensions().len())?
         .checked_add(N)?
-        .checked_add(1)
+        .checked_add(2)
 }
 
 fn build_descriptor<R: FftReal, const N: usize, const M: usize>(
@@ -1914,7 +2444,7 @@ fn build_descriptor<R: FftReal, const N: usize, const M: usize>(
     extra_shape: &ExtraShape,
     selection: AxisSelection<N>,
     value_kind: u64,
-    method: TransposeMethod,
+    layout: DistributedLayout,
 ) -> Result<Vec<u64>, ()> {
     let length = descriptor_len::<N, M>(extra_shape).ok_or(())?;
     let mut descriptor = Vec::new();
@@ -1925,7 +2455,8 @@ fn build_descriptor<R: FftReal, const N: usize, const M: usize>(
     descriptor.extend(selection.mask().iter().map(|&selected| u64::from(selected)));
     descriptor.push(value_kind);
     descriptor.push(u64::try_from(size_of::<R>()).map_err(|_| ())?);
-    descriptor.push(method.descriptor_word());
+    descriptor.push(layout.transpose_method.descriptor_word());
+    descriptor.push(u64::from(layout.permute_dims));
     if descriptor.len() != length {
         return Err(());
     }
@@ -2184,14 +2715,16 @@ mod tests {
     use super::{
         C2cInPlaceArray, C2cInPlaceWorkspace, C2cPlan, C2cState, C2cTransition, Complex, Direction,
         ExtraShape, FftError, LocalC2cError, LocalC2cPlan, OPERATION_BACKWARD,
-        OPERATION_BACKWARD_IN_PLACE, OPERATION_FORWARD, OPERATION_FORWARD_IN_PLACE,
-        OPERATION_INVERSE, OPERATION_INVERSE_IN_PLACE, OPERATION_PLAN, OPERATION_R2C_BACKWARD,
-        OPERATION_R2C_BACKWARD_IN_PLACE, OPERATION_R2C_FORWARD, OPERATION_R2C_FORWARD_IN_PLACE,
-        OPERATION_R2C_INVERSE, OPERATION_R2C_INVERSE_IN_PLACE, OPERATION_R2C_PLAN,
-        OPERATION_R2R_BACKWARD, OPERATION_R2R_BACKWARD_IN_PLACE, OPERATION_R2R_FORWARD,
-        OPERATION_R2R_FORWARD_IN_PLACE, OPERATION_R2R_INVERSE, OPERATION_R2R_INVERSE_IN_PLACE,
-        OPERATION_R2R_PLAN, R2cError, R2cPlan, TransposeMethod, descriptor_len,
-        run_in_place_transaction,
+        OPERATION_BACKWARD_IN_PLACE, OPERATION_DHT_BACKWARD, OPERATION_DHT_BACKWARD_IN_PLACE,
+        OPERATION_DHT_FORWARD, OPERATION_DHT_FORWARD_IN_PLACE, OPERATION_DHT_INVERSE,
+        OPERATION_DHT_INVERSE_IN_PLACE, OPERATION_DHT_PLAN, OPERATION_FORWARD,
+        OPERATION_FORWARD_IN_PLACE, OPERATION_INVERSE, OPERATION_INVERSE_IN_PLACE, OPERATION_PLAN,
+        OPERATION_R2C_BACKWARD, OPERATION_R2C_BACKWARD_IN_PLACE, OPERATION_R2C_FORWARD,
+        OPERATION_R2C_FORWARD_IN_PLACE, OPERATION_R2C_INVERSE, OPERATION_R2C_INVERSE_IN_PLACE,
+        OPERATION_R2C_PLAN, OPERATION_R2R_BACKWARD, OPERATION_R2R_BACKWARD_IN_PLACE,
+        OPERATION_R2R_FORWARD, OPERATION_R2R_FORWARD_IN_PLACE, OPERATION_R2R_INVERSE,
+        OPERATION_R2R_INVERSE_IN_PLACE, OPERATION_R2R_PLAN, R2cError, R2cPlan, TransposeMethod,
+        descriptor_len, run_in_place_transaction,
     };
     use crate::{AxisSelection, R2cState};
     use mpi::topology::Communicator;
@@ -2218,8 +2751,8 @@ mod tests {
         );
         let scalar_len = descriptor_len::<2, 1>(&ExtraShape::scalar()).unwrap();
         let batched_len = descriptor_len::<4, 2>(&ExtraShape::new([2, 3]).unwrap()).unwrap();
-        assert_eq!(scalar_len, 9);
-        assert_eq!(batched_len, 16);
+        assert_eq!(scalar_len, 10);
+        assert_eq!(batched_len, 17);
         assert_eq!(
             batched_len - descriptor_len::<4, 2>(&ExtraShape::scalar()).unwrap(),
             2,
@@ -2275,6 +2808,18 @@ mod tests {
                 OPERATION_R2C_BACKWARD_IN_PLACE,
             ),
             (25, 26, 27)
+        );
+        assert_eq!(
+            (
+                OPERATION_DHT_PLAN,
+                OPERATION_DHT_FORWARD,
+                OPERATION_DHT_INVERSE,
+                OPERATION_DHT_BACKWARD,
+                OPERATION_DHT_FORWARD_IN_PLACE,
+                OPERATION_DHT_INVERSE_IN_PLACE,
+                OPERATION_DHT_BACKWARD_IN_PLACE,
+            ),
+            (28, 29, 30, 31, 32, 33, 34)
         );
     }
 
@@ -2365,6 +2910,7 @@ mod tests {
                     core: Arc::clone(&plan.core),
                     transpose: TransposeWorkspace::from_vecs(Vec::new(), Vec::new()),
                     fft_scratch: Vec::new(),
+                    line_buffer: Vec::new(),
                 };
                 let short_array_before = format!("{short_array:?}");
                 let short_workspace_before = format!("{short_workspace:?}");

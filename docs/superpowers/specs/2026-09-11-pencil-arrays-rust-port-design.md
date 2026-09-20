@@ -1,7 +1,7 @@
 # PencilArrays / PencilFFTs Rust移植 設計仕様
 
 日付: 2026-09-11  
-状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R out/in-place（raw backward含む）、local R2R、AxisSelection付きAlltoallv/P2P分散C2C FFT out/in-place、AxisSelection付き分散R2C/C2R out/in-place（raw backward含む）、分散R2R out/in-place、Julia format-5交差検証fixture（52 fixture、82 layout）は実装済み。
+状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R out/in-place（raw backward含む）、local R2R、AxisSelection付きAlltoallv/P2P分散C2C FFT out/in-place、AxisSelection付き分散R2C/C2R out/in-place（raw backward含む）、分散R2R/DHT out/in-place、Julia format-6交差検証fixture（68 fixture、110 layout/policy、両方で220）は実装済み。
 対象: CPU + MPIによる任意次元分散配列基盤と分散FFT基盤
 
 ## 1. 参照実装
@@ -2221,8 +2221,8 @@ transport/backend abstractionは行わない。
 #### Milestone 7第四PR追補（distributed C2C raw backward）
 
 既存route、Alltoallv/PointToPoint transition pair、workspace、in-place transactionを共有し、
-`C2cPlan::backward`と`backward_in_place`を追加する。両APIはreversed output layoutを
-source、canonical input layoutをdestinationとし、正符号の無正規化local backwardを全stageで
+`C2cPlan::backward`と`backward_in_place`を追加する。両APIはdefaultではreversed output layoutを
+source（明示layoutではそのpolicy）、canonical input layoutをdestinationとし、正符号の無正規化local backwardを全stageで
 呼ぶ。`inverse`は従来どおり各stageで正規化し、raw forward/backward roundtripだけが
 selected spatial extentの積（identity軸とextra dimensionsを除く）を掛ける。
 
@@ -2236,7 +2236,7 @@ R2C API、endpoint policy、projection、数理は変えない。
 
 独立positive-sign DFT、raw scaling、両transport、f32/f64、N/M、extra/zero batch、empty
 local、reordered communicator、OOP/IP、descriptor rejection、post-start poisoningを既存
-MPI suiteとunit transaction testで確認する。Julia/FFTWのformat 5はcanonical
+MPI suiteとunit transaction testで確認する。Julia/FFTWのformat 6はcanonical
 `selected_axes`、`element_kind`、`axis_kinds` metadataを持つ。C2C、R2C、R2Rすべてに
 `backward_expected`を持ち、R2Rはpaired kindのraw resultとする。
 
@@ -2336,12 +2336,14 @@ this API.
 ### Milestone 9: 交差検証と性能評価
 
 Julia/FFTW cross-validation tooling is implemented as an opt-in local check;
-its canonical command, locked Julia environment, exactly 52 temporary
-format-5 fixtures and 82 case/layout combinations per method and rank are
-documented in [`tools/fftw-reference/README.md`](../../../tools/fftw-reference/README.md).
-It validates distributed C2C, R2C/C2R, and R2R forward/inverse/raw backward
-through both out-of-place and single-allocation real in-place paths without
-changing production tolerances, CI, or checked-in numeric data.
+its canonical command, locked Julia environment, exactly 68 temporary
+format-6 fixtures and 110 case/layout combinations per transpose method and
+memory-layout policy (220 with both policies) are documented in
+[`tools/fftw-reference/README.md`](../../../tools/fftw-reference/README.md).
+It validates distributed C2C, R2C/C2R, R2R, and DHT forward/inverse/raw
+backward through both out-of-place and single-allocation real in-place paths,
+with both layout policies, without changing production tolerances, CI, or
+checked-in numeric data.
 
 - Julia reference driver
 - MPI test matrix

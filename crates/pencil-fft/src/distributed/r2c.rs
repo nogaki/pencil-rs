@@ -1,12 +1,14 @@
 //! Distributed real-to-half-complex and half-complex-to-real transforms.
 
+#![allow(clippy::too_many_arguments)]
+
 use std::{
     cmp::Ordering,
     mem::{align_of, size_of},
     sync::Arc,
 };
 
-use bytemuck::{allocation::try_cast_vec, try_cast_slice};
+use bytemuck::{allocation::try_cast_vec, try_cast_slice, try_cast_slice_mut};
 #[cfg(test)]
 use mpi::topology::Communicator;
 use mpi::{
@@ -19,16 +21,19 @@ use pencil_array::{
 };
 
 use super::{
-    AxisSelection, DESCRIPTOR_SCHEMA, Direction, FftError, INVALID_WORD, LocalTransform,
-    OPERATION_R2C_BACKWARD, OPERATION_R2C_BACKWARD_IN_PLACE, OPERATION_R2C_FORWARD,
+    AxisSelection, DESCRIPTOR_SCHEMA, Direction, DistributedLayout, FftError, INVALID_WORD,
+    LocalTransform, OPERATION_R2C_BACKWARD, OPERATION_R2C_BACKWARD_IN_PLACE, OPERATION_R2C_FORWARD,
     OPERATION_R2C_FORWARD_IN_PLACE, OPERATION_R2C_INVERSE, OPERATION_R2C_INVERSE_IN_PLACE,
     OPERATION_R2C_PLAN, R2cError, StagePreparation, TransformPlanCore, TransformStage,
     TransposeMethod, VALUE_KIND_R2C, agree_execution_descriptor_ref, agree_header, agree_result,
     build_descriptor, build_route, build_transitions, collective_valid, descriptor_len,
     initialized_vec, map_array_allocation, prepare_complex_stage, registered_stage_pencils,
-    validate_out_of_place, validate_workspace_lengths_values, zero_complex,
+    strided_complex_line_len, validate_out_of_place, validate_workspace_lengths_values,
+    zero_complex,
 };
-use crate::{Complex, FftReal, LocalR2cError, LocalR2cPlan, R2cState};
+#[cfg(test)]
+use crate::LocalR2cError;
+use crate::{Complex, FftReal, LocalR2cPlan, R2cState};
 
 /// An immutable, checked distributed real-to-half-complex FFT plan.
 ///
@@ -39,8 +44,9 @@ use crate::{Complex, FftReal, LocalR2cError, LocalR2cPlan, R2cState};
 /// lower axes are complex stages and unselected axes are identity stages. The
 /// route still contains all `N` stages and `N - 1` transitions, including
 /// real-prefix transposes before a non-last boundary. The final output uses
-/// decomposition `[1..=M]` and reversed spatial memory order. Empty selections
-/// are collectively rejected before native planning.
+/// decomposition `[1..=M]`; memory order is reversed by default and remains
+/// identity when `layout.permute_dims` is false. Empty selections are
+/// collectively rejected before native planning.
 ///
 /// Constructors and `forward`/`inverse`/`backward` are collective. Every rank must use
 /// the same communicator context, API and call order, scalar type, transport
@@ -178,7 +184,7 @@ use crate::{Complex, FftReal, LocalR2cError, LocalR2cPlan, R2cState};
 ///
 /// ```
 /// use std::sync::Arc;
-/// use mpi::datatype::Equivalence;
+/// use mpi::{datatype::Equivalence, topology::Communicator};
 /// use pencil_array::{ExtraShape, MpiTopology};
 /// use pencil_fft::{Complex, FftReal, R2cPlan};
 ///
@@ -212,8 +218,10 @@ pub struct R2cWorkspace<R: FftReal, const N: usize, const M: usize> {
     real_intermediate: Option<ManyPencilArray<R, N, M>>,
     real_transpose: Option<TransposeWorkspace<R>>,
     fft_scratch: Vec<Complex<R>>,
+    real_source_line: Option<Vec<R>>,
     real_line: Vec<R>,
     complex_line: Vec<Complex<R>>,
+    complex_strided_line: Vec<Complex<R>>,
 }
 
 #[allow(dead_code)]
@@ -267,10 +275,11 @@ pub struct R2cInPlaceWorkspace<R: FftReal, const N: usize, const M: usize> {
     transpose: TransposeWorkspace<Complex<R>>,
     real_transpose: Option<TransposeWorkspace<R>>,
     fft_scratch: Vec<Complex<R>>,
-    real_source_line: Vec<R>,
+    real_source_line: Option<Vec<R>>,
     real_line: Vec<R>,
     complex_source_line: Vec<Complex<R>>,
     complex_line: Vec<Complex<R>>,
+    complex_strided_line: Vec<Complex<R>>,
 }
 
 impl<R: FftReal, const N: usize, const M: usize> R2cPlan<R, N, M>
@@ -282,11 +291,11 @@ where
         input: Arc<Pencil<N, M>>,
         extra_shape: ExtraShape,
     ) -> Result<Self, R2cError> {
-        Self::from_pencil_with_selection_and_method(
+        Self::from_pencil_with_selection_and_layout(
             input,
             extra_shape,
             AxisSelection::all(),
-            TransposeMethod::AllToAllv,
+            DistributedLayout::default(),
         )
     }
 
@@ -296,11 +305,11 @@ where
         extra_shape: ExtraShape,
         selection: AxisSelection<N>,
     ) -> Result<Self, R2cError> {
-        Self::from_pencil_with_selection_and_method(
+        Self::from_pencil_with_selection_and_layout(
             input,
             extra_shape,
             selection,
-            TransposeMethod::AllToAllv,
+            DistributedLayout::default(),
         )
     }
 
@@ -311,6 +320,38 @@ where
         selection: AxisSelection<N>,
         method: TransposeMethod,
     ) -> Result<Self, R2cError> {
+        Self::from_pencil_with_selection_and_layout(
+            input,
+            extra_shape,
+            selection,
+            DistributedLayout {
+                transpose_method: method,
+                ..DistributedLayout::default()
+            },
+        )
+    }
+
+    /// Collectively builds a plan with an explicit transport and layout policy.
+    pub fn from_pencil_with_layout(
+        input: Arc<Pencil<N, M>>,
+        extra_shape: ExtraShape,
+        layout: DistributedLayout,
+    ) -> Result<Self, R2cError> {
+        Self::from_pencil_with_selection_and_layout(
+            input,
+            extra_shape,
+            AxisSelection::all(),
+            layout,
+        )
+    }
+
+    /// Collectively builds a plan for a validated selection and layout policy.
+    pub fn from_pencil_with_selection_and_layout(
+        input: Arc<Pencil<N, M>>,
+        extra_shape: ExtraShape,
+        selection: AxisSelection<N>,
+        layout: DistributedLayout,
+    ) -> Result<Self, R2cError> {
         let topology = Arc::clone(input.topology());
         let global_shape = *input.global_shape();
         Self::construct(
@@ -319,7 +360,7 @@ where
             extra_shape,
             Ok(input),
             selection,
-            method,
+            layout,
         )
     }
 
@@ -329,20 +370,23 @@ where
         extra_shape: ExtraShape,
         method: TransposeMethod,
     ) -> Result<Self, R2cError> {
-        Self::from_pencil_with_selection_and_method(
+        Self::from_pencil_with_selection_and_layout(
             input,
             extra_shape,
             AxisSelection::all(),
-            method,
+            DistributedLayout {
+                transpose_method: method,
+                ..DistributedLayout::default()
+            },
         )
     }
 
     /// Collectively builds an Alltoallv plan from a canonical real array.
     pub fn from_array(input: &PencilArray<R, N, M>) -> Result<Self, R2cError> {
-        Self::from_array_with_selection_and_method(
+        Self::from_array_with_selection_and_layout(
             input,
             AxisSelection::all(),
-            TransposeMethod::AllToAllv,
+            DistributedLayout::default(),
         )
     }
 
@@ -351,7 +395,7 @@ where
         input: &PencilArray<R, N, M>,
         selection: AxisSelection<N>,
     ) -> Result<Self, R2cError> {
-        Self::from_array_with_selection_and_method(input, selection, TransposeMethod::AllToAllv)
+        Self::from_array_with_selection_and_layout(input, selection, DistributedLayout::default())
     }
 
     /// Collectively builds a plan from a canonical real array and selection.
@@ -359,6 +403,30 @@ where
         input: &PencilArray<R, N, M>,
         selection: AxisSelection<N>,
         method: TransposeMethod,
+    ) -> Result<Self, R2cError> {
+        Self::from_array_with_selection_and_layout(
+            input,
+            selection,
+            DistributedLayout {
+                transpose_method: method,
+                ..DistributedLayout::default()
+            },
+        )
+    }
+
+    /// Collectively builds a plan with an explicit transport and layout policy.
+    pub fn from_array_with_layout(
+        input: &PencilArray<R, N, M>,
+        layout: DistributedLayout,
+    ) -> Result<Self, R2cError> {
+        Self::from_array_with_selection_and_layout(input, AxisSelection::all(), layout)
+    }
+
+    /// Collectively builds a plan for a validated selection and layout policy.
+    pub fn from_array_with_selection_and_layout(
+        input: &PencilArray<R, N, M>,
+        selection: AxisSelection<N>,
+        layout: DistributedLayout,
     ) -> Result<Self, R2cError> {
         let topology = Arc::clone(input.pencil().topology());
         let global_shape = *input.pencil().global_shape();
@@ -368,7 +436,7 @@ where
             input.extra_shape().clone(),
             Ok(Arc::clone(input.pencil())),
             selection,
-            method,
+            layout,
         )
     }
 
@@ -377,7 +445,14 @@ where
         input: &PencilArray<R, N, M>,
         method: TransposeMethod,
     ) -> Result<Self, R2cError> {
-        Self::from_array_with_selection_and_method(input, AxisSelection::all(), method)
+        Self::from_array_with_selection_and_layout(
+            input,
+            AxisSelection::all(),
+            DistributedLayout {
+                transpose_method: method,
+                ..DistributedLayout::default()
+            },
+        )
     }
 
     /// Collectively builds an Alltoallv plan from topology and shape.
@@ -386,12 +461,12 @@ where
         global_shape: [usize; N],
         extra_shape: ExtraShape,
     ) -> Result<Self, R2cError> {
-        Self::from_shape_with_selection_and_method(
+        Self::from_shape_with_selection_and_layout(
             topology,
             global_shape,
             extra_shape,
             AxisSelection::all(),
-            TransposeMethod::AllToAllv,
+            DistributedLayout::default(),
         )
     }
 
@@ -403,12 +478,15 @@ where
         extra_shape: ExtraShape,
         method: TransposeMethod,
     ) -> Result<Self, R2cError> {
-        Self::from_shape_with_selection_and_method(
+        Self::from_shape_with_selection_and_layout(
             topology,
             global_shape,
             extra_shape,
             AxisSelection::all(),
-            method,
+            DistributedLayout {
+                transpose_method: method,
+                ..DistributedLayout::default()
+            },
         )
     }
 
@@ -419,12 +497,12 @@ where
         extra_shape: ExtraShape,
         selection: AxisSelection<N>,
     ) -> Result<Self, R2cError> {
-        Self::from_shape_with_selection_and_method(
+        Self::from_shape_with_selection_and_layout(
             topology,
             global_shape,
             extra_shape,
             selection,
-            TransposeMethod::AllToAllv,
+            DistributedLayout::default(),
         )
     }
 
@@ -435,6 +513,42 @@ where
         extra_shape: ExtraShape,
         selection: AxisSelection<N>,
         method: TransposeMethod,
+    ) -> Result<Self, R2cError> {
+        Self::from_shape_with_selection_and_layout(
+            topology,
+            global_shape,
+            extra_shape,
+            selection,
+            DistributedLayout {
+                transpose_method: method,
+                ..DistributedLayout::default()
+            },
+        )
+    }
+
+    /// Collectively builds a plan with an explicit transport and layout policy.
+    pub fn from_shape_with_layout(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        layout: DistributedLayout,
+    ) -> Result<Self, R2cError> {
+        Self::from_shape_with_selection_and_layout(
+            topology,
+            global_shape,
+            extra_shape,
+            AxisSelection::all(),
+            layout,
+        )
+    }
+
+    /// Collectively builds a plan for a validated selection and layout policy.
+    pub fn from_shape_with_selection_and_layout(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        selection: AxisSelection<N>,
+        layout: DistributedLayout,
     ) -> Result<Self, R2cError> {
         let input = Pencil::new(
             Arc::clone(&topology),
@@ -448,7 +562,7 @@ where
             extra_shape,
             input,
             selection,
-            method,
+            layout,
         )
     }
 
@@ -470,6 +584,11 @@ where
     /// Returns the exact extra shape required by this plan.
     pub fn extra_shape(&self) -> &ExtraShape {
         &self.core.extra_shape
+    }
+
+    /// Returns the transport and memory-layout policy used by this plan.
+    pub fn layout(&self) -> DistributedLayout {
+        self.core.layout
     }
 
     /// Allocates a zero-initialized local real input array.
@@ -532,8 +651,19 @@ where
             ))
         };
         let fft_scratch = initialized_vec(self.core.fft_scratch_len, zero_complex::<R>())?;
+        let boundary_stride = super::memory_stride(
+            self.core.stages[boundary].input.as_ref(),
+            self.core.stages[boundary].axis,
+        )?;
+        let real_source_line = if boundary_stride > 1 {
+            Some(initialized_vec(real_len, R::zero())?)
+        } else {
+            None
+        };
         let real_line = initialized_vec(real_len, R::zero())?;
         let complex_line = initialized_vec(complex_len, zero_complex::<R>())?;
+        let complex_strided_line =
+            initialized_vec(self.core.strided_line_len, zero_complex::<R>())?;
         Ok(R2cWorkspace {
             core: Arc::clone(&self.core),
             intermediate,
@@ -541,8 +671,10 @@ where
             real_intermediate,
             real_transpose,
             fft_scratch,
+            real_source_line,
             real_line,
             complex_line,
+            complex_strided_line,
         })
     }
 
@@ -608,6 +740,10 @@ where
                 initialized_vec(self.core.real_transpose_receive_len, R::zero())?,
             ))
         };
+        let boundary_stride = super::memory_stride(
+            self.core.stages[boundary].input.as_ref(),
+            self.core.stages[boundary].axis,
+        )?;
         Ok(R2cInPlaceWorkspace {
             core: Arc::clone(&self.core),
             transpose: TransposeWorkspace::from_vecs(
@@ -616,10 +752,15 @@ where
             ),
             real_transpose,
             fft_scratch: initialized_vec(self.core.fft_scratch_len, zero_complex::<R>())?,
-            real_source_line: initialized_vec(real_len, R::zero())?,
+            real_source_line: if boundary_stride > 1 {
+                Some(initialized_vec(real_len, R::zero())?)
+            } else {
+                None
+            },
             real_line: initialized_vec(real_len, R::zero())?,
             complex_source_line: initialized_vec(complex_len, zero_complex::<R>())?,
             complex_line: initialized_vec(complex_len, zero_complex::<R>())?,
+            complex_strided_line: initialized_vec(self.core.strided_line_len, zero_complex::<R>())?,
         })
     }
 
@@ -724,7 +865,7 @@ where
         extra_shape: ExtraShape,
         input: Result<Arc<Pencil<N, M>>, FftError>,
         selection: AxisSelection<N>,
-        method: TransposeMethod,
+        layout: DistributedLayout,
     ) -> Result<Self, R2cError> {
         let communicator = topology.communicator();
         let expected_len = descriptor_len::<N, M>(&extra_shape);
@@ -735,7 +876,7 @@ where
                 &extra_shape,
                 selection,
                 VALUE_KIND_R2C,
-                method,
+                layout,
             )
             .ok()
         });
@@ -778,7 +919,12 @@ where
 
         let original_route = agree_result(
             communicator,
-            build_route(Ok(Arc::clone(&input_pencil)), &topology, global_shape),
+            build_route(
+                Ok(Arc::clone(&input_pencil)),
+                &topology,
+                global_shape,
+                layout.permute_dims,
+            ),
         )?;
         let reduced_input = Pencil::new(
             Arc::clone(&topology),
@@ -789,7 +935,12 @@ where
         let reduced_input = agree_result(communicator, reduced_input)?;
         let reduced_route = agree_result(
             communicator,
-            build_route(Ok(Arc::clone(&reduced_input)), &topology, reduced_shape),
+            build_route(
+                Ok(Arc::clone(&reduced_input)),
+                &topology,
+                reduced_shape,
+                layout.permute_dims,
+            ),
         )?;
         let stages = agree_result(
             communicator,
@@ -836,17 +987,27 @@ where
             &stages,
             &distributed,
             &extra_shape,
-            method,
+            layout.transpose_method,
             boundary,
         )?;
+        let mut strided_line_len = strided_complex_line_len(&stages.stages)?;
+        let boundary_stride = super::memory_stride(
+            stages.stages[boundary].input.as_ref(),
+            stages.stages[boundary].axis,
+        )?;
+        if boundary_stride > 1 {
+            strided_line_len = strided_line_len.max(complex_len);
+        }
         let core = TransformPlanCore {
             stages: stages.stages,
             transitions: transitions.into_boxed_slice(),
             extra_shape,
             selection,
+            layout,
             real_stage_index: Some(boundary),
             descriptor: descriptor.into_boxed_slice(),
             fft_scratch_len: stages.fft_scratch_len,
+            strided_line_len,
             transpose_send_len,
             transpose_receive_len,
             real_transpose_send_len,
@@ -885,17 +1046,17 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
             }
             Ordering::Equal => {
                 let pencil = &original_route.stages[index];
-                if pencil.permutation().axes()[N - 1].index() != reduction_axis
-                    || pencil
-                        .decomposition()
-                        .iter()
-                        .any(|distributed| distributed.index() == reduction_axis)
+                if pencil
+                    .decomposition()
+                    .iter()
+                    .any(|distributed| distributed.index() == reduction_axis)
                     || pencil.local_shape_logical()[reduction_axis] != real_len
                 {
                     return Err(R2cError::Fft(FftError::PreparationFailed));
                 }
                 let real = LocalR2cPlan::new(real_len).map_err(R2cError::LocalR2c)?;
                 TransformStage {
+                    axis: reduction_axis,
                     input: Arc::clone(&original_route.stages[index]),
                     output: Arc::clone(&reduced_route.stages[index]),
                     local: LocalTransform::RealComplex(real),
@@ -917,19 +1078,177 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn execute_strided_real_forward<R: FftReal, const N: usize, const M: usize>(
+    plan: &LocalR2cPlan<R>,
+    pencil: &Pencil<N, M>,
+    axis: usize,
+    source: &[R],
+    destination: &mut [Complex<R>],
+    real_source_line: &mut [R],
+    real_line: &mut [R],
+    complex_line: &mut [Complex<R>],
+    scratch: &mut [Complex<R>],
+) -> Result<(), R2cError>
+where
+    Complex<R>: Equivalence,
+{
+    let stride = super::memory_stride(pencil, axis)?;
+    if stride <= 1 {
+        return plan
+            .forward(source, destination, real_line, scratch)
+            .map_err(R2cError::LocalR2c);
+    }
+    if real_source_line.len() < plan.real_len() || complex_line.len() < plan.complex_len() {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "real/complex line",
+            required: plan.real_len().max(plan.complex_len()),
+            actual: real_source_line.len().min(complex_line.len()),
+        }
+        .into());
+    }
+    let count =
+        super::strided_line_count(source.len(), plan.real_len(), stride).map_err(R2cError::Fft)?;
+    let destination_len = count
+        .checked_mul(plan.complex_len())
+        .and_then(|value| value.checked_mul(stride))
+        .ok_or(FftError::PreparationFailed)?;
+    if destination.len() != destination_len {
+        return Err(FftError::PreparationFailed.into());
+    }
+    let source_block = plan
+        .real_len()
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
+    let destination_block = plan
+        .complex_len()
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
+    for outer in 0..count {
+        let source_base = outer
+            .checked_mul(source_block)
+            .ok_or(FftError::PreparationFailed)?;
+        let destination_base = outer
+            .checked_mul(destination_block)
+            .ok_or(FftError::PreparationFailed)?;
+        for inner in 0..stride {
+            for k in 0..plan.real_len() {
+                real_source_line[k] = source[source_base + k * stride + inner];
+            }
+            plan.forward(
+                &real_source_line[..plan.real_len()],
+                &mut complex_line[..plan.complex_len()],
+                real_line,
+                scratch,
+            )
+            .map_err(R2cError::LocalR2c)?;
+            for k in 0..plan.complex_len() {
+                destination[destination_base + k * stride + inner] = complex_line[k];
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_strided_real_reverse<R: FftReal, const N: usize, const M: usize>(
+    plan: &LocalR2cPlan<R>,
+    pencil: &Pencil<N, M>,
+    axis: usize,
+    source: &[Complex<R>],
+    destination: &mut [R],
+    complex_source_line: &mut [Complex<R>],
+    complex_line: &mut [Complex<R>],
+    real_line: &mut [R],
+    scratch: &mut [Complex<R>],
+    normalize: bool,
+) -> Result<(), R2cError>
+where
+    Complex<R>: Equivalence,
+{
+    let stride = super::memory_stride(pencil, axis)?;
+    if stride <= 1 {
+        return if normalize {
+            plan.inverse(source, destination, complex_line, scratch)
+        } else {
+            plan.backward(source, destination, complex_line, scratch)
+        }
+        .map_err(R2cError::LocalR2c);
+    }
+    if complex_source_line.len() < plan.complex_len() || real_line.len() < plan.real_len() {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "complex/real line",
+            required: plan.real_len().max(plan.complex_len()),
+            actual: complex_source_line.len().min(real_line.len()),
+        }
+        .into());
+    }
+    let count = super::strided_line_count(source.len(), plan.complex_len(), stride)
+        .map_err(R2cError::Fft)?;
+    let destination_len = count
+        .checked_mul(plan.real_len())
+        .and_then(|value| value.checked_mul(stride))
+        .ok_or(FftError::PreparationFailed)?;
+    if destination.len() != destination_len {
+        return Err(FftError::PreparationFailed.into());
+    }
+    let source_block = plan
+        .complex_len()
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
+    let destination_block = plan
+        .real_len()
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
+    for outer in 0..count {
+        let source_base = outer
+            .checked_mul(source_block)
+            .ok_or(FftError::PreparationFailed)?;
+        let destination_base = outer
+            .checked_mul(destination_block)
+            .ok_or(FftError::PreparationFailed)?;
+        for inner in 0..stride {
+            for k in 0..plan.complex_len() {
+                complex_source_line[k] = source[source_base + k * stride + inner];
+            }
+            let result = if normalize {
+                plan.inverse(
+                    &complex_source_line[..plan.complex_len()],
+                    &mut real_line[..plan.real_len()],
+                    complex_line,
+                    scratch,
+                )
+            } else {
+                plan.backward(
+                    &complex_source_line[..plan.complex_len()],
+                    &mut real_line[..plan.real_len()],
+                    complex_line,
+                    scratch,
+                )
+            };
+            result.map_err(R2cError::LocalR2c)?;
+            for k in 0..plan.real_len() {
+                destination[destination_base + k * stride + inner] = real_line[k];
+            }
+        }
+    }
+    Ok(())
+}
+
 fn registered_layout_matches<R: FftReal, const N: usize, const M: usize>(
     registered: &[Arc<Pencil<N, M>>],
     stages: &[TransformStage<R, N, M>],
     use_inputs: bool,
 ) -> bool {
-    registered.len() == stages.len()
-        && registered.iter().zip(stages).all(|(registered, stage)| {
+    stages.iter().all(|stage| {
+        registered.iter().any(|registered| {
             if use_inputs {
                 registered.same_layout(stage.input.as_ref())
             } else {
                 registered.same_layout(stage.output.as_ref())
             }
         })
+    })
 }
 
 fn registered_real_stage_pencils<R: FftReal, const N: usize, const M: usize>(
@@ -944,7 +1263,14 @@ fn registered_real_stage_pencils<R: FftReal, const N: usize, const M: usize>(
     pencils
         .try_reserve_exact(count)
         .map_err(|_| FftError::AllocationFailed { required: count })?;
-    pencils.extend(stages[..count].iter().map(|stage| Arc::clone(&stage.input)));
+    for stage in &stages[..count] {
+        if !pencils
+            .iter()
+            .any(|registered: &Arc<Pencil<N, M>>| registered.same_layout(stage.input.as_ref()))
+        {
+            pencils.push(Arc::clone(&stage.input));
+        }
+    }
     Ok(pencils.into_boxed_slice())
 }
 
@@ -977,16 +1303,102 @@ fn in_place_storage_requirements<R: FftReal, const N: usize, const M: usize>(
     let complex_bytes = complex_len
         .checked_mul(size_of::<Complex<R>>())
         .ok_or(FftError::PreparationFailed)?;
-    let storage_bytes = real_bytes.max(complex_bytes);
+    let boundary_stride = super::memory_stride(
+        core.stages[boundary].input.as_ref(),
+        core.stages[boundary].axis,
+    )?;
+    let complex_size = size_of::<Complex<R>>();
+    let storage_bytes = if boundary_stride > 1 {
+        // The strided handoff promotes each real scalar to one Complex slot
+        // before outer compression.  This is the only route that needs the
+        // extra roughly-one-real-array allocation.
+        real_len
+            .max(complex_len)
+            .checked_mul(complex_size)
+            .ok_or(FftError::PreparationFailed)?
+    } else {
+        real_bytes.max(complex_bytes)
+    };
     if storage_bytes > isize::MAX as usize {
         return Err(FftError::PreparationFailed);
     }
-    let complex_size = size_of::<Complex<R>>();
     let rounded = storage_bytes
-        .checked_add(complex_size.saturating_sub(1))
+        .checked_add(
+            complex_size
+                .checked_sub(1)
+                .ok_or(FftError::PreparationFailed)?,
+        )
         .ok_or(FftError::PreparationFailed)?;
     let complex_capacity = rounded / complex_size;
     Ok((real_len, complex_len, storage_bytes, complex_capacity))
+}
+
+fn promoted_complex_len<R: FftReal, const N: usize, const M: usize>(
+    core: &TransformPlanCore<R, N, M>,
+    real_len: usize,
+    complex_len: usize,
+) -> Result<usize, FftError> {
+    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
+    let stride = super::memory_stride(
+        core.stages[boundary].input.as_ref(),
+        core.stages[boundary].axis,
+    )?;
+    if stride > 1 {
+        Ok(real_len.max(complex_len))
+    } else {
+        let real_bytes = real_len
+            .checked_mul(size_of::<R>())
+            .ok_or(FftError::PreparationFailed)?;
+        let complex_size = size_of::<Complex<R>>();
+        let rounded = real_bytes
+            .checked_add(
+                complex_size
+                    .checked_sub(1)
+                    .ok_or(FftError::PreparationFailed)?,
+            )
+            .ok_or(FftError::PreparationFailed)?
+            / complex_size;
+        Ok(rounded.max(complex_len))
+    }
+}
+
+fn strided_phase_shape<R: FftReal, const N: usize, const M: usize>(
+    core: &TransformPlanCore<R, N, M>,
+) -> Result<Option<(usize, usize, usize, usize)>, FftError> {
+    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
+    let plan = core.stages[boundary].local.real_complex();
+    let stride = super::memory_stride(
+        core.stages[boundary].input.as_ref(),
+        core.stages[boundary].axis,
+    )?;
+    if stride <= 1 {
+        return Ok(None);
+    }
+    let rows = boundary_row_count(core).map_err(|error| match error {
+        R2cError::Fft(error) => error,
+        R2cError::InvalidSpectrum => FftError::PreparationFailed,
+        R2cError::LocalR2c(_) => FftError::PreparationFailed,
+    })?;
+    if rows == 0 {
+        return Ok(Some((0, 0, 0, 0)));
+    }
+    if rows % stride != 0 {
+        return Err(FftError::PreparationFailed);
+    }
+    let groups = rows / stride;
+    let real_span = groups
+        .checked_mul(plan.real_len())
+        .and_then(|value| value.checked_mul(stride))
+        .ok_or(FftError::PreparationFailed)?;
+    let complex_span = groups
+        .checked_mul(plan.complex_len())
+        .and_then(|value| value.checked_mul(stride))
+        .ok_or(FftError::PreparationFailed)?;
+    let (real_storage_len, complex_storage_len, _, _) = in_place_storage_requirements(core)?;
+    if real_span > real_storage_len || complex_span > complex_storage_len {
+        return Err(FftError::PreparationFailed);
+    }
+    Ok(Some((rows, groups, real_span, complex_span)))
 }
 
 fn cast_complex_vec_to_real<R: FftReal>(storage: Vec<Complex<R>>) -> Result<Vec<R>, R2cError> {
@@ -1344,6 +1756,17 @@ where
         {
             return Err(FftError::StorageLayoutMismatch.into());
         }
+        // Prove every strided phase span and divisibility condition before the
+        // array is poisoned. The conversion routines contain no data-sized
+        // allocation after this point.
+        let boundary_stride = super::memory_stride(
+            self.core.stages[boundary].input.as_ref(),
+            self.core.stages[boundary].axis,
+        )?;
+        let strided = strided_phase_shape(&self.core)?;
+        if boundary_stride > 1 && strided.is_none() {
+            return Err(FftError::PreparationFailed.into());
+        }
         // Check the actual Vec length and capacity, not the requested
         // allocation size. A real Vec with an odd scalar capacity cannot be
         // recast to Complex even when its current length and total byte count
@@ -1403,12 +1826,18 @@ where
         }
 
         let (real_len, complex_len) = r2c_lengths(&self.core);
+        if boundary_stride > 1 {
+            let actual = workspace.real_source_line.as_ref().map_or(0, Vec::len);
+            if actual < real_len {
+                return Err(FftError::WorkspaceTooSmall {
+                    kind: "real source line",
+                    required: real_len,
+                    actual,
+                }
+                .into());
+            }
+        }
         for (actual, required, kind) in [
-            (
-                workspace.real_source_line.len(),
-                real_len,
-                "real source line",
-            ),
             (workspace.real_line.len(), real_len, "real line"),
             (
                 workspace.complex_source_line.len(),
@@ -1416,6 +1845,11 @@ where
                 "complex source line",
             ),
             (workspace.complex_line.len(), complex_len, "complex line"),
+            (
+                workspace.complex_strided_line.len(),
+                self.core.strided_line_len,
+                "complex line",
+            ),
         ] {
             if actual < required {
                 return Err(FftError::WorkspaceTooSmall {
@@ -1498,6 +1932,21 @@ where
             )?;
         }
         let (real_len, complex_len) = r2c_lengths(&self.core);
+        let boundary_stride = super::memory_stride(
+            self.core.stages[boundary].input.as_ref(),
+            self.core.stages[boundary].axis,
+        )?;
+        if boundary_stride > 1 {
+            let actual = workspace.real_source_line.as_ref().map_or(0, Vec::len);
+            if actual < real_len {
+                return Err(FftError::WorkspaceTooSmall {
+                    kind: "real source line",
+                    required: real_len,
+                    actual,
+                }
+                .into());
+            }
+        }
         if workspace.real_line.len() < real_len {
             return Err(FftError::WorkspaceTooSmall {
                 kind: "real line",
@@ -1511,6 +1960,14 @@ where
                 kind: "complex line",
                 required: complex_len,
                 actual: workspace.complex_line.len(),
+            }
+            .into());
+        }
+        if workspace.complex_strided_line.len() < self.core.strided_line_len {
+            return Err(FftError::WorkspaceTooSmall {
+                kind: "complex line",
+                required: self.core.strided_line_len,
+                actual: workspace.complex_strided_line.len(),
             }
             .into());
         }
@@ -1531,21 +1988,47 @@ where
     let source_view = source.view();
     if boundary == 0 {
         let stage = &core.stages[boundary];
+        let stride = super::memory_stride(stage.input.as_ref(), stage.axis)?;
         let real_line = &mut workspace.real_line;
+        let real_source_line = if stride > 1 {
+            workspace
+                .real_source_line
+                .as_mut()
+                .expect("strided R2C source line was preflighted")
+                .as_mut_slice()
+        } else {
+            &mut []
+        };
+        let complex_line = &mut workspace.complex_line;
         let fft_scratch = &mut workspace.fft_scratch;
         workspace
             .intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
-                stage
-                    .local
-                    .real_complex()
-                    .forward(
+                if stride > 1 {
+                    execute_strided_real_forward(
+                        stage.local.real_complex(),
+                        stage.input.as_ref(),
+                        stage.axis,
                         source_view.as_slice(),
                         target.as_mut_slice(),
+                        real_source_line,
                         real_line,
+                        complex_line,
                         fft_scratch,
                     )
-                    .expect("distributed R2C forward preflight validated real stage");
+                    .expect("distributed R2C strided forward was preflighted");
+                } else {
+                    stage
+                        .local
+                        .real_complex()
+                        .forward(
+                            source_view.as_slice(),
+                            target.as_mut_slice(),
+                            real_line,
+                            fft_scratch,
+                        )
+                        .expect("distributed R2C forward preflight validated real stage");
+                }
                 Ok::<_, ()>(())
             })
             .expect("distributed R2C stage-zero overwrite was preflighted");
@@ -1580,21 +2063,47 @@ where
         }
         let active = real_intermediate.active_view().map_err(FftError::Array)?;
         let stage = &core.stages[boundary];
+        let stride = super::memory_stride(stage.input.as_ref(), stage.axis)?;
         let real_line = &mut workspace.real_line;
+        let real_source_line = if stride > 1 {
+            workspace
+                .real_source_line
+                .as_mut()
+                .expect("strided R2C source line was preflighted")
+                .as_mut_slice()
+        } else {
+            &mut []
+        };
+        let complex_line = &mut workspace.complex_line;
         let fft_scratch = &mut workspace.fft_scratch;
         workspace
             .intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
-                stage
-                    .local
-                    .real_complex()
-                    .forward(
+                if stride > 1 {
+                    execute_strided_real_forward(
+                        stage.local.real_complex(),
+                        stage.input.as_ref(),
+                        stage.axis,
                         active.as_slice(),
                         target.as_mut_slice(),
+                        real_source_line,
                         real_line,
+                        complex_line,
                         fft_scratch,
                     )
-                    .expect("distributed R2C forward real boundary was preflighted");
+                    .expect("distributed R2C strided forward was preflighted");
+                } else {
+                    stage
+                        .local
+                        .real_complex()
+                        .forward(
+                            active.as_slice(),
+                            target.as_mut_slice(),
+                            real_line,
+                            fft_scratch,
+                        )
+                        .expect("distributed R2C forward real boundary was preflighted");
+                }
                 Ok::<_, ()>(())
             })
             .expect("distributed R2C boundary overwrite was preflighted");
@@ -1609,6 +2118,7 @@ where
         &mut workspace.transpose,
         destination,
         &mut workspace.fft_scratch,
+        &mut workspace.complex_strided_line,
     )?;
     Ok(())
 }
@@ -1632,6 +2142,7 @@ where
         &mut workspace.intermediate,
         &mut workspace.transpose,
         &mut workspace.fft_scratch,
+        &mut workspace.complex_strided_line,
         normalize_inverse,
     )?;
     validate_boundary(
@@ -1646,9 +2157,23 @@ where
         .intermediate
         .active_view()
         .expect("distributed R2C boundary active layout was validated");
+    let stride = super::memory_stride(stage.output.as_ref(), stage.axis)?;
     if boundary == 0 {
         let mut destination_view = destination.view_mut();
-        if normalize_inverse {
+        if stride > 1 {
+            execute_strided_real_reverse(
+                stage.local.real_complex(),
+                stage.output.as_ref(),
+                stage.axis,
+                active.as_slice(),
+                destination_view.as_mut_slice(),
+                &mut workspace.complex_strided_line,
+                &mut workspace.complex_line,
+                &mut workspace.real_line,
+                &mut workspace.fft_scratch,
+                normalize_inverse,
+            )?;
+        } else if normalize_inverse {
             stage.local.real_complex().inverse(
                 active.as_slice(),
                 destination_view.as_mut_slice(),
@@ -1672,7 +2197,20 @@ where
         .ok_or(FftError::WorkspaceMismatch)?;
     real_intermediate
         .overwrite_with(stage.input.as_ref(), |mut target| {
-            if normalize_inverse {
+            if stride > 1 {
+                execute_strided_real_reverse(
+                    stage.local.real_complex(),
+                    stage.output.as_ref(),
+                    stage.axis,
+                    active.as_slice(),
+                    target.as_mut_slice(),
+                    &mut workspace.complex_strided_line,
+                    &mut workspace.complex_line,
+                    &mut workspace.real_line,
+                    &mut workspace.fft_scratch,
+                    normalize_inverse,
+                )?;
+            } else if normalize_inverse {
                 stage.local.real_complex().inverse(
                     active.as_slice(),
                     target.as_mut_slice(),
@@ -1687,11 +2225,11 @@ where
                     &mut workspace.fft_scratch,
                 )?;
             }
-            Ok::<_, LocalR2cError>(())
+            Ok::<_, R2cError>(())
         })
         .map_err(|error| match error {
             OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
-            OverwriteError::Writer(error) => R2cError::LocalR2c(error),
+            OverwriteError::Writer(error) => error,
         })?;
     {
         let real_transpose = workspace
@@ -1721,6 +2259,21 @@ impl<R: FftReal, const N: usize, const M: usize> R2cInPlaceArray<R, N, M> {
     /// Returns the current in-place completion state.
     pub fn state(&self) -> R2cState {
         self.state
+    }
+
+    /// Returns the backing allocation capacity in bytes while it is present.
+    pub fn storage_capacity_bytes(&self) -> Option<usize> {
+        let (capacity, element_size) = match self.storage.as_ref()? {
+            R2cInPlaceStorage::Real(real) => (real.storage_capacity(), size_of::<R>()),
+            R2cInPlaceStorage::Complex(complex) => {
+                (complex.storage_capacity(), size_of::<Complex<R>>())
+            }
+            R2cInPlaceStorage::PoisonedReal(storage) => (storage.capacity(), size_of::<R>()),
+            R2cInPlaceStorage::PoisonedComplex(storage) => {
+                (storage.capacity(), size_of::<Complex<R>>())
+            }
+        };
+        capacity.checked_mul(element_size)
     }
 
     /// Borrows the active real input view.
@@ -1844,8 +2397,11 @@ where
         let mut active = complex.active_view_mut().map_err(FftError::Array)?;
         super::execute_complex_forward_in_place(
             &stage.local,
+            stage.output.as_ref(),
+            stage.axis,
             active.as_mut_slice(),
             &mut workspace.fft_scratch,
+            &mut workspace.complex_strided_line,
         )?;
     }
     let output = core
@@ -1892,8 +2448,11 @@ where
             let mut active = complex.active_view_mut().map_err(FftError::Array)?;
             super::execute_complex_reverse_in_place(
                 &stage.local,
+                stage.input.as_ref(),
+                stage.axis,
                 active.as_mut_slice(),
                 &mut workspace.fft_scratch,
+                &mut workspace.complex_strided_line,
                 normalize_inverse,
             )?;
         }
@@ -1908,8 +2467,11 @@ where
                 let mut active = complex.active_view_mut().map_err(FftError::Array)?;
                 super::execute_complex_reverse_in_place(
                     &stage.local,
+                    stage.input.as_ref(),
+                    stage.axis,
                     active.as_mut_slice(),
                     &mut workspace.fft_scratch,
+                    &mut workspace.complex_strided_line,
                     normalize_inverse,
                 )?;
             }
@@ -1962,6 +2524,96 @@ where
     Ok(())
 }
 
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+fn convert_strided_real_storage<R: FftReal, const N: usize, const M: usize>(
+    storage: &mut [Complex<R>],
+    plan: &LocalR2cPlan<R>,
+    rows: usize,
+    real_len: usize,
+    complex_len: usize,
+    stride: usize,
+    workspace: &mut R2cInPlaceWorkspace<R, N, M>,
+) -> Result<(), R2cError>
+where
+    Complex<R>: Equivalence,
+{
+    if stride <= 1 {
+        return Err(FftError::PreparationFailed.into());
+    }
+    if rows == 0 {
+        return Ok(());
+    }
+    if rows % stride != 0 {
+        return Err(FftError::PreparationFailed.into());
+    }
+    let groups = rows / stride;
+    let source_span = groups
+        .checked_mul(real_len)
+        .and_then(|value| value.checked_mul(stride))
+        .ok_or(FftError::PreparationFailed)?;
+    let destination_span = groups
+        .checked_mul(complex_len)
+        .and_then(|value| value.checked_mul(stride))
+        .ok_or(FftError::PreparationFailed)?;
+    if source_span > storage.len() || destination_span > storage.len() {
+        return Err(FftError::StorageLayoutMismatch.into());
+    }
+    let real_source_line = workspace
+        .real_source_line
+        .as_mut()
+        .ok_or(FftError::WorkspaceMismatch)?;
+    if real_source_line.len() < real_len
+        || workspace.real_line.len() < real_len
+        || workspace.complex_line.len() < complex_len
+    {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "real/complex line",
+            required: real_len.max(complex_len),
+            actual: real_source_line
+                .len()
+                .min(workspace.real_line.len())
+                .min(workspace.complex_line.len()),
+        }
+        .into());
+    }
+    let real_line = &mut workspace.real_line;
+    let complex_line = &mut workspace.complex_line;
+    for outer in 0..groups {
+        let source_base = outer
+            .checked_mul(real_len)
+            .and_then(|value| value.checked_mul(stride))
+            .ok_or(FftError::PreparationFailed)?;
+        let destination_base = outer
+            .checked_mul(complex_len)
+            .and_then(|value| value.checked_mul(stride))
+            .ok_or(FftError::PreparationFailed)?;
+        for inner in 0..stride {
+            for j in 0..real_len {
+                let index = source_base
+                    .checked_add(j.checked_mul(stride).ok_or(FftError::PreparationFailed)?)
+                    .and_then(|value| value.checked_add(inner))
+                    .ok_or(FftError::PreparationFailed)?;
+                real_source_line[j] = storage[index].re;
+            }
+            plan.forward(
+                &real_source_line[..real_len],
+                &mut complex_line[..complex_len],
+                real_line,
+                &mut workspace.fft_scratch,
+            )
+            .map_err(R2cError::LocalR2c)?;
+            for k in 0..complex_len {
+                let index = destination_base
+                    .checked_add(k.checked_mul(stride).ok_or(FftError::PreparationFailed)?)
+                    .and_then(|value| value.checked_add(inner))
+                    .ok_or(FftError::PreparationFailed)?;
+                storage[index] = complex_line[k];
+            }
+        }
+    }
+    Ok(())
+}
+
 fn convert_real_to_complex<R: FftReal, const N: usize, const M: usize>(
     core: &Arc<TransformPlanCore<R, N, M>>,
     array: &mut R2cInPlaceArray<R, N, M>,
@@ -1975,20 +2627,11 @@ where
     let rows = boundary_row_count(core)?;
     let scalar_size = size_of::<R>();
     let complex_size = size_of::<Complex<R>>();
-    let target_bytes = array
-        .complex_storage_len
+    let full_complex_len =
+        promoted_complex_len(core, array.real_storage_len, array.complex_storage_len)?;
+    let full_bytes = full_complex_len
         .checked_mul(complex_size)
         .ok_or(FftError::PreparationFailed)?;
-    let source_bytes = array
-        .real_storage_len
-        .checked_mul(scalar_size)
-        .ok_or(FftError::PreparationFailed)?;
-    let source_rounded = source_bytes
-        .checked_add(complex_size.saturating_sub(1))
-        .ok_or(FftError::PreparationFailed)?
-        / complex_size
-        * complex_size;
-    let full_bytes = source_rounded.max(target_bytes);
     if full_bytes % scalar_size != 0 {
         return Err(FftError::StorageLayoutMismatch.into());
     }
@@ -2047,6 +2690,95 @@ where
     };
 
     let plan = core.stages[boundary].local.real_complex();
+    let stride = super::memory_stride(
+        core.stages[boundary].input.as_ref(),
+        core.stages[boundary].axis,
+    )?;
+    if stride > 1 {
+        if array.real_storage_len > complex_storage.len() {
+            return Err(fail_forward_complex(
+                array,
+                source_pencils,
+                destination_pencils,
+                extra_shape,
+                complex_storage,
+                0,
+                FftError::StorageLayoutMismatch.into(),
+            ));
+        }
+        // Promote the original packed real prefix before projecting any
+        // result into the compressed complex layout. Read through a checked
+        // scalar view before each write; reading `Complex::re` here would
+        // observe a slot already overwritten by the reverse promotion order.
+        for i in (0..array.real_storage_len).rev() {
+            let value = match try_cast_slice::<Complex<R>, R>(&complex_storage) {
+                Ok(scalar_view) => match scalar_view.get(i).copied() {
+                    Some(value) => value,
+                    None => {
+                        return Err(fail_forward_complex(
+                            array,
+                            source_pencils,
+                            destination_pencils,
+                            extra_shape,
+                            complex_storage,
+                            0,
+                            FftError::StorageLayoutMismatch.into(),
+                        ));
+                    }
+                },
+                Err(_) => {
+                    return Err(fail_forward_complex(
+                        array,
+                        source_pencils,
+                        destination_pencils,
+                        extra_shape,
+                        complex_storage,
+                        0,
+                        FftError::StorageLayoutMismatch.into(),
+                    ));
+                }
+            };
+            complex_storage[i] = Complex::new(value, R::zero());
+        }
+        if let Err(error) = convert_strided_real_storage(
+            &mut complex_storage,
+            plan,
+            rows,
+            real_len,
+            complex_len,
+            stride,
+            workspace,
+        ) {
+            return Err(fail_forward_complex(
+                array,
+                source_pencils,
+                destination_pencils,
+                extra_shape,
+                complex_storage,
+                0,
+                error,
+            ));
+        }
+        let result =
+            install_complex_storage(array, destination_pencils, extra_shape, complex_storage, 0);
+        array.real_pencils = Some(source_pencils);
+        return result;
+    }
+    let real_source_line =
+        match try_cast_slice_mut::<Complex<R>, R>(&mut workspace.complex_source_line) {
+            Ok(line) if line.len() >= real_len => line,
+            _ => {
+                return Err(fail_forward_complex(
+                    array,
+                    source_pencils,
+                    destination_pencils,
+                    extra_shape,
+                    complex_storage,
+                    0,
+                    FftError::StorageLayoutMismatch.into(),
+                ));
+            }
+        };
     for row in (0..rows).rev() {
         let source_start = match row.checked_mul(real_len) {
             Some(value) => value,
@@ -2101,7 +2833,7 @@ where
                 FftError::PreparationFailed.into(),
             ));
         }
-        workspace.real_source_line[..real_len].copy_from_slice(&source[source_start..source_end]);
+        real_source_line[..real_len].copy_from_slice(&source[source_start..source_end]);
         let destination_start = match row.checked_mul(complex_len) {
             Some(value) => value,
             None => {
@@ -2142,7 +2874,7 @@ where
             ));
         }
         if let Err(error) = plan.forward(
-            &workspace.real_source_line[..real_len],
+            &real_source_line[..real_len],
             &mut complex_storage[destination_start..destination_end],
             &mut workspace.real_line,
             &mut workspace.fft_scratch,
@@ -2164,6 +2896,126 @@ where
     result
 }
 
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+fn convert_strided_complex_storage<R: FftReal, const N: usize, const M: usize>(
+    storage: &mut [Complex<R>],
+    plan: &LocalR2cPlan<R>,
+    rows: usize,
+    real_len: usize,
+    complex_len: usize,
+    stride: usize,
+    workspace: &mut R2cInPlaceWorkspace<R, N, M>,
+    normalize_inverse: bool,
+) -> Result<(), R2cError>
+where
+    Complex<R>: Equivalence,
+{
+    if stride <= 1 {
+        return Err(FftError::PreparationFailed.into());
+    }
+    if rows == 0 {
+        return Ok(());
+    }
+    if rows % stride != 0 {
+        return Err(FftError::PreparationFailed.into());
+    }
+    let groups = rows / stride;
+    let source_span = groups
+        .checked_mul(complex_len)
+        .and_then(|value| value.checked_mul(stride))
+        .ok_or(FftError::PreparationFailed)?;
+    let destination_span = groups
+        .checked_mul(real_len)
+        .and_then(|value| value.checked_mul(stride))
+        .ok_or(FftError::PreparationFailed)?;
+    if source_span > storage.len() || destination_span > storage.len() {
+        return Err(FftError::StorageLayoutMismatch.into());
+    }
+
+    // Expand compressed outer blocks from the back.  Each move is overlap
+    // safe, and a later (smaller) q never overwrites a source block still to
+    // be moved.
+    for outer in (0..groups).rev() {
+        let source_start = outer
+            .checked_mul(complex_len)
+            .and_then(|value| value.checked_mul(stride))
+            .ok_or(FftError::PreparationFailed)?;
+        let source_end = source_start
+            .checked_add(
+                complex_len
+                    .checked_mul(stride)
+                    .ok_or(FftError::PreparationFailed)?,
+            )
+            .ok_or(FftError::PreparationFailed)?;
+        let destination_start = outer
+            .checked_mul(real_len)
+            .and_then(|value| value.checked_mul(stride))
+            .ok_or(FftError::PreparationFailed)?;
+        storage.copy_within(source_start..source_end, destination_start);
+    }
+
+    let complex_source_line = &mut workspace.complex_source_line;
+    let complex_line = &mut workspace.complex_line;
+    let real_line = &mut workspace.real_line;
+    if complex_source_line.len() < complex_len
+        || complex_line.len() < complex_len
+        || real_line.len() < real_len
+    {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "complex/real line",
+            required: real_len.max(complex_len),
+            actual: complex_source_line
+                .len()
+                .min(complex_line.len())
+                .min(real_line.len()),
+        }
+        .into());
+    }
+    for outer in 0..groups {
+        let base = outer
+            .checked_mul(real_len)
+            .and_then(|value| value.checked_mul(stride))
+            .ok_or(FftError::PreparationFailed)?;
+        for inner in 0..stride {
+            for k in 0..complex_len {
+                let index = base
+                    .checked_add(k.checked_mul(stride).ok_or(FftError::PreparationFailed)?)
+                    .and_then(|value| value.checked_add(inner))
+                    .ok_or(FftError::PreparationFailed)?;
+                complex_source_line[k] = storage[index];
+            }
+            let result = if normalize_inverse {
+                plan.inverse(
+                    &complex_source_line[..complex_len],
+                    &mut real_line[..real_len],
+                    complex_line,
+                    &mut workspace.fft_scratch,
+                )
+            } else {
+                plan.backward(
+                    &complex_source_line[..complex_len],
+                    &mut real_line[..real_len],
+                    complex_line,
+                    &mut workspace.fft_scratch,
+                )
+            };
+            result.map_err(R2cError::LocalR2c)?;
+            // Store the C2R result in Complex::re slots.  Residues modulo S
+            // are disjoint, so every other inner line remains intact until it
+            // has been gathered.  The final scalar projection below is done
+            // only after all source lines have been consumed.
+            for j in 0..real_len {
+                let index = base
+                    .checked_add(j.checked_mul(stride).ok_or(FftError::PreparationFailed)?)
+                    .and_then(|value| value.checked_add(inner))
+                    .ok_or(FftError::PreparationFailed)?;
+                storage[index].re = real_line[j];
+            }
+        }
+    }
+    Ok(())
+}
+
 fn convert_complex_to_real<R: FftReal, const N: usize, const M: usize>(
     core: &Arc<TransformPlanCore<R, N, M>>,
     array: &mut R2cInPlaceArray<R, N, M>,
@@ -2176,20 +3028,26 @@ where
     let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
     let (real_len, complex_len) = r2c_lengths(core);
     let rows = boundary_row_count(core)?;
-    let scalar_size = size_of::<R>();
-    let complex_size = size_of::<Complex<R>>();
-    let target_bytes = array
-        .real_storage_len
-        .checked_mul(scalar_size)
-        .ok_or(FftError::PreparationFailed)?;
-    let rounded = target_bytes
-        .checked_add(complex_size.saturating_sub(1))
-        .ok_or(FftError::PreparationFailed)?;
-    let full_complex_len = (rounded / complex_size).max(array.complex_storage_len);
+    let full_complex_len =
+        promoted_complex_len(core, array.real_storage_len, array.complex_storage_len)?;
+    let stride = super::memory_stride(
+        core.stages[boundary].output.as_ref(),
+        core.stages[boundary].axis,
+    )?;
     let destination_pencils = array
         .real_pencils
         .take()
         .ok_or(FftError::StorageLayoutMismatch)?;
+    let destination_active = match destination_pencils
+        .iter()
+        .position(|pencil| pencil.same_layout(core.stages[boundary].input.as_ref()))
+    {
+        Some(active) => active,
+        None => {
+            array.real_pencils = Some(destination_pencils);
+            return Err(FftError::StorageLayoutMismatch.into());
+        }
+    };
     let complex = match array.storage.take() {
         Some(R2cInPlaceStorage::Complex(complex)) => complex,
         _ => {
@@ -2222,6 +3080,96 @@ where
         ));
     }
     storage.resize(full_complex_len, zero_complex::<R>());
+    let plan = core.stages[boundary].local.real_complex();
+    if stride > 1 {
+        if let Err(error) = convert_strided_complex_storage(
+            &mut storage,
+            plan,
+            rows,
+            real_len,
+            complex_len,
+            stride,
+            workspace,
+            normalize_inverse,
+        ) {
+            return Err(fail_complex_to_real(
+                array,
+                source_pencils,
+                destination_pencils,
+                extra_shape,
+                storage,
+                source_active,
+                error,
+            ));
+        }
+        let mut real_storage = match try_cast_vec(storage) {
+            Ok(storage) => storage,
+            Err((_, storage)) => {
+                array.storage = Some(R2cInPlaceStorage::PoisonedComplex(storage));
+                array.complex_pencils = Some(source_pencils);
+                array.real_pencils = Some(destination_pencils);
+                return Err(FftError::StorageLayoutMismatch.into());
+            }
+        };
+        if array.real_storage_len > real_storage.len() {
+            return Err(fail_reverse_real(
+                array,
+                source_pencils,
+                destination_pencils,
+                extra_shape,
+                real_storage,
+                destination_active,
+                FftError::StorageLayoutMismatch.into(),
+            ));
+        }
+        for i in 0..array.real_storage_len {
+            let value = match try_cast_slice::<R, Complex<R>>(&real_storage) {
+                Ok(complex_view) => match complex_view.get(i).copied() {
+                    Some(value) => value.re,
+                    None => {
+                        return Err(fail_reverse_real(
+                            array,
+                            source_pencils,
+                            destination_pencils,
+                            extra_shape,
+                            real_storage,
+                            boundary,
+                            FftError::StorageLayoutMismatch.into(),
+                        ));
+                    }
+                },
+                Err(_) => {
+                    return Err(fail_reverse_real(
+                        array,
+                        source_pencils,
+                        destination_pencils,
+                        extra_shape,
+                        real_storage,
+                        boundary,
+                        FftError::StorageLayoutMismatch.into(),
+                    ));
+                }
+            };
+            real_storage[i] = value;
+        }
+        #[cfg(test)]
+        let mut destination_pencils = destination_pencils;
+        #[cfg(test)]
+        if array.test_hook == Some(InPlaceTestHook::ReverseRestoreRejection) {
+            let mut pencils = destination_pencils.into_vec();
+            pencils.pop();
+            destination_pencils = pencils.into_boxed_slice();
+        }
+        let result = install_real_storage(
+            array,
+            destination_pencils,
+            extra_shape,
+            real_storage,
+            destination_active,
+        );
+        array.complex_pencils = Some(source_pencils);
+        return result;
+    }
     let mut real_storage = match try_cast_vec(storage) {
         Ok(storage) => storage,
         Err((_, storage)) => {
@@ -2238,11 +3186,10 @@ where
             destination_pencils,
             extra_shape,
             real_storage,
-            boundary,
+            destination_active,
             FftError::StorageLayoutMismatch.into(),
         ));
     }
-    let plan = core.stages[boundary].local.real_complex();
     for row in 0..rows {
         let source_start = match row.checked_mul(complex_len) {
             Some(value) => value,
@@ -2293,7 +3240,7 @@ where
                 destination_pencils,
                 extra_shape,
                 real_storage,
-                boundary,
+                destination_active,
                 FftError::PreparationFailed.into(),
             ));
         }
@@ -2334,7 +3281,7 @@ where
                 destination_pencils,
                 extra_shape,
                 real_storage,
-                boundary,
+                destination_active,
                 FftError::PreparationFailed.into(),
             ));
         }
@@ -2360,7 +3307,7 @@ where
                 destination_pencils,
                 extra_shape,
                 real_storage,
-                boundary,
+                destination_active,
                 error.into(),
             ));
         }
@@ -2378,7 +3325,7 @@ where
         destination_pencils,
         extra_shape,
         real_storage,
-        boundary,
+        destination_active,
     );
     array.complex_pencils = Some(source_pencils);
     result
@@ -2549,7 +3496,9 @@ pub(super) fn empty_in_place_workspace_for_test<R: FftReal, const N: usize, cons
     workspace: &mut R2cInPlaceWorkspace<R, N, M>,
 ) {
     workspace.fft_scratch.clear();
-    workspace.real_source_line.clear();
+    if let Some(real_source_line) = workspace.real_source_line.as_mut() {
+        real_source_line.clear();
+    }
     workspace.real_line.clear();
     workspace.complex_source_line.clear();
     workspace.complex_line.clear();
@@ -2689,19 +3638,7 @@ pub(super) fn storage_is_poisoned_for_test<R: FftReal, const N: usize, const M: 
 pub(super) fn storage_capacity_bytes_for_test<R: FftReal, const N: usize, const M: usize>(
     array: &R2cInPlaceArray<R, N, M>,
 ) -> Option<usize> {
-    let storage_capacity = match array.storage.as_ref()? {
-        R2cInPlaceStorage::Real(real) => real.storage_capacity(),
-        R2cInPlaceStorage::Complex(complex) => complex.storage_capacity(),
-        R2cInPlaceStorage::PoisonedReal(storage) => storage.capacity(),
-        R2cInPlaceStorage::PoisonedComplex(storage) => storage.capacity(),
-    };
-    let element_size = match array.storage.as_ref()? {
-        R2cInPlaceStorage::Real(_) | R2cInPlaceStorage::PoisonedReal(_) => size_of::<R>(),
-        R2cInPlaceStorage::Complex(_) | R2cInPlaceStorage::PoisonedComplex(_) => {
-            size_of::<Complex<R>>()
-        }
-    };
-    storage_capacity.checked_mul(element_size)
+    array.storage_capacity_bytes()
 }
 
 fn r2c_lengths<R: FftReal, const N: usize, const M: usize>(
@@ -2733,6 +3670,12 @@ where
         .iter()
         .rposition(|&selected| selected)
         .expect("R2C core has a selected reduction axis");
+    let stride = super::memory_stride(view.pencil(), reduction_axis)?;
+    let line_count =
+        super::strided_line_count(local_len, complex_len, stride).map_err(R2cError::Fft)?;
+    let line_block = complex_len
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
     let depth = normalization_depth(
         *core.stages[0].input.global_shape(),
         core.selection,
@@ -2759,39 +3702,51 @@ where
             .expect("validated extra and local lengths fit the intermediate");
         let values = &view.as_slice()[start..end];
         let mut local_max = [0.0_f64; 4];
-        for line in values.chunks_exact(complex_len) {
-            for plane in 0..plane_count {
-                let value = line[if plane == 0 { 0 } else { complex_len - 1 }];
-                let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
-                let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
-                if !re.is_finite() || !im.is_finite() {
-                    invalid = true;
-                    continue;
+        for outer in 0..line_count {
+            let base = outer
+                .checked_mul(line_block)
+                .ok_or(FftError::PreparationFailed)?;
+            for inner in 0..stride {
+                for plane in 0..plane_count {
+                    let k = if plane == 0 { 0 } else { complex_len - 1 };
+                    let value = values[base + k * stride + inner];
+                    let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
+                    let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
+                    if !re.is_finite() || !im.is_finite() {
+                        invalid = true;
+                        continue;
+                    }
+                    let slot = plane * 2;
+                    local_max[slot] = local_max[slot].max(re.abs().max(im.abs()));
+                    local_max[slot + 1] = local_max[slot + 1].max(im.abs());
                 }
-                let slot = plane * 2;
-                local_max[slot] = local_max[slot].max(re.abs().max(im.abs()));
-                local_max[slot + 1] = local_max[slot + 1].max(im.abs());
             }
         }
         let mut global_max = [0.0_f64; 4];
         communicator.all_reduce_into(&local_max, &mut global_max, SystemOperation::max());
 
         let mut local_sum = [0.0_f64; 4];
-        for line in values.chunks_exact(complex_len) {
-            for plane in 0..plane_count {
-                let value = line[if plane == 0 { 0 } else { complex_len - 1 }];
-                let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
-                let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
-                if !re.is_finite() || !im.is_finite() {
-                    continue;
-                }
-                let slot = plane * 2;
-                let scale = global_max[slot];
-                if scale != 0.0 && scale.is_finite() {
-                    let normalized_re = re / scale;
-                    let normalized_im = im / scale;
-                    local_sum[slot] += normalized_re * normalized_re;
-                    local_sum[slot + 1] += normalized_im * normalized_im;
+        for outer in 0..line_count {
+            let base = outer
+                .checked_mul(line_block)
+                .ok_or(FftError::PreparationFailed)?;
+            for inner in 0..stride {
+                for plane in 0..plane_count {
+                    let k = if plane == 0 { 0 } else { complex_len - 1 };
+                    let value = values[base + k * stride + inner];
+                    let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
+                    let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
+                    if !re.is_finite() || !im.is_finite() {
+                        continue;
+                    }
+                    let slot = plane * 2;
+                    let scale = global_max[slot];
+                    if scale != 0.0 && scale.is_finite() {
+                        let normalized_re = re / scale;
+                        let normalized_im = im / scale;
+                        local_sum[slot] += normalized_re * normalized_re;
+                        local_sum[slot + 1] += normalized_im * normalized_im;
+                    }
                 }
             }
         }
@@ -2831,6 +3786,18 @@ fn zero_accepted_boundary<R: FftReal, const N: usize, const M: usize>(
     let mut view = intermediate.active_view_mut().map_err(FftError::Array)?;
     let local_len = view.pencil().local_len();
     let (real_len, complex_len) = r2c_lengths(core);
+    let reduction_axis = core
+        .selection
+        .mask()
+        .iter()
+        .rposition(|&selected| selected)
+        .expect("R2C core has a selected reduction axis");
+    let stride = super::memory_stride(view.pencil(), reduction_axis)?;
+    let line_count =
+        super::strided_line_count(local_len, complex_len, stride).map_err(R2cError::Fft)?;
+    let line_block = complex_len
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
     let plane_count = if real_len % 2 == 0 { 2 } else { 1 };
     for batch in 0..core.extra_shape.element_count() {
         let start = batch
@@ -2839,10 +3806,16 @@ fn zero_accepted_boundary<R: FftReal, const N: usize, const M: usize>(
         let end = start
             .checked_add(local_len)
             .expect("validated extra and local lengths fit the intermediate");
-        for line in view.as_mut_slice()[start..end].chunks_exact_mut(complex_len) {
-            line[0].im = R::zero();
-            if plane_count == 2 {
-                line[complex_len - 1].im = R::zero();
+        let values = &mut view.as_mut_slice()[start..end];
+        for outer in 0..line_count {
+            let base = outer
+                .checked_mul(line_block)
+                .ok_or(FftError::PreparationFailed)?;
+            for inner in 0..stride {
+                values[base + inner].im = R::zero();
+                if plane_count == 2 {
+                    values[base + (complex_len - 1) * stride + inner].im = R::zero();
+                }
             }
         }
     }

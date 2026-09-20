@@ -1,4 +1,4 @@
-use std::{f64::consts::TAU, sync::Arc};
+use std::{f64::consts::TAU, mem::size_of_val, sync::Arc};
 
 use mpi::{
     collective::SystemOperation,
@@ -11,7 +11,8 @@ use pencil_array::{
 };
 use pencil_fft::{
     AxisSelection, C2cInPlaceArray, C2cInPlaceWorkspace, C2cOutOfPlaceWorkspace, C2cPlan, C2cState,
-    Complex, FftError, FftReal, R2cError, R2cPlan, R2cState, R2cWorkspace, TransposeMethod,
+    Complex, DhtPlan, DistributedLayout, FftError, FftReal, R2cError, R2cInPlaceArray, R2cPlan,
+    R2cState, R2cWorkspace, R2rError, R2rKind, R2rPlan, R2rState, TransposeMethod,
 };
 
 trait TestReal: FftReal + mpi::datatype::Equivalence + std::fmt::Debug {
@@ -193,6 +194,7 @@ fn distributed_c2c_one_mpi_binary() {
     );
     negative_collective_cases(&world, &topology_1d, &topology_2d);
     negative_r2c_collective_cases(&world, &topology_1d, &topology_2d);
+    negative_dht_collective_cases(&world, &topology_1d);
 }
 
 fn run_case<R: TestReal, const N: usize, const M: usize>(
@@ -962,7 +964,171 @@ fn run_r2c_in_place_cases(topology_1d: &Arc<MpiTopology<1>>, topology_2d: &Arc<M
         32.5,
         TransposeMethod::PointToPoint,
     );
+    run_r2c_strided_n4_case(topology_1d);
     run_r2c_in_place_poison_case(topology_1d);
+}
+
+fn run_r2c_strided_n4_case(topology: &Arc<MpiTopology<1>>) {
+    let shape = [4, 2];
+    let selection = AxisSelection::from_indices([0]).unwrap();
+    for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
+        let plan = R2cPlan::<f64, 2, 1>::from_shape_with_selection_and_layout(
+            Arc::clone(topology),
+            shape,
+            ExtraShape::scalar(),
+            selection,
+            DistributedLayout {
+                transpose_method: method,
+                permute_dims: false,
+            },
+        )
+        .unwrap();
+        assert!(!plan.layout().permute_dims);
+        assert_eq!(
+            plan.input_pencil().permutation(),
+            &AxisPermutation::identity()
+        );
+        assert_eq!(
+            plan.output_pencil().permutation(),
+            &AxisPermutation::identity()
+        );
+        let mut source = plan.allocate_input().unwrap();
+        fill_r2c_input(&mut source, 33.0);
+        let source_values = source.as_slice().to_vec();
+        let mut spectrum = plan.allocate_output().unwrap();
+        let mut oop_workspace = plan.allocate_workspace().unwrap();
+        plan.forward(&source, &mut spectrum, &mut oop_workspace)
+            .unwrap();
+        check_strided_n4_spectrum(&spectrum.view(), 33.0);
+
+        let mut expected_inverse = plan.allocate_input().unwrap();
+        plan.inverse(&spectrum, &mut expected_inverse, &mut oop_workspace)
+            .unwrap();
+        let mut expected_backward = plan.allocate_input().unwrap();
+        plan.backward(&spectrum, &mut expected_backward, &mut oop_workspace)
+            .unwrap();
+
+        let mut array = plan.allocate_in_place().unwrap();
+        array
+            .real_view_mut()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&source_values);
+        let pointer = array.real_view().unwrap().as_slice().as_ptr() as usize;
+        let capacity = array
+            .storage_capacity_bytes()
+            .expect("strided R2C storage is present");
+        let required = size_of_val(array.real_view().unwrap().as_slice())
+            .max(size_of_val(spectrum.as_slice()));
+        // The backing allocation may also cover an intermediate pencil; its
+        // capacity must at least cover both active representations.
+        assert!(capacity >= required);
+        assert_strided_n4_storage(&array, R2cState::RealInput, pointer, capacity, &plan);
+        let mut workspace = plan.allocate_in_place_workspace().unwrap();
+
+        for cycle in 0..2 {
+            if cycle != 0 {
+                array
+                    .real_view_mut()
+                    .unwrap()
+                    .as_mut_slice()
+                    .copy_from_slice(&source_values);
+                assert_strided_n4_storage(&array, R2cState::RealInput, pointer, capacity, &plan);
+            }
+
+            plan.forward_in_place(&mut array, &mut workspace).unwrap();
+            assert_strided_n4_storage(&array, R2cState::ComplexOutput, pointer, capacity, &plan);
+            check_strided_n4_spectrum(&array.complex_view().unwrap(), 33.0);
+            assert_eq!(
+                array.complex_view().unwrap().as_slice(),
+                spectrum.as_slice()
+            );
+
+            array
+                .complex_view_mut()
+                .unwrap()
+                .as_mut_slice()
+                .copy_from_slice(spectrum.as_slice());
+            plan.inverse_in_place(&mut array, &mut workspace).unwrap();
+            assert_strided_n4_storage(&array, R2cState::RealInput, pointer, capacity, &plan);
+            assert_close_slices(
+                array.real_view().unwrap().as_slice(),
+                expected_inverse.as_slice(),
+            );
+
+            // Re-enter the output representation before supplying the same
+            // independent spectrum to the raw backward operation.
+            plan.forward_in_place(&mut array, &mut workspace).unwrap();
+            assert_strided_n4_storage(&array, R2cState::ComplexOutput, pointer, capacity, &plan);
+            array
+                .complex_view_mut()
+                .unwrap()
+                .as_mut_slice()
+                .copy_from_slice(spectrum.as_slice());
+            plan.backward_in_place(&mut array, &mut workspace).unwrap();
+            assert_strided_n4_storage(&array, R2cState::RealInput, pointer, capacity, &plan);
+            assert_close_slices(
+                array.real_view().unwrap().as_slice(),
+                expected_backward.as_slice(),
+            );
+        }
+    }
+}
+
+fn assert_strided_n4_storage(
+    array: &R2cInPlaceArray<f64, 2, 1>,
+    state: R2cState,
+    pointer: usize,
+    capacity: usize,
+    plan: &R2cPlan<f64, 2, 1>,
+) {
+    assert_eq!(array.state(), state);
+    assert_eq!(array.storage_capacity_bytes(), Some(capacity));
+    match state {
+        R2cState::RealInput => {
+            let view = array.real_view().unwrap();
+            assert_eq!(view.as_slice().as_ptr() as usize, pointer);
+            assert!(view.pencil().same_layout(plan.input_pencil().as_ref()));
+            assert!(capacity >= size_of_val(view.as_slice()));
+        }
+        R2cState::ComplexOutput => {
+            let view = array.complex_view().unwrap();
+            assert_eq!(view.as_slice().as_ptr() as usize, pointer);
+            assert!(view.pencil().same_layout(plan.output_pencil().as_ref()));
+            assert!(capacity >= size_of_val(view.as_slice()));
+        }
+        R2cState::Poisoned => panic!("strided R2C array unexpectedly poisoned"),
+    }
+}
+
+fn check_strided_n4_spectrum(
+    view: &pencil_array::PencilArrayView<'_, Complex<f64>, 2, 1>,
+    seed: f64,
+) {
+    let local_shape = view.pencil().local_shape_logical();
+    let ranges = view.pencil().local_ranges();
+    for linear in 0..view.pencil().local_len() {
+        let local = unravel_spatial(linear, local_shape);
+        let global = [ranges[0].start + local[0], ranges[1].start + local[1]];
+        let mut expected = Complex::new(0.0, 0.0);
+        for source_axis0 in 0..4 {
+            let value = r2c_real_value(&[], [source_axis0, global[1]], seed);
+            let phase = -TAU * source_axis0 as f64 * global[0] as f64 / 4.0;
+            let (sin, cos) = phase.sin_cos();
+            expected.re += value * cos;
+            expected.im += value * sin;
+        }
+        let actual = *view.get_local(&[], local).unwrap();
+        assert!((actual.re - expected.re).abs() <= 2e-10 * (1.0 + expected.re.abs()));
+        assert!((actual.im - expected.im).abs() <= 2e-10 * (1.0 + expected.im.abs()));
+    }
+}
+
+fn assert_close_slices(actual: &[f64], expected: &[f64]) {
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!((actual - expected).abs() <= 2e-10 * (1.0 + expected.abs()));
+    }
 }
 
 fn run_r2c_in_place_poison_case(topology: &Arc<MpiTopology<1>>) {
@@ -1072,6 +1238,7 @@ fn run_r2c_in_place_case<R: TestReal, const N: usize, const M: usize>(
         method,
     )
     .unwrap();
+    assert!(plan.layout().permute_dims);
     let mut source = plan.allocate_input().unwrap();
     fill_r2c_input(&mut source, seed);
     let source_before = source.as_slice().to_vec();
@@ -1098,8 +1265,12 @@ fn run_r2c_in_place_case<R: TestReal, const N: usize, const M: usize>(
         Err(R2cError::Fft(FftError::OutputLayoutMismatch))
     ));
     let pointer = array.real_view().unwrap().as_slice().as_ptr() as usize;
+    let capacity = array
+        .storage_capacity_bytes()
+        .expect("R2C storage is present");
     let mut workspace = plan.allocate_in_place_workspace().unwrap();
     plan.forward_in_place(&mut array, &mut workspace).unwrap();
+    assert_eq!(array.storage_capacity_bytes(), Some(capacity));
     assert_eq!(array.state(), R2cState::ComplexOutput);
     assert_eq!(
         array.complex_view().unwrap().as_slice().as_ptr() as usize,
@@ -1137,6 +1308,7 @@ fn run_r2c_in_place_case<R: TestReal, const N: usize, const M: usize>(
         array.real_view().unwrap().as_slice().as_ptr() as usize,
         pointer
     );
+    assert_eq!(array.storage_capacity_bytes(), Some(capacity));
     for (actual, expected) in array
         .real_view()
         .unwrap()
@@ -1155,6 +1327,7 @@ fn run_r2c_in_place_case<R: TestReal, const N: usize, const M: usize>(
         array.real_view().unwrap().as_slice().as_ptr() as usize,
         pointer
     );
+    assert_eq!(array.storage_capacity_bytes(), Some(capacity));
     for (actual, expected) in array
         .real_view()
         .unwrap()
@@ -4249,6 +4422,309 @@ fn negative_selection_mask_cases(
             .forward(&r2c_source_b, &mut r2c_output_b, &mut r2c_workspace_b)
             .unwrap();
         world.barrier();
+    }
+}
+
+fn negative_dht_collective_cases(
+    world: &mpi::topology::SimpleCommunicator,
+    topology: &Arc<MpiTopology<1>>,
+) {
+    let rank = world.rank();
+    let size = world.size();
+    let shape = [3, 4];
+    let extra = ExtraShape::scalar();
+
+    for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
+        let plan = DhtPlan::<f64, 2, 1>::from_shape_with_method(
+            Arc::clone(topology),
+            shape,
+            extra.clone(),
+            method,
+        )
+        .unwrap();
+
+        // Every wrong-state rejection leaves the shared R2R array and
+        // workspace reusable through all three DHT directions.
+        let mut wrong_state = plan.allocate_in_place().unwrap();
+        let mut wrong_state_workspace = plan.allocate_in_place_workspace().unwrap();
+        for inverse in [true, false] {
+            let array_before = format!("{wrong_state:?}");
+            let workspace_before = format!("{wrong_state_workspace:?}");
+            let result = if inverse {
+                plan.inverse_in_place(&mut wrong_state, &mut wrong_state_workspace)
+            } else {
+                plan.backward_in_place(&mut wrong_state, &mut wrong_state_workspace)
+            };
+            assert!(matches!(
+                result,
+                Err(R2rError::Fft(FftError::InputLayoutMismatch))
+            ));
+            assert_eq!(wrong_state.state(), R2rState::Input);
+            assert_eq!(format!("{wrong_state:?}"), array_before);
+            assert_eq!(format!("{wrong_state_workspace:?}"), workspace_before);
+        }
+        plan.forward_in_place(&mut wrong_state, &mut wrong_state_workspace)
+            .unwrap();
+        assert_eq!(wrong_state.state(), R2rState::Output);
+        let output_before = format!("{wrong_state:?}");
+        assert!(matches!(
+            plan.forward_in_place(&mut wrong_state, &mut wrong_state_workspace),
+            Err(R2rError::Fft(FftError::InputLayoutMismatch))
+        ));
+        assert_eq!(format!("{wrong_state:?}"), output_before);
+        plan.inverse_in_place(&mut wrong_state, &mut wrong_state_workspace)
+            .unwrap();
+        plan.forward_in_place(&mut wrong_state, &mut wrong_state_workspace)
+            .unwrap();
+        plan.backward_in_place(&mut wrong_state, &mut wrong_state_workspace)
+            .unwrap();
+        assert_eq!(wrong_state.state(), R2rState::Input);
+        world.barrier();
+
+        // A separately constructed same-layout plan is foreign by core
+        // identity, even though DHT deliberately reuses the R2R storage type.
+        let foreign_plan = DhtPlan::<f64, 2, 1>::from_shape_with_method(
+            Arc::clone(topology),
+            shape,
+            extra.clone(),
+            method,
+        )
+        .unwrap();
+        let mut valid_array = plan.allocate_in_place().unwrap();
+        let mut valid_workspace = plan.allocate_in_place_workspace().unwrap();
+        let mut foreign_array = foreign_plan.allocate_in_place().unwrap();
+        let valid_before = format!("{valid_array:?}");
+        let foreign_before = format!("{foreign_array:?}");
+        let workspace_before = format!("{valid_workspace:?}");
+        let result = if rank == 0 {
+            plan.forward_in_place(&mut foreign_array, &mut valid_workspace)
+        } else {
+            plan.forward_in_place(&mut valid_array, &mut valid_workspace)
+        };
+        if rank == 0 {
+            assert!(matches!(
+                result,
+                Err(R2rError::Fft(FftError::Array(
+                    ArrayError::IncompatiblePencils
+                )))
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Err(R2rError::Fft(FftError::CollectivePreconditionFailed))
+            ));
+        }
+        assert_eq!(format!("{valid_array:?}"), valid_before);
+        assert_eq!(format!("{foreign_array:?}"), foreign_before);
+        assert_eq!(format!("{valid_workspace:?}"), workspace_before);
+        plan.forward_in_place(&mut valid_array, &mut valid_workspace)
+            .unwrap();
+        plan.inverse_in_place(&mut valid_array, &mut valid_workspace)
+            .unwrap();
+        world.barrier();
+
+        let mut valid_array = plan.allocate_in_place().unwrap();
+        let mut valid_workspace = plan.allocate_in_place_workspace().unwrap();
+        let mut foreign_workspace = foreign_plan.allocate_in_place_workspace().unwrap();
+        let array_before = format!("{valid_array:?}");
+        let valid_workspace_before = format!("{valid_workspace:?}");
+        let foreign_workspace_before = format!("{foreign_workspace:?}");
+        let result = if rank == 0 {
+            plan.forward_in_place(&mut valid_array, &mut foreign_workspace)
+        } else {
+            plan.forward_in_place(&mut valid_array, &mut valid_workspace)
+        };
+        if rank == 0 {
+            assert!(matches!(
+                result,
+                Err(R2rError::Fft(FftError::WorkspaceMismatch))
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Err(R2rError::Fft(FftError::CollectivePreconditionFailed))
+            ));
+        }
+        assert_eq!(format!("{valid_array:?}"), array_before);
+        assert_eq!(format!("{valid_workspace:?}"), valid_workspace_before);
+        assert_eq!(format!("{foreign_workspace:?}"), foreign_workspace_before);
+        plan.forward_in_place(&mut valid_array, &mut valid_workspace)
+            .unwrap();
+        plan.inverse_in_place(&mut valid_array, &mut valid_workspace)
+            .unwrap();
+        world.barrier();
+
+        if size > 1 {
+            // DHT operation words are distinct from one another and from the
+            // R2R family. A mixed call stops before state or data mutation.
+            let r2r = R2rPlan::<f64, 2, 1>::from_shape_with_method(
+                Arc::clone(topology),
+                shape,
+                extra.clone(),
+                [Some(R2rKind::DctII), Some(R2rKind::DstIII)],
+                method,
+            )
+            .unwrap();
+            let mut dht_array = plan.allocate_in_place().unwrap();
+            let mut dht_workspace = plan.allocate_in_place_workspace().unwrap();
+            let mut r2r_array = r2r.allocate_in_place().unwrap();
+            let mut r2r_workspace = r2r.allocate_in_place_workspace().unwrap();
+            let dht_array_before = format!("{dht_array:?}");
+            let dht_workspace_before = format!("{dht_workspace:?}");
+            let r2r_array_before = format!("{r2r_array:?}");
+            let r2r_workspace_before = format!("{r2r_workspace:?}");
+            let result = if rank == 0 {
+                plan.forward_in_place(&mut dht_array, &mut dht_workspace)
+            } else {
+                r2r.forward_in_place(&mut r2r_array, &mut r2r_workspace)
+            };
+            assert!(matches!(
+                result,
+                Err(R2rError::Fft(FftError::CollectiveDescriptorMismatch))
+            ));
+            assert_eq!(format!("{dht_array:?}"), dht_array_before);
+            assert_eq!(format!("{dht_workspace:?}"), dht_workspace_before);
+            assert_eq!(format!("{r2r_array:?}"), r2r_array_before);
+            assert_eq!(format!("{r2r_workspace:?}"), r2r_workspace_before);
+            dht_array = plan.allocate_in_place().unwrap();
+            r2r_array = r2r.allocate_in_place().unwrap();
+            plan.forward_in_place(&mut dht_array, &mut dht_workspace)
+                .unwrap();
+            plan.inverse_in_place(&mut dht_array, &mut dht_workspace)
+                .unwrap();
+            r2r.forward_in_place(&mut r2r_array, &mut r2r_workspace)
+                .unwrap();
+            r2r.inverse_in_place(&mut r2r_array, &mut r2r_workspace)
+                .unwrap();
+            world.barrier();
+
+            let mut mixed = plan.allocate_in_place().unwrap();
+            let mut mixed_workspace = plan.allocate_in_place_workspace().unwrap();
+            plan.forward_in_place(&mut mixed, &mut mixed_workspace)
+                .unwrap();
+            if rank == 0 {
+                mixed = plan.allocate_in_place().unwrap();
+            }
+            let mixed_before = format!("{mixed:?}");
+            let mixed_workspace_before = format!("{mixed_workspace:?}");
+            let result = if rank == 0 {
+                plan.forward_in_place(&mut mixed, &mut mixed_workspace)
+            } else {
+                plan.inverse_in_place(&mut mixed, &mut mixed_workspace)
+            };
+            assert!(matches!(
+                result,
+                Err(R2rError::Fft(FftError::CollectiveDescriptorMismatch))
+            ));
+            assert_eq!(format!("{mixed:?}"), mixed_before);
+            assert_eq!(format!("{mixed_workspace:?}"), mixed_workspace_before);
+            mixed = plan.allocate_in_place().unwrap();
+            plan.forward_in_place(&mut mixed, &mut mixed_workspace)
+                .unwrap();
+            plan.inverse_in_place(&mut mixed, &mut mixed_workspace)
+                .unwrap();
+            world.barrier();
+
+            let alltoallv = DhtPlan::<f64, 2, 1>::from_shape_with_layout(
+                Arc::clone(topology),
+                shape,
+                extra.clone(),
+                DistributedLayout {
+                    transpose_method: TransposeMethod::AllToAllv,
+                    permute_dims: true,
+                },
+            )
+            .unwrap();
+            let point_to_point = DhtPlan::<f64, 2, 1>::from_shape_with_layout(
+                Arc::clone(topology),
+                shape,
+                extra.clone(),
+                DistributedLayout {
+                    transpose_method: TransposeMethod::PointToPoint,
+                    permute_dims: true,
+                },
+            )
+            .unwrap();
+            let mut all_array = alltoallv.allocate_in_place().unwrap();
+            let mut all_workspace = alltoallv.allocate_in_place_workspace().unwrap();
+            let mut p2p_array = point_to_point.allocate_in_place().unwrap();
+            let mut p2p_workspace = point_to_point.allocate_in_place_workspace().unwrap();
+            let all_array_before = format!("{all_array:?}");
+            let all_workspace_before = format!("{all_workspace:?}");
+            let p2p_array_before = format!("{p2p_array:?}");
+            let p2p_workspace_before = format!("{p2p_workspace:?}");
+            let result = if rank == 0 {
+                alltoallv.forward_in_place(&mut all_array, &mut all_workspace)
+            } else {
+                point_to_point.forward_in_place(&mut p2p_array, &mut p2p_workspace)
+            };
+            assert!(matches!(
+                result,
+                Err(R2rError::Fft(FftError::CollectiveDescriptorMismatch))
+            ));
+            assert_eq!(format!("{all_array:?}"), all_array_before);
+            assert_eq!(format!("{all_workspace:?}"), all_workspace_before);
+            assert_eq!(format!("{p2p_array:?}"), p2p_array_before);
+            assert_eq!(format!("{p2p_workspace:?}"), p2p_workspace_before);
+            all_array = alltoallv.allocate_in_place().unwrap();
+            alltoallv
+                .forward_in_place(&mut all_array, &mut all_workspace)
+                .unwrap();
+            alltoallv
+                .inverse_in_place(&mut all_array, &mut all_workspace)
+                .unwrap();
+            world.barrier();
+
+            let permuted = DhtPlan::<f64, 2, 1>::from_shape_with_layout(
+                Arc::clone(topology),
+                shape,
+                extra.clone(),
+                DistributedLayout {
+                    transpose_method: TransposeMethod::AllToAllv,
+                    permute_dims: true,
+                },
+            )
+            .unwrap();
+            let strided = DhtPlan::<f64, 2, 1>::from_shape_with_layout(
+                Arc::clone(topology),
+                shape,
+                extra.clone(),
+                DistributedLayout {
+                    transpose_method: TransposeMethod::AllToAllv,
+                    permute_dims: false,
+                },
+            )
+            .unwrap();
+            let mut permuted_array = permuted.allocate_in_place().unwrap();
+            let mut permuted_workspace = permuted.allocate_in_place_workspace().unwrap();
+            let mut strided_array = strided.allocate_in_place().unwrap();
+            let mut strided_workspace = strided.allocate_in_place_workspace().unwrap();
+            let permuted_array_before = format!("{permuted_array:?}");
+            let permuted_workspace_before = format!("{permuted_workspace:?}");
+            let strided_array_before = format!("{strided_array:?}");
+            let strided_workspace_before = format!("{strided_workspace:?}");
+            let result = if rank == 0 {
+                permuted.forward_in_place(&mut permuted_array, &mut permuted_workspace)
+            } else {
+                strided.forward_in_place(&mut strided_array, &mut strided_workspace)
+            };
+            assert!(matches!(
+                result,
+                Err(R2rError::Fft(FftError::CollectiveDescriptorMismatch))
+            ));
+            assert_eq!(format!("{permuted_array:?}"), permuted_array_before);
+            assert_eq!(format!("{permuted_workspace:?}"), permuted_workspace_before);
+            assert_eq!(format!("{strided_array:?}"), strided_array_before);
+            assert_eq!(format!("{strided_workspace:?}"), strided_workspace_before);
+            permuted_array = permuted.allocate_in_place().unwrap();
+            permuted
+                .forward_in_place(&mut permuted_array, &mut permuted_workspace)
+                .unwrap();
+            permuted
+                .inverse_in_place(&mut permuted_array, &mut permuted_workspace)
+                .unwrap();
+            world.barrier();
+        }
     }
 }
 
