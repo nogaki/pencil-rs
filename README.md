@@ -26,6 +26,8 @@ the same four scalar types, with the same caller-owned line/scratch and
 out-of-place/in-place conventions.
 Distributed R2R uses the same eight kinds per logical axis, with `None` identity
 stages, for real and complex `f32`/`f64` over the existing checked transports.
+`DhtPlan` provides selected-axis self-paired discrete Hartley transforms without
+exposing the legacy R2R axis-kind constructors.
 
 `Pencil` describes spatial distribution. `PencilArray` owns one layout and
 one local buffer. `ManyPencilArray` owns a buffer large enough for several
@@ -95,8 +97,10 @@ payload communication.
 `AxisSelection<N>`. The largest selected Rust axis `r` is the real-to-complex
 axis and its extent `n` is reduced to `n/2+1`; selected axes below `r` use
 complex FFTs and every unselected axis is an identity stage. The final output
-always uses decomposition `[1..=M]` and reversed spatial memory order. The
-route nevertheless always contains all `N` stages and `N-1` transitions, so
+uses decomposition `[1..=M]` and reversed spatial memory order by default;
+`DistributedLayout::permute_dims = false` keeps identity memory order and uses
+strided line kernels. The route nevertheless always contains all `N` stages
+and `N-1` transitions, so
 unselected axes remain real-prefix or complex-suffix transposes rather than
 being skipped. `allocate_workspace` is noncollective; coordinate any local
 allocation failure before the next collective. Non-last real axes add an
@@ -139,10 +143,11 @@ A C2C plan also accepts `AxisSelection<N>`. It always follows the canonical
 full route from axis `N-1` through `0`, with one stage and transition per
 axis. A selected stage performs its local FFT; an unselected stage is an
 identity with no native plan or scaling. Thus an empty selection is a valid
-identity transform whose reversed-layout transposes still run. The output
-pencil remains the existing reversed permutation and decomposition
-`[1..=M]`, and inverse/raw-backward normalization includes only selected
-axes. `AxisSelection::all()` preserves the legacy transform exactly.
+identity transform whose selected-layout transposes still run. The output
+pencil uses decomposition `[1..=M]` and the reversed permutation by default;
+`DistributedLayout::permute_dims = false` keeps identity memory order and uses
+strided line kernels. Inverse/raw-backward normalization includes only
+selected axes. `AxisSelection::all()` preserves the legacy transform exactly.
 
 Enable the feature in this workspace with
 `cargo check -p pencil-fft --features distributed --locked`. The public
@@ -150,7 +155,7 @@ Enable the feature in this workspace with
 pencils, exact extra shapes, reusable plan-bound
 `C2cOutOfPlaceWorkspace`, and input-preserving forward, normalized inverse,
 and raw positive-sign backward execution. Forward consumes the canonical input
-layout and produces the reversed output layout; both inverse and raw backward
+layout and produces the selected output layout; both inverse and raw backward
 consume that output layout and produce canonical input. Raw backward does not
 normalize, so a forward/backward pair scales by the product of selected
 spatial extents; identity axes and extra dimensions do not contribute. Construction and execution are collective
@@ -175,8 +180,9 @@ overlap unfinished point-to-point transposes on that context. The
 `R2rPlan<T, N, M>` accepts `[Option<R2rKind>; N]` in logical-axis order;
 `None` keeps that canonical route stage as an identity. It preserves the
 original global shape, uses the same `N` stages and `N - 1` checked
-transitions, and produces the reversed output layout. `forward`, normalized
-paired `inverse`, and raw paired `backward` are input-preserving and support
+transitions, and produces the reversed output layout by default; an explicit
+`DistributedLayout` can retain identity memory order with strided line
+kernels. `forward`, normalized paired `inverse`, and raw paired `backward` are input-preserving and support
 real or complex `f32`/`f64`. The in-place API uses a plan-bound
 `ManyPencilArray` and the shared `Input -> Poisoned -> Output` state contract;
 public `R2rState` reuses that completion-state enum. R2R descriptor agreement
@@ -198,10 +204,11 @@ arbitrary spectral data for either reverse operation.
 ## Local Julia/FFTW reference validation
 
 The opt-in Milestone 9 checker generates temporary Julia 1.12.6/FFTW.jl
-1.10.0 references and validates the distributed C2C, R2C/C2R, and R2R
+1.10.0 references and validates the distributed C2C, R2C/C2R, R2R, and DHT
 forward/inverse/raw backward APIs at 1, 4, and 6 MPI ranks with both
-transpose methods. It covers exactly 52 fixtures and 82 valid case/layout
-combinations per method and rank, including real/complex R2R `f32`/`f64`.
+transpose methods and both memory-layout policies. It covers exactly 68
+fixtures and 110 valid case/layout combinations per policy (220 with both
+policies), including real/complex R2R and DHT `f32`/`f64`.
 The external comparison is explicitly opt-in; normal Rust tests need no Julia.
 See [`tools/fftw-reference/README.md`](tools/fftw-reference/README.md) and run
 `tools/fftw-reference/check.sh` only when Julia, FFTW.jl, and MPI are locally

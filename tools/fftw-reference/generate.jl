@@ -1,7 +1,7 @@
 using FFTW
 using Printf
 
-const REFERENCE_VERSION = 5
+const REFERENCE_VERSION = 6
 
 struct ReferenceCase
     name::String
@@ -54,6 +54,43 @@ function partial_cases()
     ]
 end
 
+function dht_cases()
+    return [
+        ReferenceCase(
+            "dht_2d_3x4_dht-dht",
+            :dht,
+            [3, 4],
+            Int[],
+            [0, 1],
+            [:dht, :dht],
+        ),
+        ReferenceCase(
+            "dht_3d_3x2x4_extra2x3_dht-none-dht",
+            :dht,
+            [3, 2, 4],
+            [2, 3],
+            [0, 2],
+            [:dht, nothing, :dht],
+        ),
+        ReferenceCase(
+            "dht_4d_2x3x2x3_dht-none-none-dht",
+            :dht,
+            [2, 3, 2, 3],
+            Int[],
+            [0, 3],
+            [:dht, nothing, nothing, :dht],
+        ),
+        ReferenceCase(
+            "dht_4d_2x3x2x3_none-none-none-none",
+            :dht,
+            [2, 3, 2, 3],
+            Int[],
+            Int[],
+            [nothing, nothing, nothing, nothing],
+        ),
+    ]
+end
+
 function r2r_cases()
     return [
         ReferenceCase("r2r_2d_3x4_dcti-dctii", :r2r, [3, 4], Int[], [0, 1], [:dcti, :dctii]),
@@ -66,7 +103,7 @@ function r2r_cases()
 end
 
 function reference_cases()
-    return vcat(full_cases(), partial_cases(), r2r_cases())
+    return vcat(full_cases(), partial_cases(), r2r_cases(), dht_cases())
 end
 
 function precision_name(::Type{Float32})
@@ -264,6 +301,49 @@ function r2r_logical_factor(item::ReferenceCase)
     return factor
 end
 
+function dht_axis(array, dimension)
+    T = eltype(array)
+    n = size(array, dimension)
+    output = similar(array)
+    for index in CartesianIndices(array)
+        coordinates = collect(Tuple(index))
+        k = coordinates[dimension] - 1
+        value = zero(T)
+        for j in 0:n-1
+            coordinates[dimension] = j + 1
+            value += array[CartesianIndex(Tuple(coordinates))] * T(cos(2pi * j * k / n) + sin(2pi * j * k / n))
+        end
+        output[index] = value
+    end
+    return output
+end
+
+function dht_values(::Type{T}, item::ReferenceCase) where {T}
+    input = if T <: Complex
+        fill_complex!(logical_array(T, item), 307.5)
+    else
+        fill_real!(logical_array(T, item), 307.5)
+    end
+    inverse_input = if T <: Complex
+        fill_complex!(logical_array(T, item), 409.75)
+    else
+        fill_real!(logical_array(T, item), 409.75)
+    end
+    selected_dims = selected_julia_dims(item)
+    forward = copy(input)
+    backward = copy(inverse_input)
+    for dimension in selected_dims
+        forward = dht_axis(forward, dimension)
+        backward = dht_axis(backward, dimension)
+    end
+    factor = prod(item.spatial[axis + 1] for axis in item.selected; init = 1)
+    inverse = backward ./ T(factor)
+    @assert size(forward) == Tuple(reverse(logical_shape(item)))
+    @assert size(inverse) == Tuple(reverse(logical_shape(item)))
+    @assert size(backward) == Tuple(reverse(logical_shape(item)))
+    return input, inverse_input, forward, inverse, backward
+end
+
 function r2r_values(::Type{T}, item::ReferenceCase) where {T}
     input = if T <: Complex
         fill_complex!(logical_array(T, item), 101.5)
@@ -342,7 +422,7 @@ function print_complex_section(io, name::String, values)
 end
 
 function write_case(output_directory::String, item::ReferenceCase, ::Type{T}, provider, native_version) where {T}
-    suffix = item.kind == :r2r ? "_" * element_kind(T) : ""
+    suffix = item.kind in (:r2r, :dht) ? "_" * element_kind(T) : ""
     filename = joinpath(output_directory, item.name * suffix * "_" * precision_name(T) * ".txt")
     open(filename, "w") do io
         print_header(io, item, T, provider, native_version)
@@ -360,6 +440,21 @@ function write_case(output_directory::String, item::ReferenceCase, ::Type{T}, pr
             print_complex_section(io, "forward_expected", forward)
             print_real_section(io, "inverse_expected", inverse)
             print_real_section(io, "backward_expected", backward)
+        elseif item.kind == :dht
+            input, inverse_input, forward, inverse, backward = dht_values(T, item)
+            if T <: Complex
+                print_complex_section(io, "input", input)
+                print_complex_section(io, "inverse_input", inverse_input)
+                print_complex_section(io, "forward_expected", forward)
+                print_complex_section(io, "inverse_expected", inverse)
+                print_complex_section(io, "backward_expected", backward)
+            else
+                print_real_section(io, "input", input)
+                print_real_section(io, "inverse_input", inverse_input)
+                print_real_section(io, "forward_expected", forward)
+                print_real_section(io, "inverse_expected", inverse)
+                print_real_section(io, "backward_expected", backward)
+            end
         else
             input, inverse_input, forward, inverse, backward = r2r_values(T, item)
             if T <: Complex
@@ -401,8 +496,13 @@ function main()
             write_case(output_directory, item, T, provider, native_version)
         end
     end
+    for item in dht_cases()
+        for T in (Float32, Float64, Complex{Float32}, Complex{Float64})
+            write_case(output_directory, item, T, provider, native_version)
+        end
+    end
     files = filter(name -> endswith(name, ".txt"), readdir(output_directory))
-    expected = 52
+    expected = 68
     length(files) == expected || error("generated ", length(files), " fixtures, expected ", expected)
     println("generated ", length(files), " fixtures in ", output_directory)
 end

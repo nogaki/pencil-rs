@@ -69,6 +69,29 @@ impl R2rKind {
     }
 }
 
+/// The transform family assigned to one distributed real-to-real axis.
+///
+/// `Fftw` preserves the eight legacy DCT/DST kinds. `Dht` selects the
+/// self-paired discrete Hartley transform without changing [`R2rKind`].
+#[cfg(feature = "distributed")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AxisR2rKind {
+    /// One of the legacy FFTW-compatible DCT/DST kinds.
+    Fftw(R2rKind),
+    /// The discrete Hartley transform.
+    Dht,
+}
+
+#[cfg(feature = "distributed")]
+impl AxisR2rKind {
+    pub(crate) const fn descriptor_code(self) -> u64 {
+        match self {
+            Self::Fftw(kind) => kind.descriptor_code(),
+            Self::Dht => 9,
+        }
+    }
+}
+
 /// A scalar accepted by [`LocalR2rPlan`].
 ///
 /// This trait is sealed and is implemented for exactly `f32`, `f64`,

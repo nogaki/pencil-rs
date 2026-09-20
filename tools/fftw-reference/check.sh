@@ -64,7 +64,7 @@ fi
 shopt -s nullglob
 fixture_entries=("$FIXTURES"/*)
 fixture_files=("$FIXTURES"/*.txt)
-expected_fixture_count=52
+expected_fixture_count=68
 [[ ${#fixture_entries[@]} -eq "$expected_fixture_count" && ${#fixture_files[@]} -eq "$expected_fixture_count" ]] || {
     printf 'expected exactly %s fixture files, found %s entries and %s txt files\n' \
         "$expected_fixture_count" "${#fixture_entries[@]}" "${#fixture_files[@]}" >&2
@@ -75,8 +75,8 @@ for fixture in "${fixture_files[@]}"; do
         printf 'empty fixture: %s\n' "$fixture" >&2
         exit 1
     }
-    grep -Fxq 'PENCIL_FFTW_REFERENCE 5' "$fixture" || {
-        printf 'fixture is missing mandatory format-5 metadata: %s\n' "$fixture" >&2
+    grep -Fxq 'PENCIL_FFTW_REFERENCE 6' "$fixture" || {
+        printf 'fixture is missing mandatory format-6 metadata: %s\n' "$fixture" >&2
         exit 1
     }
     grep -Eq '^element_kind (real|complex)$' "$fixture" || {
@@ -140,6 +140,8 @@ CORRUPT_R2C_FORWARD="$WORK/corrupt-r2c-forward-fixtures"
 CORRUPT_R2C_BACKWARD="$WORK/corrupt-r2c-backward-fixtures"
 CORRUPT_R2R_FORWARD="$WORK/corrupt-r2r-forward-fixtures"
 CORRUPT_R2R_BACKWARD="$WORK/corrupt-r2r-backward-fixtures"
+CORRUPT_DHT_FORWARD="$WORK/corrupt-dht-forward-fixtures"
+CORRUPT_DHT_BACKWARD="$WORK/corrupt-dht-backward-fixtures"
 corrupt_directories=(
     "$CORRUPT_C2C_FORWARD"
     "$CORRUPT_C2C_BACKWARD"
@@ -147,6 +149,8 @@ corrupt_directories=(
     "$CORRUPT_R2C_BACKWARD"
     "$CORRUPT_R2R_FORWARD"
     "$CORRUPT_R2R_BACKWARD"
+    "$CORRUPT_DHT_FORWARD"
+    "$CORRUPT_DHT_BACKWARD"
 )
 mkdir -p "${corrupt_directories[@]}"
 for corrupt_directory in "${corrupt_directories[@]}"; do
@@ -205,13 +209,31 @@ for candidate in "$CORRUPT_R2R_BACKWARD"/*.txt; do
         break
     fi
 done
+corrupt_dht_forward_file=
+for candidate in "$CORRUPT_DHT_FORWARD"/*.txt; do
+    if grep -Fxq 'kind dht' "$candidate" \
+        && grep -Fq 'section forward_expected real ' "$candidate"; then
+        corrupt_dht_forward_file=$candidate
+        break
+    fi
+done
+corrupt_dht_backward_file=
+for candidate in "$CORRUPT_DHT_BACKWARD"/*.txt; do
+    if grep -Fxq 'kind dht' "$candidate" \
+        && grep -Fq 'section backward_expected real ' "$candidate"; then
+        corrupt_dht_backward_file=$candidate
+        break
+    fi
+done
 [[ -n "$corrupt_c2c_forward_file" \
     && -n "$corrupt_c2c_backward_file" \
     && -n "$corrupt_r2c_forward_file" \
     && -n "$corrupt_r2c_backward_file" \
     && -n "$corrupt_r2r_forward_file" \
-    && -n "$corrupt_r2r_backward_file" ]] || {
-    printf 'required C2C, R2C, and R2R corruption fixtures were not generated\n' >&2
+    && -n "$corrupt_r2r_backward_file" \
+    && -n "$corrupt_dht_forward_file" \
+    && -n "$corrupt_dht_backward_file" ]] || {
+    printf 'required C2C, R2C, R2R, and DHT corruption fixtures were not generated\n' >&2
     exit 1
 }
 "$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" -e '
@@ -241,13 +263,17 @@ corrupt(ARGS[5], ARGS[6])
 corrupt(ARGS[7], ARGS[8])
 corrupt(ARGS[9], ARGS[10])
 corrupt(ARGS[11], ARGS[12])
+corrupt(ARGS[13], ARGS[14])
+corrupt(ARGS[15], ARGS[16])
 ' \
     "$corrupt_c2c_forward_file" forward_expected \
     "$corrupt_c2c_backward_file" backward_expected \
     "$corrupt_r2c_forward_file" forward_expected \
     "$corrupt_r2c_backward_file" backward_expected \
     "$corrupt_r2r_forward_file" forward_expected \
-    "$corrupt_r2r_backward_file" backward_expected
+    "$corrupt_r2r_backward_file" backward_expected \
+    "$corrupt_dht_forward_file" forward_expected \
+    "$corrupt_dht_backward_file" backward_expected
 
 check_corruption_log() {
     local log_file=$1
@@ -320,3 +346,21 @@ if run_reference 1 "$CORRUPT_R2R_BACKWARD" "$R2R_BACKWARD_CORRUPT_LOG"; then
 fi
 check_corruption_log "$R2R_BACKWARD_CORRUPT_LOG" 'R2R backward'
 printf 'corrupted R2R backward_expected rejected as intended\n'
+
+printf '\n== corrupted DHT forward_expected rejection ==\n'
+DHT_FORWARD_CORRUPT_LOG="$WORK/corrupted-dht-forward.log"
+if run_reference 1 "$CORRUPT_DHT_FORWARD" "$DHT_FORWARD_CORRUPT_LOG"; then
+    printf 'checker accepted a deliberately corrupted DHT forward_expected value\n' >&2
+    exit 1
+fi
+check_corruption_log "$DHT_FORWARD_CORRUPT_LOG" 'DHT forward'
+printf 'corrupted DHT forward_expected rejected as intended\n'
+
+printf '\n== corrupted DHT backward_expected rejection ==\n'
+DHT_BACKWARD_CORRUPT_LOG="$WORK/corrupted-dht-backward.log"
+if run_reference 1 "$CORRUPT_DHT_BACKWARD" "$DHT_BACKWARD_CORRUPT_LOG"; then
+    printf 'checker accepted a deliberately corrupted DHT backward_expected value\n' >&2
+    exit 1
+fi
+check_corruption_log "$DHT_BACKWARD_CORRUPT_LOG" 'DHT backward'
+printf 'corrupted DHT backward_expected rejected as intended\n'
