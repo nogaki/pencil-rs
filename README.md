@@ -201,14 +201,40 @@ poisoned before its first write, and any later failure or panic leaves it
 `Poisoned`, so callers reallocate it. A mutable output view may contain
 arbitrary spectral data for either reverse operation.
 
+## Distributed mixed-axis plans
+
+`MixedC2cPlan<R, N, M>` and `MixedR2cPlan<R, N, M>` apply a typed
+`[AxisTransform; N]` in canonical descending route order. `None` is an
+identity, `Fft` is a complex FFT, `R2r(AxisR2rKind::Fftw(...))` selects a DCT
+or DST, and `R2r(AxisR2rKind::Dht)` selects a Hartley transform. `MixedC2cPlan`
+rejects `Rfft`; `MixedR2cPlan` requires exactly one `Rfft`, permits only
+identity/R2R/DHT stages on the real prefix and identity/FFT/R2R stages on the
+complex suffix, and reduces only the boundary axis. Both plans provide
+input-preserving out-of-place forward/inverse/raw-backward operations,
+plan-bound workspaces, checked single-allocation in-place arrays, both
+Alltoallv and point-to-point transitions, and the same normalized/raw pairing
+as the homogeneous plans. `MixedR2cPlan` validates finite DC/Nyquist planes
+collectively before C2R output and preserves the poisoned in-place state after
+post-start errors or panics; a representation handoff panic may discard the
+backing owner. `DistributedLayout::permute_dims = false` selects the strided
+per-line kernels. The mixed descriptors use distinct collective
+operation words, scalar widths, reduced shape, axis transform codes, and
+transport policy, so mixed and legacy calls cannot accidentally agree.
+
+The existing `tools/fftw-reference` Julia/FFTW checker remains the independent
+numerical reference for the component FFT, R2R, DHT, and R2C kernels. Mixed
+plans are validated by composing those same one-axis references in route order.
+The reusable oracle is `tools/fftw-reference/mixed_reference.jl`; focused MPI
+coverage is in `crates/pencil-fft/tests/distributed_mixed.rs`.
+
 ## Local Julia/FFTW reference validation
 
 The opt-in Milestone 9 checker generates temporary Julia 1.12.6/FFTW.jl
 1.10.0 references and validates the distributed C2C, R2C/C2R, R2R, and DHT
 forward/inverse/raw backward APIs at 1, 4, and 6 MPI ranks with both
-transpose methods and both memory-layout policies. It covers exactly 68
-fixtures and 110 valid case/layout combinations per policy (220 with both
-policies), including real/complex R2R and DHT `f32`/`f64`.
+transpose methods and both memory-layout policies. It covers exactly 82
+fixtures and 136 valid case/layout combinations per policy (272 with both
+policies), including mixed-axis C2C/R2C and real/complex R2R and DHT `f32`/`f64`.
 The external comparison is explicitly opt-in; normal Rust tests need no Julia.
 See [`tools/fftw-reference/README.md`](tools/fftw-reference/README.md) and run
 `tools/fftw-reference/check.sh` only when Julia, FFTW.jl, and MPI are locally
@@ -341,8 +367,9 @@ cargo doc --workspace --no-deps --locked
 cargo doc -p pencil-fft --features distributed --no-deps --locked
 cargo test --workspace --doc --locked -- --show-output
 cargo test -p pencil-fft --features distributed --doc --locked -- --show-output
-# The distributed suites cover C2C, R2C/C2R, and R2R over Alltoallv/P2P;
-# distributed C2C, R2C/C2R, and R2R also have in-place APIs; local C2C
+# The distributed suites cover C2C, R2C/C2R, R2R, and mixed-axis plans over
+# Alltoallv/P2P; distributed C2C, R2C/C2R, R2R, and mixed plans also have
+# in-place APIs; local C2C
 # and local R2C also have in-place APIs.
 for n in 1 4 6; do
   timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
@@ -350,6 +377,9 @@ for n in 1 4 6; do
       --locked -- --nocapture --test-threads=1 || exit 1
   timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
     cargo test -p pencil-fft --features distributed --test distributed_r2r \
+      --locked -- --nocapture --test-threads=1 || exit 1
+  timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
+    cargo test -p pencil-fft --features distributed --test distributed_mixed \
       --locked -- --nocapture --test-threads=1 || exit 1
 done
 ```

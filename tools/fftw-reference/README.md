@@ -5,7 +5,12 @@ and DHT forward/inverse/backward APIs. C2C backward is the positive-sign,
 unnormalized route from reversed output layout to canonical input layout; R2C
 backward is the corresponding raw C2R route; R2R backward applies the paired
 raw DCT/DST kind. It changes no production tolerances, CI, or checked-in
-numeric data.
+numeric data. Mixed-axis plans compose these independent one-axis FFTW/R2R/DHT
+values in route order; their focused MPI coverage is kept separate in
+`crates/pencil-fft/tests/distributed_mixed.rs` for focused state/layout
+coverage. The reusable Julia oracle is
+`tools/fftw-reference/mixed_reference.jl`; it accepts Rust-axis transform
+symbols and is included by the fixture generator for the mixed cases.
 
 ## Run
 
@@ -36,21 +41,24 @@ populate or precompile into its first entry. Startup files are disabled and
 user preferences are never edited. Open MPI/OpenRTE gets `--oversubscribe` unless
 `PENCIL_FFTW_NO_OVERSUBSCRIBE=1` is set.
 
-The runner generates exactly 68 temporary, non-empty fixtures by default:
+The runner generates exactly 82 temporary, non-empty fixtures by default:
 the original 28 C2C/R2C fixtures, 24 R2R fixtures (six cases × real and
-complex `f32`/`f64`), and 16 DHT fixtures (four cases × real and complex
-`f32`/`f64`). It builds the Rust test once with `cargo test --no-run`,
-runs its ordinary parser self-check, then runs the explicit ignored test
+complex `f32`/`f64`), 16 DHT fixtures (four cases × real and complex
+`f32`/`f64`), and 14 mixed-axis C2C/R2C fixtures. The mixed fixtures include
+FFT, RFFT, DCT, DHT, extra dimensions, and both odd/even reduced lengths.
+It builds the Rust test once with `cargo test --no-run`, runs its ordinary
+parser self-check, then runs the explicit ignored test
 through `cargo test -- --ignored` at 1, 4, and 6 MPI ranks. The original full
-and partial C2C/R2C cases are retained. For every R2C fixture and transport,
-the Rust checker compares the same independent expected values through
+and partial C2C/R2C cases are retained. For every R2C or mixed R2C fixture and
+transport, the Rust checker compares the same independent expected values through
 out-of-place and single-allocation real in-place forward/inverse/raw backward
 paths. All fixtures contain raw
 `backward_expected` values. It verifies a test-run marker so a missing ignored
-test cannot pass silently. It also runs eight independent pristine-fixture
-copies, corrupting `forward_expected` and `backward_expected` separately for
-C2C, R2C, R2R, and DHT; each one-rank run must fail with comparison markers
-and matching kind/operation context. Missing Julia, MPI, fixtures, or matrix members is a failure, never a
+test cannot pass silently. It also runs eight independent pristine-fixture copies for legacy C2C, R2C,
+R2R, and DHT, plus twelve independent mixed-axis corruption copies covering
+both mixed plan families and all forward/inverse/raw-backward expected sections;
+each one-rank run must fail with comparison markers and matching kind/operation
+context. Missing Julia, MPI, fixtures, or matrix members is a failure, never a
 skip. The runner uses Cargo's selected toolchain and target directory; it never
 selects an executable by filename or timestamp. Set `RUSTUP_TOOLCHAIN=1.85.0`
 to run the reference matrix with an installed MSRV toolchain.
@@ -80,19 +88,20 @@ printed by every generation run and recorded in every fixture.
 
 ## Fixture contract
 
-Every file has this fixed order (format version 6):
+Every file has this fixed order (format version 7):
 
 ```text
-PENCIL_FFTW_REFERENCE 6
+PENCIL_FFTW_REFERENCE 7
 runtime julia=1.12.6 fftw_jl=1.10.0 native=... provider=fftw
 case CASE_ID
-kind c2c|r2c|r2r|dht
+kind c2c|r2c|r2r|dht|mixed_c2c|mixed_r2c
 element_kind real|complex
 precision f32|f64
 original_shape N0 N1 ...
 extra_shape [optional positive extents]
-axis_kinds none|dcti|dctii|dctiii|dctiv|dsti|dstii|dstiii|dstiv|dht [one per Rust axis]
+axis_kinds none|fft|rfft|dcti|dctii|dctiii|dctiv|dsti|dstii|dstiii|dstiv|dht [one per Rust axis]
 selected_axes [canonical ascending Rust zero-based axes]
+original_n N (mixed_r2c only, the original RFFT extent)
 section input real|complex COUNT
 ... COUNT values ...
 end
@@ -111,10 +120,11 @@ end
 ```
 
 Every fixture has five counted sections in this order. Section typing is fixed
-by transform kind: C2C is complex throughout; R2C is half-complex, with real
-`input`, `inverse_expected`, and `backward_expected` plus complex
-`inverse_input` and `forward_expected`; R2R and DHT use real or complex for
-all five sections according to `element_kind`. DHT is the self-paired
+by transform kind: C2C and mixed C2C are complex throughout; R2C and mixed R2C
+are half-complex, with real `input`, `inverse_expected`, and
+`backward_expected` plus complex `inverse_input` and `forward_expected`; R2R
+and DHT use real or complex for all five sections according to
+`element_kind`. DHT is the self-paired
 separable Hartley transform; its normalized inverse divides by selected-axis
 lengths and its backward result is raw. C2C `backward_expected` is generated by
 FFTW's unnormalized
@@ -131,27 +141,31 @@ bounds. The generator fixes `ESTIMATE` and one FFTW thread; the Rust checker
 runs both methods. These constants are not serialized repeatedly.
 The parser rejects unknown, duplicate, reordered, trailing, malformed, empty,
 non-finite, or incomplete data, zero dimensions, invalid ranks, overflowed
-products, and counts before reserving section storage. Format 5 is rejected;
-format 6 is required.
+products, and counts before reserving section storage. Format 6 is rejected; format 7 is required.
 
 The serialized order is global logical Rust row-major `[extra..., spatial...]`.
 `selected_axes` is canonical Rust zero-based metadata; Julia maps Rust axis `a`
-to Julia dimension `N-a`. `axis_kinds` is always present in canonical logical axis order; non-R2R/DHT
-fixtures use `none` on every axis. DHT uses `dht` for selected axes. Julia allocates
-`reverse([extra..., spatial...])`. C2C transforms the selected dimensions, or
-copies for an empty selection. R2C uses the first selected Julia dimension (the
-maximum selected Rust axis) as the real FFT boundary and takes its original real
-length for `rfft`/`brfft`; only that extent is reduced. C2C/R2R use independent
-forward and inverse inputs; R2C creates the independent inverse spectrum from a
-real input, snapshots it before planning, and executes both C2R and raw `brfft`
-on private copies. FFTW `ESTIMATE`, one thread, the `fftw` provider, and
-native-version metadata remain explicit.
+to Julia dimension `N-a`. `axis_kinds` is always present in canonical logical
+axis order; legacy non-R2R/DHT fixtures use `none` on every axis. Mixed fixtures
+use `none`, `fft`, `rfft`, DCT/DST, and `dht` directly and require the selected
+axes to match the non-identity transforms. Julia allocates
+`reverse([extra..., spatial...])`. C2C and mixed C2C apply transforms in
+canonical descending Rust route order. Legacy R2C uses the maximum selected
+Rust axis as its real FFT boundary; mixed R2C uses its single `rfft` axis and requires only identity/R2R/DHT
+stages on the real prefix (higher Rust axes) and identity/FFT/R2R stages on
+the complex suffix (lower Rust axes); `original_n` must match that axis. Only that
+extent is reduced. C2C/R2R use independent forward and inverse inputs; R2C and
+mixed R2C create the independent inverse spectrum from a real input, snapshot it
+before planning, and execute both C2R and raw `brfft` on private copies. FFTW
+`ESTIMATE`, one thread, the `fftw` provider, and native-version metadata remain
+explicit.
 
 There are eight full-axis base cases and six partial-axis cases. Both
 precisions therefore produce the original 28 files. R2R adds six bounded cases
 for each of four element/precision combinations, for 24 more files; DHT adds
 four bounded cases (including the independent empty selection case) for the
-same four combinations, for 68 total:
+same four combinations; mixed C2C/R2C adds seven cases at two precisions, for 82
+total:
 
 - Full-axis C2C: `[3,4]`, `[3,2,5]` with extras `[2,3]`, `[2,1,3,4]`
   with extra `[2]`.
@@ -162,13 +176,17 @@ same four combinations, for 68 total:
   `[2,3,4]` with extra `[2]` and `[0,2]`.
 - DHT: `[3,4]` full, `[3,2,4]` partial with extra `[2,3]`, and
   `[2,3,2,3]` partial with `[0,3]` plus an independent empty selection.
+- Mixed: C2C `[3,2,4]` with `fft-dctii-dht`, `[2,3,2,3]` with
+  `none-fft-dctiv-dht`, and two `[2,3,2,3]` cases covering all DCT/DST kinds;
+  R2C `[4,3,5]` with `rfft-dctii-dht`, `[3,4,5]` with extra `[2]` and
+  `fft-rfft-dht`, and `[3,4]` with `rfft-dht`.
 
-The original cases are generated for f32 and f64. R2R and DHT cases are
-generated for real and complex f32 and f64. No fixture topology is serialized.
+The original and mixed cases are generated for f32 and f64. R2R and DHT cases
+are generated for real and complex f32 and f64. No fixture topology is serialized.
 For every file Rust runs all valid `M=1` layouts for `N=2,3,4` and also `M=2`
-for `N=3,4`: 110 case/layout combinations per transpose method and memory
+for `N=3,4`: 136 case/layout combinations per transpose method and memory
 policy per rank. Both Alltoallv and point-to-point are checked with both
-`DistributedLayout::permute_dims` values, for 220 total policy/layout runs.
+`DistributedLayout::permute_dims` values, for 272 total policy/layout runs.
 Small leading axes (including the R2R `[2,1,3,3]` case) deliberately create
 empty local ranges.
 
@@ -178,8 +196,9 @@ output permutations (reversed and identity) plus expected decompositions, and
 fills/compares raw slices without `get_local`. A Cartesian integer all-reduce proves every tiny
 fixture element is owned exactly once. It also checks out-of-place source and
 spectrum preservation, normalized inverse, raw backward, and C2C/R2R in-place
-values, including independent real and imaginary component bounds. DHT uses
-an independent direct Hartley oracle rather than round-trip-only assertions.
+values, including independent real and imaginary component bounds. Mixed
+fixtures use an independent per-axis FFTW/R2R/DHT oracle rather than
+round-trip-only assertions. DHT uses an independent direct Hartley oracle.
 
 ## Short plan
 

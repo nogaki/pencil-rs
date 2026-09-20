@@ -12,8 +12,9 @@ use mpi::{
 };
 use pencil_array::{ExtraShape, MpiTopology, Pencil, SpatialAxis};
 use pencil_fft::{
-    AxisSelection, C2cPlan, Complex, DhtPlan, DistributedLayout, FftReal, R2cPlan, R2rKind,
-    R2rPlan, R2rScalar, R2rState, TransposeMethod,
+    AxisR2rKind, AxisSelection, AxisTransform, C2cPlan, Complex, DhtPlan, DistributedLayout,
+    FftReal, MixedC2cPlan, MixedR2cPlan, R2cPlan, R2rKind, R2rPlan, R2rScalar, R2rState,
+    TransposeMethod,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +23,8 @@ enum Kind {
     R2c,
     R2r,
     Dht,
+    MixedC2c,
+    MixedR2c,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +36,8 @@ enum ElementKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum R2rAxisKind {
     None,
+    Fft,
+    Rfft,
     DctI,
     DctII,
     DctIII,
@@ -56,6 +61,7 @@ struct Fixture {
     element_kind: ElementKind,
     precision: Precision,
     shape: Vec<usize>,
+    original_n: Option<usize>,
     extra: Vec<usize>,
     axis_kinds: Vec<R2rAxisKind>,
     selection: Vec<usize>,
@@ -203,6 +209,8 @@ fn selected_axes(line: &str, dimensions: usize) -> Result<Vec<usize>, String> {
 fn parse_r2r_axis_kind(word: &str) -> Result<R2rAxisKind, String> {
     match word {
         "none" => Ok(R2rAxisKind::None),
+        "fft" => Ok(R2rAxisKind::Fft),
+        "rfft" => Ok(R2rAxisKind::Rfft),
         "dcti" => Ok(R2rAxisKind::DctI),
         "dctii" => Ok(R2rAxisKind::DctII),
         "dctiii" => Ok(R2rAxisKind::DctIII),
@@ -233,13 +241,25 @@ fn axis_kinds(line: &str, dimensions: usize) -> Result<Vec<R2rAxisKind>, String>
         .collect()
 }
 
-fn reduced(kind: Kind, shape: &[usize], selection: &[usize]) -> Vec<usize> {
+fn reduced(
+    kind: Kind,
+    shape: &[usize],
+    selection: &[usize],
+    axis_kinds: &[R2rAxisKind],
+) -> Vec<usize> {
     let mut result = shape.to_vec();
-    if kind == Kind::R2c {
-        let axis = *selection
-            .iter()
-            .max()
-            .expect("R2C reference selection is nonempty");
+    if matches!(kind, Kind::R2c | Kind::MixedR2c) {
+        let axis = if kind == Kind::MixedR2c {
+            axis_kinds
+                .iter()
+                .position(|kind| *kind == R2rAxisKind::Rfft)
+                .expect("mixed R2C reference has an RFFT axis")
+        } else {
+            *selection
+                .iter()
+                .max()
+                .expect("R2C reference selection is nonempty")
+        };
         result[axis] = result[axis] / 2 + 1;
     }
     result
@@ -258,7 +278,7 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
         lines.pop();
     }
     let mut cursor = 0;
-    if next(&lines, &mut cursor, "version")? != "PENCIL_FFTW_REFERENCE 6" {
+    if next(&lines, &mut cursor, "version")? != "PENCIL_FFTW_REFERENCE 7" {
         return Err("invalid reference version header".into());
     }
 
@@ -282,6 +302,8 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
         "r2c" => Kind::R2c,
         "r2r" => Kind::R2r,
         "dht" => Kind::Dht,
+        "mixed_c2c" => Kind::MixedC2c,
+        "mixed_r2c" => Kind::MixedR2c,
         other => return Err(format!("invalid kind {other:?}")),
     };
     let element_kind = match field(next(&lines, &mut cursor, "element_kind")?, "element_kind")? {
@@ -310,35 +332,89 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
         next(&lines, &mut cursor, "selected_axes")?,
         original_shape.len(),
     )?;
+    let original_n = if kind == Kind::MixedR2c {
+        Some(
+            field(next(&lines, &mut cursor, "original_n")?, "original_n")?
+                .parse()
+                .map_err(|error| format!("original_n: invalid usize: {error}"))?,
+        )
+    } else {
+        None
+    };
     let derived_selection = axis_kinds
         .iter()
         .enumerate()
         .filter_map(|(axis, kind)| (*kind != R2rAxisKind::None).then_some(axis))
         .collect::<Vec<_>>();
-    if kind == Kind::R2c && selection.is_empty() {
+    if matches!(kind, Kind::R2c | Kind::MixedR2c) && selection.is_empty() {
         return Err("R2C selected_axes must be nonempty".into());
     }
-    if !matches!(kind, Kind::R2r | Kind::Dht)
-        && axis_kinds.iter().any(|kind| *kind != R2rAxisKind::None)
-    {
-        return Err("axis_kinds: non-identity kinds require kind r2r or dht".into());
-    }
-    if kind == Kind::R2r && axis_kinds.contains(&R2rAxisKind::Dht) {
-        return Err("axis_kinds: dht requires kind dht".into());
-    }
-    if kind == Kind::Dht
-        && axis_kinds
+    if matches!(kind, Kind::MixedC2c | Kind::MixedR2c) {
+        let rfft_count = axis_kinds
             .iter()
-            .any(|kind| *kind != R2rAxisKind::None && *kind != R2rAxisKind::Dht)
-    {
-        return Err("axis_kinds: DHT fixtures require dht or none".into());
-    }
-    if matches!(kind, Kind::R2r | Kind::Dht) && selection != derived_selection {
-        return Err("selected_axes: does not match non-identity axis_kinds".into());
+            .filter(|kind| **kind == R2rAxisKind::Rfft)
+            .count();
+        if kind == Kind::MixedC2c && rfft_count != 0 {
+            return Err("mixed C2C cannot contain rfft".into());
+        }
+        if kind == Kind::MixedR2c && rfft_count != 1 {
+            return Err("mixed R2C requires exactly one rfft".into());
+        }
+        if kind == Kind::MixedR2c {
+            let boundary = axis_kinds
+                .iter()
+                .position(|kind| *kind == R2rAxisKind::Rfft)
+                .expect("rfft count was checked");
+            for (axis, kind) in axis_kinds.iter().enumerate() {
+                if axis > boundary && matches!(kind, R2rAxisKind::Fft | R2rAxisKind::Rfft) {
+                    return Err("mixed R2C: real prefix contains a complex axis".into());
+                }
+            }
+            if original_n != Some(original_shape[boundary]) {
+                return Err("original_n does not match the RFFT axis extent".into());
+            }
+        }
+        if selection != derived_selection {
+            return Err("selected_axes: does not match mixed axis_kinds".into());
+        }
+    } else {
+        if matches!(kind, Kind::C2c | Kind::R2c)
+            && axis_kinds.iter().any(|kind| *kind != R2rAxisKind::None)
+        {
+            return Err("axis_kinds: FFT/RFFT/R2R kinds require a mixed or R2R fixture".into());
+        }
+        if kind == Kind::R2r
+            && axis_kinds.iter().any(|kind| {
+                matches!(
+                    kind,
+                    R2rAxisKind::Fft | R2rAxisKind::Rfft | R2rAxisKind::Dht
+                )
+            })
+        {
+            return Err("axis_kinds: R2R fixtures require DCT/DST kinds or none".into());
+        }
+        if !matches!(kind, Kind::R2r | Kind::Dht)
+            && axis_kinds.iter().any(|kind| *kind != R2rAxisKind::None)
+        {
+            return Err("axis_kinds: non-identity kinds require kind r2r or dht".into());
+        }
+        if kind == Kind::R2r && axis_kinds.contains(&R2rAxisKind::Dht) {
+            return Err("axis_kinds: dht requires kind dht".into());
+        }
+        if kind == Kind::Dht
+            && axis_kinds
+                .iter()
+                .any(|kind| *kind != R2rAxisKind::None && *kind != R2rAxisKind::Dht)
+        {
+            return Err("axis_kinds: DHT fixtures require dht or none".into());
+        }
+        if matches!(kind, Kind::R2r | Kind::Dht) && selection != derived_selection {
+            return Err("selected_axes: does not match non-identity axis_kinds".into());
+        }
     }
     let expected_element_kind = match kind {
-        Kind::C2c => ElementKind::Complex,
-        Kind::R2c => ElementKind::Real,
+        Kind::C2c | Kind::MixedC2c => ElementKind::Complex,
+        Kind::R2c | Kind::MixedR2c => ElementKind::Real,
         Kind::R2r | Kind::Dht => element_kind,
     };
     if element_kind != expected_element_kind {
@@ -347,11 +423,11 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
     let mut input_shape = extra.clone();
     input_shape.extend(&original_shape);
     let mut output_shape = extra.clone();
-    output_shape.extend(reduced(kind, &original_shape, &selection));
+    output_shape.extend(reduced(kind, &original_shape, &selection, &axis_kinds));
     let input_count = product(&input_shape, "input shape")?;
     let output_count = product(&output_shape, "output shape")?;
     let input_kind = section_kind(element_kind);
-    let transformed_kind = if kind == Kind::R2c {
+    let transformed_kind = if matches!(kind, Kind::R2c | Kind::MixedR2c) {
         "complex"
     } else {
         input_kind
@@ -378,7 +454,7 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
         input_kind,
         input_count,
     )?;
-    let backward_kind = if kind == Kind::C2c {
+    let backward_kind = if matches!(kind, Kind::C2c | Kind::MixedC2c) {
         "complex"
     } else {
         input_kind
@@ -402,6 +478,7 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
         element_kind,
         precision,
         shape: original_shape,
+        original_n,
         extra,
         axis_kinds,
         selection,
@@ -428,6 +505,8 @@ fn all_axes(dimensions: usize) -> Vec<usize> {
 fn axis_kind_name(kind: R2rAxisKind) -> &'static str {
     match kind {
         R2rAxisKind::None => "none",
+        R2rAxisKind::Fft => "fft",
+        R2rAxisKind::Rfft => "rfft",
         R2rAxisKind::DctI => "dcti",
         R2rAxisKind::DctII => "dctii",
         R2rAxisKind::DctIII => "dctiii",
@@ -455,15 +534,25 @@ fn expected_case(
             Kind::R2c => "r2c",
             Kind::R2r => "r2r",
             Kind::Dht => "dht",
+            Kind::MixedC2c => "mixed_c2c",
+            Kind::MixedR2c => "mixed_r2c",
         },
         shape.len(),
         joined(shape)
     );
-    if !extra.is_empty() && matches!(kind, Kind::R2c | Kind::R2r | Kind::Dht) {
+    if !extra.is_empty()
+        && matches!(
+            kind,
+            Kind::R2c | Kind::R2r | Kind::Dht | Kind::MixedC2c | Kind::MixedR2c
+        )
+    {
         name.push_str("_extra");
         name.push_str(&joined(extra));
     }
-    if matches!(kind, Kind::R2r | Kind::Dht) {
+    if matches!(
+        kind,
+        Kind::R2r | Kind::Dht | Kind::MixedC2c | Kind::MixedR2c
+    ) {
         name.push('_');
         name.push_str(
             &axis_kinds
@@ -496,6 +585,7 @@ fn expected_case(
 }
 
 type CaseSpec = (Kind, Vec<usize>, Vec<usize>, Vec<usize>);
+type MixedCaseSpec = (Kind, Vec<usize>, Vec<usize>, Vec<usize>, Vec<R2rAxisKind>);
 
 fn base_cases() -> Vec<CaseSpec> {
     vec![
@@ -518,6 +608,75 @@ fn partial_cases() -> Vec<CaseSpec> {
         (Kind::R2c, vec![2, 3, 2, 3], vec![], vec![0, 2]),
         (Kind::R2c, vec![2, 3, 2, 3], vec![], vec![0, 3]),
         (Kind::R2c, vec![2, 3, 4], vec![2], vec![0, 2]),
+    ]
+}
+
+fn mixed_cases() -> Vec<MixedCaseSpec> {
+    vec![
+        (
+            Kind::MixedC2c,
+            vec![3, 2, 4],
+            vec![2],
+            vec![0, 1, 2],
+            vec![R2rAxisKind::Fft, R2rAxisKind::DctII, R2rAxisKind::Dht],
+        ),
+        (
+            Kind::MixedC2c,
+            vec![2, 3, 2, 3],
+            vec![],
+            vec![1, 2, 3],
+            vec![
+                R2rAxisKind::None,
+                R2rAxisKind::Fft,
+                R2rAxisKind::DctIV,
+                R2rAxisKind::Dht,
+            ],
+        ),
+        (
+            Kind::MixedC2c,
+            vec![2, 3, 2, 3],
+            vec![],
+            vec![0, 1, 2, 3],
+            vec![
+                R2rAxisKind::DctI,
+                R2rAxisKind::DstII,
+                R2rAxisKind::DctIII,
+                R2rAxisKind::DstIV,
+            ],
+        ),
+        (
+            Kind::MixedC2c,
+            vec![2, 3, 2, 3],
+            vec![],
+            vec![0, 1, 2, 3],
+            vec![
+                R2rAxisKind::DctIV,
+                R2rAxisKind::DstI,
+                R2rAxisKind::DstIII,
+                R2rAxisKind::DctII,
+            ],
+        ),
+        (
+            Kind::MixedR2c,
+            vec![4, 3, 5],
+            vec![],
+            vec![0, 1, 2],
+            vec![R2rAxisKind::Rfft, R2rAxisKind::DctII, R2rAxisKind::Dht],
+        ),
+        (
+            Kind::MixedR2c,
+            vec![3, 4, 5],
+            vec![2],
+            vec![0, 1, 2],
+            vec![R2rAxisKind::Fft, R2rAxisKind::Rfft, R2rAxisKind::Dht],
+        ),
+        (
+            Kind::MixedR2c,
+            vec![3, 4],
+            vec![],
+            vec![0, 1],
+            vec![R2rAxisKind::Rfft, R2rAxisKind::Dht],
+        ),
     ]
 }
 
@@ -603,7 +762,10 @@ fn fixtures(directory: &Path) -> Vec<Fixture> {
         .collect::<Result<_, _>>()
         .unwrap();
     paths.sort();
-    let expected_files = 68;
+    let expected_files = 2 * (base_cases().len() + partial_cases().len())
+        + 4 * r2r_cases().len()
+        + 2 * mixed_cases().len()
+        + 4 * dht_cases().len();
     assert_eq!(
         paths.len(),
         expected_files,
@@ -672,6 +834,52 @@ fn fixtures(directory: &Path) -> Vec<Fixture> {
                     "missing or duplicate R2R fixture"
                 );
             }
+        }
+    }
+    for (kind, shape, extra, selection, axis_kinds) in mixed_cases() {
+        for precision in [Precision::F32, Precision::F64] {
+            let matches = result
+                .iter()
+                .filter(|fixture| {
+                    fixture.kind == kind
+                        && fixture.element_kind
+                            == if kind == Kind::MixedC2c {
+                                ElementKind::Complex
+                            } else {
+                                ElementKind::Real
+                            }
+                        && fixture.precision == precision
+                        && fixture.shape == shape
+                        && fixture.extra == extra
+                        && fixture.selection == selection
+                        && fixture.axis_kinds == axis_kinds
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "missing or duplicate mixed fixture");
+            let fixture = matches[0];
+            assert_eq!(
+                fixture.original_n,
+                (kind == Kind::MixedR2c).then(|| {
+                    let axis = axis_kinds
+                        .iter()
+                        .position(|kind| *kind == R2rAxisKind::Rfft)
+                        .unwrap();
+                    shape[axis]
+                })
+            );
+            assert_eq!(
+                fixture.input.len(),
+                product(
+                    &fixture
+                        .extra
+                        .iter()
+                        .chain(fixture.shape.iter())
+                        .copied()
+                        .collect::<Vec<_>>(),
+                    "mixed input",
+                )
+                .unwrap()
+            );
         }
     }
     for (shape, extra, axis_kinds) in dht_cases() {
@@ -1098,7 +1306,7 @@ fn axis_selection<const N: usize>(fixture: &Fixture) -> AxisSelection<N> {
 
 fn r2r_kind(kind: R2rAxisKind) -> Option<R2rKind> {
     match kind {
-        R2rAxisKind::None => None,
+        R2rAxisKind::None | R2rAxisKind::Fft | R2rAxisKind::Rfft => None,
         R2rAxisKind::DctI => Some(R2rKind::DctI),
         R2rAxisKind::DctII => Some(R2rKind::DctII),
         R2rAxisKind::DctIII => Some(R2rKind::DctIII),
@@ -1120,6 +1328,34 @@ fn r2r_kinds<const N: usize>(fixture: &Fixture) -> [Option<R2rKind>; N] {
         .collect::<Vec<_>>()
         .try_into()
         .expect("fixture axis kind rank was validated")
+}
+
+fn mixed_transform(kind: R2rAxisKind) -> AxisTransform {
+    match kind {
+        R2rAxisKind::None => AxisTransform::None,
+        R2rAxisKind::Fft => AxisTransform::Fft,
+        R2rAxisKind::Rfft => AxisTransform::Rfft,
+        R2rAxisKind::DctI => AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DctI)),
+        R2rAxisKind::DctII => AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DctII)),
+        R2rAxisKind::DctIII => AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DctIII)),
+        R2rAxisKind::DctIV => AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DctIV)),
+        R2rAxisKind::DstI => AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DstI)),
+        R2rAxisKind::DstII => AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DstII)),
+        R2rAxisKind::DstIII => AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DstIII)),
+        R2rAxisKind::DstIV => AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DstIV)),
+        R2rAxisKind::Dht => AxisTransform::R2r(AxisR2rKind::Dht),
+    }
+}
+
+fn mixed_transforms<const N: usize>(fixture: &Fixture) -> [AxisTransform; N] {
+    fixture
+        .axis_kinds
+        .iter()
+        .copied()
+        .map(mixed_transform)
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("mixed fixture axis rank was validated")
 }
 
 fn c2c_case<R: Real, const N: usize, const M: usize>(
@@ -1283,6 +1519,176 @@ fn c2c_methods<R: Real, const N: usize, const M: usize>(
     }
 }
 
+fn mixed_c2c_case<R: Real, const N: usize, const M: usize>(
+    fixture: &Fixture,
+    topology: &Arc<MpiTopology<M>>,
+    method: TransposeMethod,
+    permute_dims: bool,
+    rank: i32,
+) where
+    Complex<R>: Equivalence,
+{
+    let shape: [usize; N] = fixture.shape.as_slice().try_into().unwrap();
+    let extra = extra(fixture);
+    let transforms = mixed_transforms::<N>(fixture);
+    let layout = Layout {
+        input: shape,
+        output: shape,
+        extra: &fixture.extra,
+        permute_dims,
+    };
+    let plan = MixedC2cPlan::<R, N, M>::from_shape_with_layout(
+        Arc::clone(topology),
+        shape,
+        extra.clone(),
+        transforms,
+        DistributedLayout {
+            transpose_method: method,
+            permute_dims,
+        },
+    )
+    .unwrap();
+    assert_eq!(plan.transforms(), transforms);
+    let mut source = plan.allocate_input().unwrap();
+    let source_snapshot = snap!(layout, source, false, "mixed C2C source");
+    ownership(source.pencil(), &source_snapshot, "mixed C2C source");
+    fill_complex(source.as_mut_slice(), &source_snapshot, &fixture.input);
+    let source_before = source.as_slice().to_vec();
+    let mut output = plan.allocate_output().unwrap();
+    let output_snapshot = snap!(layout, output, true, "mixed C2C output");
+    ownership(output.pencil(), &output_snapshot, "mixed C2C output");
+    let mut workspace = plan.allocate_workspace().unwrap();
+    plan.forward(&source, &mut output, &mut workspace).unwrap();
+    assert_eq!(source.as_slice(), source_before.as_slice());
+    check_c!(
+        output.as_slice(),
+        &output_snapshot,
+        &fixture.forward,
+        fixture,
+        rank,
+        method,
+        "mixed C2C forward"
+    );
+
+    let mut inverse_source = plan.allocate_output().unwrap();
+    let inverse_snapshot = snap!(layout, inverse_source, true, "mixed C2C inverse source");
+    fill_complex(
+        inverse_source.as_mut_slice(),
+        &inverse_snapshot,
+        &fixture.inverse_input,
+    );
+    let inverse_before = inverse_source.as_slice().to_vec();
+    let mut recovered = plan.allocate_input().unwrap();
+    let recovered_snapshot = snap!(layout, recovered, false, "mixed C2C recovered");
+    plan.inverse(&inverse_source, &mut recovered, &mut workspace)
+        .unwrap();
+    assert_eq!(inverse_source.as_slice(), inverse_before.as_slice());
+    check_c!(
+        recovered.as_slice(),
+        &recovered_snapshot,
+        &fixture.inverse,
+        fixture,
+        rank,
+        method,
+        "mixed C2C inverse"
+    );
+
+    let mut backward = plan.allocate_input().unwrap();
+    let backward_snapshot = snap!(layout, backward, false, "mixed C2C backward");
+    plan.backward(&inverse_source, &mut backward, &mut workspace)
+        .unwrap();
+    assert_eq!(inverse_source.as_slice(), inverse_before.as_slice());
+    check_c!(
+        backward.as_slice(),
+        &backward_snapshot,
+        &fixture.backward,
+        fixture,
+        rank,
+        method,
+        "mixed C2C backward"
+    );
+
+    let mut inplace = plan.allocate_in_place().unwrap();
+    {
+        let mut view = inplace.view_mut().unwrap();
+        let snapshot = snap!(layout, view, false, "mixed C2C in-place input");
+        fill_complex(view.as_mut_slice(), &snapshot, &fixture.input);
+    }
+    let pointer = inplace.view().unwrap().as_slice().as_ptr();
+    let mut inplace_workspace = plan.allocate_in_place_workspace().unwrap();
+    plan.forward_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    {
+        let view = inplace.view().unwrap();
+        assert_eq!(view.as_slice().as_ptr(), pointer);
+        let snapshot = snap!(layout, view, true, "mixed C2C in-place output");
+        check_c!(
+            view.as_slice(),
+            &snapshot,
+            &fixture.forward,
+            fixture,
+            rank,
+            method,
+            "mixed C2C in-place forward"
+        );
+    }
+    {
+        let mut view = inplace.view_mut().unwrap();
+        let snapshot = snap!(layout, view, true, "mixed C2C in-place inverse source");
+        fill_complex(view.as_mut_slice(), &snapshot, &fixture.inverse_input);
+    }
+    plan.inverse_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    {
+        let view = inplace.view().unwrap();
+        assert_eq!(view.as_slice().as_ptr(), pointer);
+        let snapshot = snap!(layout, view, false, "mixed C2C in-place inverse");
+        check_c!(
+            view.as_slice(),
+            &snapshot,
+            &fixture.inverse,
+            fixture,
+            rank,
+            method,
+            "mixed C2C in-place inverse"
+        );
+    }
+    plan.forward_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    {
+        let mut view = inplace.view_mut().unwrap();
+        let snapshot = snap!(layout, view, true, "mixed C2C in-place backward source");
+        fill_complex(view.as_mut_slice(), &snapshot, &fixture.inverse_input);
+    }
+    plan.backward_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    let view = inplace.view().unwrap();
+    assert_eq!(view.as_slice().as_ptr(), pointer);
+    let snapshot = snap!(layout, view, false, "mixed C2C in-place backward");
+    check_c!(
+        view.as_slice(),
+        &snapshot,
+        &fixture.backward,
+        fixture,
+        rank,
+        method,
+        "mixed C2C in-place backward"
+    );
+}
+
+fn mixed_c2c_methods<R: Real, const N: usize, const M: usize>(
+    fixture: &Fixture,
+    topology: &Arc<MpiTopology<M>>,
+    permute_dims: bool,
+    rank: i32,
+) where
+    Complex<R>: Equivalence,
+{
+    for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
+        mixed_c2c_case::<R, N, M>(fixture, topology, method, permute_dims, rank);
+    }
+}
+
 fn r2c_case<R: Real, const N: usize, const M: usize>(
     fixture: &Fixture,
     topology: &Arc<MpiTopology<M>>,
@@ -1294,10 +1700,15 @@ fn r2c_case<R: Real, const N: usize, const M: usize>(
 {
     let input_shape: [usize; N] = fixture.shape.as_slice().try_into().unwrap();
     let selection = axis_selection::<N>(fixture);
-    let output_shape: [usize; N] = reduced(Kind::R2c, &fixture.shape, &fixture.selection)
-        .as_slice()
-        .try_into()
-        .unwrap();
+    let output_shape: [usize; N] = reduced(
+        Kind::R2c,
+        &fixture.shape,
+        &fixture.selection,
+        &fixture.axis_kinds,
+    )
+    .as_slice()
+    .try_into()
+    .unwrap();
     let extra = extra(fixture);
     let layout = Layout {
         input: input_shape,
@@ -1447,6 +1858,197 @@ fn r2c_methods<R: Real, const N: usize, const M: usize>(
 {
     for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
         r2c_case::<R, N, M>(fixture, topology, method, permute_dims, rank);
+    }
+}
+
+fn mixed_r2c_case<R: Real, const N: usize, const M: usize>(
+    fixture: &Fixture,
+    topology: &Arc<MpiTopology<M>>,
+    method: TransposeMethod,
+    permute_dims: bool,
+    rank: i32,
+) where
+    Complex<R>: Equivalence,
+{
+    let input_shape: [usize; N] = fixture.shape.as_slice().try_into().unwrap();
+    let output_shape: [usize; N] = reduced(
+        Kind::MixedR2c,
+        &fixture.shape,
+        &fixture.selection,
+        &fixture.axis_kinds,
+    )
+    .as_slice()
+    .try_into()
+    .unwrap();
+    let extra = extra(fixture);
+    let transforms = mixed_transforms::<N>(fixture);
+    let layout = Layout {
+        input: input_shape,
+        output: output_shape,
+        extra: &fixture.extra,
+        permute_dims,
+    };
+    let plan = MixedR2cPlan::<R, N, M>::from_shape_with_layout(
+        Arc::clone(topology),
+        input_shape,
+        extra.clone(),
+        transforms,
+        DistributedLayout {
+            transpose_method: method,
+            permute_dims,
+        },
+    )
+    .unwrap();
+    assert_eq!(plan.transforms(), transforms);
+    let reduction_axis = fixture
+        .axis_kinds
+        .iter()
+        .position(|kind| *kind == R2rAxisKind::Rfft)
+        .unwrap();
+    assert_eq!(plan.reduction_axis(), reduction_axis);
+    assert_eq!(plan.original_n(), input_shape[reduction_axis]);
+
+    let mut source = plan.allocate_input().unwrap();
+    let source_snapshot = snap!(layout, source, false, "mixed R2C source");
+    ownership(source.pencil(), &source_snapshot, "mixed R2C source");
+    fill_real(source.as_mut_slice(), &source_snapshot, &fixture.input);
+    let source_before = source.as_slice().to_vec();
+    let mut output = plan.allocate_output().unwrap();
+    let output_snapshot = snap!(layout, output, true, "mixed R2C output");
+    ownership(output.pencil(), &output_snapshot, "mixed R2C output");
+    let mut workspace = plan.allocate_workspace().unwrap();
+    plan.forward(&source, &mut output, &mut workspace).unwrap();
+    assert_eq!(source.as_slice(), source_before.as_slice());
+    check_c!(
+        output.as_slice(),
+        &output_snapshot,
+        &fixture.forward,
+        fixture,
+        rank,
+        method,
+        "mixed R2C forward"
+    );
+
+    let mut inverse_source = plan.allocate_output().unwrap();
+    let inverse_snapshot = snap!(layout, inverse_source, true, "mixed C2R inverse source");
+    fill_complex(
+        inverse_source.as_mut_slice(),
+        &inverse_snapshot,
+        &fixture.inverse_input,
+    );
+    let inverse_before = inverse_source.as_slice().to_vec();
+    let mut recovered = plan.allocate_input().unwrap();
+    let recovered_snapshot = snap!(layout, recovered, false, "mixed C2R recovered");
+    plan.inverse(&inverse_source, &mut recovered, &mut workspace)
+        .unwrap_or_else(|error| {
+            panic!(
+                "{} {:?} mixed C2R inverse failed: {error:?}",
+                fixture.case, method,
+            )
+        });
+    assert_eq!(inverse_source.as_slice(), inverse_before.as_slice());
+    check_r!(
+        recovered.as_slice(),
+        &recovered_snapshot,
+        &fixture.inverse,
+        fixture,
+        rank,
+        method,
+        "mixed C2R inverse"
+    );
+
+    let mut backward = plan.allocate_input().unwrap();
+    let backward_snapshot = snap!(layout, backward, false, "mixed C2R backward");
+    plan.backward(&inverse_source, &mut backward, &mut workspace)
+        .unwrap();
+    assert_eq!(inverse_source.as_slice(), inverse_before.as_slice());
+    check_r!(
+        backward.as_slice(),
+        &backward_snapshot,
+        &fixture.backward,
+        fixture,
+        rank,
+        method,
+        "mixed R2C backward"
+    );
+
+    let mut inplace = plan.allocate_in_place().unwrap();
+    {
+        let mut view = inplace.real_view_mut().unwrap();
+        let snapshot = snap!(layout, view, false, "mixed R2C in-place input");
+        fill_real(view.as_mut_slice(), &snapshot, &fixture.input);
+    }
+    let pointer = inplace.real_view().unwrap().as_slice().as_ptr();
+    let mut inplace_workspace = plan.allocate_in_place_workspace().unwrap();
+    plan.forward_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    {
+        let view = inplace.complex_view().unwrap();
+        let snapshot = snap!(layout, view, true, "mixed R2C in-place output");
+        check_c!(
+            view.as_slice(),
+            &snapshot,
+            &fixture.forward,
+            fixture,
+            rank,
+            method,
+            "mixed R2C in-place forward"
+        );
+    }
+    {
+        let mut view = inplace.complex_view_mut().unwrap();
+        let snapshot = snap!(layout, view, true, "mixed C2R in-place inverse source");
+        fill_complex(view.as_mut_slice(), &snapshot, &fixture.inverse_input);
+    }
+    plan.inverse_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    {
+        let view = inplace.real_view().unwrap();
+        assert_eq!(view.as_slice().as_ptr(), pointer);
+        let snapshot = snap!(layout, view, false, "mixed C2R in-place inverse");
+        check_r!(
+            view.as_slice(),
+            &snapshot,
+            &fixture.inverse,
+            fixture,
+            rank,
+            method,
+            "mixed C2R in-place inverse"
+        );
+    }
+    plan.forward_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    {
+        let mut view = inplace.complex_view_mut().unwrap();
+        let snapshot = snap!(layout, view, true, "mixed C2R in-place backward source");
+        fill_complex(view.as_mut_slice(), &snapshot, &fixture.inverse_input);
+    }
+    plan.backward_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    let view = inplace.real_view().unwrap();
+    assert_eq!(view.as_slice().as_ptr(), pointer);
+    let snapshot = snap!(layout, view, false, "mixed R2C in-place backward");
+    check_r!(
+        view.as_slice(),
+        &snapshot,
+        &fixture.backward,
+        fixture,
+        rank,
+        method,
+        "mixed R2C in-place backward"
+    );
+}
+
+fn mixed_r2c_methods<R: Real, const N: usize, const M: usize>(
+    fixture: &Fixture,
+    topology: &Arc<MpiTopology<M>>,
+    permute_dims: bool,
+    rank: i32,
+) where
+    Complex<R>: Equivalence,
+{
+    for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
+        mixed_r2c_case::<R, N, M>(fixture, topology, method, permute_dims, rank);
     }
 }
 
@@ -1973,6 +2575,18 @@ fn run_fixture(
         (Kind::R2c, _, Precision::F64, 3) => dispatch!(r2c_methods, f64, 3),
         (Kind::R2c, _, Precision::F32, 4) => dispatch!(r2c_methods, f32, 4),
         (Kind::R2c, _, Precision::F64, 4) => dispatch!(r2c_methods, f64, 4),
+        (Kind::MixedC2c, _, Precision::F32, 2) => dispatch!(mixed_c2c_methods, f32, 2),
+        (Kind::MixedC2c, _, Precision::F64, 2) => dispatch!(mixed_c2c_methods, f64, 2),
+        (Kind::MixedC2c, _, Precision::F32, 3) => dispatch!(mixed_c2c_methods, f32, 3),
+        (Kind::MixedC2c, _, Precision::F64, 3) => dispatch!(mixed_c2c_methods, f64, 3),
+        (Kind::MixedC2c, _, Precision::F32, 4) => dispatch!(mixed_c2c_methods, f32, 4),
+        (Kind::MixedC2c, _, Precision::F64, 4) => dispatch!(mixed_c2c_methods, f64, 4),
+        (Kind::MixedR2c, _, Precision::F32, 2) => dispatch!(mixed_r2c_methods, f32, 2),
+        (Kind::MixedR2c, _, Precision::F64, 2) => dispatch!(mixed_r2c_methods, f64, 2),
+        (Kind::MixedR2c, _, Precision::F32, 3) => dispatch!(mixed_r2c_methods, f32, 3),
+        (Kind::MixedR2c, _, Precision::F64, 3) => dispatch!(mixed_r2c_methods, f64, 3),
+        (Kind::MixedR2c, _, Precision::F32, 4) => dispatch!(mixed_r2c_methods, f32, 4),
+        (Kind::MixedR2c, _, Precision::F64, 4) => dispatch!(mixed_r2c_methods, f64, 4),
         (Kind::R2r, ElementKind::Real, Precision::F32, 2) => dispatch!(r2r_methods, f32, 2),
         (Kind::R2r, ElementKind::Real, Precision::F64, 2) => dispatch!(r2r_methods, f64, 2),
         (Kind::R2r, ElementKind::Real, Precision::F32, 3) => dispatch!(r2r_methods, f32, 3),
@@ -2031,7 +2645,7 @@ fn parser_and_offset_self_check() {
     let section = |name: &str| format!("section {name} complex 6\n{values}end\n");
     let backward_section = section("backward_expected");
     let valid = format!(
-        "PENCIL_FFTW_REFERENCE 6\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase c2c_2d_2x3_f64\nkind c2c\nelement_kind complex\nprecision f64\noriginal_shape 2 3\nextra_shape\naxis_kinds none none\nselected_axes 0 1\n{}{}{}{}{}",
+        "PENCIL_FFTW_REFERENCE 7\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase c2c_2d_2x3_f64\nkind c2c\nelement_kind complex\nprecision f64\noriginal_shape 2 3\nextra_shape\naxis_kinds none none\nselected_axes 0 1\n{}{}{}{}{}",
         section("input"),
         section("inverse_input"),
         section("forward_expected"),
@@ -2041,17 +2655,19 @@ fn parser_and_offset_self_check() {
     assert_eq!(parse_fixture(&valid).unwrap().input.len(), 6);
     assert_eq!(parse_fixture(&valid).unwrap().backward.len(), 6);
     assert!(
-        parse_fixture(&valid.replacen("PENCIL_FFTW_REFERENCE 6", "PENCIL_FFTW_REFERENCE 5", 1,))
+        parse_fixture(&valid.replacen("PENCIL_FFTW_REFERENCE 7", "PENCIL_FFTW_REFERENCE 6", 1,))
             .is_err()
     );
     assert!(parse_fixture(&valid.replacen("selected_axes 0 1", "selected_axes 1 0", 1)).is_err());
     assert!(parse_fixture(&valid.replacen("selected_axes 0 1", "selected_axes 0 0", 1)).is_err());
+    assert!(parse_fixture(&valid.replace("axis_kinds none none", "axis_kinds fft none")).is_err());
+    assert!(parse_fixture(&valid.replace("axis_kinds none none", "axis_kinds rfft none")).is_err());
 
     let r2c_section = |name: &str, kind: &str, count: usize, values: &str| {
         format!("section {name} {kind} {count}\n{values}end\n")
     };
     let r2c = format!(
-        "PENCIL_FFTW_REFERENCE 6\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase r2c_2d_2x3_f64\nkind r2c\nelement_kind real\nprecision f64\noriginal_shape 2 3\nextra_shape\naxis_kinds none none\nselected_axes 0 1\n{}{}{}{}{}",
+        "PENCIL_FFTW_REFERENCE 7\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase r2c_2d_2x3_f64\nkind r2c\nelement_kind real\nprecision f64\noriginal_shape 2 3\nextra_shape\naxis_kinds none none\nselected_axes 0 1\n{}{}{}{}{}",
         r2c_section("input", "real", 6, "1\n2\n3\n4\n5\n6\n"),
         r2c_section("inverse_input", "complex", 4, "1 0\n2 0\n3 0\n4 0\n"),
         r2c_section("forward_expected", "complex", 4, "1 0\n2 0\n3 0\n4 0\n"),
@@ -2077,6 +2693,69 @@ fn parser_and_offset_self_check() {
         ))
         .is_err()
     );
+
+    let mixed_c2c = format!(
+        "PENCIL_FFTW_REFERENCE 7\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase mixed_c2c_2d_2x3_fft-dctii_f64\nkind mixed_c2c\nelement_kind complex\nprecision f64\noriginal_shape 2 3\nextra_shape\naxis_kinds fft dctii\nselected_axes 0 1\n{}{}{}{}{}",
+        section("input"),
+        section("inverse_input"),
+        section("forward_expected"),
+        section("inverse_expected"),
+        backward_section,
+    );
+    let parsed_mixed_c2c = parse_fixture(&mixed_c2c).unwrap();
+    assert_eq!(parsed_mixed_c2c.kind, Kind::MixedC2c);
+    assert_eq!(parsed_mixed_c2c.element_kind, ElementKind::Complex);
+    assert_eq!(parsed_mixed_c2c.original_n, None);
+    assert!(
+        parse_fixture(&mixed_c2c.replace("axis_kinds fft dctii", "axis_kinds rfft dctii")).is_err()
+    );
+
+    let mixed_r2c = format!(
+        "PENCIL_FFTW_REFERENCE 7\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase mixed_r2c_2d_3x2_rfft-dht_f64\nkind mixed_r2c\nelement_kind real\nprecision f64\noriginal_shape 3 2\nextra_shape\naxis_kinds rfft dht\nselected_axes 0 1\noriginal_n 3\n{}{}{}{}{}",
+        r2c_section("input", "real", 6, "1\n2\n3\n4\n5\n6\n"),
+        r2c_section("inverse_input", "complex", 4, "1 0\n2 0\n3 0\n4 0\n"),
+        r2c_section("forward_expected", "complex", 4, "1 0\n2 0\n3 0\n4 0\n"),
+        r2c_section("inverse_expected", "real", 6, "1\n2\n3\n4\n5\n6\n"),
+        r2c_section("backward_expected", "real", 6, "1\n2\n3\n4\n5\n6\n"),
+    );
+    let parsed_mixed_r2c = parse_fixture(&mixed_r2c).unwrap();
+    assert_eq!(parsed_mixed_r2c.kind, Kind::MixedR2c);
+    assert_eq!(parsed_mixed_r2c.original_n, Some(3));
+    assert!(
+        parse_fixture(&mixed_r2c.replace("axis_kinds rfft dht", "axis_kinds rfft fft")).is_err()
+    );
+    assert!(
+        parse_fixture(&mixed_r2c.replace("axis_kinds rfft dht", "axis_kinds none dht")).is_err()
+    );
+    assert!(
+        parse_fixture(&mixed_r2c.replace("axis_kinds rfft dht", "axis_kinds rfft rfft")).is_err()
+    );
+    assert!(
+        parse_fixture(&mixed_r2c.replace("element_kind real", "element_kind complex")).is_err()
+    );
+    assert!(
+        parse_fixture(&mixed_r2c.replace("axis_kinds rfft dht", "axis_kinds rfft none")).is_err()
+    );
+    assert!(parse_fixture(&mixed_r2c.replace("original_n 3", "original_n 4")).is_err());
+    assert!(parse_fixture(&mixed_r2c.replace("original_n 3\n", "")).is_err());
+    assert!(
+        parse_fixture(&mixed_r2c.replace("original_n 3\n", "original_n 3\noriginal_n 3\n"))
+            .is_err()
+    );
+    assert!(
+        parse_fixture(&mixed_r2c.replace(
+            "section forward_expected complex 4",
+            "section forward_expected real 4"
+        ))
+        .is_err()
+    );
+    assert!(
+        parse_fixture(&mixed_r2c.replace(
+            "section backward_expected real 6",
+            "section backward_expected real 5"
+        ))
+        .is_err()
+    );
     assert!(
         parse_fixture(&r2c.replacen(
             "section backward_expected real 6\n1",
@@ -2087,7 +2766,7 @@ fn parser_and_offset_self_check() {
     );
 
     let r2r_real = format!(
-        "PENCIL_FFTW_REFERENCE 6\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase r2r_2d_2x3_dctii-none_f64\nkind r2r\nelement_kind real\nprecision f64\noriginal_shape 2 3\nextra_shape\naxis_kinds dctii none\nselected_axes 0\n{}{}{}{}{}",
+        "PENCIL_FFTW_REFERENCE 7\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase r2r_2d_2x3_dctii-none_f64\nkind r2r\nelement_kind real\nprecision f64\noriginal_shape 2 3\nextra_shape\naxis_kinds dctii none\nselected_axes 0\n{}{}{}{}{}",
         r2c_section("input", "real", 6, "1\n2\n3\n4\n5\n6\n"),
         r2c_section("inverse_input", "real", 6, "7\n8\n9\n10\n11\n12\n"),
         r2c_section("forward_expected", "real", 6, "13\n14\n15\n16\n17\n18\n"),
@@ -2103,6 +2782,12 @@ fn parser_and_offset_self_check() {
     );
     assert_eq!(parsed_r2r_real.selection, vec![0]);
     assert_eq!(parsed_r2r_real.forward.len(), 6);
+    assert!(
+        parse_fixture(&r2r_real.replace("axis_kinds dctii none", "axis_kinds fft none")).is_err()
+    );
+    assert!(
+        parse_fixture(&r2r_real.replace("axis_kinds dctii none", "axis_kinds rfft none")).is_err()
+    );
     let dht = r2r_real
         .replace("r2r_2d_2x3_dctii-none_f64", "dht_2d_2x3_dht-none_f64")
         .replace("kind r2r", "kind dht")
@@ -2118,7 +2803,7 @@ fn parser_and_offset_self_check() {
 
     let complex_values = "1 0\n2 1\n3 2\n4 3\n5 4\n6 5\n";
     let r2r_complex = format!(
-        "PENCIL_FFTW_REFERENCE 6\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase r2r_2d_2x3_none-dstiv_f64\nkind r2r\nelement_kind complex\nprecision f64\noriginal_shape 2 3\nextra_shape\naxis_kinds none dstiv\nselected_axes 1\n{}{}{}{}{}",
+        "PENCIL_FFTW_REFERENCE 7\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase r2r_2d_2x3_none-dstiv_f64\nkind r2r\nelement_kind complex\nprecision f64\noriginal_shape 2 3\nextra_shape\naxis_kinds none dstiv\nselected_axes 1\n{}{}{}{}{}",
         r2c_section("input", "complex", 6, complex_values),
         r2c_section("inverse_input", "complex", 6, complex_values),
         r2c_section("forward_expected", "complex", 6, complex_values),
@@ -2262,7 +2947,29 @@ fn fftw_reference_matrix() {
         .iter()
         .map(|fixture| std::cmp::min(2, fixture.shape.len() - 1))
         .sum();
-    assert_eq!(layouts, 110);
+    let layout_count = |shape: &[usize]| std::cmp::min(2, shape.len() - 1);
+    let expected_layouts = base_cases()
+        .into_iter()
+        .chain(partial_cases())
+        .map(|(_, shape, _, _)| layout_count(&shape))
+        .sum::<usize>()
+        * 2
+        + r2r_cases()
+            .into_iter()
+            .map(|(shape, _, _)| layout_count(&shape))
+            .sum::<usize>()
+            * 4
+        + mixed_cases()
+            .into_iter()
+            .map(|(_, shape, _, _, _)| layout_count(&shape))
+            .sum::<usize>()
+            * 2
+        + dht_cases()
+            .into_iter()
+            .map(|(shape, _, _)| layout_count(&shape))
+            .sum::<usize>()
+            * 4;
+    assert_eq!(layouts, expected_layouts);
     let layout_policies = 2;
     let total_layouts = layouts * layout_policies;
     println!(
