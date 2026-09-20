@@ -1283,6 +1283,69 @@ fn r2c_case<R: Real, const N: usize, const M: usize>(
         method,
         "R2C backward"
     );
+
+    let mut inplace = plan.allocate_in_place().unwrap();
+    {
+        let mut view = inplace.real_view_mut().unwrap();
+        let snapshot = snap!(layout, view, false, "R2C in-place input");
+        fill_real(view.as_mut_slice(), &snapshot, &fixture.input);
+    }
+    let mut inplace_workspace = plan.allocate_in_place_workspace().unwrap();
+    plan.forward_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    {
+        let view = inplace.complex_view().unwrap();
+        let snapshot = snap!(layout, view, true, "R2C in-place output");
+        check_c!(
+            view.as_slice(),
+            &snapshot,
+            &fixture.forward,
+            fixture,
+            rank,
+            method,
+            "R2C in-place forward"
+        );
+    }
+    {
+        let mut view = inplace.complex_view_mut().unwrap();
+        let snapshot = snap!(layout, view, true, "C2R in-place inverse input");
+        fill_complex(view.as_mut_slice(), &snapshot, &fixture.inverse_input);
+    }
+    plan.inverse_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    {
+        let view = inplace.real_view().unwrap();
+        let snapshot = snap!(layout, view, false, "C2R in-place recovered");
+        check_r!(
+            view.as_slice(),
+            &snapshot,
+            &fixture.inverse,
+            fixture,
+            rank,
+            method,
+            "C2R in-place inverse"
+        );
+    }
+    plan.forward_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    {
+        let mut view = inplace.complex_view_mut().unwrap();
+        let snapshot = snap!(layout, view, true, "R2C in-place backward input");
+        fill_complex(view.as_mut_slice(), &snapshot, &fixture.inverse_input);
+    }
+    plan.backward_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    let view = inplace.real_view().unwrap();
+    let snapshot = snap!(layout, view, false, "R2C in-place backward");
+    check_r!(
+        view.as_slice(),
+        &snapshot,
+        &fixture.backward,
+        fixture,
+        rank,
+        method,
+        "R2C in-place backward"
+    );
 }
 
 fn r2c_methods<R: Real, const N: usize, const M: usize>(

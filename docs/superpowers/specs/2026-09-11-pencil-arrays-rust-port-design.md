@@ -1,7 +1,7 @@
 # PencilArrays / PencilFFTs Rust移植 設計仕様
 
 日付: 2026-09-11  
-状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R raw backward、local R2R、AxisSelection付きAlltoallv/P2P分散C2C FFT out/in-place、AxisSelection付き分散R2C/C2R out-of-place raw backward、分散R2R out/in-place、Julia format-5交差検証fixture（52 fixture、82 layout）は実装済み。
+状態: Array基盤、LocalTranspose、Alltoallv out/in-place、P2P out/in-place、local C2C、local R2C/C2R out/in-place（raw backward含む）、local R2R、AxisSelection付きAlltoallv/P2P分散C2C FFT out/in-place、AxisSelection付き分散R2C/C2R out/in-place（raw backward含む）、分散R2R out/in-place、Julia format-5交差検証fixture（52 fixture、82 layout）は実装済み。
 対象: CPU + MPIによる任意次元分散配列基盤と分散FFT基盤
 
 ## 1. 参照実装
@@ -2230,8 +2230,10 @@ The distributed feature exposes `R2cPlan<R, N, M>`, `R2cWorkspace`, and
 the input pencil is canonical identity with decomposition `[0..M)`. A non-empty
 `AxisSelection<N>` chooses its largest Rust axis as the real boundary; only
 that selected extent `n` becomes `m = n/2+1`. Constructors mirror `C2cPlan`,
-including both checked transports, and allocation is noncollective. There is
-no real in-place API; an empty R2C selection is collectively rejected.
+including both checked transports, and allocation is noncollective. At this
+2026-09-18 out-of-place snapshot there was no real in-place API; the current
+single-allocation addition is recorded in the dated section below. Empty R2C
+selections are collectively rejected.
 
 The selected boundary stage is `LocalR2cPlan::forward`, `inverse`, or
 `backward`; selected axes below it are complex FFTs and unselected stages are
@@ -2266,6 +2268,34 @@ finite-positive raw threshold are collectively validated during plan
 construction before native planning.
 Normalized inverse threshold arithmetic is unchanged.
 
+#### Milestone 8 current capability: distributed real in-place (2026-09-20)
+
+The distributed R2C/C2R plan now also exposes
+`allocate_in_place`, `allocate_in_place_workspace`, and the typed
+`forward_in_place`, `inverse_in_place`, and `backward_in_place` operations.
+`R2cInPlaceArray` owns one allocation whose bytes are safely recast between a
+real-prefix `ManyPencilArray<R>` registry and a reduced-complex-suffix
+`ManyPencilArray<Complex<R>>` registry. It supports selected and non-last real
+boundaries, both checked transports, extra batches, empty local partitions,
+and length-one/odd/even reduced axes. The public views are state checked and
+return only the matching `PencilArrayView` type.
+
+The data allocation is sized once for the checked maximum byte requirement of
+both registries; representation handoff uses bytemuck's fallible ownership
+casts, never unsafe/raw parts or a full-array temporary. Real boundary rows are
+packed and processed back-to-front for forward and front-to-back for C2R.
+Complex suffix transitions and native stages run in the same allocation. The
+outer state changes `RealInput -> Poisoned -> ComplexOutput` for forward and
+`ComplexOutput -> Poisoned -> RealInput` for reverse operations. Initial
+collective preflight errors preserve state/data/workspace; after start, errors,
+invalid spectra, and panics leave the array poisoned. The normalized/raw
+boundary policy is the existing out-of-place policy; invalid spectra are
+reported after complex-tail work without a rollback promise.
+
+R2C in-place collective operation words are 25, 26, and 27 for forward,
+normalized inverse, and raw backward. Words 18 through 24 remain reserved for
+the parallel distributed R2R API.
+
 Collective operation words 12, 13, 14, and 17 are R2C construction, forward,
 inverse, and raw backward. The five-word header and operation words remain fixed. The exact schema-2
 R2C descriptor records the original real shape, process grid, extra rank and
@@ -2281,7 +2311,8 @@ its canonical command, locked Julia environment, exactly 52 temporary
 format-5 fixtures and 82 case/layout combinations per method and rank are
 documented in [`tools/fftw-reference/README.md`](../../../tools/fftw-reference/README.md).
 It validates distributed C2C, R2C/C2R, and R2R forward/inverse/raw backward
-without changing production tolerances, CI, or checked-in numeric data.
+through both out-of-place and single-allocation real in-place paths without
+changing production tolerances, CI, or checked-in numeric data.
 
 - Julia reference driver
 - MPI test matrix
@@ -2306,6 +2337,7 @@ without changing production tolerances, CI, or checked-in numeric data.
 - 全spatial軸または選択軸集合のC2C in-place
 - 全spatial軸または選択軸集合のR2C/C2R out-of-place
 - 全spatial軸のDCT/DST-I-IV R2R out-of-place/in-place
+- 分散R2C/C2Rのsingle-allocation in-place
 - `f32`,`f64`および対応する複素R2Rスカラー
 - single-rankおよびmulti-rank参照結果と一致
 - Julia logical resultと一致
@@ -2322,8 +2354,8 @@ without changing production tolerances, CI, or checked-in numeric data.
 
 - GPU追加時も`Pencil`へbufferを持たせない
 - FFTW追加時もArray crateを変更しない
-- in-place R2C追加時も共通`TransformStage`を維持し、異種型共有storageだけを専用化する
-- 追加のreal-to-real kindも局所transform variantとして追加し、配置列を再利用する
+- R2C in-placeは共通`TransformStage`を維持し、異種型共有storageだけを専用化する
+- DCT/DST追加時も局所transform variantとして追加し、配置列を再利用する
 - 部分FFTは公開`AxisSelection<N>`を入力にし、既存の全軸選択を既定値とする。実行routeは常に軸`N-1`から`0`までの`N`段・`N-1`遷移を保ち、未選択stageはnative FFTとscaleを持たないidentityとする。したがって空のC2Cは値を変えずにcanonical full routeの転置だけを行う。R2Cは選択集合の最大Rust軸をreal boundaryにし、その軸だけを`n/2+1`へreductionする。
 - I/O、reduction、global viewはArray crate上の独立モジュールとして追加する
 

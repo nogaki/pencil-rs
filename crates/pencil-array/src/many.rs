@@ -47,13 +47,34 @@ impl<T, const N: usize, const M: usize> ManyPencilArray<T, N, M> {
         extra_shape: ExtraShape,
         storage: Vec<T>,
     ) -> Result<Self, ArrayError> {
+        Self::from_vec_preserving(pencils, active, extra_shape, storage)
+            .map_err(|(error, _storage)| error)
+    }
+
+    /// Takes ownership of a buffer sized for the largest registered local
+    /// layout, returning the buffer as well when validation fails.
+    ///
+    /// This is useful for a caller that must keep ownership of a partially
+    /// transformed buffer after rejecting its replacement layout.
+    pub fn from_vec_preserving(
+        pencils: impl Into<Box<[Arc<Pencil<N, M>>]>>,
+        active: usize,
+        extra_shape: ExtraShape,
+        storage: Vec<T>,
+    ) -> Result<Self, (ArrayError, Vec<T>)> {
         let pencils = pencils.into();
-        let required = validate_registry(&pencils, active, &extra_shape)?;
+        let required = match validate_registry(&pencils, active, &extra_shape) {
+            Ok(required) => required,
+            Err(error) => return Err((error, storage)),
+        };
         if storage.len() != required {
-            return Err(ArrayError::StorageLengthMismatch {
-                required,
-                actual: storage.len(),
-            });
+            return Err((
+                ArrayError::StorageLengthMismatch {
+                    required,
+                    actual: storage.len(),
+                },
+                storage,
+            ));
         }
 
         Ok(Self {
@@ -93,6 +114,55 @@ impl<T, const N: usize, const M: usize> ManyPencilArray<T, N, M> {
     /// Returns every registered pencil in registration order.
     pub fn pencils(&self) -> &[Arc<Pencil<N, M>>] {
         &self.pencils
+    }
+
+    /// Returns the initialized backing storage length in elements.
+    pub fn storage_len(&self) -> usize {
+        self.storage.len()
+    }
+
+    /// Returns the backing storage capacity in elements.
+    pub fn storage_capacity(&self) -> usize {
+        self.storage.capacity()
+    }
+
+    /// Consumes the array and returns its complete backing storage.
+    ///
+    /// The storage includes the full registered maximum, not just the active
+    /// layout. The allocation and its capacity are preserved.
+    pub fn into_storage(self) -> Vec<T> {
+        self.storage
+    }
+
+    /// Consumes the array and returns its registry, active index, extra shape,
+    /// and complete backing storage.
+    ///
+    /// A poisoned array cannot be decomposed through this method.
+    #[allow(clippy::type_complexity)]
+    pub fn into_parts(
+        self,
+    ) -> Result<(Box<[Arc<Pencil<N, M>>]>, usize, ExtraShape, Vec<T>), ArrayError> {
+        self.into_parts_preserving()
+            .map_err(|(error, _array)| error)
+    }
+
+    /// Consumes the array and returns its parts, or the original array when
+    /// its active layout is invalid.
+    #[allow(clippy::type_complexity)]
+    pub fn into_parts_preserving(
+        self,
+    ) -> Result<(Box<[Arc<Pencil<N, M>>]>, usize, ExtraShape, Vec<T>), (ArrayError, Self)> {
+        let active = match self.active_index() {
+            Ok(active) => active,
+            Err(error) => return Err((error, self)),
+        };
+        let Self {
+            pencils,
+            extra_shape,
+            storage,
+            state: _,
+        } = self;
+        Ok((pencils, active, extra_shape, storage))
     }
 
     /// Returns the active pencil, or [`ArrayError::Poisoned`] after an incomplete write.
