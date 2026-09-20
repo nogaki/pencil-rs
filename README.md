@@ -21,6 +21,9 @@ out-of-place and in-place execution. Its `forward`/`backward` operations use
 raw unnormalized FFTW conventions, while `inverse` is normalized by the
 logical transform factor. Each line uses at most `8n` complex embedding values
 plus queried native scratch, using the existing RustFFT backend without MPI.
+`LocalDhtPlan` provides the local self-paired discrete Hartley transform for
+the same four scalar types, with the same caller-owned line/scratch and
+out-of-place/in-place conventions.
 Distributed R2R uses the same eight kinds per logical axis, with `None` identity
 stages, for real and complex `f32`/`f64` over the existing checked transports.
 

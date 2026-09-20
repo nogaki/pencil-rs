@@ -171,6 +171,14 @@ impl R2rScalar for Complex<f64> {
     type Real = f64;
 }
 
+pub(crate) fn r2r_to_complex<T: R2rScalar>(value: T) -> Complex<T::Real> {
+    <T as private::SealedR2rScalar>::to_complex(value)
+}
+
+pub(crate) fn r2r_from_complex<T: R2rScalar>(value: Complex<T::Real>) -> T {
+    <T as private::SealedR2rScalar>::from_complex(value)
+}
+
 #[cfg(feature = "distributed")]
 pub(crate) fn r2r_value_kind<T: R2rScalar>() -> u64 {
     <T as private::SealedR2rScalar>::VALUE_KIND
@@ -184,7 +192,7 @@ pub(crate) fn r2r_zero<T: R2rScalar>() -> T {
     ))
 }
 
-/// Errors returned by local DCT/DST plan construction and execution.
+/// Errors returned by local real-to-real plan construction and execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LocalR2rError {
     /// The line length is zero or is one for DCT-I.
