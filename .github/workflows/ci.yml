@@ -40,10 +40,16 @@ jobs:
       - name: Install MPI toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libopenmpi-dev openmpi-bin pkg-config libclang-dev
+          sudo apt-get install --yes libopenmpi-dev openmpi-bin libhdf5-openmpi-dev pkg-config libclang-dev
 
       - name: Install Rust components
         run: rustup component add rustfmt clippy
+
+      - name: Verify parallel HDF5 pkg-config discovery
+        run: |
+          pkg-config --exists hdf5-openmpi
+          pkg-config --exists hdf5
+          pkg-config --modversion hdf5-openmpi
 
       - name: Restore Cargo build data
         id: cargo-cache
@@ -63,6 +69,14 @@ jobs:
 
       - name: Run library tests
         run: cargo test --workspace --lib --locked
+
+      - name: Check optional pencil-io targets
+        run: cargo check -p pencil-io --all-features --all-targets --locked
+
+      - name: Build pencil-io integration tests
+        run: |
+          cargo test -p pencil-io --no-default-features --test mpi_io --no-run --locked
+          cargo test -p pencil-io --features parallel-hdf5 --test hdf5_io --no-run --locked
 
       - name: Check distributed FFT targets
         run: cargo check -p pencil-fft --features distributed --all-targets --locked
@@ -136,17 +150,46 @@ jobs:
       - name: Run distributed C2C/R2C/C2R FFT suite (Alltoallv/P2P) on six ranks
         run: timeout --foreground 120s mpiexec --oversubscribe -n 6 cargo test -p pencil-fft --features distributed --test distributed_c2c --locked -- --nocapture --test-threads=1
 
+      - name: Run pencil-io MPI-IO tests
+        run: |
+          for n in 1 4 6; do
+            timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-io --no-default-features --test mpi_io --locked \
+                -- --nocapture --test-threads=1
+          done
+
+      - name: Run pencil-io parallel HDF5 tests
+        run: |
+          for n in 1 4 6; do
+            timeout --foreground 180s mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-io --features parallel-hdf5 --test hdf5_io --locked \
+                -- --nocapture --test-threads=1
+          done
+
+      - name: Run pencil-io post-cleanup unit test in a fresh process
+        run: |
+          timeout --foreground 120s mpiexec --oversubscribe -n 1 \
+            cargo test -p pencil-io --features parallel-hdf5 --lib \
+              post_cleanup_errors_preserve_destination_and_valid_commits --locked \
+              -- --nocapture --test-threads=1
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run distributed FFT Clippy
         run: cargo clippy -p pencil-fft --features distributed --all-targets --locked -- -D warnings
 
+      - name: Run pencil-io Clippy with optional HDF5
+        run: cargo clippy -p pencil-io --all-features --all-targets --locked -- -D warnings
+
       - name: Build API documentation
         run: cargo doc --workspace --no-deps --locked
 
       - name: Build distributed FFT documentation
         run: cargo doc -p pencil-fft --features distributed --no-deps --locked
+
+      - name: Build pencil-io documentation with optional HDF5
+        run: cargo doc -p pencil-io --all-features --no-deps --locked
 
       - name: Test documentation examples and public API restrictions
         run: cargo test --workspace --doc --locked -- --show-output
@@ -173,11 +216,19 @@ jobs:
       - name: Install MPI toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libopenmpi-dev openmpi-bin pkg-config libclang-dev
+          sudo apt-get install --yes libopenmpi-dev openmpi-bin libhdf5-openmpi-dev pkg-config libclang-dev
+      - name: Verify parallel HDF5 pkg-config discovery
+        run: |
+          pkg-config --exists hdf5-openmpi
+          pkg-config --exists hdf5
+          pkg-config --modversion hdf5-openmpi
       - name: Install minimum supported Rust
         run: rustup toolchain install 1.85.0 --profile minimal
       - name: Check minimum supported Rust
         run: cargo +1.85.0 check --workspace --all-targets --locked
+
+      - name: Check pencil-io with optional HDF5 on minimum supported Rust
+        run: cargo +1.85.0 check -p pencil-io --all-features --all-targets --locked
 
       - name: Check distributed FFT on minimum supported Rust
         run: cargo +1.85.0 check -p pencil-fft --features distributed --all-targets --locked

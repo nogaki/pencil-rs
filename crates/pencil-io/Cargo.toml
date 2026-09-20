@@ -1,0 +1,18 @@
+[package]
+name = "pencil-io"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+parallel-hdf5 = ["dep:hdf5-metno", "dep:hdf5-metno-sys"]
+
+[dependencies]
+mpi.workspace = true
+num-complex = "0.4.6"
+thiserror.workspace = true
+pencil-array = { path = "../pencil-array" }
+hdf5-metno = { version = "=0.12.0", default-features = false, features = ["mpio"], optional = true }
+hdf5-metno-sys = { version = "=0.11.0", features = ["mpio"], optional = true }
