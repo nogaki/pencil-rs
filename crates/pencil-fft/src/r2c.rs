@@ -7,7 +7,7 @@ use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
 use super::{Complex, FftReal};
 
-/// Completion state of a local real-to-half-complex in-place array.
+/// Completion state of a real-to-half-complex in-place array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum R2cState {
     /// The initialized prefix contains packed real input values.
@@ -304,6 +304,11 @@ impl<R: FftReal> LocalR2cPlan<R> {
     /// either direction.
     pub fn scratch_len(&self) -> usize {
         self.scratch_len
+    }
+
+    #[cfg(all(test, feature = "distributed"))]
+    pub(crate) fn inject_scratch_shortage_for_test(&mut self) {
+        self.scratch_len += 1;
     }
 
     /// Allocates one zero-initialized packed array for `batch_count` real

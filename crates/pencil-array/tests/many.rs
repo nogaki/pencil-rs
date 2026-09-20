@@ -336,4 +336,21 @@ fn many_pencil_array_enforces_registry_views_and_transactions() {
         zero_active.active_view().unwrap().len(),
         zero_base.local_len()
     );
+
+    let owned = ManyPencilArray::from_elem(
+        vec![Arc::clone(&base), Arc::clone(&redistributed)],
+        0,
+        ExtraShape::scalar(),
+        53u32,
+    )
+    .unwrap();
+    let pointer = owned.active_view().unwrap().as_slice().as_ptr();
+    let capacity = owned.storage_capacity();
+    let storage = owned.into_storage();
+    assert_eq!(storage.as_ptr(), pointer);
+    assert_eq!(storage.capacity(), capacity);
+    assert_eq!(
+        storage.len(),
+        base.local_len().max(redistributed.local_len())
+    );
 }

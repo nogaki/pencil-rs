@@ -41,7 +41,10 @@ the original 28 C2C/R2C fixtures plus 24 R2R fixtures (six cases × real and
 complex `f32`/`f64`). It builds the Rust test once with `cargo test --no-run`,
 runs its ordinary parser self-check, then runs the explicit ignored test
 through `cargo test -- --ignored` at 1, 4, and 6 MPI ranks. The original full
-and partial C2C/R2C cases are retained. All fixtures contain raw
+and partial C2C/R2C cases are retained. For every R2C fixture and transport,
+the Rust checker compares the same independent expected values through
+out-of-place and single-allocation real in-place forward/inverse/raw backward
+paths. All fixtures contain raw
 `backward_expected` values. It verifies a test-run marker so a missing ignored
 test cannot pass silently. It also runs six independent pristine-fixture
 copies, corrupting `forward_expected` and `backward_expected` separately for

@@ -12,8 +12,9 @@ flat slices, uses RustFFT/RealFFT, and is independent of MPI and
 `pencil-fft/distributed` feature adds out-of-place, input-preserving and
 single-buffer in-place distributed C2C FFTs, including raw positive-sign
 `backward`, and out-of-place distributed R2C/C2R forward, normalized inverse,
-and raw backward over checked Alltoallv or point-to-point transitions. Local
-out-of-place and packed single-allocation in-place R2C/C2R are also
+and raw backward over checked Alltoallv or point-to-point transitions. Its
+R2C/C2R API also provides a state-checked single-allocation in-place buffer.
+Local out-of-place and packed single-allocation in-place R2C/C2R are also
 available. `LocalR2rPlan` provides all eight
 FFTW-compatible DCT/DST-I-IV kinds for real and complex `f32`/`f64`, with
 out-of-place and in-place execution. Its `forward`/`backward` operations use
@@ -32,9 +33,9 @@ process-local memory-axis permutations. `AllToAllvTransposePlan` and
 `PointToPointTransposePlan` provide checked distributed redistribution through
 out-of-place views and shared-storage in-place execution. The optional
 `pencil-fft/distributed` feature composes these checked transitions into
-out-of-place and in-place distributed C2C forward/inverse/backward transforms
-and out-of-place R2C/C2R; distributed R2C has no in-place API, and this does
-not change the MPI-free local FFT default.
+out-of-place and in-place distributed C2C forward/inverse/backward transforms and
+out-of-place plus single-allocation in-place R2C/C2R; this does not change
+the MPI-free local FFT default.
 `C2cPlan` and `R2cPlan` provide matching selection-aware shape, pencil, and
 array constructors through `AxisSelection<N>`, plus the existing
 `from_*_with_method` forms. `AxisSelection::all()` is the default; its
@@ -77,13 +78,19 @@ route nevertheless always contains all `N` stages and `N-1` transitions, so
 unselected axes remain real-prefix or complex-suffix transposes rather than
 being skipped. `allocate_workspace` is noncollective; coordinate any local
 allocation failure before the next collective. Non-last real axes add an
-optional real intermediate and real transpose workspace. `forward`, normalized
-`inverse`, and unnormalized positive-sign `backward` are exposed—there is no
-real in-place API. Empty R2C selections are collectively rejected before
+optional real intermediate and real transpose workspace. `forward`, normalized `inverse`, and unnormalized positive-sign `backward`
+are exposed in both out-of-place and state-checked single-allocation in-place
+forms. Empty R2C selections are collectively rejected before
 planning. The constructors and operations require the same communicator
 context, API/order, scalar type, selection, method, and layouts on every rank.
 Legacy constructors use Alltoallv; point-to-point uses the fixed `0x5054` tag
-and must not overlap unfinished transposes on its context.
+and must not overlap unfinished transposes on its context. The in-place array
+exposes only the state-matching real or complex `PencilArrayView`; its one
+allocation is recast safely between separate real-prefix and reduced-complex
+suffix registries. Forward processes packed boundary rows back-to-front and
+C2R processes them front-to-back. Initial preflight errors preserve the array;
+after start, an error, invalid spectrum, or panic leaves it poisoned. In-place
+operation words are 25/26/27; 18..24 remain reserved for distributed R2R.
 
 The inverse performs the transverse complex inverse stages first, then
 validates each extra batch and constrained DC/Nyquist plane. It accepts a
@@ -222,7 +229,8 @@ cargo doc -p pencil-fft --features distributed --no-deps --locked
 cargo test --workspace --doc --locked -- --show-output
 cargo test -p pencil-fft --features distributed --doc --locked -- --show-output
 # The distributed suites cover C2C, R2C/C2R, and R2R over Alltoallv/P2P;
-# distributed C2C and R2R also have in-place APIs.
+# distributed C2C, R2C/C2R, and R2R also have in-place APIs; local C2C
+# and local R2C also have in-place APIs.
 for n in 1 4 6; do
   timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
     cargo test -p pencil-fft --features distributed --test distributed_c2c \

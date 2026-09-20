@@ -1,26 +1,34 @@
 //! Distributed real-to-half-complex and half-complex-to-real transforms.
 
-use std::{cmp::Ordering, sync::Arc};
+use std::{
+    cmp::Ordering,
+    mem::{align_of, size_of},
+    sync::Arc,
+};
 
+use bytemuck::{allocation::try_cast_vec, try_cast_slice};
+#[cfg(test)]
+use mpi::topology::Communicator;
 use mpi::{
     collective::{CommunicatorCollectives, SystemOperation},
     datatype::Equivalence,
 };
 use pencil_array::{
-    ExtraShape, ManyPencilArray, MpiTopology, OverwriteError, Pencil, PencilArray,
-    TransposeWorkspace,
+    ArrayError, ExtraShape, ManyPencilArray, MpiTopology, OverwriteError, Pencil, PencilArray,
+    PencilArrayView, PencilArrayViewMut, TransposeWorkspace,
 };
 
 use super::{
     AxisSelection, DESCRIPTOR_SCHEMA, Direction, FftError, INVALID_WORD, LocalTransform,
-    OPERATION_R2C_BACKWARD, OPERATION_R2C_FORWARD, OPERATION_R2C_INVERSE, OPERATION_R2C_PLAN,
-    R2cError, StagePreparation, TransformPlanCore, TransformStage, TransposeMethod, VALUE_KIND_R2C,
-    agree_execution_descriptor_ref, agree_header, agree_result, build_descriptor, build_route,
-    build_transitions, collective_valid, descriptor_len, initialized_vec, map_array_allocation,
-    prepare_complex_stage, registered_stage_pencils, validate_out_of_place,
-    validate_workspace_lengths_values, zero_complex,
+    OPERATION_R2C_BACKWARD, OPERATION_R2C_BACKWARD_IN_PLACE, OPERATION_R2C_FORWARD,
+    OPERATION_R2C_FORWARD_IN_PLACE, OPERATION_R2C_INVERSE, OPERATION_R2C_INVERSE_IN_PLACE,
+    OPERATION_R2C_PLAN, R2cError, StagePreparation, TransformPlanCore, TransformStage,
+    TransposeMethod, VALUE_KIND_R2C, agree_execution_descriptor_ref, agree_header, agree_result,
+    build_descriptor, build_route, build_transitions, collective_valid, descriptor_len,
+    initialized_vec, map_array_allocation, prepare_complex_stage, registered_stage_pencils,
+    validate_out_of_place, validate_workspace_lengths_values, zero_complex,
 };
-use crate::{Complex, FftReal, LocalR2cError, LocalR2cPlan};
+use crate::{Complex, FftReal, LocalR2cError, LocalR2cPlan, R2cState};
 
 /// An immutable, checked distributed real-to-half-complex FFT plan.
 ///
@@ -42,7 +50,8 @@ use crate::{Complex, FftReal, LocalR2cError, LocalR2cPlan};
 /// `0x5054` tag and changed-axis context, so unfinished transposes must not
 /// overlap on that context. Allocation methods are noncollective; callers
 /// must coordinate a local allocation failure before the next collective.
-/// There is intentionally no distributed real in-place API.
+/// The `*_in_place` methods use one state-checked allocation shared by the
+/// real prefix and reduced-complex suffix.
 ///
 /// `inverse` is normalized by the product of the selected spatial extents;
 /// `backward` uses the same positive-sign C2R transform without that
@@ -60,7 +69,7 @@ use crate::{Complex, FftReal, LocalR2cError, LocalR2cPlan};
 /// ```
 /// use mpi::traits::*;
 /// use pencil_array::{ExtraShape, MpiTopology};
-/// use pencil_fft::R2cPlan;
+/// use pencil_fft::{R2cPlan, R2cState};
 ///
 /// fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     let universe = mpi::initialize().expect("MPI must not already be initialized");
@@ -93,6 +102,14 @@ use crate::{Complex, FftReal, LocalR2cError, LocalR2cPlan};
 ///         for (actual, expected) in recovered.as_slice().iter().zip(&original) {
 ///             assert!((actual - expected).abs() < 1e-9);
 ///         }
+///
+///         let mut in_place = plan.allocate_in_place()?;
+///         in_place.real_view_mut()?.as_mut_slice().copy_from_slice(&original);
+///         let mut in_place_workspace = plan.allocate_in_place_workspace()?;
+///         plan.forward_in_place(&mut in_place, &mut in_place_workspace)?;
+///         assert_eq!(in_place.state(), R2cState::ComplexOutput);
+///         plan.inverse_in_place(&mut in_place, &mut in_place_workspace)?;
+///         assert_eq!(in_place.state(), R2cState::RealInput);
 ///         Ok::<(), Box<dyn std::error::Error>>(())
 ///     };
 ///     result
@@ -136,10 +153,25 @@ use crate::{Complex, FftReal, LocalR2cError, LocalR2cPlan};
 /// identity axes, extra dimensions, and the reduced complex extent are not
 /// normalization factors.
 ///
-/// ```compile_fail
-/// use pencil_fft::R2cPlan;
+/// The real/complex handoff is a rank-local checked phase. Its complete
+/// conversion result is agreed collectively before the next transpose; a
+/// conversion error on any rank therefore returns on every rank and leaves
+/// every in-place array poisoned. The failed owner is retained privately when
+/// ordinary reconstruction is rejected; a panic may abandon the typed owner.
+/// The typed views remain state-checked, and Rust also prevents two mutable
+/// representations from being borrowed at once:
 ///
-/// let _ = R2cPlan::<f64, 2, 1>::forward_in_place;
+/// ```compile_fail
+/// use pencil_fft::{Complex, FftReal, R2cInPlaceArray};
+///
+/// fn alias<R: FftReal, const N: usize, const M: usize>(
+///     array: &mut R2cInPlaceArray<R, N, M>,
+/// ) {
+///     let mut real = array.real_view_mut().unwrap();
+///     let _complex = array.complex_view_mut();
+///     real.as_mut_slice();
+///     let _: Option<Complex<R>> = None;
+/// }
 /// ```
 ///
 /// Existing generic callers only need their original bounds:
@@ -181,6 +213,63 @@ pub struct R2cWorkspace<R: FftReal, const N: usize, const M: usize> {
     real_transpose: Option<TransposeWorkspace<R>>,
     fft_scratch: Vec<Complex<R>>,
     real_line: Vec<R>,
+    complex_line: Vec<Complex<R>>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+enum R2cInPlaceStorage<R: FftReal, const N: usize, const M: usize> {
+    Real(ManyPencilArray<R, N, M>),
+    Complex(ManyPencilArray<Complex<R>, N, M>),
+    /// An owner retained after a failed representation handoff. The outer
+    /// array is poisoned, so this variant is never exposed as a typed view.
+    PoisonedReal(Vec<R>),
+    PoisonedComplex(Vec<Complex<R>>),
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InPlaceTestHook {
+    PanicAfterForwardDetach,
+    PanicAfterReverseDetach,
+    OddForwardCast,
+    ReverseRestoreRejection,
+}
+
+/// An opaque single-allocation distributed real-to-half-complex array.
+///
+/// The allocation is represented as real scalars while the array is in
+/// [`R2cState::RealInput`] and as complex values while it is in
+/// [`R2cState::ComplexOutput`]. The public typed views expose only the active
+/// representation. A failed or panicking operation leaves the array poisoned;
+/// the backing owner may be absent after an interrupted representation handoff.
+#[derive(Debug)]
+pub struct R2cInPlaceArray<R: FftReal, const N: usize, const M: usize> {
+    core: Arc<TransformPlanCore<R, N, M>>,
+    real_pencils: Option<Box<[Arc<Pencil<N, M>>]>>,
+    complex_pencils: Option<Box<[Arc<Pencil<N, M>>]>>,
+    real_storage_len: usize,
+    complex_storage_len: usize,
+    storage_bytes: usize,
+    storage: Option<R2cInPlaceStorage<R, N, M>>,
+    state: R2cState,
+    #[cfg(test)]
+    test_hook: Option<InPlaceTestHook>,
+}
+
+/// Reusable workspace for distributed real in-place R2C/C2R execution.
+///
+/// It contains only transpose buffers, native FFT scratch, and per-line
+/// buffers. The transform data remains in [`R2cInPlaceArray`].
+#[derive(Debug)]
+pub struct R2cInPlaceWorkspace<R: FftReal, const N: usize, const M: usize> {
+    core: Arc<TransformPlanCore<R, N, M>>,
+    transpose: TransposeWorkspace<Complex<R>>,
+    real_transpose: Option<TransposeWorkspace<R>>,
+    fft_scratch: Vec<Complex<R>>,
+    real_source_line: Vec<R>,
+    real_line: Vec<R>,
+    complex_source_line: Vec<Complex<R>>,
     complex_line: Vec<Complex<R>>,
 }
 
@@ -457,6 +546,83 @@ where
         })
     }
 
+    /// Allocates one zero-initialized data allocation for distributed in-place
+    /// forward, inverse, and backward execution.
+    ///
+    /// The returned array starts in [`R2cState::RealInput`]. Its backing
+    /// allocation is large enough in bytes for every registered real-prefix
+    /// and reduced-complex-suffix layout. No data reallocation is performed by
+    /// any later representation transition.
+    pub fn allocate_in_place(&self) -> Result<R2cInPlaceArray<R, N, M>, R2cError> {
+        let boundary = self
+            .core
+            .real_stage_index
+            .ok_or(FftError::PreparationFailed)?;
+        let real_pencils = registered_real_stage_pencils(&self.core.stages, boundary)?;
+        let complex_pencils = registered_stage_pencils(&self.core.stages[boundary..])?;
+        let (real_storage_len, complex_storage_len, storage_bytes, complex_capacity) =
+            in_place_storage_requirements(&self.core)?;
+
+        let mut storage = Vec::new();
+        storage
+            .try_reserve_exact(complex_capacity)
+            .map_err(|_| FftError::AllocationFailed {
+                required: complex_capacity,
+            })?;
+        storage.resize(complex_capacity, zero_complex::<R>());
+        let mut real_storage = cast_complex_vec_to_real(storage)?;
+        if real_storage.len() < real_storage_len {
+            return Err(FftError::StorageLayoutMismatch.into());
+        }
+        real_storage.truncate(real_storage_len);
+        let storage =
+            ManyPencilArray::from_vec(real_pencils, 0, self.core.extra_shape.clone(), real_storage)
+                .map_err(map_array_allocation)?;
+
+        Ok(R2cInPlaceArray {
+            core: Arc::clone(&self.core),
+            real_pencils: None,
+            complex_pencils: Some(complex_pencils),
+            real_storage_len,
+            complex_storage_len,
+            storage_bytes,
+            storage: Some(R2cInPlaceStorage::Real(storage)),
+            state: R2cState::RealInput,
+            #[cfg(test)]
+            test_hook: None,
+        })
+    }
+
+    /// Allocates reusable scratch for distributed real in-place execution.
+    pub fn allocate_in_place_workspace(&self) -> Result<R2cInPlaceWorkspace<R, N, M>, R2cError> {
+        let boundary = self
+            .core
+            .real_stage_index
+            .ok_or(FftError::PreparationFailed)?;
+        let (real_len, complex_len) = r2c_lengths(&self.core);
+        let real_transpose = if boundary == 0 {
+            None
+        } else {
+            Some(TransposeWorkspace::from_vecs(
+                initialized_vec(self.core.real_transpose_send_len, R::zero())?,
+                initialized_vec(self.core.real_transpose_receive_len, R::zero())?,
+            ))
+        };
+        Ok(R2cInPlaceWorkspace {
+            core: Arc::clone(&self.core),
+            transpose: TransposeWorkspace::from_vecs(
+                initialized_vec(self.core.transpose_send_len, zero_complex::<R>())?,
+                initialized_vec(self.core.transpose_receive_len, zero_complex::<R>())?,
+            ),
+            real_transpose,
+            fft_scratch: initialized_vec(self.core.fft_scratch_len, zero_complex::<R>())?,
+            real_source_line: initialized_vec(real_len, R::zero())?,
+            real_line: initialized_vec(real_len, R::zero())?,
+            complex_source_line: initialized_vec(complex_len, zero_complex::<R>())?,
+            complex_line: initialized_vec(complex_len, zero_complex::<R>())?,
+        })
+    }
+
     /// Computes an unnormalized forward real-to-half-complex transform.
     pub fn forward(
         &self,
@@ -519,6 +685,37 @@ where
         workspace: &mut R2cWorkspace<R, N, M>,
     ) -> Result<(), R2cError> {
         self.execute_reverse(source, destination, workspace, false)
+    }
+
+    /// Computes an unnormalized forward transform in the single data
+    /// allocation. The array must be in [`R2cState::RealInput`].
+    pub fn forward_in_place(
+        &self,
+        array: &mut R2cInPlaceArray<R, N, M>,
+        workspace: &mut R2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<(), R2cError> {
+        self.execute_in_place(Direction::Forward, array, workspace)
+    }
+
+    /// Computes a normalized inverse transform in the single data allocation.
+    /// The array must be in [`R2cState::ComplexOutput`].
+    pub fn inverse_in_place(
+        &self,
+        array: &mut R2cInPlaceArray<R, N, M>,
+        workspace: &mut R2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<(), R2cError> {
+        self.execute_in_place(Direction::Inverse, array, workspace)
+    }
+
+    /// Computes an unnormalized positive-sign backward transform in the
+    /// single data allocation. The array must be in
+    /// [`R2cState::ComplexOutput`].
+    pub fn backward_in_place(
+        &self,
+        array: &mut R2cInPlaceArray<R, N, M>,
+        workspace: &mut R2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<(), R2cError> {
+        self.execute_in_place(Direction::Backward, array, workspace)
     }
 
     fn construct(
@@ -720,6 +917,21 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
     })
 }
 
+fn registered_layout_matches<R: FftReal, const N: usize, const M: usize>(
+    registered: &[Arc<Pencil<N, M>>],
+    stages: &[TransformStage<R, N, M>],
+    use_inputs: bool,
+) -> bool {
+    registered.len() == stages.len()
+        && registered.iter().zip(stages).all(|(registered, stage)| {
+            if use_inputs {
+                registered.same_layout(stage.input.as_ref())
+            } else {
+                registered.same_layout(stage.output.as_ref())
+            }
+        })
+}
+
 fn registered_real_stage_pencils<R: FftReal, const N: usize, const M: usize>(
     stages: &[TransformStage<R, N, M>],
     boundary: usize,
@@ -734,6 +946,208 @@ fn registered_real_stage_pencils<R: FftReal, const N: usize, const M: usize>(
         .map_err(|_| FftError::AllocationFailed { required: count })?;
     pencils.extend(stages[..count].iter().map(|stage| Arc::clone(&stage.input)));
     Ok(pencils.into_boxed_slice())
+}
+
+fn in_place_storage_requirements<R: FftReal, const N: usize, const M: usize>(
+    core: &TransformPlanCore<R, N, M>,
+) -> Result<(usize, usize, usize, usize), FftError> {
+    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
+    let extra = core.extra_shape.element_count();
+    let mut real_len = 0usize;
+    for stage in &core.stages[..=boundary] {
+        let length = stage
+            .input
+            .local_len()
+            .checked_mul(extra)
+            .ok_or(FftError::PreparationFailed)?;
+        real_len = real_len.max(length);
+    }
+    let mut complex_len = 0usize;
+    for stage in &core.stages[boundary..] {
+        let length = stage
+            .output
+            .local_len()
+            .checked_mul(extra)
+            .ok_or(FftError::PreparationFailed)?;
+        complex_len = complex_len.max(length);
+    }
+    let real_bytes = real_len
+        .checked_mul(size_of::<R>())
+        .ok_or(FftError::PreparationFailed)?;
+    let complex_bytes = complex_len
+        .checked_mul(size_of::<Complex<R>>())
+        .ok_or(FftError::PreparationFailed)?;
+    let storage_bytes = real_bytes.max(complex_bytes);
+    if storage_bytes > isize::MAX as usize {
+        return Err(FftError::PreparationFailed);
+    }
+    let complex_size = size_of::<Complex<R>>();
+    let rounded = storage_bytes
+        .checked_add(complex_size.saturating_sub(1))
+        .ok_or(FftError::PreparationFailed)?;
+    let complex_capacity = rounded / complex_size;
+    Ok((real_len, complex_len, storage_bytes, complex_capacity))
+}
+
+fn cast_complex_vec_to_real<R: FftReal>(storage: Vec<Complex<R>>) -> Result<Vec<R>, R2cError> {
+    try_cast_vec(storage).map_err(|(_, _)| R2cError::Fft(FftError::StorageLayoutMismatch))
+}
+
+fn validate_recast_capacity<T, U>(capacity: usize, required_bytes: usize) -> Result<(), FftError> {
+    let source_size = size_of::<T>();
+    let target_size = size_of::<U>();
+    if source_size == 0
+        || target_size == 0
+        || align_of::<T>() != align_of::<U>()
+        || capacity
+            .checked_mul(source_size)
+            .is_none_or(|bytes| bytes > isize::MAX as usize || bytes < required_bytes)
+    {
+        return Err(FftError::StorageLayoutMismatch);
+    }
+    let capacity_bytes = capacity
+        .checked_mul(source_size)
+        .ok_or(FftError::StorageLayoutMismatch)?;
+    if capacity_bytes % target_size != 0 {
+        return Err(FftError::StorageLayoutMismatch);
+    }
+    Ok(())
+}
+
+fn install_real_storage<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+    pencils: Box<[Arc<Pencil<N, M>>]>,
+    extra_shape: ExtraShape,
+    mut storage: Vec<R>,
+    active: usize,
+) -> Result<(), R2cError> {
+    storage.truncate(array.real_storage_len);
+    match ManyPencilArray::from_vec_preserving(pencils, active, extra_shape, storage) {
+        Ok(real) => {
+            array.storage = Some(R2cInPlaceStorage::Real(real));
+            Ok(())
+        }
+        Err((error, storage)) => {
+            array.storage = Some(R2cInPlaceStorage::PoisonedReal(storage));
+            Err(map_array_allocation(error).into())
+        }
+    }
+}
+
+fn install_complex_storage<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+    pencils: Box<[Arc<Pencil<N, M>>]>,
+    extra_shape: ExtraShape,
+    mut storage: Vec<Complex<R>>,
+    active: usize,
+) -> Result<(), R2cError> {
+    storage.truncate(array.complex_storage_len);
+    match ManyPencilArray::from_vec_preserving(pencils, active, extra_shape, storage) {
+        Ok(complex) => {
+            array.storage = Some(R2cInPlaceStorage::Complex(complex));
+            Ok(())
+        }
+        Err((error, storage)) => {
+            array.storage = Some(R2cInPlaceStorage::PoisonedComplex(storage));
+            Err(map_array_allocation(error).into())
+        }
+    }
+}
+
+fn retain_real_error<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+    pencils: Box<[Arc<Pencil<N, M>>]>,
+    extra_shape: ExtraShape,
+    storage: Vec<R>,
+    active: usize,
+    cause: R2cError,
+) -> R2cError {
+    install_real_storage(array, pencils, extra_shape, storage, active)
+        .err()
+        .unwrap_or(cause)
+}
+
+fn retain_complex_error<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+    pencils: Box<[Arc<Pencil<N, M>>]>,
+    extra_shape: ExtraShape,
+    storage: Vec<Complex<R>>,
+    active: usize,
+    cause: R2cError,
+) -> R2cError {
+    install_complex_storage(array, pencils, extra_shape, storage, active)
+        .err()
+        .unwrap_or(cause)
+}
+
+fn fail_real_to_complex<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+    source_pencils: Box<[Arc<Pencil<N, M>>]>,
+    destination_pencils: Box<[Arc<Pencil<N, M>>]>,
+    extra_shape: ExtraShape,
+    storage: Vec<R>,
+    active: usize,
+    cause: R2cError,
+) -> R2cError {
+    let error = retain_real_error(array, source_pencils, extra_shape, storage, active, cause);
+    array.complex_pencils = Some(destination_pencils);
+    error
+}
+
+fn fail_complex_to_real<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+    source_pencils: Box<[Arc<Pencil<N, M>>]>,
+    destination_pencils: Box<[Arc<Pencil<N, M>>]>,
+    extra_shape: ExtraShape,
+    storage: Vec<Complex<R>>,
+    active: usize,
+    cause: R2cError,
+) -> R2cError {
+    let error = retain_complex_error(array, source_pencils, extra_shape, storage, active, cause);
+    array.real_pencils = Some(destination_pencils);
+    error
+}
+
+fn fail_forward_complex<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+    source_pencils: Box<[Arc<Pencil<N, M>>]>,
+    destination_pencils: Box<[Arc<Pencil<N, M>>]>,
+    extra_shape: ExtraShape,
+    storage: Vec<Complex<R>>,
+    active: usize,
+    cause: R2cError,
+) -> R2cError {
+    let error = retain_complex_error(
+        array,
+        destination_pencils,
+        extra_shape,
+        storage,
+        active,
+        cause,
+    );
+    array.real_pencils = Some(source_pencils);
+    error
+}
+
+fn fail_reverse_real<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+    source_pencils: Box<[Arc<Pencil<N, M>>]>,
+    destination_pencils: Box<[Arc<Pencil<N, M>>]>,
+    extra_shape: ExtraShape,
+    storage: Vec<R>,
+    active: usize,
+    cause: R2cError,
+) -> R2cError {
+    let error = retain_real_error(
+        array,
+        destination_pencils,
+        extra_shape,
+        storage,
+        active,
+        cause,
+    );
+    array.complex_pencils = Some(source_pencils);
+    error
 }
 
 impl<R: FftReal, const N: usize, const M: usize> R2cPlan<R, N, M>
@@ -791,6 +1205,228 @@ where
             normalize_inverse,
             self.raw_absolute_threshold,
         )
+    }
+
+    fn execute_in_place(
+        &self,
+        direction: Direction,
+        array: &mut R2cInPlaceArray<R, N, M>,
+        workspace: &mut R2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<(), R2cError> {
+        let communicator = self.input_pencil().topology().communicator();
+        let operation = match direction {
+            Direction::Forward => OPERATION_R2C_FORWARD_IN_PLACE,
+            Direction::Inverse => OPERATION_R2C_INVERSE_IN_PLACE,
+            Direction::Backward => OPERATION_R2C_BACKWARD_IN_PLACE,
+        };
+        agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
+        let preflight = self.preflight_in_place(direction, array, workspace);
+        if !collective_valid(communicator, preflight.is_ok()) {
+            return Err(preflight
+                .err()
+                .unwrap_or(R2cError::Fft(FftError::CollectivePreconditionFailed)));
+        }
+        preflight.expect("distributed R2C in-place preflight succeeded");
+
+        // The owner is deliberately detached by the phase helpers. A panic or
+        // a post-start error therefore cannot expose a partly typed buffer.
+        array.state = R2cState::Poisoned;
+        let result = match direction {
+            Direction::Forward => execute_in_place_forward(&self.core, array, workspace),
+            Direction::Inverse | Direction::Backward => execute_in_place_reverse(
+                &self.core,
+                array,
+                workspace,
+                matches!(direction, Direction::Inverse),
+                self.raw_absolute_threshold,
+            ),
+        };
+        if result.is_ok() {
+            array.state = match direction {
+                Direction::Forward => R2cState::ComplexOutput,
+                Direction::Inverse | Direction::Backward => R2cState::RealInput,
+            };
+        }
+        result
+    }
+
+    fn preflight_in_place(
+        &self,
+        direction: Direction,
+        array: &R2cInPlaceArray<R, N, M>,
+        workspace: &R2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<(), R2cError> {
+        if !Arc::ptr_eq(&array.core, &self.core) {
+            return Err(FftError::Array(ArrayError::IncompatiblePencils).into());
+        }
+        if !Arc::ptr_eq(&workspace.core, &self.core) {
+            return Err(FftError::WorkspaceMismatch.into());
+        }
+        let expected_state = match direction {
+            Direction::Forward => R2cState::RealInput,
+            Direction::Inverse | Direction::Backward => R2cState::ComplexOutput,
+        };
+        match array.state {
+            R2cState::Poisoned => return Err(FftError::Array(ArrayError::Poisoned).into()),
+            state if state != expected_state => return Err(FftError::InputLayoutMismatch.into()),
+            _ => {}
+        }
+
+        let boundary = self
+            .core
+            .real_stage_index
+            .ok_or(FftError::PreparationFailed)?;
+        if array.storage.is_none() {
+            return Err(FftError::StorageLayoutMismatch.into());
+        }
+        let expected_pencil = match direction {
+            Direction::Forward => self.input_pencil(),
+            Direction::Inverse | Direction::Backward => self.output_pencil(),
+        };
+        let inactive_registry_valid = match direction {
+            Direction::Forward => array.complex_pencils.as_ref().is_some_and(|pencils| {
+                registered_layout_matches(pencils, &self.core.stages[boundary..], false)
+            }),
+            Direction::Inverse | Direction::Backward => {
+                array.real_pencils.as_ref().is_some_and(|pencils| {
+                    registered_layout_matches(pencils, &self.core.stages[..=boundary], true)
+                })
+            }
+        };
+        if !inactive_registry_valid {
+            return Err(FftError::WorkspaceMismatch.into());
+        }
+        match (direction, array.storage.as_ref().expect("checked above")) {
+            (Direction::Forward, R2cInPlaceStorage::Real(real)) => {
+                if real.extra_shape() != &self.core.extra_shape
+                    || !registered_layout_matches(
+                        real.pencils(),
+                        &self.core.stages[..=boundary],
+                        true,
+                    )
+                {
+                    return Err(FftError::StorageLayoutMismatch.into());
+                }
+                if !real
+                    .active_pencil()
+                    .map_err(FftError::Array)?
+                    .same_layout(expected_pencil.as_ref())
+                {
+                    return Err(FftError::InputLayoutMismatch.into());
+                }
+            }
+            (Direction::Inverse | Direction::Backward, R2cInPlaceStorage::Complex(complex)) => {
+                if complex.extra_shape() != &self.core.extra_shape
+                    || !registered_layout_matches(
+                        complex.pencils(),
+                        &self.core.stages[boundary..],
+                        false,
+                    )
+                {
+                    return Err(FftError::StorageLayoutMismatch.into());
+                }
+                if !complex
+                    .active_pencil()
+                    .map_err(FftError::Array)?
+                    .same_layout(expected_pencil.as_ref())
+                {
+                    return Err(FftError::InputLayoutMismatch.into());
+                }
+            }
+            _ => return Err(FftError::StorageLayoutMismatch.into()),
+        }
+
+        let (required_real, required_complex, required_bytes, _) =
+            in_place_storage_requirements(&self.core)?;
+        if required_real != array.real_storage_len
+            || required_complex != array.complex_storage_len
+            || required_bytes != array.storage_bytes
+        {
+            return Err(FftError::StorageLayoutMismatch.into());
+        }
+        // Check the actual Vec length and capacity, not the requested
+        // allocation size. A real Vec with an odd scalar capacity cannot be
+        // recast to Complex even when its current length and total byte count
+        // look sufficient.
+        match array.storage.as_ref().expect("checked above") {
+            R2cInPlaceStorage::Real(real) => {
+                if real.storage_len() != required_real {
+                    return Err(FftError::StorageLayoutMismatch.into());
+                }
+                validate_recast_capacity::<R, Complex<R>>(real.storage_capacity(), required_bytes)?
+            }
+            R2cInPlaceStorage::Complex(complex) => {
+                if complex.storage_len() != required_complex {
+                    return Err(FftError::StorageLayoutMismatch.into());
+                }
+                validate_recast_capacity::<Complex<R>, R>(
+                    complex.storage_capacity(),
+                    required_bytes,
+                )?
+            }
+            R2cInPlaceStorage::PoisonedReal(_) | R2cInPlaceStorage::PoisonedComplex(_) => {
+                return Err(FftError::StorageLayoutMismatch.into());
+            }
+        }
+
+        validate_workspace_lengths_values(
+            workspace.fft_scratch.len(),
+            self.core.fft_scratch_len,
+            workspace.transpose.send_len(),
+            self.core.transpose_send_len,
+            workspace.transpose.receive_len(),
+            self.core.transpose_receive_len,
+        )?;
+        if boundary > 0 {
+            let real_transpose = workspace
+                .real_transpose
+                .as_ref()
+                .ok_or(FftError::WorkspaceMismatch)?;
+            validate_workspace_lengths_values(
+                workspace.fft_scratch.len(),
+                self.core.fft_scratch_len,
+                real_transpose.send_len(),
+                self.core.real_transpose_send_len,
+                real_transpose.receive_len(),
+                self.core.real_transpose_receive_len,
+            )?;
+        }
+        // The inactive registry is moved into the next typed Many array at
+        // the boundary. Check that it is available while collective
+        // preflight is still active, before any payload or data write starts.
+        let registry_ready = match direction {
+            Direction::Forward => array.complex_pencils.is_some(),
+            Direction::Inverse | Direction::Backward => array.real_pencils.is_some(),
+        };
+        if !registry_ready {
+            return Err(FftError::WorkspaceMismatch.into());
+        }
+
+        let (real_len, complex_len) = r2c_lengths(&self.core);
+        for (actual, required, kind) in [
+            (
+                workspace.real_source_line.len(),
+                real_len,
+                "real source line",
+            ),
+            (workspace.real_line.len(), real_len, "real line"),
+            (
+                workspace.complex_source_line.len(),
+                complex_len,
+                "complex source line",
+            ),
+            (workspace.complex_line.len(), complex_len, "complex line"),
+        ] {
+            if actual < required {
+                return Err(FftError::WorkspaceTooSmall {
+                    kind,
+                    required,
+                    actual,
+                }
+                .into());
+            }
+        }
+        Ok(())
     }
 
     fn preflight_forward(
@@ -1079,6 +1715,993 @@ where
         .as_mut_slice()
         .copy_from_slice(active.as_slice());
     Ok(())
+}
+
+impl<R: FftReal, const N: usize, const M: usize> R2cInPlaceArray<R, N, M> {
+    /// Returns the current in-place completion state.
+    pub fn state(&self) -> R2cState {
+        self.state
+    }
+
+    /// Borrows the active real input view.
+    pub fn real_view(&self) -> Result<PencilArrayView<'_, R, N, M>, R2cError> {
+        match self.state {
+            R2cState::Poisoned => Err(FftError::Array(ArrayError::Poisoned).into()),
+            R2cState::ComplexOutput => Err(FftError::InputLayoutMismatch.into()),
+            R2cState::RealInput => match self.storage.as_ref() {
+                Some(R2cInPlaceStorage::Real(real)) => real
+                    .active_view()
+                    .map_err(FftError::Array)
+                    .map_err(Into::into),
+                _ => Err(FftError::StorageLayoutMismatch.into()),
+            },
+        }
+    }
+
+    /// Borrows the active mutable real input view.
+    pub fn real_view_mut(&mut self) -> Result<PencilArrayViewMut<'_, R, N, M>, R2cError> {
+        match self.state {
+            R2cState::Poisoned => Err(FftError::Array(ArrayError::Poisoned).into()),
+            R2cState::ComplexOutput => Err(FftError::InputLayoutMismatch.into()),
+            R2cState::RealInput => match self.storage.as_mut() {
+                Some(R2cInPlaceStorage::Real(real)) => real
+                    .active_view_mut()
+                    .map_err(FftError::Array)
+                    .map_err(Into::into),
+                _ => Err(FftError::StorageLayoutMismatch.into()),
+            },
+        }
+    }
+
+    /// Borrows the active reduced-complex output view.
+    pub fn complex_view(&self) -> Result<PencilArrayView<'_, Complex<R>, N, M>, R2cError> {
+        match self.state {
+            R2cState::Poisoned => Err(FftError::Array(ArrayError::Poisoned).into()),
+            R2cState::RealInput => Err(FftError::OutputLayoutMismatch.into()),
+            R2cState::ComplexOutput => match self.storage.as_ref() {
+                Some(R2cInPlaceStorage::Complex(complex)) => complex
+                    .active_view()
+                    .map_err(FftError::Array)
+                    .map_err(Into::into),
+                _ => Err(FftError::StorageLayoutMismatch.into()),
+            },
+        }
+    }
+
+    /// Borrows the active mutable reduced-complex output view.
+    pub fn complex_view_mut(
+        &mut self,
+    ) -> Result<PencilArrayViewMut<'_, Complex<R>, N, M>, R2cError> {
+        match self.state {
+            R2cState::Poisoned => Err(FftError::Array(ArrayError::Poisoned).into()),
+            R2cState::RealInput => Err(FftError::OutputLayoutMismatch.into()),
+            R2cState::ComplexOutput => match self.storage.as_mut() {
+                Some(R2cInPlaceStorage::Complex(complex)) => complex
+                    .active_view_mut()
+                    .map_err(FftError::Array)
+                    .map_err(Into::into),
+                _ => Err(FftError::StorageLayoutMismatch.into()),
+            },
+        }
+    }
+}
+
+fn boundary_row_count<R: FftReal, const N: usize, const M: usize>(
+    core: &TransformPlanCore<R, N, M>,
+) -> Result<usize, R2cError> {
+    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
+    let real_len = core.stages[boundary].local.real_complex().real_len();
+    let local_len = core.stages[boundary].input.local_len();
+    if local_len % real_len != 0 {
+        return Err(FftError::PreparationFailed.into());
+    }
+    (local_len / real_len)
+        .checked_mul(core.extra_shape.element_count())
+        .ok_or_else(|| FftError::PreparationFailed.into())
+}
+
+fn execute_in_place_forward<R: FftReal, const N: usize, const M: usize>(
+    core: &Arc<TransformPlanCore<R, N, M>>,
+    array: &mut R2cInPlaceArray<R, N, M>,
+    workspace: &mut R2cInPlaceWorkspace<R, N, M>,
+) -> Result<(), R2cError>
+where
+    Complex<R>: Equivalence,
+{
+    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
+    let mut real = match array.storage.take() {
+        Some(R2cInPlaceStorage::Real(real)) => real,
+        _ => return Err(FftError::StorageLayoutMismatch.into()),
+    };
+    if boundary > 0 {
+        let real_transpose = workspace
+            .real_transpose
+            .as_mut()
+            .ok_or(FftError::WorkspaceMismatch)?;
+        for index in 0..boundary {
+            super::execute_transition(&core.transitions[index].forward, &mut real, real_transpose)?;
+        }
+    }
+    array.storage = Some(R2cInPlaceStorage::Real(real));
+    // Conversion is rank-local. Agree once for the complete handoff before
+    // any rank can enter the first complex transpose.
+    agree_result(
+        core.stages[0].input.topology().communicator(),
+        convert_real_to_complex(core, array, workspace),
+    )?;
+
+    let complex = match array.storage.as_mut() {
+        Some(R2cInPlaceStorage::Complex(complex)) => complex,
+        _ => return Err(FftError::StorageLayoutMismatch.into()),
+    };
+    for index in boundary..core.transitions.len() {
+        super::execute_transition(
+            &core.transitions[index].forward,
+            complex,
+            &mut workspace.transpose,
+        )?;
+        let stage = &core.stages[index + 1];
+        let mut active = complex.active_view_mut().map_err(FftError::Array)?;
+        super::execute_complex_forward_in_place(
+            &stage.local,
+            active.as_mut_slice(),
+            &mut workspace.fft_scratch,
+        )?;
+    }
+    let output = core
+        .stages
+        .last()
+        .ok_or(FftError::PreparationFailed)?
+        .output
+        .as_ref();
+    if !complex
+        .active_pencil()
+        .map_err(FftError::Array)?
+        .same_layout(output)
+        || array.real_pencils.is_none()
+        || array.complex_pencils.is_some()
+    {
+        return Err(FftError::PreparationFailed.into());
+    }
+    Ok(())
+}
+
+fn execute_in_place_reverse<R: FftReal, const N: usize, const M: usize>(
+    core: &Arc<TransformPlanCore<R, N, M>>,
+    array: &mut R2cInPlaceArray<R, N, M>,
+    workspace: &mut R2cInPlaceWorkspace<R, N, M>,
+    normalize_inverse: bool,
+    raw_absolute_threshold: f64,
+) -> Result<(), R2cError>
+where
+    Complex<R>: Equivalence,
+{
+    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
+    {
+        let complex = match array.storage.as_mut() {
+            Some(R2cInPlaceStorage::Complex(complex)) => complex,
+            _ => return Err(FftError::StorageLayoutMismatch.into()),
+        };
+        let last = core
+            .stages
+            .len()
+            .checked_sub(1)
+            .ok_or(FftError::PreparationFailed)?;
+        if last > boundary {
+            let stage = &core.stages[last];
+            let mut active = complex.active_view_mut().map_err(FftError::Array)?;
+            super::execute_complex_reverse_in_place(
+                &stage.local,
+                active.as_mut_slice(),
+                &mut workspace.fft_scratch,
+                normalize_inverse,
+            )?;
+        }
+        for index in (boundary..core.transitions.len()).rev() {
+            super::execute_transition(
+                &core.transitions[index].backward,
+                complex,
+                &mut workspace.transpose,
+            )?;
+            if index != boundary {
+                let stage = &core.stages[index];
+                let mut active = complex.active_view_mut().map_err(FftError::Array)?;
+                super::execute_complex_reverse_in_place(
+                    &stage.local,
+                    active.as_mut_slice(),
+                    &mut workspace.fft_scratch,
+                    normalize_inverse,
+                )?;
+            }
+        }
+    }
+
+    {
+        let complex = match array.storage.as_ref() {
+            Some(R2cInPlaceStorage::Complex(complex)) => complex,
+            _ => return Err(FftError::StorageLayoutMismatch.into()),
+        };
+        validate_boundary(core, complex, normalize_inverse, raw_absolute_threshold)?;
+    }
+    {
+        let complex = match array.storage.as_mut() {
+            Some(R2cInPlaceStorage::Complex(complex)) => complex,
+            _ => return Err(FftError::StorageLayoutMismatch.into()),
+        };
+        zero_accepted_boundary(core, complex)?;
+    }
+    // The real representation handoff is the one rank-local phase in the
+    // reverse route. All ranks must agree before the real-prefix transpose.
+    agree_result(
+        core.stages[0].input.topology().communicator(),
+        convert_complex_to_real(core, array, workspace, normalize_inverse),
+    )?;
+
+    let real = match array.storage.as_mut() {
+        Some(R2cInPlaceStorage::Real(real)) => real,
+        _ => return Err(FftError::StorageLayoutMismatch.into()),
+    };
+    if boundary > 0 {
+        let real_transpose = workspace
+            .real_transpose
+            .as_mut()
+            .ok_or(FftError::WorkspaceMismatch)?;
+        for index in (0..boundary).rev() {
+            super::execute_transition(&core.transitions[index].backward, real, real_transpose)?;
+        }
+    }
+    if !real
+        .active_pencil()
+        .map_err(FftError::Array)?
+        .same_layout(core.stages[0].input.as_ref())
+        || array.real_pencils.is_some()
+        || array.complex_pencils.is_none()
+    {
+        return Err(FftError::PreparationFailed.into());
+    }
+    Ok(())
+}
+
+fn convert_real_to_complex<R: FftReal, const N: usize, const M: usize>(
+    core: &Arc<TransformPlanCore<R, N, M>>,
+    array: &mut R2cInPlaceArray<R, N, M>,
+    workspace: &mut R2cInPlaceWorkspace<R, N, M>,
+) -> Result<(), R2cError>
+where
+    Complex<R>: Equivalence,
+{
+    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
+    let (real_len, complex_len) = r2c_lengths(core);
+    let rows = boundary_row_count(core)?;
+    let scalar_size = size_of::<R>();
+    let complex_size = size_of::<Complex<R>>();
+    let target_bytes = array
+        .complex_storage_len
+        .checked_mul(complex_size)
+        .ok_or(FftError::PreparationFailed)?;
+    let source_bytes = array
+        .real_storage_len
+        .checked_mul(scalar_size)
+        .ok_or(FftError::PreparationFailed)?;
+    let source_rounded = source_bytes
+        .checked_add(complex_size.saturating_sub(1))
+        .ok_or(FftError::PreparationFailed)?
+        / complex_size
+        * complex_size;
+    let full_bytes = source_rounded.max(target_bytes);
+    if full_bytes % scalar_size != 0 {
+        return Err(FftError::StorageLayoutMismatch.into());
+    }
+    let full_real_len = full_bytes / scalar_size;
+    let destination_pencils = array
+        .complex_pencils
+        .take()
+        .ok_or(FftError::StorageLayoutMismatch)?;
+    let real = match array.storage.take() {
+        Some(R2cInPlaceStorage::Real(real)) => real,
+        _ => {
+            array.complex_pencils = Some(destination_pencils);
+            return Err(FftError::StorageLayoutMismatch.into());
+        }
+    };
+    let (source_pencils, source_active, extra_shape, mut storage) =
+        match real.into_parts_preserving() {
+            Ok(parts) => parts,
+            Err((error, real)) => {
+                array.storage = Some(R2cInPlaceStorage::PoisonedReal(real.into_storage()));
+                array.complex_pencils = Some(destination_pencils);
+                return Err(map_array_allocation(error).into());
+            }
+        };
+    #[cfg(test)]
+    if array.test_hook == Some(InPlaceTestHook::PanicAfterForwardDetach) {
+        panic!("injected R2C forward panic after owner detachment");
+    }
+    if full_real_len > storage.capacity() {
+        return Err(fail_real_to_complex(
+            array,
+            source_pencils,
+            destination_pencils,
+            extra_shape,
+            storage,
+            source_active,
+            FftError::StorageLayoutMismatch.into(),
+        ));
+    }
+    storage.resize(full_real_len, R::zero());
+    #[cfg(test)]
+    if array.test_hook == Some(InPlaceTestHook::OddForwardCast) {
+        assert!(storage.pop().is_some());
+    }
+    let mut complex_storage = match try_cast_vec(storage) {
+        Ok(storage) => storage,
+        Err((_, storage)) => {
+            // `try_cast_vec` returns the original owner on failure. Keep that
+            // raw owner in the poisoned object instead of dropping or trying
+            // to expose it through a typed registry.
+            array.storage = Some(R2cInPlaceStorage::PoisonedReal(storage));
+            array.real_pencils = Some(source_pencils);
+            array.complex_pencils = Some(destination_pencils);
+            return Err(FftError::StorageLayoutMismatch.into());
+        }
+    };
+
+    let plan = core.stages[boundary].local.real_complex();
+    for row in (0..rows).rev() {
+        let source_start = match row.checked_mul(real_len) {
+            Some(value) => value,
+            None => {
+                return Err(fail_forward_complex(
+                    array,
+                    source_pencils,
+                    destination_pencils,
+                    extra_shape,
+                    complex_storage,
+                    0,
+                    FftError::PreparationFailed.into(),
+                ));
+            }
+        };
+        let source_end = match source_start.checked_add(real_len) {
+            Some(value) => value,
+            None => {
+                return Err(fail_forward_complex(
+                    array,
+                    source_pencils,
+                    destination_pencils,
+                    extra_shape,
+                    complex_storage,
+                    0,
+                    FftError::PreparationFailed.into(),
+                ));
+            }
+        };
+        let source = match try_cast_slice::<Complex<R>, R>(&complex_storage) {
+            Ok(source) => source,
+            Err(_) => {
+                return Err(fail_forward_complex(
+                    array,
+                    source_pencils,
+                    destination_pencils,
+                    extra_shape,
+                    complex_storage,
+                    0,
+                    FftError::StorageLayoutMismatch.into(),
+                ));
+            }
+        };
+        if source_end > source.len() {
+            return Err(fail_forward_complex(
+                array,
+                source_pencils,
+                destination_pencils,
+                extra_shape,
+                complex_storage,
+                0,
+                FftError::PreparationFailed.into(),
+            ));
+        }
+        workspace.real_source_line[..real_len].copy_from_slice(&source[source_start..source_end]);
+        let destination_start = match row.checked_mul(complex_len) {
+            Some(value) => value,
+            None => {
+                return Err(fail_forward_complex(
+                    array,
+                    source_pencils,
+                    destination_pencils,
+                    extra_shape,
+                    complex_storage,
+                    0,
+                    FftError::PreparationFailed.into(),
+                ));
+            }
+        };
+        let destination_end = match destination_start.checked_add(complex_len) {
+            Some(value) => value,
+            None => {
+                return Err(fail_forward_complex(
+                    array,
+                    source_pencils,
+                    destination_pencils,
+                    extra_shape,
+                    complex_storage,
+                    0,
+                    FftError::PreparationFailed.into(),
+                ));
+            }
+        };
+        if destination_end > complex_storage.len() {
+            return Err(fail_forward_complex(
+                array,
+                source_pencils,
+                destination_pencils,
+                extra_shape,
+                complex_storage,
+                0,
+                FftError::PreparationFailed.into(),
+            ));
+        }
+        if let Err(error) = plan.forward(
+            &workspace.real_source_line[..real_len],
+            &mut complex_storage[destination_start..destination_end],
+            &mut workspace.real_line,
+            &mut workspace.fft_scratch,
+        ) {
+            return Err(fail_forward_complex(
+                array,
+                source_pencils,
+                destination_pencils,
+                extra_shape,
+                complex_storage,
+                0,
+                error.into(),
+            ));
+        }
+    }
+    let result =
+        install_complex_storage(array, destination_pencils, extra_shape, complex_storage, 0);
+    array.real_pencils = Some(source_pencils);
+    result
+}
+
+fn convert_complex_to_real<R: FftReal, const N: usize, const M: usize>(
+    core: &Arc<TransformPlanCore<R, N, M>>,
+    array: &mut R2cInPlaceArray<R, N, M>,
+    workspace: &mut R2cInPlaceWorkspace<R, N, M>,
+    normalize_inverse: bool,
+) -> Result<(), R2cError>
+where
+    Complex<R>: Equivalence,
+{
+    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
+    let (real_len, complex_len) = r2c_lengths(core);
+    let rows = boundary_row_count(core)?;
+    let scalar_size = size_of::<R>();
+    let complex_size = size_of::<Complex<R>>();
+    let target_bytes = array
+        .real_storage_len
+        .checked_mul(scalar_size)
+        .ok_or(FftError::PreparationFailed)?;
+    let rounded = target_bytes
+        .checked_add(complex_size.saturating_sub(1))
+        .ok_or(FftError::PreparationFailed)?;
+    let full_complex_len = (rounded / complex_size).max(array.complex_storage_len);
+    let destination_pencils = array
+        .real_pencils
+        .take()
+        .ok_or(FftError::StorageLayoutMismatch)?;
+    let complex = match array.storage.take() {
+        Some(R2cInPlaceStorage::Complex(complex)) => complex,
+        _ => {
+            array.real_pencils = Some(destination_pencils);
+            return Err(FftError::StorageLayoutMismatch.into());
+        }
+    };
+    let (source_pencils, source_active, extra_shape, mut storage) =
+        match complex.into_parts_preserving() {
+            Ok(parts) => parts,
+            Err((error, complex)) => {
+                array.storage = Some(R2cInPlaceStorage::PoisonedComplex(complex.into_storage()));
+                array.real_pencils = Some(destination_pencils);
+                return Err(map_array_allocation(error).into());
+            }
+        };
+    #[cfg(test)]
+    if array.test_hook == Some(InPlaceTestHook::PanicAfterReverseDetach) {
+        panic!("injected R2C reverse panic after owner detachment");
+    }
+    if full_complex_len > storage.capacity() {
+        return Err(fail_complex_to_real(
+            array,
+            source_pencils,
+            destination_pencils,
+            extra_shape,
+            storage,
+            source_active,
+            FftError::StorageLayoutMismatch.into(),
+        ));
+    }
+    storage.resize(full_complex_len, zero_complex::<R>());
+    let mut real_storage = match try_cast_vec(storage) {
+        Ok(storage) => storage,
+        Err((_, storage)) => {
+            array.storage = Some(R2cInPlaceStorage::PoisonedComplex(storage));
+            array.complex_pencils = Some(source_pencils);
+            array.real_pencils = Some(destination_pencils);
+            return Err(FftError::StorageLayoutMismatch.into());
+        }
+    };
+    if array.real_storage_len > real_storage.len() {
+        return Err(fail_reverse_real(
+            array,
+            source_pencils,
+            destination_pencils,
+            extra_shape,
+            real_storage,
+            boundary,
+            FftError::StorageLayoutMismatch.into(),
+        ));
+    }
+    let plan = core.stages[boundary].local.real_complex();
+    for row in 0..rows {
+        let source_start = match row.checked_mul(complex_len) {
+            Some(value) => value,
+            None => {
+                return Err(fail_reverse_real(
+                    array,
+                    source_pencils,
+                    destination_pencils,
+                    extra_shape,
+                    real_storage,
+                    boundary,
+                    FftError::PreparationFailed.into(),
+                ));
+            }
+        };
+        let source_end = match source_start.checked_add(complex_len) {
+            Some(value) => value,
+            None => {
+                return Err(fail_reverse_real(
+                    array,
+                    source_pencils,
+                    destination_pencils,
+                    extra_shape,
+                    real_storage,
+                    boundary,
+                    FftError::PreparationFailed.into(),
+                ));
+            }
+        };
+        let source = match try_cast_slice::<R, Complex<R>>(&real_storage) {
+            Ok(source) => source,
+            Err(_) => {
+                return Err(fail_reverse_real(
+                    array,
+                    source_pencils,
+                    destination_pencils,
+                    extra_shape,
+                    real_storage,
+                    boundary,
+                    FftError::StorageLayoutMismatch.into(),
+                ));
+            }
+        };
+        if source_end > source.len() {
+            return Err(fail_reverse_real(
+                array,
+                source_pencils,
+                destination_pencils,
+                extra_shape,
+                real_storage,
+                boundary,
+                FftError::PreparationFailed.into(),
+            ));
+        }
+        workspace.complex_source_line[..complex_len]
+            .copy_from_slice(&source[source_start..source_end]);
+        let destination_start = match row.checked_mul(real_len) {
+            Some(value) => value,
+            None => {
+                return Err(fail_reverse_real(
+                    array,
+                    source_pencils,
+                    destination_pencils,
+                    extra_shape,
+                    real_storage,
+                    boundary,
+                    FftError::PreparationFailed.into(),
+                ));
+            }
+        };
+        let destination_end = match destination_start.checked_add(real_len) {
+            Some(value) => value,
+            None => {
+                return Err(fail_reverse_real(
+                    array,
+                    source_pencils,
+                    destination_pencils,
+                    extra_shape,
+                    real_storage,
+                    boundary,
+                    FftError::PreparationFailed.into(),
+                ));
+            }
+        };
+        if destination_end > real_storage.len() {
+            return Err(fail_reverse_real(
+                array,
+                source_pencils,
+                destination_pencils,
+                extra_shape,
+                real_storage,
+                boundary,
+                FftError::PreparationFailed.into(),
+            ));
+        }
+        let result = if normalize_inverse {
+            plan.inverse(
+                &workspace.complex_source_line[..complex_len],
+                &mut real_storage[destination_start..destination_end],
+                &mut workspace.complex_line,
+                &mut workspace.fft_scratch,
+            )
+        } else {
+            plan.backward(
+                &workspace.complex_source_line[..complex_len],
+                &mut real_storage[destination_start..destination_end],
+                &mut workspace.complex_line,
+                &mut workspace.fft_scratch,
+            )
+        };
+        if let Err(error) = result {
+            return Err(fail_reverse_real(
+                array,
+                source_pencils,
+                destination_pencils,
+                extra_shape,
+                real_storage,
+                boundary,
+                error.into(),
+            ));
+        }
+    }
+    #[cfg(test)]
+    let mut destination_pencils = destination_pencils;
+    #[cfg(test)]
+    if array.test_hook == Some(InPlaceTestHook::ReverseRestoreRejection) {
+        let mut pencils = destination_pencils.into_vec();
+        pencils.pop();
+        destination_pencils = pencils.into_boxed_slice();
+    }
+    let result = install_real_storage(
+        array,
+        destination_pencils,
+        extra_shape,
+        real_storage,
+        boundary,
+    );
+    array.complex_pencils = Some(source_pencils);
+    result
+}
+
+#[cfg(all(test, feature = "distributed"))]
+pub(super) fn run_rank_specific_conversion_failure(world: &mpi::topology::SimpleCommunicator) {
+    let size = usize::try_from(world.size()).unwrap();
+    assert!(matches!(size, 4 | 6));
+
+    // Keep the existing full-axis forward case: the conversion is followed by
+    // a complex distributed payload, so peers must not enter it after rank 1
+    // rejects the local conversion.
+    let topology = MpiTopology::<1>::new(world, [size]).unwrap();
+    let mut plan = R2cPlan::<f64, 2, 1>::from_shape_with_method(
+        Arc::clone(&topology),
+        [3, 4],
+        ExtraShape::scalar(),
+        TransposeMethod::AllToAllv,
+    )
+    .unwrap();
+    inject_conversion_scratch_failure(&mut plan, topology.rank() == 1);
+    let mut array = plan.allocate_in_place().unwrap();
+    array.real_view_mut().unwrap().as_mut_slice().fill(1.0);
+    let mut workspace = plan.allocate_in_place_workspace().unwrap();
+    let result = plan.forward_in_place(&mut array, &mut workspace);
+    assert_conversion_failure_result(result, topology.rank() == 1);
+    assert_poisoned_views_and_retries(&plan, &mut array, &mut workspace);
+
+    // A non-last reduction leaves real-prefix transposes after the
+    // representation handoff on reverse execution. Run both reverse APIs;
+    // the collective conversion agreement must finish before either peer can
+    // enter those payload collectives.
+    let grid = match size {
+        4 => [2, 2],
+        6 => [2, 3],
+        _ => unreachable!(),
+    };
+    let topology_2d = MpiTopology::<2>::new(world, grid).unwrap();
+    let selection = AxisSelection::<3>::from_indices([0]).unwrap();
+    for normalize in [true, false] {
+        let mut reverse_plan = R2cPlan::<f64, 3, 2>::from_shape_with_selection_and_method(
+            Arc::clone(&topology_2d),
+            [size, size / 2, 3],
+            ExtraShape::scalar(),
+            selection,
+            TransposeMethod::AllToAllv,
+        )
+        .unwrap();
+        inject_conversion_scratch_failure(&mut reverse_plan, topology_2d.rank() == 1);
+        let mut reverse_array = reverse_plan.allocate_in_place().unwrap();
+        force_complex_input(&mut reverse_array);
+        let mut reverse_workspace = reverse_plan.allocate_in_place_workspace().unwrap();
+        let result = if normalize {
+            reverse_plan.inverse_in_place(&mut reverse_array, &mut reverse_workspace)
+        } else {
+            reverse_plan.backward_in_place(&mut reverse_array, &mut reverse_workspace)
+        };
+        assert_conversion_failure_result(result, topology_2d.rank() == 1);
+        assert_poisoned_views_and_retries(
+            &reverse_plan,
+            &mut reverse_array,
+            &mut reverse_workspace,
+        );
+        topology_2d.communicator().barrier();
+    }
+
+    world.barrier();
+}
+
+#[cfg(all(test, feature = "distributed"))]
+fn inject_conversion_scratch_failure<R: FftReal, const N: usize, const M: usize>(
+    plan: &mut R2cPlan<R, N, M>,
+    enabled: bool,
+) {
+    if enabled {
+        let core = Arc::get_mut(&mut plan.core).unwrap();
+        let boundary = core.real_stage_index.unwrap();
+        match &mut core.stages[boundary].local {
+            LocalTransform::RealComplex(local) => local.inject_scratch_shortage_for_test(),
+            _ => unreachable!("test plan has a real boundary"),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "distributed"))]
+fn assert_conversion_failure_result(result: Result<(), R2cError>, local: bool) {
+    if local {
+        assert!(matches!(
+            result,
+            Err(R2cError::LocalR2c(LocalR2cError::ScratchTooSmall { .. }))
+        ));
+    } else {
+        assert!(matches!(
+            result,
+            Err(R2cError::Fft(FftError::CollectivePreconditionFailed))
+        ));
+    }
+}
+
+#[cfg(all(test, feature = "distributed"))]
+pub(super) fn assert_poisoned_views_and_retries<const N: usize, const M: usize>(
+    plan: &R2cPlan<f64, N, M>,
+    array: &mut R2cInPlaceArray<f64, N, M>,
+    workspace: &mut R2cInPlaceWorkspace<f64, N, M>,
+) where
+    Complex<f64>: Equivalence,
+{
+    assert_eq!(array.state(), R2cState::Poisoned);
+    assert!(matches!(
+        array.real_view(),
+        Err(R2cError::Fft(FftError::Array(ArrayError::Poisoned)))
+    ));
+    assert!(matches!(
+        array.real_view_mut(),
+        Err(R2cError::Fft(FftError::Array(ArrayError::Poisoned)))
+    ));
+    assert!(matches!(
+        array.complex_view(),
+        Err(R2cError::Fft(FftError::Array(ArrayError::Poisoned)))
+    ));
+    assert!(matches!(
+        array.complex_view_mut(),
+        Err(R2cError::Fft(FftError::Array(ArrayError::Poisoned)))
+    ));
+    for direction in [Direction::Forward, Direction::Inverse, Direction::Backward] {
+        let array_before = format!("{array:?}");
+        let workspace_before = format!("{workspace:?}");
+        let result = match direction {
+            Direction::Forward => plan.forward_in_place(array, workspace),
+            Direction::Inverse => plan.inverse_in_place(array, workspace),
+            Direction::Backward => plan.backward_in_place(array, workspace),
+        };
+        assert!(matches!(
+            result,
+            Err(R2cError::Fft(FftError::Array(ArrayError::Poisoned)))
+        ));
+        assert_eq!(array.state(), R2cState::Poisoned);
+        assert_eq!(format!("{array:?}"), array_before);
+        assert_eq!(format!("{workspace:?}"), workspace_before);
+    }
+}
+
+#[cfg(all(test, feature = "distributed"))]
+pub(super) fn force_odd_real_capacity<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+) {
+    let storage = array.storage.take().expect("test array has storage");
+    let R2cInPlaceStorage::Real(real) = storage else {
+        panic!("test array starts in the real representation");
+    };
+    let (pencils, active, extra_shape, storage) = real.into_parts().unwrap();
+    let requested = if storage.capacity() % 2 == 0 {
+        storage.capacity().checked_add(1).unwrap()
+    } else {
+        storage.capacity()
+    };
+    let mut replacement = Vec::with_capacity(requested);
+    replacement.extend(storage);
+    assert_eq!(replacement.capacity() % 2, 1);
+    array.storage = Some(R2cInPlaceStorage::Real(
+        ManyPencilArray::from_vec(pencils, active, extra_shape, replacement).unwrap(),
+    ));
+}
+
+#[cfg(all(test, feature = "distributed"))]
+pub(super) fn empty_in_place_workspace_for_test<R: FftReal, const N: usize, const M: usize>(
+    workspace: &mut R2cInPlaceWorkspace<R, N, M>,
+) {
+    workspace.fft_scratch.clear();
+    workspace.real_source_line.clear();
+    workspace.real_line.clear();
+    workspace.complex_source_line.clear();
+    workspace.complex_line.clear();
+}
+
+#[cfg(all(test, feature = "distributed"))]
+pub(super) fn force_complex_input<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+) where
+    Complex<R>: Equivalence,
+{
+    let storage = array.storage.take().expect("test array has storage");
+    let R2cInPlaceStorage::Real(real) = storage else {
+        panic!("test array starts in the real representation");
+    };
+    let (real_pencils, _active, extra_shape, mut storage) = real.into_parts().unwrap();
+    let complex_pencils = array
+        .complex_pencils
+        .take()
+        .expect("test array has complex layouts");
+    let complex_size = size_of::<Complex<R>>();
+    let scalar_size = size_of::<R>();
+    let target_bytes = array.complex_storage_len.checked_mul(complex_size).unwrap();
+    let source_bytes = storage.len().checked_mul(scalar_size).unwrap();
+    let bytes = source_bytes.max(target_bytes);
+    let full_bytes = bytes.checked_add(complex_size - 1).unwrap() / complex_size * complex_size;
+    storage.resize(full_bytes / scalar_size, R::zero());
+    let mut storage = try_cast_vec(storage).unwrap();
+    storage.truncate(array.complex_storage_len);
+    let active = complex_pencils.len().checked_sub(1).unwrap();
+    array.real_pencils = Some(real_pencils);
+    array.storage = Some(R2cInPlaceStorage::Complex(
+        ManyPencilArray::from_vec(complex_pencils, active, extra_shape, storage).unwrap(),
+    ));
+    array.state = R2cState::ComplexOutput;
+}
+
+#[cfg(all(test, feature = "distributed"))]
+pub(super) fn panic_after_forward_detach_for_test<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+) {
+    array.test_hook = Some(InPlaceTestHook::PanicAfterForwardDetach);
+}
+
+#[cfg(all(test, feature = "distributed"))]
+pub(super) fn panic_after_reverse_detach_for_test<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+) {
+    array.test_hook = Some(InPlaceTestHook::PanicAfterReverseDetach);
+}
+
+#[cfg(all(test, feature = "distributed"))]
+pub(super) fn force_odd_forward_cast_for_test<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+) {
+    array.test_hook = Some(InPlaceTestHook::OddForwardCast);
+}
+
+#[cfg(all(test, feature = "distributed"))]
+pub(super) fn force_reverse_restore_rejection_for_test<
+    R: FftReal,
+    const N: usize,
+    const M: usize,
+>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+) {
+    array.test_hook = Some(InPlaceTestHook::ReverseRestoreRejection);
+}
+
+#[cfg(all(test, feature = "distributed"))]
+pub(super) fn corrupt_real_extra_shape_for_test<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+    extra_shape: ExtraShape,
+) {
+    let storage = array.storage.take().expect("test array has storage");
+    let R2cInPlaceStorage::Real(real) = storage else {
+        panic!("test array is not in the real representation");
+    };
+    let (pencils, active, _old_extra_shape, storage) = real.into_parts().unwrap();
+    array.storage = Some(R2cInPlaceStorage::Real(
+        ManyPencilArray::from_vec(pencils, active, extra_shape, storage).unwrap(),
+    ));
+}
+
+#[cfg(all(test, feature = "distributed"))]
+pub(super) fn corrupt_complex_extra_shape_for_test<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+    extra_shape: ExtraShape,
+) {
+    let storage = array.storage.take().expect("test array has storage");
+    let R2cInPlaceStorage::Complex(complex) = storage else {
+        panic!("test array is not in the complex representation");
+    };
+    let (pencils, active, _old_extra_shape, storage) = complex.into_parts().unwrap();
+    array.storage = Some(R2cInPlaceStorage::Complex(
+        ManyPencilArray::from_vec(pencils, active, extra_shape, storage).unwrap(),
+    ));
+}
+
+#[cfg(all(test, feature = "distributed"))]
+pub(super) fn corrupt_forward_registry_for_test<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+) {
+    let boundary = array.core.real_stage_index.unwrap();
+    let registry = array
+        .complex_pencils
+        .as_mut()
+        .expect("test array has a complex registry");
+    assert!(!registry.is_empty());
+    registry[0] = Arc::clone(&array.core.stages[boundary].input);
+}
+
+#[cfg(all(test, feature = "distributed"))]
+pub(super) fn corrupt_reverse_registry_for_test<R: FftReal, const N: usize, const M: usize>(
+    array: &mut R2cInPlaceArray<R, N, M>,
+) {
+    let boundary = array.core.real_stage_index.unwrap();
+    let registry = array
+        .real_pencils
+        .as_mut()
+        .expect("test array has a real registry");
+    assert!(!registry.is_empty());
+    registry[0] = Arc::clone(&array.core.stages[boundary].output);
+}
+
+#[cfg(all(test, feature = "distributed"))]
+pub(super) fn storage_is_poisoned_for_test<R: FftReal, const N: usize, const M: usize>(
+    array: &R2cInPlaceArray<R, N, M>,
+) -> bool {
+    matches!(
+        array.storage.as_ref(),
+        Some(R2cInPlaceStorage::PoisonedReal(_)) | Some(R2cInPlaceStorage::PoisonedComplex(_))
+    )
+}
+
+#[cfg(all(test, feature = "distributed"))]
+pub(super) fn storage_capacity_bytes_for_test<R: FftReal, const N: usize, const M: usize>(
+    array: &R2cInPlaceArray<R, N, M>,
+) -> Option<usize> {
+    let storage_capacity = match array.storage.as_ref()? {
+        R2cInPlaceStorage::Real(real) => real.storage_capacity(),
+        R2cInPlaceStorage::Complex(complex) => complex.storage_capacity(),
+        R2cInPlaceStorage::PoisonedReal(storage) => storage.capacity(),
+        R2cInPlaceStorage::PoisonedComplex(storage) => storage.capacity(),
+    };
+    let element_size = match array.storage.as_ref()? {
+        R2cInPlaceStorage::Real(_) | R2cInPlaceStorage::PoisonedReal(_) => size_of::<R>(),
+        R2cInPlaceStorage::Complex(_) | R2cInPlaceStorage::PoisonedComplex(_) => {
+            size_of::<Complex<R>>()
+        }
+    };
+    storage_capacity.checked_mul(element_size)
 }
 
 fn r2c_lengths<R: FftReal, const N: usize, const M: usize>(

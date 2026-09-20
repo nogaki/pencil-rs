@@ -29,7 +29,8 @@
 //! [`R2cPlan`] reuses the same private route and transition machinery for an
 //! original real endpoint followed by homogeneous complex tail stages. Its
 //! reduced output shape and post-tail constrained-plane validation are
-//! implemented in the child module without adding a real in-place API.
+//! implemented in the child module, which also provides a single-allocation
+//! real in-place API.
 //!
 //! [`R2rPlan`] keeps the original shape and uses a sibling generic core for
 //! real or complex DCT/DST data. Each logical axis has either one of the eight
@@ -74,6 +75,10 @@ const OPERATION_R2R_BACKWARD: u64 = 21;
 const OPERATION_R2R_FORWARD_IN_PLACE: u64 = 22;
 const OPERATION_R2R_INVERSE_IN_PLACE: u64 = 23;
 const OPERATION_R2R_BACKWARD_IN_PLACE: u64 = 24;
+// Operation words 18..24 are reserved for the parallel distributed R2R API.
+const OPERATION_R2C_FORWARD_IN_PLACE: u64 = 25;
+const OPERATION_R2C_INVERSE_IN_PLACE: u64 = 26;
+const OPERATION_R2C_BACKWARD_IN_PLACE: u64 = 27;
 const INVALID_WORD: u64 = u64::MAX;
 const METHOD_ALL_TO_ALLV: u64 = 0;
 const METHOD_POINT_TO_POINT: u64 = 1;
@@ -149,6 +154,10 @@ pub enum FftError {
         required: usize,
     },
 
+    /// The single in-place allocation cannot be safely recast for its next phase.
+    #[error("distributed in-place storage has an incompatible scalar layout")]
+    StorageLayoutMismatch,
+
     /// The local native FFT plan or operation rejected checked input.
     #[error(transparent)]
     LocalC2c(#[from] LocalC2cError),
@@ -206,7 +215,7 @@ mod r2r;
 pub(crate) static MPI_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
     std::sync::OnceLock::new();
 
-pub use r2c::{R2cPlan, R2cWorkspace};
+pub use r2c::{R2cInPlaceArray, R2cInPlaceWorkspace, R2cPlan, R2cWorkspace};
 pub use r2r::{R2rInPlaceArray, R2rInPlaceWorkspace, R2rPlan, R2rWorkspace};
 
 /// Selects the distributed transition transport used by [`C2cPlan`], [`R2cPlan`], and [`R2rPlan`].
@@ -2177,14 +2186,16 @@ mod tests {
         ExtraShape, FftError, LocalC2cError, LocalC2cPlan, OPERATION_BACKWARD,
         OPERATION_BACKWARD_IN_PLACE, OPERATION_FORWARD, OPERATION_FORWARD_IN_PLACE,
         OPERATION_INVERSE, OPERATION_INVERSE_IN_PLACE, OPERATION_PLAN, OPERATION_R2C_BACKWARD,
-        OPERATION_R2C_FORWARD, OPERATION_R2C_INVERSE, OPERATION_R2C_PLAN, OPERATION_R2R_BACKWARD,
-        OPERATION_R2R_BACKWARD_IN_PLACE, OPERATION_R2R_FORWARD, OPERATION_R2R_FORWARD_IN_PLACE,
-        OPERATION_R2R_INVERSE, OPERATION_R2R_INVERSE_IN_PLACE, OPERATION_R2R_PLAN, TransposeMethod,
-        descriptor_len, run_in_place_transaction,
+        OPERATION_R2C_BACKWARD_IN_PLACE, OPERATION_R2C_FORWARD, OPERATION_R2C_FORWARD_IN_PLACE,
+        OPERATION_R2C_INVERSE, OPERATION_R2C_INVERSE_IN_PLACE, OPERATION_R2C_PLAN,
+        OPERATION_R2R_BACKWARD, OPERATION_R2R_BACKWARD_IN_PLACE, OPERATION_R2R_FORWARD,
+        OPERATION_R2R_FORWARD_IN_PLACE, OPERATION_R2R_INVERSE, OPERATION_R2R_INVERSE_IN_PLACE,
+        OPERATION_R2R_PLAN, R2cError, R2cPlan, TransposeMethod, descriptor_len,
+        run_in_place_transaction,
     };
-    use crate::AxisSelection;
+    use crate::{AxisSelection, R2cState};
     use mpi::topology::Communicator;
-    use pencil_array::{MpiTopology, TransposeWorkspace};
+    use pencil_array::{ArrayError, MpiTopology, TransposeWorkspace};
 
     #[test]
     fn axis_selection_validates_and_ignores_input_order() {
@@ -2257,6 +2268,14 @@ mod tests {
             ),
             (18, 19, 20, 21, 22, 23, 24)
         );
+        assert_eq!(
+            (
+                OPERATION_R2C_FORWARD_IN_PLACE,
+                OPERATION_R2C_INVERSE_IN_PLACE,
+                OPERATION_R2C_BACKWARD_IN_PLACE,
+            ),
+            (25, 26, 27)
+        );
     }
 
     #[test]
@@ -2267,7 +2286,10 @@ mod tests {
             .unwrap();
         let universe = mpi::initialize().expect("MPI initialization failed");
         let world = universe.world();
-        assert_eq!(world.size(), 1, "run this unit test with one MPI rank");
+        if world.size() != 1 {
+            super::r2c::run_rank_specific_conversion_failure(&world);
+            return;
+        }
         let result = {
             let topology = MpiTopology::<1>::new(&world, [1]).unwrap();
             let legacy_shape = C2cPlan::<f64, 2, 1>::from_shape(
@@ -2473,9 +2495,296 @@ mod tests {
                 );
             }
 
+            let capacity_plan = R2cPlan::<f64, 2, 1>::from_shape_with_method(
+                Arc::clone(&topology),
+                [3, 4],
+                ExtraShape::scalar(),
+                TransposeMethod::AllToAllv,
+            )
+            .unwrap();
+            let mut capacity_array = capacity_plan.allocate_in_place().unwrap();
+            capacity_array
+                .real_view_mut()
+                .unwrap()
+                .as_mut_slice()
+                .fill(7.0);
+            let capacity_snapshot = capacity_array.real_view().unwrap().as_slice().to_vec();
+            super::r2c::force_odd_real_capacity(&mut capacity_array);
+            let capacity_pointer = capacity_array.real_view().unwrap().as_slice().as_ptr();
+            let mut capacity_workspace = capacity_plan.allocate_in_place_workspace().unwrap();
+            let workspace_snapshot = format!("{capacity_workspace:?}");
+            assert!(matches!(
+                capacity_plan.forward_in_place(&mut capacity_array, &mut capacity_workspace),
+                Err(R2cError::Fft(FftError::StorageLayoutMismatch))
+            ));
+            assert_eq!(capacity_array.state(), R2cState::RealInput);
+            assert_eq!(
+                capacity_array.real_view().unwrap().as_slice(),
+                capacity_snapshot.as_slice()
+            );
+            assert_eq!(
+                capacity_array.real_view().unwrap().as_slice().as_ptr(),
+                capacity_pointer
+            );
+            assert_eq!(format!("{capacity_workspace:?}"), workspace_snapshot);
+
+            let mut short_array = capacity_plan.allocate_in_place().unwrap();
+            short_array
+                .real_view_mut()
+                .unwrap()
+                .as_mut_slice()
+                .fill(8.0);
+            let short_data = short_array.real_view().unwrap().as_slice().to_vec();
+            let short_pointer = short_array.real_view().unwrap().as_slice().as_ptr();
+            let mut short_workspace = capacity_plan.allocate_in_place_workspace().unwrap();
+            super::r2c::empty_in_place_workspace_for_test(&mut short_workspace);
+            let short_workspace_snapshot = format!("{short_workspace:?}");
+            assert!(matches!(
+                capacity_plan.forward_in_place(&mut short_array, &mut short_workspace),
+                Err(R2cError::Fft(FftError::WorkspaceTooSmall { .. }))
+            ));
+            assert_eq!(short_array.state(), R2cState::RealInput);
+            assert_eq!(short_array.real_view().unwrap().as_slice(), short_data);
+            assert_eq!(
+                short_array.real_view().unwrap().as_slice().as_ptr(),
+                short_pointer
+            );
+            assert_eq!(format!("{short_workspace:?}"), short_workspace_snapshot);
+
+            r2c_conversion_panic_cases(&topology);
+            r2c_conversion_owner_failure_cases(&topology);
+            r2c_preflight_corruption_cases(&topology);
+
             Ok::<(), ()>(())
         };
         result.unwrap();
+    }
+
+    fn r2c_conversion_panic_cases(topology: &Arc<MpiTopology<1>>) {
+        let plan = R2cPlan::<f64, 2, 1>::from_shape_with_method(
+            Arc::clone(topology),
+            [3, 4],
+            ExtraShape::scalar(),
+            TransposeMethod::AllToAllv,
+        )
+        .unwrap();
+        let mut forward_array = plan.allocate_in_place().unwrap();
+        forward_array
+            .real_view_mut()
+            .unwrap()
+            .as_mut_slice()
+            .fill(1.0);
+        super::r2c::panic_after_forward_detach_for_test(&mut forward_array);
+        let mut forward_workspace = plan.allocate_in_place_workspace().unwrap();
+        let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            plan.forward_in_place(&mut forward_array, &mut forward_workspace)
+        }));
+        assert!(panic_result.is_err());
+        assert!(super::r2c::storage_capacity_bytes_for_test(&forward_array).is_none());
+        super::r2c::assert_poisoned_views_and_retries(
+            &plan,
+            &mut forward_array,
+            &mut forward_workspace,
+        );
+
+        let mut reverse_array = plan.allocate_in_place().unwrap();
+        let mut reverse_workspace = plan.allocate_in_place_workspace().unwrap();
+        plan.forward_in_place(&mut reverse_array, &mut reverse_workspace)
+            .unwrap();
+        super::r2c::panic_after_reverse_detach_for_test(&mut reverse_array);
+        let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            plan.inverse_in_place(&mut reverse_array, &mut reverse_workspace)
+        }));
+        assert!(panic_result.is_err());
+        assert!(super::r2c::storage_capacity_bytes_for_test(&reverse_array).is_none());
+        super::r2c::assert_poisoned_views_and_retries(
+            &plan,
+            &mut reverse_array,
+            &mut reverse_workspace,
+        );
+    }
+
+    fn r2c_conversion_owner_failure_cases(topology: &Arc<MpiTopology<1>>) {
+        let plan = R2cPlan::<f64, 2, 1>::from_shape_with_method(
+            Arc::clone(topology),
+            [3, 4],
+            ExtraShape::scalar(),
+            TransposeMethod::AllToAllv,
+        )
+        .unwrap();
+        let mut forward_array = plan.allocate_in_place().unwrap();
+        forward_array
+            .real_view_mut()
+            .unwrap()
+            .as_mut_slice()
+            .fill(2.0);
+        let capacity = super::r2c::storage_capacity_bytes_for_test(&forward_array).unwrap();
+        super::r2c::force_odd_forward_cast_for_test(&mut forward_array);
+        let mut forward_workspace = plan.allocate_in_place_workspace().unwrap();
+        let result = plan.forward_in_place(&mut forward_array, &mut forward_workspace);
+        assert!(matches!(
+            result,
+            Err(R2cError::Fft(FftError::StorageLayoutMismatch))
+        ));
+        assert_eq!(forward_array.state(), R2cState::Poisoned);
+        assert!(super::r2c::storage_is_poisoned_for_test(&forward_array));
+        assert_eq!(
+            super::r2c::storage_capacity_bytes_for_test(&forward_array),
+            Some(capacity)
+        );
+        super::r2c::assert_poisoned_views_and_retries(
+            &plan,
+            &mut forward_array,
+            &mut forward_workspace,
+        );
+
+        let mut reverse_array = plan.allocate_in_place().unwrap();
+        let mut reverse_workspace = plan.allocate_in_place_workspace().unwrap();
+        plan.forward_in_place(&mut reverse_array, &mut reverse_workspace)
+            .unwrap();
+        let capacity = super::r2c::storage_capacity_bytes_for_test(&reverse_array).unwrap();
+        super::r2c::force_reverse_restore_rejection_for_test(&mut reverse_array);
+        let result = plan.inverse_in_place(&mut reverse_array, &mut reverse_workspace);
+        assert!(matches!(
+            result,
+            Err(R2cError::Fft(FftError::Array(
+                ArrayError::IncompatiblePencils
+            )))
+        ));
+        assert_eq!(reverse_array.state(), R2cState::Poisoned);
+        assert!(super::r2c::storage_is_poisoned_for_test(&reverse_array));
+        assert_eq!(
+            super::r2c::storage_capacity_bytes_for_test(&reverse_array),
+            Some(capacity)
+        );
+        super::r2c::assert_poisoned_views_and_retries(
+            &plan,
+            &mut reverse_array,
+            &mut reverse_workspace,
+        );
+    }
+
+    fn r2c_preflight_corruption_cases(topology: &Arc<MpiTopology<1>>) {
+        let extra = ExtraShape::new([2]).unwrap();
+        let wrong_extra = ExtraShape::new([1, 2]).unwrap();
+        let plan = R2cPlan::<f64, 2, 1>::from_shape_with_method(
+            Arc::clone(topology),
+            [3, 4],
+            extra.clone(),
+            TransposeMethod::AllToAllv,
+        )
+        .unwrap();
+        let mut real_extra_array = plan.allocate_in_place().unwrap();
+        real_extra_array
+            .real_view_mut()
+            .unwrap()
+            .as_mut_slice()
+            .fill(3.0);
+        super::r2c::corrupt_real_extra_shape_for_test(&mut real_extra_array, wrong_extra.clone());
+        let real_before = real_extra_array.real_view().unwrap().as_slice().to_vec();
+        let real_array_before = format!("{real_extra_array:?}");
+        let mut real_workspace = plan.allocate_in_place_workspace().unwrap();
+        let real_workspace_before = format!("{real_workspace:?}");
+        assert!(matches!(
+            plan.forward_in_place(&mut real_extra_array, &mut real_workspace),
+            Err(R2cError::Fft(FftError::StorageLayoutMismatch))
+        ));
+        assert_eq!(real_extra_array.state(), R2cState::RealInput);
+        assert_eq!(
+            real_extra_array.real_view().unwrap().as_slice(),
+            real_before.as_slice()
+        );
+        assert_eq!(format!("{real_extra_array:?}"), real_array_before);
+        assert_eq!(format!("{real_workspace:?}"), real_workspace_before);
+
+        let registry_plan = R2cPlan::<f64, 2, 1>::from_shape_with_method(
+            Arc::clone(topology),
+            [3, 4],
+            ExtraShape::scalar(),
+            TransposeMethod::AllToAllv,
+        )
+        .unwrap();
+        let mut real_registry_array = registry_plan.allocate_in_place().unwrap();
+        real_registry_array
+            .real_view_mut()
+            .unwrap()
+            .as_mut_slice()
+            .fill(4.0);
+        super::r2c::corrupt_forward_registry_for_test(&mut real_registry_array);
+        let real_before = real_registry_array.real_view().unwrap().as_slice().to_vec();
+        let real_array_before = format!("{real_registry_array:?}");
+        let mut real_registry_workspace = registry_plan.allocate_in_place_workspace().unwrap();
+        let real_workspace_before = format!("{real_registry_workspace:?}");
+        assert!(matches!(
+            registry_plan.forward_in_place(&mut real_registry_array, &mut real_registry_workspace),
+            Err(R2cError::Fft(FftError::WorkspaceMismatch))
+        ));
+        assert_eq!(real_registry_array.state(), R2cState::RealInput);
+        assert_eq!(
+            real_registry_array.real_view().unwrap().as_slice(),
+            real_before.as_slice()
+        );
+        assert_eq!(format!("{real_registry_array:?}"), real_array_before);
+        assert_eq!(
+            format!("{real_registry_workspace:?}"),
+            real_workspace_before
+        );
+
+        let mut complex_extra_array = plan.allocate_in_place().unwrap();
+        let mut complex_extra_workspace = plan.allocate_in_place_workspace().unwrap();
+        plan.forward_in_place(&mut complex_extra_array, &mut complex_extra_workspace)
+            .unwrap();
+        super::r2c::corrupt_complex_extra_shape_for_test(&mut complex_extra_array, wrong_extra);
+        let complex_before = complex_extra_array
+            .complex_view()
+            .unwrap()
+            .as_slice()
+            .to_vec();
+        let complex_array_before = format!("{complex_extra_array:?}");
+        let complex_workspace_before = format!("{complex_extra_workspace:?}");
+        assert!(matches!(
+            plan.inverse_in_place(&mut complex_extra_array, &mut complex_extra_workspace),
+            Err(R2cError::Fft(FftError::StorageLayoutMismatch))
+        ));
+        assert_eq!(complex_extra_array.state(), R2cState::ComplexOutput);
+        assert_eq!(
+            complex_extra_array.complex_view().unwrap().as_slice(),
+            complex_before.as_slice()
+        );
+        assert_eq!(format!("{complex_extra_array:?}"), complex_array_before);
+        assert_eq!(
+            format!("{complex_extra_workspace:?}"),
+            complex_workspace_before
+        );
+
+        let mut complex_registry_array = registry_plan.allocate_in_place().unwrap();
+        let mut complex_registry_workspace = registry_plan.allocate_in_place_workspace().unwrap();
+        registry_plan
+            .forward_in_place(&mut complex_registry_array, &mut complex_registry_workspace)
+            .unwrap();
+        super::r2c::corrupt_reverse_registry_for_test(&mut complex_registry_array);
+        let complex_before = complex_registry_array
+            .complex_view()
+            .unwrap()
+            .as_slice()
+            .to_vec();
+        let complex_array_before = format!("{complex_registry_array:?}");
+        let complex_workspace_before = format!("{complex_registry_workspace:?}");
+        assert!(matches!(
+            registry_plan
+                .inverse_in_place(&mut complex_registry_array, &mut complex_registry_workspace),
+            Err(R2cError::Fft(FftError::WorkspaceMismatch))
+        ));
+        assert_eq!(complex_registry_array.state(), R2cState::ComplexOutput);
+        assert_eq!(
+            complex_registry_array.complex_view().unwrap().as_slice(),
+            complex_before.as_slice()
+        );
+        assert_eq!(format!("{complex_registry_array:?}"), complex_array_before);
+        assert_eq!(
+            format!("{complex_registry_workspace:?}"),
+            complex_workspace_before
+        );
     }
 
     fn assert_transition_method(plan: &C2cPlan<f64, 2, 1>, method: TransposeMethod) {

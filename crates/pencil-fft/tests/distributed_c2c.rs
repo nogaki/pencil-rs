@@ -6,12 +6,12 @@ use mpi::{
     traits::CommunicatorCollectives,
 };
 use pencil_array::{
-    AllToAllvTransposePlan, AxisPermutation, ExtraShape, ManyPencilArray, MpiTopology, Pencil,
-    PencilArray, PencilArrayView, PointToPointTransposePlan, TransposeWorkspace,
+    AllToAllvTransposePlan, ArrayError, AxisPermutation, ExtraShape, ManyPencilArray, MpiTopology,
+    Pencil, PencilArray, PencilArrayView, PointToPointTransposePlan, TransposeWorkspace,
 };
 use pencil_fft::{
     AxisSelection, C2cInPlaceArray, C2cInPlaceWorkspace, C2cOutOfPlaceWorkspace, C2cPlan, C2cState,
-    Complex, FftError, FftReal, R2cError, R2cPlan, R2cWorkspace, TransposeMethod,
+    Complex, FftError, FftReal, R2cError, R2cPlan, R2cState, R2cWorkspace, TransposeMethod,
 };
 
 trait TestReal: FftReal + mpi::datatype::Equivalence + std::fmt::Debug {
@@ -183,6 +183,7 @@ fn distributed_c2c_one_mpi_binary() {
     );
 
     run_r2c_cases(&topology_1d, &topology_2d);
+    run_r2c_in_place_cases(&topology_1d, &topology_2d);
     run_partial_subset_cases(&topology_1d, &topology_2d);
     assert_r2c_method_parity::<f64, 3, 1>(
         &reversed_topology,
@@ -910,6 +911,260 @@ fn run_r2c_cases(topology_1d: &Arc<MpiTopology<1>>, topology_2d: &Arc<MpiTopolog
 
     run_r2c_boundary_cases(topology_1d);
     run_r2c_boundary_hard_cases(topology_1d, topology_2d);
+}
+
+fn run_r2c_in_place_cases(topology_1d: &Arc<MpiTopology<1>>, topology_2d: &Arc<MpiTopology<2>>) {
+    run_r2c_in_place_case::<f64, 2, 1>(
+        topology_1d,
+        [3, 4],
+        AxisSelection::all(),
+        ExtraShape::scalar(),
+        30.0,
+        TransposeMethod::AllToAllv,
+    );
+    run_r2c_in_place_case::<f64, 3, 1>(
+        topology_1d,
+        [3, 2, 5],
+        AxisSelection::from_indices([1]).unwrap(),
+        ExtraShape::new([2]).unwrap(),
+        30.5,
+        TransposeMethod::PointToPoint,
+    );
+    run_r2c_in_place_case::<f64, 3, 1>(
+        topology_1d,
+        [3, 2, 5],
+        AxisSelection::from_indices([0]).unwrap(),
+        ExtraShape::scalar(),
+        31.0,
+        TransposeMethod::AllToAllv,
+    );
+    run_r2c_in_place_case::<f32, 4, 2>(
+        topology_2d,
+        [3, 1, 2, 4],
+        AxisSelection::from_indices([2]).unwrap(),
+        ExtraShape::new([2, 3]).unwrap(),
+        31.5,
+        TransposeMethod::PointToPoint,
+    );
+    run_r2c_in_place_case::<f32, 4, 2>(
+        topology_2d,
+        [3, 1, 2, 4],
+        AxisSelection::from_indices([0]).unwrap(),
+        ExtraShape::scalar(),
+        32.0,
+        TransposeMethod::AllToAllv,
+    );
+    run_r2c_in_place_case::<f64, 4, 2>(
+        topology_2d,
+        [3, 1, 2, 4],
+        AxisSelection::all(),
+        ExtraShape::new([0]).unwrap(),
+        32.5,
+        TransposeMethod::PointToPoint,
+    );
+    run_r2c_in_place_poison_case(topology_1d);
+}
+
+fn run_r2c_in_place_poison_case(topology: &Arc<MpiTopology<1>>) {
+    let plan = R2cPlan::<f64, 2, 1>::from_shape_with_method(
+        Arc::clone(topology),
+        [3, 4],
+        ExtraShape::scalar(),
+        TransposeMethod::AllToAllv,
+    )
+    .unwrap();
+    let foreign_plan = R2cPlan::<f64, 2, 1>::from_shape_with_method(
+        Arc::clone(topology),
+        [3, 4],
+        ExtraShape::scalar(),
+        TransposeMethod::AllToAllv,
+    )
+    .unwrap();
+    let mut foreign_array = foreign_plan.allocate_in_place().unwrap();
+    foreign_array
+        .real_view_mut()
+        .unwrap()
+        .as_mut_slice()
+        .fill(2.0);
+    let mut foreign_array_workspace = plan.allocate_in_place_workspace().unwrap();
+    let foreign_array_before = foreign_array.real_view().unwrap().as_slice().to_vec();
+    let foreign_array_workspace_before = format!("{foreign_array_workspace:?}");
+    assert!(matches!(
+        plan.forward_in_place(&mut foreign_array, &mut foreign_array_workspace),
+        Err(R2cError::Fft(FftError::Array(
+            ArrayError::IncompatiblePencils
+        )))
+    ));
+    assert_eq!(foreign_array.state(), R2cState::RealInput);
+    assert_eq!(
+        foreign_array.real_view().unwrap().as_slice(),
+        foreign_array_before.as_slice()
+    );
+    assert_eq!(
+        format!("{foreign_array_workspace:?}"),
+        foreign_array_workspace_before
+    );
+
+    let mut workspace_foreign = foreign_plan.allocate_in_place_workspace().unwrap();
+    let mut own_array = plan.allocate_in_place().unwrap();
+    own_array.real_view_mut().unwrap().as_mut_slice().fill(3.0);
+    let own_array_before = own_array.real_view().unwrap().as_slice().to_vec();
+    let workspace_foreign_before = format!("{workspace_foreign:?}");
+    assert!(matches!(
+        plan.forward_in_place(&mut own_array, &mut workspace_foreign),
+        Err(R2cError::Fft(FftError::WorkspaceMismatch))
+    ));
+    assert_eq!(own_array.state(), R2cState::RealInput);
+    assert_eq!(
+        own_array.real_view().unwrap().as_slice(),
+        own_array_before.as_slice()
+    );
+    assert_eq!(format!("{workspace_foreign:?}"), workspace_foreign_before);
+
+    let mut array = plan.allocate_in_place().unwrap();
+    array.real_view_mut().unwrap().as_mut_slice().fill(1.0);
+    let before = array.real_view().unwrap().as_slice().to_vec();
+    let pointer = array.real_view().unwrap().as_slice().as_ptr() as usize;
+    let mut workspace = plan.allocate_in_place_workspace().unwrap();
+    assert!(matches!(
+        plan.inverse_in_place(&mut array, &mut workspace),
+        Err(R2cError::Fft(FftError::InputLayoutMismatch))
+    ));
+    assert_eq!(array.state(), R2cState::RealInput);
+    assert_eq!(array.real_view().unwrap().as_slice(), before.as_slice());
+    assert_eq!(
+        array.real_view().unwrap().as_slice().as_ptr() as usize,
+        pointer
+    );
+
+    plan.forward_in_place(&mut array, &mut workspace).unwrap();
+    if let Some(value) = array.complex_view_mut().unwrap().as_mut_slice().first_mut() {
+        value.im = 1.0;
+    }
+    assert!(matches!(
+        plan.inverse_in_place(&mut array, &mut workspace),
+        Err(R2cError::InvalidSpectrum)
+    ));
+    assert_eq!(array.state(), R2cState::Poisoned);
+    assert!(array.real_view().is_err());
+    assert!(array.complex_view().is_err());
+    assert!(matches!(
+        plan.forward_in_place(&mut array, &mut workspace),
+        Err(R2cError::Fft(FftError::Array(_)))
+    ));
+}
+
+fn run_r2c_in_place_case<R: TestReal, const N: usize, const M: usize>(
+    topology: &Arc<MpiTopology<M>>,
+    global_shape: [usize; N],
+    selection: AxisSelection<N>,
+    extra_shape: ExtraShape,
+    seed: f64,
+    method: TransposeMethod,
+) where
+    Complex<R>: mpi::datatype::Equivalence,
+{
+    let plan = R2cPlan::<R, N, M>::from_shape_with_selection_and_method(
+        Arc::clone(topology),
+        global_shape,
+        extra_shape.clone(),
+        selection,
+        method,
+    )
+    .unwrap();
+    let mut source = plan.allocate_input().unwrap();
+    fill_r2c_input(&mut source, seed);
+    let source_before = source.as_slice().to_vec();
+    let mut spectrum = plan.allocate_output().unwrap();
+    let mut oop_workspace = plan.allocate_workspace().unwrap();
+    plan.forward(&source, &mut spectrum, &mut oop_workspace)
+        .unwrap();
+    let spectrum_before = spectrum.as_slice().to_vec();
+    let mut expected_inverse = plan.allocate_input().unwrap();
+    plan.inverse(&spectrum, &mut expected_inverse, &mut oop_workspace)
+        .unwrap();
+    let mut expected_backward = plan.allocate_input().unwrap();
+    plan.backward(&spectrum, &mut expected_backward, &mut oop_workspace)
+        .unwrap();
+
+    let mut array = plan.allocate_in_place().unwrap();
+    {
+        let mut view = array.real_view_mut().unwrap();
+        assert_eq!(view.len(), source_before.len());
+        view.as_mut_slice().copy_from_slice(&source_before);
+    }
+    assert!(matches!(
+        array.complex_view(),
+        Err(R2cError::Fft(FftError::OutputLayoutMismatch))
+    ));
+    let pointer = array.real_view().unwrap().as_slice().as_ptr() as usize;
+    let mut workspace = plan.allocate_in_place_workspace().unwrap();
+    plan.forward_in_place(&mut array, &mut workspace).unwrap();
+    assert_eq!(array.state(), R2cState::ComplexOutput);
+    assert_eq!(
+        array.complex_view().unwrap().as_slice().as_ptr() as usize,
+        pointer
+    );
+    if selection.is_all() {
+        check_r2c_forward(
+            &array.complex_view().unwrap(),
+            &extra_shape,
+            global_shape,
+            seed,
+        );
+    }
+    for (actual, expected) in array
+        .complex_view()
+        .unwrap()
+        .as_slice()
+        .iter()
+        .zip(&spectrum_before)
+    {
+        assert_close(*actual, *expected);
+    }
+    assert!(matches!(
+        array.real_view(),
+        Err(R2cError::Fft(FftError::InputLayoutMismatch))
+    ));
+
+    if let Err(error) = plan.inverse_in_place(&mut array, &mut workspace) {
+        panic!(
+            "in-place inverse failed for shape={global_shape:?}, selection={selection:?}, method={method:?}: {error:?}"
+        );
+    }
+    assert_eq!(array.state(), R2cState::RealInput);
+    assert_eq!(
+        array.real_view().unwrap().as_slice().as_ptr() as usize,
+        pointer
+    );
+    for (actual, expected) in array
+        .real_view()
+        .unwrap()
+        .as_slice()
+        .iter()
+        .zip(expected_inverse.as_slice())
+    {
+        let bound = R::tolerance() * (1.0 + R::to_f64(*expected).abs());
+        assert!((R::to_f64(*actual) - R::to_f64(*expected)).abs() <= bound);
+    }
+
+    plan.forward_in_place(&mut array, &mut workspace).unwrap();
+    plan.backward_in_place(&mut array, &mut workspace).unwrap();
+    assert_eq!(array.state(), R2cState::RealInput);
+    assert_eq!(
+        array.real_view().unwrap().as_slice().as_ptr() as usize,
+        pointer
+    );
+    for (actual, expected) in array
+        .real_view()
+        .unwrap()
+        .as_slice()
+        .iter()
+        .zip(expected_backward.as_slice())
+    {
+        let bound = R::tolerance() * (1.0 + R::to_f64(*expected).abs());
+        assert!((R::to_f64(*actual) - R::to_f64(*expected)).abs() <= bound);
+    }
 }
 
 fn assert_r2c_method_parity<R: TestReal, const N: usize, const M: usize>(
