@@ -67,6 +67,11 @@
 //! not guarantee global recovery or a recovered `Result`;
 //! `mpi::request::scope` may abort if it exits with unfinished requests.
 //!
+//! Global reductions (`global_sum`, `global_min`, `global_max`, `l2_norm`,
+//! `any`, `all`, `sum_by`, and `norm_by`) and root `gather` apply the same
+//! collective descriptor and count preflight. Gather returns logical global
+//! row-major order on the root; non-root ranks receive `None`.
+//!
 //! # One-rank example
 //!
 //! Run this example as one ordinary process. The array is declared after the
@@ -275,6 +280,7 @@ mod alltoallv_transpose;
 mod array;
 mod axis;
 mod checked;
+mod collectives;
 mod decomposition;
 mod error;
 mod extra_shape;
@@ -291,9 +297,14 @@ mod view;
 pub use alltoallv_transpose::AllToAllvTransposePlan;
 pub use array::PencilArray;
 pub use axis::{AxisPermutation, SpatialAxis};
+pub use collectives::{
+    NormOutput, OrderedScalar, SupportedScalar, TruthValue, all, all_by, any, any_by, gather,
+    global_max, global_min, global_sum, l2_norm, norm_by, sum_by,
+};
 pub use decomposition::Decomposition;
 pub use error::{
-    ArrayError, AxisError, GeometryError, LocalGridError, PencilError, ShapeError, TopologyError,
+    ArrayError, AxisError, CollectiveError, GeometryError, LocalGridError, PencilError, ShapeError,
+    TopologyError,
 };
 pub use extra_shape::ExtraShape;
 pub use geometry::partition_range;

@@ -163,6 +163,60 @@ pub enum ArrayError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+/// Errors returned by global array reductions and root gathers.
+///
+/// Reduction and gather calls perform their ordinary validation collectively
+/// before any variable-count or point-to-point communication. MPI failures,
+/// process loss, and a callback that panics are outside that recovery
+/// guarantee.
+pub enum CollectiveError {
+    /// Ranks supplied different operation or array descriptors.
+    #[error("collective array descriptors differ between ranks")]
+    CollectiveDescriptorMismatch,
+
+    /// At least one rank rejected a collective precondition.
+    #[error("a collective array precondition failed on another rank")]
+    CollectivePreconditionFailed,
+
+    /// Descriptor, metadata, or allocation preparation failed collectively.
+    #[error("collective array metadata preparation failed")]
+    PreparationFailed,
+
+    /// A root rank was not a rank in the topology Cartesian communicator.
+    #[error("root rank {root} is outside 0..{size}")]
+    RootOutOfBounds {
+        /// The supplied root rank after conversion to a signed MPI rank.
+        root: i64,
+        /// The communicator size.
+        size: usize,
+    },
+
+    /// The payload type has no addressable elements and cannot be seeded safely.
+    #[error("zero-sized gather payload types are unsupported")]
+    ZeroSizedTypeUnsupported,
+
+    /// A local count, global length, or MPI count conversion overflowed.
+    #[error("array collective count or size overflowed")]
+    CountOverflow,
+
+    /// A required descriptor, reduction scratch, or root gather buffer could
+    /// not be reserved.
+    #[error("array collective allocation failed for {elements} elements")]
+    AllocationFailed {
+        /// The number of elements that could not be reserved.
+        elements: usize,
+    },
+
+    /// A checked integer sum overflowed on at least one rank.
+    #[error("checked integer array sum overflowed")]
+    IntegerOverflow,
+
+    /// A lower-level local array validation failed.
+    #[error(transparent)]
+    Array(#[from] ArrayError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 /// Errors constructing or querying an MPI Cartesian topology.
 pub enum TopologyError {
     /// The supplied communicator was an intercommunicator.

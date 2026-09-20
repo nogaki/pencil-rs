@@ -97,6 +97,15 @@ jobs:
       - name: Run six-rank array access tests
         run: mpiexec --oversubscribe -n 6 cargo test -p pencil-array --test array_access --locked -- --nocapture --test-threads=1
 
+      - name: Run one-rank collectives tests
+        run: mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test collectives --locked -- --nocapture --test-threads=1
+
+      - name: Run four-rank collectives tests
+        run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test collectives --locked -- --nocapture --test-threads=1
+
+      - name: Run six-rank collectives tests
+        run: mpiexec --oversubscribe -n 6 cargo test -p pencil-array --test collectives --locked -- --nocapture --test-threads=1
+
       - name: Run one-rank shared array tests
         run: mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test many --locked -- --nocapture --test-threads=1
 

@@ -74,6 +74,21 @@ every request, and must not overlap unfinished transposes on that context. MPI
 failures, arbitrary panics, and process loss do not guarantee global recovery;
 an unfinished request scope may abort.
 
+## Global array collectives
+
+`pencil-array` provides collective `global_sum`, `global_min`, `global_max`,
+`l2_norm`, `any`, `all`, `sum_by`, and `norm_by` operations, plus root
+`gather`. Numeric reductions use the sealed `i8`-through-`u64`, `f32`/`f64`,
+and complex scalar set; integer sums are checked and floating-point NaN and
+infinity results follow the documented IEEE policy. Methods are available on
+`PencilArray` and `PencilArrayView`; free
+functions take a validated view. `ManyPencilArray` intentionally has no direct
+collective methods: coordinate `active_view()` validity across ranks first,
+then call the corresponding view method or free function. Gather returns
+logical `[extra..., spatial...]` row-major order on the root and `None`
+elsewhere; all ranks validate descriptors, counts, and root allocation before
+payload communication.
+
 ## Distributed R2C/C2R FFT
 
 `R2cPlan<R, N, M>` accepts a canonical real input pencil and a non-empty
@@ -230,6 +245,9 @@ timeout --foreground 120s mpiexec -n 4 cargo test -p pencil-array --test local_t
 timeout --foreground 120s mpiexec -n 1 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
 timeout --foreground 120s mpiexec -n 4 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
 timeout --foreground 120s mpiexec -n 6 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
+timeout --foreground 120s mpiexec -n 1 cargo test -p pencil-array --test collectives --locked -- --nocapture --test-threads=1
+timeout --foreground 120s mpiexec -n 4 cargo test -p pencil-array --test collectives --locked -- --nocapture --test-threads=1
+timeout --foreground 120s mpiexec -n 6 cargo test -p pencil-array --test collectives --locked -- --nocapture --test-threads=1
 
 cargo doc --workspace --no-deps --locked
 cargo doc -p pencil-fft --features distributed --no-deps --locked
