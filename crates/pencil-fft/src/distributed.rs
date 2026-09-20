@@ -30,6 +30,11 @@
 //! original real endpoint followed by homogeneous complex tail stages. Its
 //! reduced output shape and post-tail constrained-plane validation are
 //! implemented in the child module without adding a real in-place API.
+//!
+//! [`R2rPlan`] keeps the original shape and uses a sibling generic core for
+//! real or complex DCT/DST data. Each logical axis has either one of the eight
+//! local kinds or an identity stage, while transitions and collective checks
+//! remain the existing implementations.
 
 use std::{borrow::Borrow, mem::size_of, sync::Arc};
 
@@ -46,7 +51,9 @@ use pencil_array::{
 };
 use thiserror::Error;
 
-use crate::{Complex, FftReal, LocalC2cError, LocalC2cPlan, LocalR2cError, LocalR2cPlan};
+use crate::{
+    Complex, FftReal, LocalC2cError, LocalC2cPlan, LocalR2cError, LocalR2cPlan, LocalR2rError,
+};
 
 const DESCRIPTOR_SCHEMA: u64 = 2;
 const OPERATION_PLAN: u64 = 7;
@@ -60,6 +67,13 @@ const OPERATION_R2C_INVERSE: u64 = 14;
 const OPERATION_BACKWARD: u64 = 15;
 const OPERATION_BACKWARD_IN_PLACE: u64 = 16;
 const OPERATION_R2C_BACKWARD: u64 = 17;
+const OPERATION_R2R_PLAN: u64 = 18;
+const OPERATION_R2R_FORWARD: u64 = 19;
+const OPERATION_R2R_INVERSE: u64 = 20;
+const OPERATION_R2R_BACKWARD: u64 = 21;
+const OPERATION_R2R_FORWARD_IN_PLACE: u64 = 22;
+const OPERATION_R2R_INVERSE_IN_PLACE: u64 = 23;
+const OPERATION_R2R_BACKWARD_IN_PLACE: u64 = 24;
 const INVALID_WORD: u64 = u64::MAX;
 const METHOD_ALL_TO_ALLV: u64 = 0;
 const METHOD_POINT_TO_POINT: u64 = 1;
@@ -173,11 +187,29 @@ pub enum R2cError {
     InvalidSpectrum,
 }
 
+/// Errors returned by the distributed DCT/DST API.
+#[derive(Debug, Error)]
+pub enum R2rError {
+    /// An existing distributed FFT or array/transpose validation failed.
+    #[error(transparent)]
+    Fft(#[from] FftError),
+
+    /// The local DCT/DST plan or operation rejected checked input.
+    #[error(transparent)]
+    LocalR2r(#[from] LocalR2rError),
+}
+
 mod r2c;
+mod r2r;
+
+#[cfg(test)]
+pub(crate) static MPI_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
 
 pub use r2c::{R2cPlan, R2cWorkspace};
+pub use r2r::{R2rInPlaceArray, R2rInPlaceWorkspace, R2rPlan, R2rWorkspace};
 
-/// Selects the distributed transition transport used by [`C2cPlan`] and [`R2cPlan`].
+/// Selects the distributed transition transport used by [`C2cPlan`], [`R2cPlan`], and [`R2rPlan`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransposeMethod {
     /// Use one checked `MPI_Alltoallv` for each distributed transition.
@@ -469,6 +501,9 @@ pub struct C2cInPlaceWorkspace<R: FftReal, const N: usize, const M: usize> {
     transpose: TransposeWorkspace<Complex<R>>,
     fft_scratch: Vec<Complex<R>>,
 }
+
+/// The distributed R2R in-place API reuses the C2C completion states.
+pub type R2rState = C2cState;
 
 #[derive(Debug)]
 enum LocalTransform<R: FftReal> {
@@ -1982,13 +2017,13 @@ fn validate_workspace_lengths<R: FftReal, const N: usize, const M: usize>(
     )
 }
 
-fn validate_out_of_place<R: FftReal, T, U, const N: usize, const M: usize>(
+fn validate_out_of_place<R: FftReal, T, U, V, const N: usize, const M: usize>(
     core: &Arc<TransformPlanCore<R, N, M>>,
     workspace_core: &Arc<TransformPlanCore<R, N, M>>,
     direction: Direction,
     source: &PencilArray<T, N, M>,
     destination: &PencilArray<U, N, M>,
-    intermediate: &ManyPencilArray<Complex<R>, N, M>,
+    intermediate: &ManyPencilArray<V, N, M>,
     lengths: (usize, usize, usize),
 ) -> Result<(), FftError> {
     if !Arc::ptr_eq(workspace_core, core) {
@@ -2142,7 +2177,9 @@ mod tests {
         ExtraShape, FftError, LocalC2cError, LocalC2cPlan, OPERATION_BACKWARD,
         OPERATION_BACKWARD_IN_PLACE, OPERATION_FORWARD, OPERATION_FORWARD_IN_PLACE,
         OPERATION_INVERSE, OPERATION_INVERSE_IN_PLACE, OPERATION_PLAN, OPERATION_R2C_BACKWARD,
-        OPERATION_R2C_FORWARD, OPERATION_R2C_INVERSE, OPERATION_R2C_PLAN, TransposeMethod,
+        OPERATION_R2C_FORWARD, OPERATION_R2C_INVERSE, OPERATION_R2C_PLAN, OPERATION_R2R_BACKWARD,
+        OPERATION_R2R_BACKWARD_IN_PLACE, OPERATION_R2R_FORWARD, OPERATION_R2R_FORWARD_IN_PLACE,
+        OPERATION_R2R_INVERSE, OPERATION_R2R_INVERSE_IN_PLACE, OPERATION_R2R_PLAN, TransposeMethod,
         descriptor_len, run_in_place_transaction,
     };
     use crate::AxisSelection;
@@ -2208,10 +2245,26 @@ mod tests {
             ),
             (12, 13, 14, 15, 16, 17)
         );
+        assert_eq!(
+            (
+                OPERATION_R2R_PLAN,
+                OPERATION_R2R_FORWARD,
+                OPERATION_R2R_INVERSE,
+                OPERATION_R2R_BACKWARD,
+                OPERATION_R2R_FORWARD_IN_PLACE,
+                OPERATION_R2R_INVERSE_IN_PLACE,
+                OPERATION_R2R_BACKWARD_IN_PLACE,
+            ),
+            (18, 19, 20, 21, 22, 23, 24)
+        );
     }
 
     #[test]
     fn in_place_transaction_poison_survives_error_and_panic() {
+        let _mpi_test_lock = super::MPI_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
         let universe = mpi::initialize().expect("MPI initialization failed");
         let world = universe.world();
         assert_eq!(world.size(), 1, "run this unit test with one MPI rank");

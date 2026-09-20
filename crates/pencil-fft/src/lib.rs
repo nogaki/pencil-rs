@@ -22,14 +22,17 @@
 //! input-preserving out-of-place R2C/C2R forward, normalized inverse, and raw
 //! backward with a selected-axis reduction. `AxisSelection` keeps the full
 //! canonical route while making unselected stages identities; C2C also retains
-//! its state-checked single-buffer API; distributed R2C has
-//! no real in-place API. Both support `N >= 2`, `1 <= M < N`, and checked
-//! Alltoallv or receive-before-send point-to-point transitions; legacy
-//! constructors default to Alltoallv. Plan construction and transform calls
-//! are collective on the topology's Cartesian communicator; workspace
-//! allocation and views are noncollective. Allocation failures must be
-//! coordinated by callers before the next collective call. The default feature
-//! set remains MPI-free.
+//! its state-checked single-buffer API; distributed R2C has no real in-place
+//! API. `R2rPlan` adds per-axis `Option<R2rKind>` identity selection for all
+//! eight DCT/DST kinds, real and complex `f32`/`f64`, with the same route,
+//! checked transports, raw paired backward, normalized inverse, and poisoned
+//! in-place state contract. All distributed plans support `N >= 2`,
+//! `1 <= M < N`, and checked Alltoallv or receive-before-send point-to-point
+//! transitions; legacy constructors default to Alltoallv. Plan construction
+//! and transform calls are collective on the topology's Cartesian communicator;
+//! workspace allocation and views are noncollective. Allocation failures must
+//! be coordinated by callers before the next collective call. The default
+//! feature set remains MPI-free.
 //!
 //! # Example
 //!
@@ -204,8 +207,8 @@ mod distributed;
 #[cfg(feature = "distributed")]
 pub use distributed::{
     AxisSelection, AxisSelectionError, C2cInPlaceArray, C2cInPlaceWorkspace,
-    C2cOutOfPlaceWorkspace, C2cPlan, C2cState, FftError, R2cError, R2cPlan, R2cWorkspace,
-    TransposeMethod,
+    C2cOutOfPlaceWorkspace, C2cPlan, C2cState, FftError, R2cError, R2cPlan, R2cWorkspace, R2rError,
+    R2rInPlaceArray, R2rInPlaceWorkspace, R2rPlan, R2rState, R2rWorkspace, TransposeMethod,
 };
 
 /// Errors returned by local C2C plan construction and execution.

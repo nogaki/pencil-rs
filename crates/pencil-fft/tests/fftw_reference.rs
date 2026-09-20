@@ -11,12 +11,35 @@ use mpi::{
     traits::*,
 };
 use pencil_array::{ExtraShape, MpiTopology, Pencil, SpatialAxis};
-use pencil_fft::{AxisSelection, C2cPlan, Complex, FftReal, R2cPlan, TransposeMethod};
+use pencil_fft::{
+    AxisSelection, C2cPlan, Complex, FftReal, R2cPlan, R2rKind, R2rPlan, R2rScalar, R2rState,
+    TransposeMethod,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     C2c,
     R2c,
+    R2r,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ElementKind {
+    Real,
+    Complex,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum R2rAxisKind {
+    None,
+    DctI,
+    DctII,
+    DctIII,
+    DctIV,
+    DstI,
+    DstII,
+    DstIII,
+    DstIV,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,9 +51,11 @@ enum Precision {
 struct Fixture {
     case: String,
     kind: Kind,
+    element_kind: ElementKind,
     precision: Precision,
     shape: Vec<usize>,
     extra: Vec<usize>,
+    axis_kinds: Vec<R2rAxisKind>,
     selection: Vec<usize>,
     input: Vec<Complex<f64>>,
     inverse_input: Vec<Complex<f64>>,
@@ -173,6 +198,38 @@ fn selected_axes(line: &str, dimensions: usize) -> Result<Vec<usize>, String> {
     Ok(axes)
 }
 
+fn parse_r2r_axis_kind(word: &str) -> Result<R2rAxisKind, String> {
+    match word {
+        "none" => Ok(R2rAxisKind::None),
+        "dcti" => Ok(R2rAxisKind::DctI),
+        "dctii" => Ok(R2rAxisKind::DctII),
+        "dctiii" => Ok(R2rAxisKind::DctIII),
+        "dctiv" => Ok(R2rAxisKind::DctIV),
+        "dsti" => Ok(R2rAxisKind::DstI),
+        "dstii" => Ok(R2rAxisKind::DstII),
+        "dstiii" => Ok(R2rAxisKind::DstIII),
+        "dstiv" => Ok(R2rAxisKind::DstIV),
+        other => Err(format!("axis_kinds: invalid kind {other:?}")),
+    }
+}
+
+fn axis_kinds(line: &str, dimensions: usize) -> Result<Vec<R2rAxisKind>, String> {
+    let words: Vec<_> = line.split_whitespace().collect();
+    if words.first().copied() != Some("axis_kinds") {
+        return Err(format!("expected axis_kinds ..., got {line:?}"));
+    }
+    if words.len() != dimensions + 1 {
+        return Err(format!(
+            "axis_kinds: expected {dimensions} values, got {}",
+            words.len().saturating_sub(1)
+        ));
+    }
+    words[1..]
+        .iter()
+        .map(|word| parse_r2r_axis_kind(word))
+        .collect()
+}
+
 fn reduced(kind: Kind, shape: &[usize], selection: &[usize]) -> Vec<usize> {
     let mut result = shape.to_vec();
     if kind == Kind::R2c {
@@ -185,13 +242,20 @@ fn reduced(kind: Kind, shape: &[usize], selection: &[usize]) -> Vec<usize> {
     result
 }
 
+fn section_kind(element_kind: ElementKind) -> &'static str {
+    match element_kind {
+        ElementKind::Real => "real",
+        ElementKind::Complex => "complex",
+    }
+}
+
 fn parse_fixture(text: &str) -> Result<Fixture, String> {
     let mut lines: Vec<_> = text.lines().map(str::trim).collect();
     while lines.last().copied() == Some("") {
         lines.pop();
     }
     let mut cursor = 0;
-    if next(&lines, &mut cursor, "version")? != "PENCIL_FFTW_REFERENCE 4" {
+    if next(&lines, &mut cursor, "version")? != "PENCIL_FFTW_REFERENCE 5" {
         return Err("invalid reference version header".into());
     }
 
@@ -213,7 +277,13 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
     let kind = match field(next(&lines, &mut cursor, "kind")?, "kind")? {
         "c2c" => Kind::C2c,
         "r2c" => Kind::R2c,
+        "r2r" => Kind::R2r,
         other => return Err(format!("invalid kind {other:?}")),
+    };
+    let element_kind = match field(next(&lines, &mut cursor, "element_kind")?, "element_kind")? {
+        "real" => ElementKind::Real,
+        "complex" => ElementKind::Complex,
+        other => return Err(format!("invalid element_kind {other:?}")),
     };
     let precision = match field(next(&lines, &mut cursor, "precision")?, "precision")? {
         "f32" => Precision::F32,
@@ -228,12 +298,35 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
         return Err("original_shape: expected 2 to 4 dimensions".into());
     }
     let extra = shape(next(&lines, &mut cursor, "extra_shape")?, "extra_shape")?;
+    let axis_kinds = axis_kinds(
+        next(&lines, &mut cursor, "axis_kinds")?,
+        original_shape.len(),
+    )?;
     let selection = selected_axes(
         next(&lines, &mut cursor, "selected_axes")?,
         original_shape.len(),
     )?;
+    let derived_selection = axis_kinds
+        .iter()
+        .enumerate()
+        .filter_map(|(axis, kind)| (*kind != R2rAxisKind::None).then_some(axis))
+        .collect::<Vec<_>>();
     if kind == Kind::R2c && selection.is_empty() {
         return Err("R2C selected_axes must be nonempty".into());
+    }
+    if kind != Kind::R2r && axis_kinds.iter().any(|kind| *kind != R2rAxisKind::None) {
+        return Err("axis_kinds: non-identity kinds require kind r2r".into());
+    }
+    if kind == Kind::R2r && selection != derived_selection {
+        return Err("selected_axes: does not match non-identity axis_kinds".into());
+    }
+    let expected_element_kind = match kind {
+        Kind::C2c => ElementKind::Complex,
+        Kind::R2c => ElementKind::Real,
+        Kind::R2r => element_kind,
+    };
+    if element_kind != expected_element_kind {
+        return Err("element_kind is inconsistent with fixture kind".into());
     }
     let mut input_shape = extra.clone();
     input_shape.extend(&original_shape);
@@ -241,20 +334,25 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
     output_shape.extend(reduced(kind, &original_shape, &selection));
     let input_count = product(&input_shape, "input shape")?;
     let output_count = product(&output_shape, "output shape")?;
-    let input_kind = if kind == Kind::C2c { "complex" } else { "real" };
+    let input_kind = section_kind(element_kind);
+    let transformed_kind = if kind == Kind::R2c {
+        "complex"
+    } else {
+        input_kind
+    };
     let input = section(&lines, &mut cursor, "input", input_kind, input_count)?;
     let inverse_input = section(
         &lines,
         &mut cursor,
         "inverse_input",
-        "complex",
+        transformed_kind,
         output_count,
     )?;
     let forward = section(
         &lines,
         &mut cursor,
         "forward_expected",
-        "complex",
+        transformed_kind,
         output_count,
     )?;
     let inverse = section(
@@ -264,11 +362,16 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
         input_kind,
         input_count,
     )?;
+    let backward_kind = if kind == Kind::C2c {
+        "complex"
+    } else {
+        input_kind
+    };
     let backward = section(
         &lines,
         &mut cursor,
         "backward_expected",
-        if kind == Kind::C2c { "complex" } else { "real" },
+        backward_kind,
         input_count,
     )?;
     if cursor != lines.len() {
@@ -280,9 +383,11 @@ fn parse_fixture(text: &str) -> Result<Fixture, String> {
     Ok(Fixture {
         case,
         kind,
+        element_kind,
         precision,
         shape: original_shape,
         extra,
+        axis_kinds,
         selection,
         input,
         inverse_input,
@@ -304,24 +409,52 @@ fn all_axes(dimensions: usize) -> Vec<usize> {
     (0..dimensions).collect()
 }
 
+fn axis_kind_name(kind: R2rAxisKind) -> &'static str {
+    match kind {
+        R2rAxisKind::None => "none",
+        R2rAxisKind::DctI => "dcti",
+        R2rAxisKind::DctII => "dctii",
+        R2rAxisKind::DctIII => "dctiii",
+        R2rAxisKind::DctIV => "dctiv",
+        R2rAxisKind::DstI => "dsti",
+        R2rAxisKind::DstII => "dstii",
+        R2rAxisKind::DstIII => "dstiii",
+        R2rAxisKind::DstIV => "dstiv",
+    }
+}
+
 fn expected_case(
     kind: Kind,
     precision: Precision,
     shape: &[usize],
     extra: &[usize],
+    axis_kinds: &[R2rAxisKind],
     selection: &[usize],
 ) -> String {
     let mut name = format!(
         "{}_{}d_{}",
-        if kind == Kind::C2c { "c2c" } else { "r2c" },
+        match kind {
+            Kind::C2c => "c2c",
+            Kind::R2c => "r2c",
+            Kind::R2r => "r2r",
+        },
         shape.len(),
         joined(shape)
     );
-    if kind == Kind::R2c && !extra.is_empty() {
+    if !extra.is_empty() && matches!(kind, Kind::R2c | Kind::R2r) {
         name.push_str("_extra");
         name.push_str(&joined(extra));
     }
-    if selection != all_axes(shape.len()).as_slice() {
+    if kind == Kind::R2r {
+        name.push('_');
+        name.push_str(
+            &axis_kinds
+                .iter()
+                .map(|kind| axis_kind_name(*kind))
+                .collect::<Vec<_>>()
+                .join("-"),
+        );
+    } else if selection != all_axes(shape.len()).as_slice() {
         name.push_str("_sel");
         if selection.is_empty() {
             name.push_str("none");
@@ -370,6 +503,46 @@ fn partial_cases() -> Vec<CaseSpec> {
     ]
 }
 
+fn r2r_cases() -> Vec<(Vec<usize>, Vec<usize>, Vec<R2rAxisKind>)> {
+    vec![
+        (
+            vec![3, 4],
+            vec![],
+            vec![R2rAxisKind::DctI, R2rAxisKind::DctII],
+        ),
+        (
+            vec![3, 4],
+            vec![],
+            vec![R2rAxisKind::DctIII, R2rAxisKind::DctIV],
+        ),
+        (
+            vec![3, 4],
+            vec![],
+            vec![R2rAxisKind::DstI, R2rAxisKind::DstII],
+        ),
+        (
+            vec![3, 4],
+            vec![],
+            vec![R2rAxisKind::DstIII, R2rAxisKind::DstIV],
+        ),
+        (
+            vec![3, 2, 4],
+            vec![2, 3],
+            vec![R2rAxisKind::DctII, R2rAxisKind::None, R2rAxisKind::DstII],
+        ),
+        (
+            vec![2, 1, 3, 3],
+            vec![2],
+            vec![
+                R2rAxisKind::None,
+                R2rAxisKind::None,
+                R2rAxisKind::None,
+                R2rAxisKind::None,
+            ],
+        ),
+    ]
+}
+
 fn fixtures(directory: &Path) -> Vec<Fixture> {
     assert!(
         directory.is_dir(),
@@ -381,7 +554,7 @@ fn fixtures(directory: &Path) -> Vec<Fixture> {
         .collect::<Result<_, _>>()
         .unwrap();
     paths.sort();
-    let expected_files = 28;
+    let expected_files = 52;
     assert_eq!(
         paths.len(),
         expected_files,
@@ -406,6 +579,7 @@ fn fixtures(directory: &Path) -> Vec<Fixture> {
                     fixture.precision,
                     &fixture.shape,
                     &fixture.extra,
+                    &fixture.axis_kinds,
                     &fixture.selection,
                 )
             );
@@ -430,6 +604,25 @@ fn fixtures(directory: &Path) -> Vec<Fixture> {
                 1,
                 "missing or duplicate fixture"
             );
+        }
+    }
+    for (shape, extra, axis_kinds) in r2r_cases() {
+        for precision in [Precision::F32, Precision::F64] {
+            for element_kind in [ElementKind::Real, ElementKind::Complex] {
+                assert_eq!(
+                    result
+                        .iter()
+                        .filter(|fixture| fixture.kind == Kind::R2r
+                            && fixture.element_kind == element_kind
+                            && fixture.precision == precision
+                            && fixture.shape == shape
+                            && fixture.extra == extra
+                            && fixture.axis_kinds == axis_kinds)
+                        .count(),
+                    1,
+                    "missing or duplicate R2R fixture"
+                );
+            }
         }
     }
     result
@@ -605,6 +798,58 @@ impl Real for f64 {
     }
 }
 
+trait R2rValue: R2rScalar + Equivalence + std::fmt::Debug + PartialEq {
+    fn from_complex(value: Complex<f64>) -> Self;
+    fn to_complex(value: Self) -> Complex<f64>;
+}
+
+impl R2rValue for f32 {
+    fn from_complex(value: Complex<f64>) -> Self {
+        value.re as f32
+    }
+
+    fn to_complex(value: Self) -> Complex<f64> {
+        Complex::new(value as f64, 0.0)
+    }
+}
+
+impl R2rValue for f64 {
+    fn from_complex(value: Complex<f64>) -> Self {
+        value.re
+    }
+
+    fn to_complex(value: Self) -> Complex<f64> {
+        Complex::new(value, 0.0)
+    }
+}
+
+impl R2rValue for Complex<f32> {
+    fn from_complex(value: Complex<f64>) -> Self {
+        Complex::new(value.re as f32, value.im as f32)
+    }
+
+    fn to_complex(value: Self) -> Complex<f64> {
+        Complex::new(value.re as f64, value.im as f64)
+    }
+}
+
+impl R2rValue for Complex<f64> {
+    fn from_complex(value: Complex<f64>) -> Self {
+        value
+    }
+
+    fn to_complex(value: Self) -> Complex<f64> {
+        value
+    }
+}
+
+fn fill_r2r<T: R2rValue>(storage: &mut [T], snapshot: &Snapshot, values: &[Complex<f64>]) {
+    assert_eq!(storage.len(), snapshot.offsets.len());
+    for (slot, &offset) in storage.iter_mut().zip(&snapshot.offsets) {
+        *slot = <T as R2rValue>::from_complex(values[offset]);
+    }
+}
+
 fn fill_complex<R: Real>(storage: &mut [Complex<R>], snapshot: &Snapshot, values: &[Complex<f64>]) {
     assert_eq!(storage.len(), snapshot.offsets.len());
     for (slot, &offset) in storage.iter_mut().zip(&snapshot.offsets) {
@@ -690,6 +935,36 @@ fn check_real<R: Real>(
     }
 }
 
+fn check_r2r<T: R2rValue>(
+    storage: &[T],
+    snapshot: &Snapshot,
+    expected: &[Complex<f64>],
+    precision: Precision,
+    label: &str,
+) {
+    assert_eq!(storage.len(), snapshot.offsets.len());
+    let (abs, relative) = tolerance(precision);
+    for (value, &offset) in storage.iter().zip(&snapshot.offsets) {
+        let actual = <T as R2rValue>::to_complex(*value);
+        compare(
+            actual.re,
+            expected[offset].re,
+            abs,
+            relative,
+            &format!("{label} offset={offset} real"),
+        )
+        .unwrap();
+        compare(
+            actual.im,
+            expected[offset].im,
+            abs,
+            relative,
+            &format!("{label} offset={offset} imaginary"),
+        )
+        .unwrap();
+    }
+}
+
 macro_rules! snap {
     ($layout:expr, $array:expr, $output:expr, $label:expr) => {
         snapshot(
@@ -724,6 +999,17 @@ macro_rules! check_r {
         )
     };
 }
+macro_rules! check_r2r {
+    ($array:expr, $snapshot:expr, $expected:expr, $fixture:expr, $rank:expr, $method:expr, $label:expr) => {
+        check_r2r(
+            $array,
+            $snapshot,
+            $expected,
+            $fixture.precision,
+            &format!("rank {} {} {:?} {}", $rank, $fixture.case, $method, $label),
+        )
+    };
+}
 
 fn extra(fixture: &Fixture) -> ExtraShape {
     ExtraShape::new(fixture.extra.clone().into_boxed_slice()).unwrap()
@@ -731,6 +1017,31 @@ fn extra(fixture: &Fixture) -> ExtraShape {
 
 fn axis_selection<const N: usize>(fixture: &Fixture) -> AxisSelection<N> {
     AxisSelection::from_indices(fixture.selection.iter().copied()).unwrap()
+}
+
+fn r2r_kind(kind: R2rAxisKind) -> Option<R2rKind> {
+    match kind {
+        R2rAxisKind::None => None,
+        R2rAxisKind::DctI => Some(R2rKind::DctI),
+        R2rAxisKind::DctII => Some(R2rKind::DctII),
+        R2rAxisKind::DctIII => Some(R2rKind::DctIII),
+        R2rAxisKind::DctIV => Some(R2rKind::DctIV),
+        R2rAxisKind::DstI => Some(R2rKind::DstI),
+        R2rAxisKind::DstII => Some(R2rKind::DstII),
+        R2rAxisKind::DstIII => Some(R2rKind::DstIII),
+        R2rAxisKind::DstIV => Some(R2rKind::DstIV),
+    }
+}
+
+fn r2r_kinds<const N: usize>(fixture: &Fixture) -> [Option<R2rKind>; N] {
+    fixture
+        .axis_kinds
+        .iter()
+        .copied()
+        .map(r2r_kind)
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("fixture axis kind rank was validated")
 }
 
 fn c2c_case<R: Real, const N: usize, const M: usize>(
@@ -775,7 +1086,7 @@ fn c2c_case<R: Real, const N: usize, const M: usize>(
         fixture,
         rank,
         method,
-        "OOP forward"
+        "C2C forward"
     );
     let mut inverse_source = plan.allocate_output().unwrap();
     let inverse_snapshot = snap!(layout, inverse_source, true, "C2C inverse source");
@@ -812,7 +1123,7 @@ fn c2c_case<R: Real, const N: usize, const M: usize>(
         fixture,
         rank,
         method,
-        "OOP backward"
+        "C2C backward"
     );
     let mut inplace = plan.allocate_in_place().unwrap();
     {
@@ -986,6 +1297,205 @@ fn r2c_methods<R: Real, const N: usize, const M: usize>(
     }
 }
 
+#[derive(Debug, PartialEq)]
+struct R2rSnapshots<T>(Vec<T>, Vec<T>, Vec<T>, Vec<T>, Vec<T>, Vec<T>);
+
+fn r2r_case<T: R2rValue, const N: usize, const M: usize>(
+    fixture: &Fixture,
+    topology: &Arc<MpiTopology<M>>,
+    method: TransposeMethod,
+    rank: i32,
+) -> R2rSnapshots<T> {
+    let shape: [usize; N] = fixture.shape.as_slice().try_into().unwrap();
+    let extra = extra(fixture);
+    let layout = Layout {
+        input: shape,
+        output: shape,
+        extra: &fixture.extra,
+    };
+    let kinds = r2r_kinds::<N>(fixture);
+    let plan = R2rPlan::<T, N, M>::from_shape_with_method(
+        Arc::clone(topology),
+        shape,
+        extra.clone(),
+        kinds,
+        method,
+    )
+    .unwrap();
+    assert_eq!(plan.kinds(), kinds);
+    let mut source = plan.allocate_input().unwrap();
+    let source_snapshot = snap!(layout, source, false, "R2R source");
+    if source_snapshot.global_count != 0 {
+        ownership(source.pencil(), &source_snapshot, "R2R source");
+    }
+    fill_r2r(source.as_mut_slice(), &source_snapshot, &fixture.input);
+    let source_before = source.as_slice().to_vec();
+    let mut output = plan.allocate_output().unwrap();
+    let output_snapshot = snap!(layout, output, true, "R2R output");
+    if output_snapshot.global_count != 0 {
+        ownership(output.pencil(), &output_snapshot, "R2R output");
+    }
+    let mut workspace = plan.allocate_workspace().unwrap();
+    plan.forward(&source, &mut output, &mut workspace).unwrap();
+    assert_eq!(source.as_slice(), source_before.as_slice());
+    check_r2r!(
+        output.as_slice(),
+        &output_snapshot,
+        &fixture.forward,
+        fixture,
+        rank,
+        method,
+        "R2R forward"
+    );
+    let forward_snapshot = output.as_slice().to_vec();
+
+    let mut inverse_source = plan.allocate_output().unwrap();
+    let inverse_source_snapshot = snap!(layout, inverse_source, true, "R2R inverse source");
+    fill_r2r(
+        inverse_source.as_mut_slice(),
+        &inverse_source_snapshot,
+        &fixture.inverse_input,
+    );
+    let inverse_source_before = inverse_source.as_slice().to_vec();
+    let mut inverse = plan.allocate_input().unwrap();
+    let inverse_snapshot = snap!(layout, inverse, false, "R2R inverse");
+    plan.inverse(&inverse_source, &mut inverse, &mut workspace)
+        .unwrap();
+    assert_eq!(inverse_source.as_slice(), inverse_source_before.as_slice());
+    check_r2r!(
+        inverse.as_slice(),
+        &inverse_snapshot,
+        &fixture.inverse,
+        fixture,
+        rank,
+        method,
+        "OOP inverse"
+    );
+    let inverse_result = inverse.as_slice().to_vec();
+
+    let mut backward = plan.allocate_input().unwrap();
+    let backward_snapshot = snap!(layout, backward, false, "R2R backward");
+    plan.backward(&inverse_source, &mut backward, &mut workspace)
+        .unwrap();
+    assert_eq!(inverse_source.as_slice(), inverse_source_before.as_slice());
+    check_r2r!(
+        backward.as_slice(),
+        &backward_snapshot,
+        &fixture.backward,
+        fixture,
+        rank,
+        method,
+        "R2R backward"
+    );
+    let backward_result = backward.as_slice().to_vec();
+
+    let mut inplace = plan.allocate_in_place().unwrap();
+    {
+        let mut view = inplace.view_mut().unwrap();
+        let snapshot = snap!(layout, view, false, "R2R in-place input");
+        fill_r2r(view.as_mut_slice(), &snapshot, &fixture.input);
+    }
+    let pointer = inplace.view().unwrap().as_slice().as_ptr();
+    let mut inplace_workspace = plan.allocate_in_place_workspace().unwrap();
+    plan.forward_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    assert_eq!(inplace.state(), R2rState::Output);
+    assert_eq!(inplace.view().unwrap().as_slice().as_ptr(), pointer);
+    {
+        let view = inplace.view().unwrap();
+        let snapshot = snap!(layout, view, true, "R2R in-place forward");
+        check_r2r!(
+            view.as_slice(),
+            &snapshot,
+            &fixture.forward,
+            fixture,
+            rank,
+            method,
+            "in-place forward"
+        );
+    }
+    let inplace_forward = inplace.view().unwrap().as_slice().to_vec();
+
+    {
+        let mut view = inplace.view_mut().unwrap();
+        let snapshot = snap!(layout, view, true, "R2R in-place inverse source");
+        fill_r2r(view.as_mut_slice(), &snapshot, &fixture.inverse_input);
+    }
+    plan.inverse_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    assert_eq!(inplace.state(), R2rState::Input);
+    assert_eq!(inplace.view().unwrap().as_slice().as_ptr(), pointer);
+    {
+        let view = inplace.view().unwrap();
+        let snapshot = snap!(layout, view, false, "R2R in-place inverse");
+        check_r2r!(
+            view.as_slice(),
+            &snapshot,
+            &fixture.inverse,
+            fixture,
+            rank,
+            method,
+            "in-place inverse"
+        );
+    }
+    let inplace_inverse = inplace.view().unwrap().as_slice().to_vec();
+
+    plan.forward_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    {
+        let mut view = inplace.view_mut().unwrap();
+        let snapshot = snap!(layout, view, true, "R2R in-place backward source");
+        fill_r2r(view.as_mut_slice(), &snapshot, &fixture.inverse_input);
+    }
+    plan.backward_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    assert_eq!(inplace.state(), R2rState::Input);
+    assert_eq!(inplace.view().unwrap().as_slice().as_ptr(), pointer);
+    {
+        let view = inplace.view().unwrap();
+        let snapshot = snap!(layout, view, false, "R2R in-place backward");
+        check_r2r!(
+            view.as_slice(),
+            &snapshot,
+            &fixture.backward,
+            fixture,
+            rank,
+            method,
+            "in-place backward"
+        );
+    }
+    let inplace_backward = inplace.view().unwrap().as_slice().to_vec();
+
+    // Reuse the same workspaces after all three directions.
+    plan.forward(&source, &mut output, &mut workspace).unwrap();
+    plan.inverse(&inverse_source, &mut inverse, &mut workspace)
+        .unwrap();
+    plan.forward_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+    plan.inverse_in_place(&mut inplace, &mut inplace_workspace)
+        .unwrap();
+
+    R2rSnapshots(
+        forward_snapshot,
+        inverse_result,
+        backward_result,
+        inplace_forward,
+        inplace_inverse,
+        inplace_backward,
+    )
+}
+
+fn r2r_methods<T: R2rValue + Equivalence, const N: usize, const M: usize>(
+    fixture: &Fixture,
+    topology: &Arc<MpiTopology<M>>,
+    rank: i32,
+) {
+    let alltoallv = r2r_case::<T, N, M>(fixture, topology, TransposeMethod::AllToAllv, rank);
+    let point_to_point =
+        r2r_case::<T, N, M>(fixture, topology, TransposeMethod::PointToPoint, rank);
+    assert_eq!(alltoallv, point_to_point, "R2R transport parity");
+}
+
 fn run_fixture(fixture: &Fixture, one: &Arc<MpiTopology<1>>, two: &Arc<MpiTopology<2>>, rank: i32) {
     macro_rules! dispatch {
         ($run:ident, $real:ty, $n:expr) => {
@@ -998,19 +1508,48 @@ fn run_fixture(fixture: &Fixture, one: &Arc<MpiTopology<1>>, two: &Arc<MpiTopolo
             }
         };
     }
-    match (fixture.kind, fixture.precision, fixture.shape.len()) {
-        (Kind::C2c, Precision::F32, 2) => dispatch!(c2c_methods, f32, 2),
-        (Kind::C2c, Precision::F64, 2) => dispatch!(c2c_methods, f64, 2),
-        (Kind::C2c, Precision::F32, 3) => dispatch!(c2c_methods, f32, 3),
-        (Kind::C2c, Precision::F64, 3) => dispatch!(c2c_methods, f64, 3),
-        (Kind::C2c, Precision::F32, 4) => dispatch!(c2c_methods, f32, 4),
-        (Kind::C2c, Precision::F64, 4) => dispatch!(c2c_methods, f64, 4),
-        (Kind::R2c, Precision::F32, 2) => dispatch!(r2c_methods, f32, 2),
-        (Kind::R2c, Precision::F64, 2) => dispatch!(r2c_methods, f64, 2),
-        (Kind::R2c, Precision::F32, 3) => dispatch!(r2c_methods, f32, 3),
-        (Kind::R2c, Precision::F64, 3) => dispatch!(r2c_methods, f64, 3),
-        (Kind::R2c, Precision::F32, 4) => dispatch!(r2c_methods, f32, 4),
-        (Kind::R2c, Precision::F64, 4) => dispatch!(r2c_methods, f64, 4),
+    match (
+        fixture.kind,
+        fixture.element_kind,
+        fixture.precision,
+        fixture.shape.len(),
+    ) {
+        (Kind::C2c, _, Precision::F32, 2) => dispatch!(c2c_methods, f32, 2),
+        (Kind::C2c, _, Precision::F64, 2) => dispatch!(c2c_methods, f64, 2),
+        (Kind::C2c, _, Precision::F32, 3) => dispatch!(c2c_methods, f32, 3),
+        (Kind::C2c, _, Precision::F64, 3) => dispatch!(c2c_methods, f64, 3),
+        (Kind::C2c, _, Precision::F32, 4) => dispatch!(c2c_methods, f32, 4),
+        (Kind::C2c, _, Precision::F64, 4) => dispatch!(c2c_methods, f64, 4),
+        (Kind::R2c, _, Precision::F32, 2) => dispatch!(r2c_methods, f32, 2),
+        (Kind::R2c, _, Precision::F64, 2) => dispatch!(r2c_methods, f64, 2),
+        (Kind::R2c, _, Precision::F32, 3) => dispatch!(r2c_methods, f32, 3),
+        (Kind::R2c, _, Precision::F64, 3) => dispatch!(r2c_methods, f64, 3),
+        (Kind::R2c, _, Precision::F32, 4) => dispatch!(r2c_methods, f32, 4),
+        (Kind::R2c, _, Precision::F64, 4) => dispatch!(r2c_methods, f64, 4),
+        (Kind::R2r, ElementKind::Real, Precision::F32, 2) => dispatch!(r2r_methods, f32, 2),
+        (Kind::R2r, ElementKind::Real, Precision::F64, 2) => dispatch!(r2r_methods, f64, 2),
+        (Kind::R2r, ElementKind::Real, Precision::F32, 3) => dispatch!(r2r_methods, f32, 3),
+        (Kind::R2r, ElementKind::Real, Precision::F64, 3) => dispatch!(r2r_methods, f64, 3),
+        (Kind::R2r, ElementKind::Real, Precision::F32, 4) => dispatch!(r2r_methods, f32, 4),
+        (Kind::R2r, ElementKind::Real, Precision::F64, 4) => dispatch!(r2r_methods, f64, 4),
+        (Kind::R2r, ElementKind::Complex, Precision::F32, 2) => {
+            dispatch!(r2r_methods, Complex<f32>, 2)
+        }
+        (Kind::R2r, ElementKind::Complex, Precision::F64, 2) => {
+            dispatch!(r2r_methods, Complex<f64>, 2)
+        }
+        (Kind::R2r, ElementKind::Complex, Precision::F32, 3) => {
+            dispatch!(r2r_methods, Complex<f32>, 3)
+        }
+        (Kind::R2r, ElementKind::Complex, Precision::F64, 3) => {
+            dispatch!(r2r_methods, Complex<f64>, 3)
+        }
+        (Kind::R2r, ElementKind::Complex, Precision::F32, 4) => {
+            dispatch!(r2r_methods, Complex<f32>, 4)
+        }
+        (Kind::R2r, ElementKind::Complex, Precision::F64, 4) => {
+            dispatch!(r2r_methods, Complex<f64>, 4)
+        }
         _ => panic!("unsupported fixture"),
     }
 }
@@ -1021,7 +1560,7 @@ fn parser_and_offset_self_check() {
     let section = |name: &str| format!("section {name} complex 6\n{values}end\n");
     let backward_section = section("backward_expected");
     let valid = format!(
-        "PENCIL_FFTW_REFERENCE 4\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase c2c_2d_2x3_f64\nkind c2c\nprecision f64\noriginal_shape 2 3\nextra_shape\nselected_axes 0 1\n{}{}{}{}{}",
+        "PENCIL_FFTW_REFERENCE 5\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase c2c_2d_2x3_f64\nkind c2c\nelement_kind complex\nprecision f64\noriginal_shape 2 3\nextra_shape\naxis_kinds none none\nselected_axes 0 1\n{}{}{}{}{}",
         section("input"),
         section("inverse_input"),
         section("forward_expected"),
@@ -1031,7 +1570,7 @@ fn parser_and_offset_self_check() {
     assert_eq!(parse_fixture(&valid).unwrap().input.len(), 6);
     assert_eq!(parse_fixture(&valid).unwrap().backward.len(), 6);
     assert!(
-        parse_fixture(&valid.replacen("PENCIL_FFTW_REFERENCE 4", "PENCIL_FFTW_REFERENCE 2", 1,))
+        parse_fixture(&valid.replacen("PENCIL_FFTW_REFERENCE 5", "PENCIL_FFTW_REFERENCE 4", 1,))
             .is_err()
     );
     assert!(parse_fixture(&valid.replacen("selected_axes 0 1", "selected_axes 1 0", 1)).is_err());
@@ -1041,7 +1580,7 @@ fn parser_and_offset_self_check() {
         format!("section {name} {kind} {count}\n{values}end\n")
     };
     let r2c = format!(
-        "PENCIL_FFTW_REFERENCE 4\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase r2c_2d_2x3_f64\nkind r2c\nprecision f64\noriginal_shape 2 3\nextra_shape\nselected_axes 0 1\n{}{}{}{}{}",
+        "PENCIL_FFTW_REFERENCE 5\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase r2c_2d_2x3_f64\nkind r2c\nelement_kind real\nprecision f64\noriginal_shape 2 3\nextra_shape\naxis_kinds none none\nselected_axes 0 1\n{}{}{}{}{}",
         r2c_section("input", "real", 6, "1\n2\n3\n4\n5\n6\n"),
         r2c_section("inverse_input", "complex", 4, "1 0\n2 0\n3 0\n4 0\n"),
         r2c_section("forward_expected", "complex", 4, "1 0\n2 0\n3 0\n4 0\n"),
@@ -1075,6 +1614,104 @@ fn parser_and_offset_self_check() {
         ))
         .is_err()
     );
+
+    let r2r_real = format!(
+        "PENCIL_FFTW_REFERENCE 5\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase r2r_2d_2x3_dctii-none_f64\nkind r2r\nelement_kind real\nprecision f64\noriginal_shape 2 3\nextra_shape\naxis_kinds dctii none\nselected_axes 0\n{}{}{}{}{}",
+        r2c_section("input", "real", 6, "1\n2\n3\n4\n5\n6\n"),
+        r2c_section("inverse_input", "real", 6, "7\n8\n9\n10\n11\n12\n"),
+        r2c_section("forward_expected", "real", 6, "13\n14\n15\n16\n17\n18\n"),
+        r2c_section("inverse_expected", "real", 6, "19\n20\n21\n22\n23\n24\n"),
+        r2c_section("backward_expected", "real", 6, "25\n26\n27\n28\n29\n30\n"),
+    );
+    let parsed_r2r_real = parse_fixture(&r2r_real).unwrap();
+    assert_eq!(parsed_r2r_real.kind, Kind::R2r);
+    assert_eq!(parsed_r2r_real.element_kind, ElementKind::Real);
+    assert_eq!(
+        parsed_r2r_real.axis_kinds,
+        vec![R2rAxisKind::DctII, R2rAxisKind::None]
+    );
+    assert_eq!(parsed_r2r_real.selection, vec![0]);
+    assert_eq!(parsed_r2r_real.forward.len(), 6);
+
+    let complex_values = "1 0\n2 1\n3 2\n4 3\n5 4\n6 5\n";
+    let r2r_complex = format!(
+        "PENCIL_FFTW_REFERENCE 5\nruntime julia=1.12.6 fftw_jl=1.10.0 native=3.3.12 provider=fftw\ncase r2r_2d_2x3_none-dstiv_f64\nkind r2r\nelement_kind complex\nprecision f64\noriginal_shape 2 3\nextra_shape\naxis_kinds none dstiv\nselected_axes 1\n{}{}{}{}{}",
+        r2c_section("input", "complex", 6, complex_values),
+        r2c_section("inverse_input", "complex", 6, complex_values),
+        r2c_section("forward_expected", "complex", 6, complex_values),
+        r2c_section("inverse_expected", "complex", 6, complex_values),
+        r2c_section("backward_expected", "complex", 6, complex_values),
+    );
+    let parsed_r2r_complex = parse_fixture(&r2r_complex).unwrap();
+    assert_eq!(parsed_r2r_complex.kind, Kind::R2r);
+    assert_eq!(parsed_r2r_complex.element_kind, ElementKind::Complex);
+    assert_eq!(
+        parsed_r2r_complex.axis_kinds,
+        vec![R2rAxisKind::None, R2rAxisKind::DstIV]
+    );
+    assert_eq!(parsed_r2r_complex.selection, vec![1]);
+    assert_eq!(parsed_r2r_complex.inverse_input.len(), 6);
+
+    assert!(parse_fixture(&r2r_real.replacen("axis_kinds dctii none\n", "", 1)).is_err());
+    assert!(
+        parse_fixture(&r2r_real.replacen("axis_kinds dctii none", "axis_kinds dctii", 1)).is_err()
+    );
+    assert!(
+        parse_fixture(&r2r_real.replacen("axis_kinds dctii none", "axis_kinds dctii none none", 1))
+            .is_err()
+    );
+    assert!(
+        parse_fixture(&r2r_real.replacen("axis_kinds dctii none", "axis_kinds unknown none", 1))
+            .is_err()
+    );
+    assert!(parse_fixture(&r2r_real.replacen("selected_axes 0", "selected_axes 1", 1)).is_err());
+    assert!(
+        parse_fixture(&r2r_real.replacen("element_kind real", "element_kind scalar", 1)).is_err()
+    );
+    assert!(
+        parse_fixture(&valid.replacen("element_kind complex", "element_kind real", 1)).is_err()
+    );
+    assert!(parse_fixture(&r2c.replacen("element_kind real", "element_kind complex", 1)).is_err());
+    assert!(
+        parse_fixture(&r2r_real.replacen("section input real 6", "section input complex 6", 1,))
+            .is_err()
+    );
+    assert!(
+        parse_fixture(&r2r_complex.replacen("section input complex 6", "section input real 6", 1,))
+            .is_err()
+    );
+    assert!(
+        parse_fixture(&r2r_real.replacen(
+            "section forward_expected real 6",
+            "section forward_expected real 5",
+            1,
+        ))
+        .is_err()
+    );
+    let r2r_real_without_backward = r2r_real.replacen(
+        &r2c_section("backward_expected", "real", 6, "25\n26\n27\n28\n29\n30\n"),
+        "",
+        1,
+    );
+    assert!(parse_fixture(&r2r_real_without_backward).is_err());
+    assert!(
+        parse_fixture(&r2r_real.replacen(
+            "section forward_expected real 6\n13",
+            "section forward_expected real 6\nNaN",
+            1,
+        ))
+        .is_err()
+    );
+    assert!(
+        parse_fixture(&r2r_complex.replacen(
+            "section forward_expected complex 6\n1 0",
+            "section forward_expected complex 6\n1 NaN",
+            1,
+        ))
+        .is_err()
+    );
+    assert!(parse_fixture(&format!("{r2r_complex}unexpected\n")).is_err());
+
     for malformed in ["kind", "", "kind c2c trailing"] {
         assert!(field(malformed, "kind").is_err());
     }
@@ -1142,7 +1779,7 @@ fn fftw_reference_matrix() {
         .iter()
         .map(|fixture| std::cmp::min(2, fixture.shape.len() - 1))
         .sum();
-    assert_eq!(layouts, 50);
+    assert_eq!(layouts, 82);
     println!(
         "PENCIL_FFTW_REFERENCE_MATRIX_STARTED fixtures={} layouts={layouts}",
         fixtures.len()
