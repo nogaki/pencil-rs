@@ -15,7 +15,8 @@
 //!
 //! [`LocalR2rPlan`] adds the eight FFTW-compatible DCT/DST-I-IV kinds for the
 //! four supported scalar types, with component-wise complex transforms and raw
-//! paired backward plus normalized inverse operations.
+//! paired backward plus normalized inverse operations. [`LocalDhtPlan`] adds
+//! the local self-paired discrete Hartley transform over the same scalar types.
 //!
 //! With the opt-in `distributed` feature, `C2cPlan` and its workspaces provide
 //! input-preserving distributed C2C transforms, while `R2cPlan` provides
@@ -193,9 +194,11 @@ pub trait FftReal:
 impl FftReal for f32 {}
 impl FftReal for f64 {}
 
+mod dht;
 mod r2c;
 mod r2r;
 
+pub use dht::LocalDhtPlan;
 pub use r2c::{
     LocalR2cError, LocalR2cInPlaceArray, LocalR2cInPlaceWorkspace, LocalR2cPlan, R2cState,
 };
