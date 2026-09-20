@@ -207,6 +207,70 @@ See [`tools/fftw-reference/README.md`](tools/fftw-reference/README.md) and run
 `tools/fftw-reference/check.sh` only when Julia, FFTW.jl, and MPI are locally
 available.
 
+## Native collective I/O
+
+`pencil-io` adds collective, decomposition-independent persistence for
+`PencilArray` views without changing `pencil-array` or `pencil-fft`. The native
+MPI-IO backend writes a versioned header and canonical little-endian row-major
+payload, and uses MPI byte-subarray file views; readers stage and validate the
+complete payload before mutating the destination. Writes use exclusive file
+creation and a flushed commit marker, so incomplete and committed states are
+reported separately. The format records type, width, logical shapes, writer
+process grid, and writer permutation; writer layout metadata is provenance,
+not a read-layout requirement.
+
+Enable the optional native parallel HDF5 backend with
+`pencil-io/parallel-hdf5`. It stores the same logical order and strict scalar
+or `{r,i}` compound little-endian type under `/pencil_io_v1/data`, with typed
+metadata attributes and the same incomplete/committed protocol. This feature
+requires a parallel HDF5 installation discoverable by `pkg-config` or
+`HDF5_DIR`; it is intentionally not enabled by default. Both APIs are
+collective over the view's Cartesian communicator, and every rank must enter
+calls in the same order without overlapping another operation on that
+communicator. The HDF5 path explicitly creates a dataset-transfer property
+list with `H5Pset_dxpl_mpio(..., H5FD_MPIO_COLLECTIVE)`; verify that the HDF5
+and MPI libraries resolved by the build and runtime are the same ABI. The
+lockfile's shared `mpi-sys` dependency is not ABI evidence: the pair is
+validated only by inspecting the test executable's `ldd` output and recording
+runtime MPI and HDF5 versions from that same environment.
+
+Run the MPI-IO integration test at the required 1/4/6 rank matrix:
+
+```bash
+for n in 1 4 6; do
+  timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
+    cargo test -p pencil-io --test mpi_io --locked -- --nocapture --test-threads=1
+done
+```
+
+The integration cases cover every supported scalar family (`i8`/`u8`,
+`i16`/`u16`, `i32`/`u32`, `i64`/`u64`, `f32`/`f64`, and complex `f32`/`f64`),
+changed decompositions and permutations, committed-marker rejection, and
+empty local ranks.
+
+With parallel HDF5 configured, run the corresponding HDF5 matrix:
+
+```bash
+for n in 1 4 6; do
+  timeout --foreground 180s mpiexec --oversubscribe -n "$n" \
+    cargo test -p pencil-io --features parallel-hdf5 --test hdf5_io --locked \
+      -- --nocapture --test-threads=1
+done
+```
+
+For the declared MSRV, run
+`cargo +1.85.0 check --workspace --all-features --locked` before the native
+matrix.
+
+After building the HDF5 test binary, inspect its resolved native ABI before
+running the matrix (the exact binary name is printed by Cargo):
+
+```bash
+ldd target/debug/deps/hdf5_io-* | grep -E 'lib(hdf5|mpi|open-rte|open-pal)'
+mpiexec --version
+pkg-config --modversion hdf5-openmpi
+```
+
 ## Prerequisites
 
 - Rust stable, with a minimum supported Rust version of 1.85
