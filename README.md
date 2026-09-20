@@ -80,8 +80,8 @@ an unfinished request scope may abort.
 `l2_norm`, `any`, `all`, `sum_by`, and `norm_by` operations, plus root
 `gather`. Numeric reductions use the sealed `i8`-through-`u64`, `f32`/`f64`,
 and complex scalar set; integer sums are checked and floating-point NaN and
-infinity results follow the documented IEEE policy. `map` is a local callback
-helper. Methods are available on `PencilArray` and `PencilArrayView`; free
+infinity results follow the documented IEEE policy. Methods are available on
+`PencilArray` and `PencilArrayView`; free
 functions take a validated view. `ManyPencilArray` intentionally has no direct
 collective methods: coordinate `active_view()` validity across ranks first,
 then call the corresponding view method or free function. Gather returns

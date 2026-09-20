@@ -522,22 +522,6 @@ where
     by_truth_layout(view, OP_ALL_BY, false, |value| predicate(value))
 }
 
-/// Maps local physical storage once into supported scalar values.
-///
-/// This is intentionally local and noncollective. `sum_by` and `norm_by` are
-/// the collective mapped reductions. The returned vector keeps the view's
-/// `[extra..., permuted spatial...]` row-major order.
-pub fn map<T, U, F, const N: usize, const M: usize>(
-    view: &PencilArrayView<'_, T, N, M>,
-    f: F,
-) -> Result<Vec<U>, CollectiveError>
-where
-    U: SupportedScalar,
-    F: FnMut(&T) -> U,
-{
-    map_values(view.as_slice(), f)
-}
-
 /// Computes a global sum after invoking `f` once per local input value.
 pub fn sum_by<T, U, F, const N: usize, const M: usize>(
     view: &PencilArrayView<'_, T, N, M>,
@@ -579,18 +563,6 @@ where
     R: TryInto<usize> + Copy,
 {
     gather_layout(view, root)
-}
-
-/// Compatibility spelling for [`gather`].
-pub fn global_gather<T, R, const N: usize, const M: usize>(
-    view: &PencilArrayView<'_, T, N, M>,
-    root: R,
-) -> Result<Option<Vec<T>>, CollectiveError>
-where
-    T: Copy + Equivalence,
-    R: TryInto<usize> + Copy,
-{
-    gather(view, root)
 }
 
 impl<T, const N: usize, const M: usize> PencilArrayView<'_, T, N, M> {
@@ -656,15 +628,6 @@ impl<T, const N: usize, const M: usize> PencilArrayView<'_, T, N, M> {
         F: FnMut(&T) -> bool,
     {
         all_by(self, predicate)
-    }
-
-    /// See [`map`].
-    pub fn map<U, F>(&self, f: F) -> Result<Vec<U>, CollectiveError>
-    where
-        U: SupportedScalar,
-        F: FnMut(&T) -> U,
-    {
-        map(self, f)
     }
 
     /// See [`sum_by`].
@@ -758,15 +721,6 @@ impl<T, const N: usize, const M: usize> PencilArray<T, N, M> {
         F: FnMut(&T) -> bool,
     {
         all_by(&self.view(), predicate)
-    }
-
-    /// See [`map`].
-    pub fn map<U, F>(&self, f: F) -> Result<Vec<U>, CollectiveError>
-    where
-        U: SupportedScalar,
-        F: FnMut(&T) -> U,
-    {
-        map(&self.view(), f)
     }
 
     /// See [`sum_by`].

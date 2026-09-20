@@ -216,12 +216,6 @@ pub enum CollectiveError {
     Array(#[from] ArrayError),
 }
 
-/// Compatibility name for [`CollectiveError`].
-pub type ArrayCollectiveError = CollectiveError;
-
-/// Compatibility name for [`CollectiveError`] used by gather callers.
-pub type GatherError = CollectiveError;
-
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 /// Errors constructing or querying an MPI Cartesian topology.
 pub enum TopologyError {

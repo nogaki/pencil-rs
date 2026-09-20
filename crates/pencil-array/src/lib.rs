@@ -299,12 +299,12 @@ pub use array::PencilArray;
 pub use axis::{AxisPermutation, SpatialAxis};
 pub use collectives::{
     NormOutput, OrderedScalar, SupportedScalar, TruthValue, all, all_by, any, any_by, gather,
-    global_gather, global_max, global_min, global_sum, l2_norm, map, norm_by, sum_by,
+    global_max, global_min, global_sum, l2_norm, norm_by, sum_by,
 };
 pub use decomposition::Decomposition;
 pub use error::{
-    ArrayCollectiveError, ArrayError, AxisError, CollectiveError, GatherError, GeometryError,
-    LocalGridError, PencilError, ShapeError, TopologyError,
+    ArrayError, AxisError, CollectiveError, GeometryError, LocalGridError, PencilError, ShapeError,
+    TopologyError,
 };
 pub use extra_shape::ExtraShape;
 pub use geometry::partition_range;

@@ -8,7 +8,7 @@ use num_complex::Complex32;
 use pencil_array::{
     AllToAllvTransposePlan, AxisPermutation, CollectiveError, ExtraShape, MpiTopology, Pencil,
     PencilArray, TransposeError, all, all_by, any, any_by, gather, global_max, global_min,
-    global_sum, l2_norm, map, norm_by, sum_by,
+    global_sum, l2_norm, norm_by, sum_by,
 };
 
 fn check_all<C: CommunicatorCollectives>(communicator: &C, local: bool) {
@@ -501,12 +501,6 @@ fn reductions_and_logical_gather_cover_permuted_pencils() {
         all_result == Ok(true) && all_calls.get() == array.len(),
     );
 
-    let mapped = map(&array.view(), |value| *value as i32);
-    let expected_mapped: Vec<i32> = array.as_slice().iter().map(|&value| value as i32).collect();
-    check_all(
-        &world,
-        mapped.as_ref().map(|values| values == &expected_mapped) == Ok(true),
-    );
     check_all(
         &world,
         sum_by(&array.view(), |value| *value as i32) == Ok(expected_sum as i32),
