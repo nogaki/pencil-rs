@@ -324,6 +324,7 @@ name = "pencil-array"
 version = "0.1.0"
 dependencies = [
  "mpi",
+ "num-complex",
  "proptest",
  "thiserror",
 ]

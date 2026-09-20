@@ -6,7 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-mpi.workspace = true
+mpi = { workspace = true, features = ["complex"] }
+num-complex = "0.4.6"
 thiserror.workspace = true
 
 [dev-dependencies]
