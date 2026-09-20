@@ -258,8 +258,25 @@ for n in 1 4 6; do
 done
 ```
 
+The feature-enabled build checks used by CI are:
+
+```bash
+pkg-config --exists hdf5-openmpi
+pkg-config --exists hdf5
+cargo check -p pencil-io --all-features --all-targets --locked
+cargo test -p pencil-io --no-default-features --test mpi_io --no-run --locked
+cargo test -p pencil-io --features parallel-hdf5 --test hdf5_io --no-run --locked
+cargo clippy -p pencil-io --all-features --all-targets --locked -- -D warnings
+cargo doc -p pencil-io --all-features --no-deps --locked
+timeout --foreground 120s mpiexec --oversubscribe -n 1 \
+  cargo test -p pencil-io --features parallel-hdf5 --lib \
+  post_cleanup_errors_preserve_destination_and_valid_commits --locked \
+  -- --nocapture --test-threads=1
+```
+
 For the declared MSRV, run
-`cargo +1.85.0 check --workspace --all-features --locked` before the native
+`cargo +1.85.0 check --workspace --all-targets --locked` and
+`cargo +1.85.0 check -p pencil-io --all-features --all-targets --locked` before the native
 matrix.
 
 After building the HDF5 test binary, inspect its resolved native ABI before
