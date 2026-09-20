@@ -522,10 +522,39 @@ impl<T, const N: usize, const M: usize> PencilArray<T, N, M> {
         extra_indices: &[usize],
         spatial_indices: [usize; N],
     ) -> Option<&mut T>;
+
+    pub fn get_global(
+        &self,
+        extra_indices: &[usize],
+        global_spatial_indices: [usize; N],
+    ) -> Option<&T>;
+
+    pub fn get_global_mut(
+        &mut self,
+        extra_indices: &[usize],
+        global_spatial_indices: [usize; N],
+    ) -> Option<&mut T>;
+
+    pub fn local_grid<'a, C>(
+        &self,
+        coordinates: [&'a [C]; N],
+    ) -> Result<LocalGrid<'a, C, N>, LocalGridError>;
 }
 ```
 
 `as_slice`の並びは`memory_shape()`に対するrow-major順である。
+`get_global`はlocal rangesを検査するだけの非collective accessであり、他rankが
+所有する座標、global shape外、empty local rangeは`None`を返す。`permutation`を
+通じて物理offsetへ変換するが、MPI通信や要素コピーは行わない。read-only/mutable
+borrowed viewも同じglobal accessors（mutable viewは`get_global_mut`を含む）を提供する。
+
+`LocalGrid<'a, C, N>`は各spatial軸のglobal coordinate sliceを借用する。各sliceの
+長さは対応するglobal extentと一致しなければならず、grid生成時に検証される。gridは
+local rangeのcoordinate slices、local shape、permutationだけを保持し、MPI resourceは
+保持しない。`axis`、local logical indexによる`get_local`、`iter`を提供し、`iter`の
+tupleはlogical axis順だが順序はarrayのphysical spatial memory orderである。extra axis
+はgrid対象外なのでextra batchごとに同じgridを繰り返す。unowned rangeとempty rankは
+要素を生成しない。
 
 ## 12. 借用view
 

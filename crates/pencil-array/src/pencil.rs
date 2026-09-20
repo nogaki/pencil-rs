@@ -1,7 +1,8 @@
 use std::{ops::Range, sync::Arc};
 
 use crate::{
-    AxisPermutation, Decomposition, GeometryError, MpiTopology, PencilError, SpatialAxis,
+    AxisPermutation, Decomposition, GeometryError, LocalGrid, LocalGridError, MpiTopology,
+    PencilError, SpatialAxis,
     checked::checked_product,
     geometry::{local_ranges_for, shape_from_ranges},
 };
@@ -153,6 +154,19 @@ impl<const N: usize, const M: usize> Pencil<N, M> {
     /// Returns the number of global spatial elements.
     pub fn global_len(&self) -> usize {
         self.global_len
+    }
+
+    /// Borrows caller-provided global coordinate axes for this pencil's local grid.
+    ///
+    /// The input contains one complete coordinate slice per logical spatial
+    /// axis. Every slice must have the corresponding [`Self::global_shape`]
+    /// length. The returned grid keeps only local coordinate slices and no
+    /// reference to this pencil or its MPI topology.
+    pub fn local_grid<'a, C>(
+        &self,
+        coordinates: [&'a [C]; N],
+    ) -> Result<LocalGrid<'a, C, N>, LocalGridError> {
+        LocalGrid::from_pencil(self, coordinates)
     }
 
     /// Computes logical ranges for arbitrary valid Cartesian process coordinates.

@@ -28,7 +28,11 @@ stages, for real and complex `f32`/`f64` over the existing checked transports.
 one local buffer. `ManyPencilArray` owns a buffer large enough for several
 registered layouts and exposes only its active layout. Array shapes use
 logical order `[extra..., spatial...]`; their row-major buffers use memory
-order `[extra..., permuted spatial...]`. `LocalTransposePlan` provides
+order `[extra..., permuted spatial...]`. `get_global` is a noncollective,
+local-only lookup: remotely owned or out-of-range coordinates return `None`.
+`Pencil::local_grid` borrows one complete global coordinate slice per spatial
+axis and iterates this rank's spatial coordinates in physical memory order;
+extra batches repeat that spatial grid. `LocalTransposePlan` provides
 process-local memory-axis permutations. `AllToAllvTransposePlan` and
 `PointToPointTransposePlan` provide checked distributed redistribution through
 out-of-place views and shared-storage in-place execution. The optional

@@ -1,4 +1,7 @@
-use crate::{ArrayError, ExtraShape, Pencil, checked::checked_product, geometry::row_major_offset};
+use crate::{
+    ArrayError, ExtraShape, LocalGrid, LocalGridError, Pencil, checked::checked_product,
+    geometry::row_major_offset,
+};
 
 pub(crate) trait LocalArrayLayout<T, const N: usize, const M: usize> {
     fn pencil(&self) -> &Pencil<N, M>;
@@ -50,6 +53,29 @@ pub(crate) trait LocalArrayLayout<T, const N: usize, const M: usize> {
                 .map(|axis| spatial_indices[axis.index()]),
         );
         Ok(row_major_offset(&self.memory_shape(), &memory_indices)?)
+    }
+
+    fn global_offset(
+        &self,
+        extra_indices: &[usize],
+        global_spatial_indices: [usize; N],
+    ) -> Option<usize> {
+        let mut local_spatial_indices = [0; N];
+        for axis in 0..N {
+            let range = &self.pencil().local_ranges()[axis];
+            if !range.contains(&global_spatial_indices[axis]) {
+                return None;
+            }
+            local_spatial_indices[axis] = global_spatial_indices[axis] - range.start;
+        }
+        self.local_offset(extra_indices, local_spatial_indices).ok()
+    }
+
+    fn local_grid<'a, C>(
+        &self,
+        coordinates: [&'a [C]; N],
+    ) -> Result<LocalGrid<'a, C, N>, LocalGridError> {
+        self.pencil().local_grid(coordinates)
     }
 }
 
@@ -124,6 +150,28 @@ impl<'a, T, const N: usize, const M: usize> PencilArrayView<'a, T, N, M> {
     pub fn get_local(&self, extra_indices: &[usize], spatial_indices: [usize; N]) -> Option<&T> {
         let offset = LocalArrayLayout::local_offset(self, extra_indices, spatial_indices).ok()?;
         self.storage.get(offset)
+    }
+
+    /// Returns a shared reference at locally owned global spatial indices.
+    ///
+    /// Global indices owned by another rank, outside the global shape, or
+    /// outside this rank's local range return `None`. This accessor is local
+    /// and performs no MPI operation.
+    pub fn get_global(
+        &self,
+        extra_indices: &[usize],
+        global_spatial_indices: [usize; N],
+    ) -> Option<&T> {
+        let offset = LocalArrayLayout::global_offset(self, extra_indices, global_spatial_indices)?;
+        self.storage.get(offset)
+    }
+
+    /// Borrows caller-provided global coordinate axes for this view's local grid.
+    pub fn local_grid<'c, C>(
+        &self,
+        coordinates: [&'c [C]; N],
+    ) -> Result<LocalGrid<'c, C, N>, LocalGridError> {
+        LocalArrayLayout::local_grid(self, coordinates)
     }
 }
 
@@ -227,6 +275,40 @@ impl<'a, T, const N: usize, const M: usize> PencilArrayViewMut<'a, T, N, M> {
     ) -> Option<&mut T> {
         let offset = LocalArrayLayout::local_offset(self, extra_indices, spatial_indices).ok()?;
         self.storage.get_mut(offset)
+    }
+
+    /// Returns a shared reference at locally owned global spatial indices.
+    ///
+    /// Global indices owned by another rank, outside the global shape, or
+    /// outside this rank's local range return `None`. This accessor is local
+    /// and performs no MPI operation.
+    pub fn get_global(
+        &self,
+        extra_indices: &[usize],
+        global_spatial_indices: [usize; N],
+    ) -> Option<&T> {
+        let offset = LocalArrayLayout::global_offset(self, extra_indices, global_spatial_indices)?;
+        self.storage.get(offset)
+    }
+
+    /// Returns a mutable reference at locally owned global spatial indices.
+    ///
+    /// The lookup is local-only and performs no MPI operation.
+    pub fn get_global_mut(
+        &mut self,
+        extra_indices: &[usize],
+        global_spatial_indices: [usize; N],
+    ) -> Option<&mut T> {
+        let offset = LocalArrayLayout::global_offset(self, extra_indices, global_spatial_indices)?;
+        self.storage.get_mut(offset)
+    }
+
+    /// Borrows caller-provided global coordinate axes for this view's local grid.
+    pub fn local_grid<'c, C>(
+        &self,
+        coordinates: [&'c [C]; N],
+    ) -> Result<LocalGrid<'c, C, N>, LocalGridError> {
+        LocalArrayLayout::local_grid(self, coordinates)
     }
 }
 

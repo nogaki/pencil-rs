@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::{
-    ArrayError, ExtraShape, Pencil, PencilArrayView, PencilArrayViewMut, checked::checked_product,
-    view::LocalArrayLayout,
+    ArrayError, ExtraShape, LocalGrid, LocalGridError, Pencil, PencilArrayView, PencilArrayViewMut,
+    checked::checked_product, view::LocalArrayLayout,
 };
 
 #[derive(Debug)]
@@ -123,6 +123,40 @@ impl<T, const N: usize, const M: usize> PencilArray<T, N, M> {
     ) -> Option<&mut T> {
         let offset = LocalArrayLayout::local_offset(self, extra_indices, spatial_indices).ok()?;
         self.storage.get_mut(offset)
+    }
+
+    /// Returns a shared reference at locally owned global spatial indices.
+    ///
+    /// Global indices owned by another rank, outside the global shape, or
+    /// outside this rank's local range return `None`. This accessor is local
+    /// and performs no MPI operation.
+    pub fn get_global(
+        &self,
+        extra_indices: &[usize],
+        global_spatial_indices: [usize; N],
+    ) -> Option<&T> {
+        let offset = LocalArrayLayout::global_offset(self, extra_indices, global_spatial_indices)?;
+        self.storage.get(offset)
+    }
+
+    /// Returns a mutable reference at locally owned global spatial indices.
+    ///
+    /// The lookup is local-only and performs no MPI operation.
+    pub fn get_global_mut(
+        &mut self,
+        extra_indices: &[usize],
+        global_spatial_indices: [usize; N],
+    ) -> Option<&mut T> {
+        let offset = LocalArrayLayout::global_offset(self, extra_indices, global_spatial_indices)?;
+        self.storage.get_mut(offset)
+    }
+
+    /// Borrows caller-provided global coordinate axes for this array's local grid.
+    pub fn local_grid<'a, C>(
+        &self,
+        coordinates: [&'a [C]; N],
+    ) -> Result<LocalGrid<'a, C, N>, LocalGridError> {
+        LocalArrayLayout::local_grid(self, coordinates)
     }
 
     /// Borrows the array as a read-only view tied to this owner.
