@@ -480,6 +480,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pencil-cuda"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "mpi",
+ "num-complex",
+ "pencil-array",
+ "pencil-fft",
+ "thiserror",
+]
+
+[[package]]
 name = "pencil-fft"
 version = "0.1.0"
 dependencies = [
