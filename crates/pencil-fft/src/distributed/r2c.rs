@@ -6,6 +6,7 @@ use std::{
     cmp::Ordering,
     mem::{align_of, size_of},
     sync::Arc,
+    time::Instant,
 };
 
 use bytemuck::{allocation::try_cast_vec, try_cast_slice, try_cast_slice_mut};
@@ -16,24 +17,36 @@ use mpi::{
     datatype::Equivalence,
 };
 use pencil_array::{
-    ArrayError, ExtraShape, ManyPencilArray, MpiTopology, OverwriteError, Pencil, PencilArray,
-    PencilArrayView, PencilArrayViewMut, TransposeWorkspace,
+    ArrayError, ExtraShape, ManyPencilArray, MpiTopology, OverlapError, OverwriteError, Pencil,
+    PencilArray, PencilArrayView, PencilArrayViewMut, TransposeWorkspace,
 };
 
 use super::{
-    AxisSelection, DESCRIPTOR_SCHEMA, Direction, DistributedLayout, FftError, INVALID_WORD,
-    LocalTransform, OPERATION_R2C_BACKWARD, OPERATION_R2C_BACKWARD_IN_PLACE, OPERATION_R2C_FORWARD,
-    OPERATION_R2C_FORWARD_IN_PLACE, OPERATION_R2C_INVERSE, OPERATION_R2C_INVERSE_IN_PLACE,
-    OPERATION_R2C_PLAN, R2cError, StagePreparation, TransformPlanCore, TransformStage,
-    TransposeMethod, VALUE_KIND_R2C, agree_execution_descriptor_ref, agree_header, agree_result,
-    build_descriptor, build_route, build_transitions, collective_valid, descriptor_len,
-    initialized_vec, map_array_allocation, prepare_complex_stage, registered_stage_pencils,
+    AxisSelection, C2cTransition, DESCRIPTOR_SCHEMA, Direction, DistributedLayout, FftError,
+    FourierDirections, INVALID_WORD, LocalTransform, OPERATION_R2C_BACKWARD,
+    OPERATION_R2C_BACKWARD_IN_PLACE, OPERATION_R2C_FORWARD, OPERATION_R2C_FORWARD_IN_PLACE,
+    OPERATION_R2C_INVERSE, OPERATION_R2C_INVERSE_IN_PLACE, OPERATION_R2C_PLAN, R2cError,
+    StagePreparation, TransformPlanCore, TransformStage, TransformTiming, TransposeMethod,
+    VALUE_KIND_R2C, agree_execution_descriptor_ref, agree_header, agree_result, build_descriptor,
+    build_route, build_transitions, collective_valid, descriptor_len, initialized_vec,
+    map_array_allocation, prepare_complex_stage, registered_stage_pencils,
     strided_complex_line_len, validate_out_of_place, validate_workspace_lengths_values,
     zero_complex,
 };
 #[cfg(test)]
 use crate::LocalR2cError;
 use crate::{Complex, FftReal, LocalR2cPlan, R2cState};
+
+// 55..57 are C2C overlap words. Keep every operation descriptor unique.
+const OPERATION_R2C_FORWARD_OVERLAP: u64 = 73;
+const OPERATION_R2C_INVERSE_OVERLAP: u64 = 74;
+const OPERATION_R2C_BACKWARD_OVERLAP: u64 = 75;
+const OPERATION_R2C_FORWARD_TIMED: u64 = 79;
+const OPERATION_R2C_INVERSE_TIMED: u64 = 80;
+const OPERATION_R2C_BACKWARD_TIMED: u64 = 81;
+const OPERATION_R2C_FORWARD_IN_PLACE_TIMED: u64 = 82;
+const OPERATION_R2C_INVERSE_IN_PLACE_TIMED: u64 = 83;
+const OPERATION_R2C_BACKWARD_IN_PLACE_TIMED: u64 = 84;
 
 /// An immutable, checked distributed real-to-half-complex FFT plan.
 ///
@@ -591,6 +604,19 @@ where
         self.core.layout
     }
 
+    /// Returns the immutable checked geometry used by every route stage.
+    pub fn stage_geometry(&self) -> Box<[super::StageGeometry<N, M>]> {
+        self.core
+            .stages
+            .iter()
+            .map(|stage| super::StageGeometry {
+                axis: stage.axis,
+                source: Arc::clone(&stage.input),
+                output: Arc::clone(&stage.output),
+            })
+            .collect()
+    }
+
     /// Allocates a zero-initialized local real input array.
     pub fn allocate_input(&self) -> Result<PencilArray<R, N, M>, R2cError> {
         Ok(PencilArray::from_fn(
@@ -771,7 +797,50 @@ where
         destination: &mut PencilArray<Complex<R>, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
     ) -> Result<(), R2cError> {
-        self.execute_forward(source, destination, workspace)
+        self.execute_forward(source, destination, workspace, None)
+    }
+
+    /// Runs [`Self::forward`] and returns per-stage timing.
+    pub fn forward_with_timing(
+        &self,
+        source: &PencilArray<R, N, M>,
+        destination: &mut PencilArray<Complex<R>, N, M>,
+        workspace: &mut R2cWorkspace<R, N, M>,
+    ) -> Result<TransformTiming<N>, R2cError> {
+        let mut timing = TransformTiming::default();
+        self.execute_forward(source, destination, workspace, Some(&mut timing))?;
+        Ok(timing)
+    }
+
+    /// Computes forward while running each next complex FFT from a P2P receive.
+    pub fn forward_with_overlap(
+        &self,
+        source: &PencilArray<R, N, M>,
+        destination: &mut PencilArray<Complex<R>, N, M>,
+        workspace: &mut R2cWorkspace<R, N, M>,
+    ) -> Result<(), R2cError> {
+        self.execute_overlap_forward(source, destination, workspace)
+    }
+
+    /// Computes a normalized inverse while running each next complex FFT from a P2P receive.
+    pub fn inverse_with_overlap(
+        &self,
+        source: &PencilArray<Complex<R>, N, M>,
+        destination: &mut PencilArray<R, N, M>,
+        workspace: &mut R2cWorkspace<R, N, M>,
+    ) -> Result<(), R2cError> {
+        self.execute_overlap_reverse(Direction::Inverse, source, destination, workspace)
+    }
+
+    /// Computes an unnormalized backward transform with local FFTs after
+    /// receive/unpack completion and before point-to-point send waits.
+    pub fn backward_with_overlap(
+        &self,
+        source: &PencilArray<Complex<R>, N, M>,
+        destination: &mut PencilArray<R, N, M>,
+        workspace: &mut R2cWorkspace<R, N, M>,
+    ) -> Result<(), R2cError> {
+        self.execute_overlap_reverse(Direction::Backward, source, destination, workspace)
     }
 
     /// Computes a normalized inverse half-complex-to-real transform.
@@ -804,7 +873,19 @@ where
         destination: &mut PencilArray<R, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
     ) -> Result<(), R2cError> {
-        self.execute_reverse(source, destination, workspace, true)
+        self.execute_reverse(source, destination, workspace, true, None)
+    }
+
+    /// Runs [`Self::inverse`] and returns per-stage timing.
+    pub fn inverse_with_timing(
+        &self,
+        source: &PencilArray<Complex<R>, N, M>,
+        destination: &mut PencilArray<R, N, M>,
+        workspace: &mut R2cWorkspace<R, N, M>,
+    ) -> Result<TransformTiming<N>, R2cError> {
+        let mut timing = TransformTiming::default();
+        self.execute_reverse(source, destination, workspace, true, Some(&mut timing))?;
+        Ok(timing)
     }
 
     /// Computes an unnormalized positive-sign backward half-complex-to-real
@@ -825,7 +906,19 @@ where
         destination: &mut PencilArray<R, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
     ) -> Result<(), R2cError> {
-        self.execute_reverse(source, destination, workspace, false)
+        self.execute_reverse(source, destination, workspace, false, None)
+    }
+
+    /// Runs [`Self::backward`] and returns per-stage timing.
+    pub fn backward_with_timing(
+        &self,
+        source: &PencilArray<Complex<R>, N, M>,
+        destination: &mut PencilArray<R, N, M>,
+        workspace: &mut R2cWorkspace<R, N, M>,
+    ) -> Result<TransformTiming<N>, R2cError> {
+        let mut timing = TransformTiming::default();
+        self.execute_reverse(source, destination, workspace, false, Some(&mut timing))?;
+        Ok(timing)
     }
 
     /// Computes an unnormalized forward transform in the single data
@@ -835,7 +928,18 @@ where
         array: &mut R2cInPlaceArray<R, N, M>,
         workspace: &mut R2cInPlaceWorkspace<R, N, M>,
     ) -> Result<(), R2cError> {
-        self.execute_in_place(Direction::Forward, array, workspace)
+        self.execute_in_place(Direction::Forward, array, workspace, None)
+    }
+
+    /// Runs [`Self::forward_in_place`] and returns per-stage timing.
+    pub fn forward_in_place_with_timing(
+        &self,
+        array: &mut R2cInPlaceArray<R, N, M>,
+        workspace: &mut R2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<TransformTiming<N>, R2cError> {
+        let mut timing = TransformTiming::default();
+        self.execute_in_place(Direction::Forward, array, workspace, Some(&mut timing))?;
+        Ok(timing)
     }
 
     /// Computes a normalized inverse transform in the single data allocation.
@@ -845,7 +949,18 @@ where
         array: &mut R2cInPlaceArray<R, N, M>,
         workspace: &mut R2cInPlaceWorkspace<R, N, M>,
     ) -> Result<(), R2cError> {
-        self.execute_in_place(Direction::Inverse, array, workspace)
+        self.execute_in_place(Direction::Inverse, array, workspace, None)
+    }
+
+    /// Runs [`Self::inverse_in_place`] and returns per-stage timing.
+    pub fn inverse_in_place_with_timing(
+        &self,
+        array: &mut R2cInPlaceArray<R, N, M>,
+        workspace: &mut R2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<TransformTiming<N>, R2cError> {
+        let mut timing = TransformTiming::default();
+        self.execute_in_place(Direction::Inverse, array, workspace, Some(&mut timing))?;
+        Ok(timing)
     }
 
     /// Computes an unnormalized positive-sign backward transform in the
@@ -856,7 +971,18 @@ where
         array: &mut R2cInPlaceArray<R, N, M>,
         workspace: &mut R2cInPlaceWorkspace<R, N, M>,
     ) -> Result<(), R2cError> {
-        self.execute_in_place(Direction::Backward, array, workspace)
+        self.execute_in_place(Direction::Backward, array, workspace, None)
+    }
+
+    /// Runs [`Self::backward_in_place`] and returns per-stage timing.
+    pub fn backward_in_place_with_timing(
+        &self,
+        array: &mut R2cInPlaceArray<R, N, M>,
+        workspace: &mut R2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<TransformTiming<N>, R2cError> {
+        let mut timing = TransformTiming::default();
+        self.execute_in_place(Direction::Backward, array, workspace, Some(&mut timing))?;
+        Ok(timing)
     }
 
     fn construct(
@@ -1012,6 +1138,8 @@ where
             transpose_receive_len,
             real_transpose_send_len,
             real_transpose_receive_len,
+            directions: FourierDirections::default(),
+            strict_array_identity: false,
         };
         Ok(Self {
             core: Arc::new(core),
@@ -1041,9 +1169,13 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
     for index in 0..N {
         let axis = N - 1 - index;
         let stage = match index.cmp(&boundary) {
-            Ordering::Less => {
-                prepare_complex_stage(&original_route.stages[index], original_shape, axis, false)?
-            }
+            Ordering::Less => prepare_complex_stage(
+                &original_route.stages[index],
+                original_shape,
+                axis,
+                false,
+                FourierDirections::default(),
+            )?,
             Ordering::Equal => {
                 let pencil = &original_route.stages[index];
                 if pencil
@@ -1067,6 +1199,7 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
                 reduced_shape,
                 axis,
                 selection.contains(axis),
+                FourierDirections::default(),
             )?,
         };
         fft_scratch_len = fft_scratch_len.max(stage.local.scratch_len());
@@ -1571,11 +1704,17 @@ where
         source: &PencilArray<R, N, M>,
         destination: &mut PencilArray<Complex<R>, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
+        mut report: Option<&mut TransformTiming<N>>,
     ) -> Result<(), R2cError> {
+        let started = Instant::now();
         let communicator = self.input_pencil().topology().communicator();
         agree_execution_descriptor_ref::<N, M>(
             communicator,
-            OPERATION_R2C_FORWARD,
+            if report.is_some() {
+                OPERATION_R2C_FORWARD_TIMED
+            } else {
+                OPERATION_R2C_FORWARD
+            },
             &self.core.descriptor,
         )?;
         let preflight = self.preflight_forward(source, destination, workspace);
@@ -1585,7 +1724,77 @@ where
                 .unwrap_or(R2cError::Fft(FftError::CollectivePreconditionFailed)));
         }
         preflight.expect("distributed R2C forward preflight succeeded");
-        execute_forward(&self.core, source, destination, workspace)
+        let result = execute_forward(
+            &self.core,
+            source,
+            destination,
+            workspace,
+            report.as_deref_mut(),
+        );
+        if let Some(timing) = report {
+            timing.total = started.elapsed();
+        }
+        result
+    }
+
+    fn execute_overlap_forward(
+        &self,
+        source: &PencilArray<R, N, M>,
+        destination: &mut PencilArray<Complex<R>, N, M>,
+        workspace: &mut R2cWorkspace<R, N, M>,
+    ) -> Result<(), R2cError> {
+        let communicator = self.input_pencil().topology().communicator();
+        agree_execution_descriptor_ref::<N, M>(
+            communicator,
+            OPERATION_R2C_FORWARD_OVERLAP,
+            &self.core.descriptor,
+        )?;
+        let preflight = self.preflight_forward(source, destination, workspace);
+        if !collective_valid(communicator, preflight.is_ok()) {
+            return Err(preflight
+                .err()
+                .unwrap_or(R2cError::Fft(FftError::CollectivePreconditionFailed)));
+        }
+        if !collective_valid(
+            communicator,
+            overlap_supported(&self.core, Direction::Forward),
+        ) {
+            return Err(R2cError::Fft(FftError::OverlapUnsupported));
+        }
+        execute_forward_overlap(&self.core, source, destination, workspace)
+    }
+
+    fn execute_overlap_reverse(
+        &self,
+        direction: Direction,
+        source: &PencilArray<Complex<R>, N, M>,
+        destination: &mut PencilArray<R, N, M>,
+        workspace: &mut R2cWorkspace<R, N, M>,
+    ) -> Result<(), R2cError> {
+        let communicator = self.input_pencil().topology().communicator();
+        let operation = if matches!(direction, Direction::Inverse) {
+            OPERATION_R2C_INVERSE_OVERLAP
+        } else {
+            OPERATION_R2C_BACKWARD_OVERLAP
+        };
+        agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
+        let preflight = self.preflight_inverse(source, destination, workspace);
+        if !collective_valid(communicator, preflight.is_ok()) {
+            return Err(preflight
+                .err()
+                .unwrap_or(R2cError::Fft(FftError::CollectivePreconditionFailed)));
+        }
+        if !collective_valid(communicator, overlap_supported(&self.core, direction)) {
+            return Err(R2cError::Fft(FftError::OverlapUnsupported));
+        }
+        execute_reverse_overlap(
+            &self.core,
+            source,
+            destination,
+            workspace,
+            matches!(direction, Direction::Inverse),
+            self.raw_absolute_threshold,
+        )
     }
 
     fn execute_reverse(
@@ -1594,12 +1803,22 @@ where
         destination: &mut PencilArray<R, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
         normalize_inverse: bool,
+        mut report: Option<&mut TransformTiming<N>>,
     ) -> Result<(), R2cError> {
+        let started = Instant::now();
         let communicator = self.input_pencil().topology().communicator();
         let operation = if normalize_inverse {
-            OPERATION_R2C_INVERSE
+            if report.is_some() {
+                OPERATION_R2C_INVERSE_TIMED
+            } else {
+                OPERATION_R2C_INVERSE
+            }
         } else {
-            OPERATION_R2C_BACKWARD
+            if report.is_some() {
+                OPERATION_R2C_BACKWARD_TIMED
+            } else {
+                OPERATION_R2C_BACKWARD
+            }
         };
         agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
         let preflight = self.preflight_inverse(source, destination, workspace);
@@ -1609,14 +1828,19 @@ where
                 .unwrap_or(R2cError::Fft(FftError::CollectivePreconditionFailed)));
         }
         preflight.expect("distributed R2C reverse preflight succeeded");
-        execute_inverse(
+        let result = execute_inverse(
             &self.core,
             source,
             destination,
             workspace,
             normalize_inverse,
             self.raw_absolute_threshold,
-        )
+            report.as_deref_mut(),
+        );
+        if let Some(timing) = report {
+            timing.total = started.elapsed();
+        }
+        result
     }
 
     fn execute_in_place(
@@ -1624,12 +1848,32 @@ where
         direction: Direction,
         array: &mut R2cInPlaceArray<R, N, M>,
         workspace: &mut R2cInPlaceWorkspace<R, N, M>,
+        mut report: Option<&mut TransformTiming<N>>,
     ) -> Result<(), R2cError> {
+        let started = Instant::now();
         let communicator = self.input_pencil().topology().communicator();
         let operation = match direction {
-            Direction::Forward => OPERATION_R2C_FORWARD_IN_PLACE,
-            Direction::Inverse => OPERATION_R2C_INVERSE_IN_PLACE,
-            Direction::Backward => OPERATION_R2C_BACKWARD_IN_PLACE,
+            Direction::Forward => {
+                if report.is_some() {
+                    OPERATION_R2C_FORWARD_IN_PLACE_TIMED
+                } else {
+                    OPERATION_R2C_FORWARD_IN_PLACE
+                }
+            }
+            Direction::Inverse => {
+                if report.is_some() {
+                    OPERATION_R2C_INVERSE_IN_PLACE_TIMED
+                } else {
+                    OPERATION_R2C_INVERSE_IN_PLACE
+                }
+            }
+            Direction::Backward => {
+                if report.is_some() {
+                    OPERATION_R2C_BACKWARD_IN_PLACE_TIMED
+                } else {
+                    OPERATION_R2C_BACKWARD_IN_PLACE
+                }
+            }
         };
         agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
         let preflight = self.preflight_in_place(direction, array, workspace);
@@ -1644,13 +1888,16 @@ where
         // a post-start error therefore cannot expose a partly typed buffer.
         array.state = R2cState::Poisoned;
         let result = match direction {
-            Direction::Forward => execute_in_place_forward(&self.core, array, workspace),
+            Direction::Forward => {
+                execute_in_place_forward(&self.core, array, workspace, report.as_deref_mut())
+            }
             Direction::Inverse | Direction::Backward => execute_in_place_reverse(
                 &self.core,
                 array,
                 workspace,
                 matches!(direction, Direction::Inverse),
                 self.raw_absolute_threshold,
+                report.as_deref_mut(),
             ),
         };
         if result.is_ok() {
@@ -1658,6 +1905,9 @@ where
                 Direction::Forward => R2cState::ComplexOutput,
                 Direction::Inverse | Direction::Backward => R2cState::RealInput,
             };
+        }
+        if let Some(timing) = report {
+            timing.total = started.elapsed();
         }
         result
     }
@@ -1980,6 +2230,7 @@ fn execute_forward<R: FftReal, const N: usize, const M: usize>(
     source: &PencilArray<R, N, M>,
     destination: &mut PencilArray<Complex<R>, N, M>,
     workspace: &mut R2cWorkspace<R, N, M>,
+    mut report: Option<&mut TransformTiming<N>>,
 ) -> Result<(), R2cError>
 where
     Complex<R>: Equivalence,
@@ -2001,6 +2252,7 @@ where
         };
         let complex_line = &mut workspace.complex_line;
         let fft_scratch = &mut workspace.fft_scratch;
+        let fft_started = Instant::now();
         workspace
             .intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
@@ -2032,6 +2284,7 @@ where
                 Ok::<_, ()>(())
             })
             .expect("distributed R2C stage-zero overwrite was preflighted");
+        super::record_fft_timing(&mut report, boundary, fft_started);
     } else {
         let real_intermediate = workspace
             .real_intermediate
@@ -2054,10 +2307,12 @@ where
                 .as_mut()
                 .ok_or(FftError::WorkspaceMismatch)?;
             for index in 0..boundary {
-                super::execute_transition(
+                super::execute_transition_timed(
                     &core.transitions[index].forward,
                     real_intermediate,
                     real_transpose,
+                    report.as_deref_mut(),
+                    index,
                 )?;
             }
         }
@@ -2076,6 +2331,7 @@ where
         };
         let complex_line = &mut workspace.complex_line;
         let fft_scratch = &mut workspace.fft_scratch;
+        let fft_started = Instant::now();
         workspace
             .intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
@@ -2107,20 +2363,632 @@ where
                 Ok::<_, ()>(())
             })
             .expect("distributed R2C boundary overwrite was preflighted");
+        super::record_fft_timing(&mut report, boundary, fft_started);
     }
 
     let tail = &core.stages[boundary..];
     let tail_transitions = &core.transitions[boundary..];
-    super::execute_forward_complex_tail(
-        tail,
-        tail_transitions,
-        &mut workspace.intermediate,
-        &mut workspace.transpose,
-        destination,
-        &mut workspace.fft_scratch,
-        &mut workspace.complex_strided_line,
-    )?;
+    if let Some(timing) = report {
+        // The shared tail helper numbers stages from zero.  Keep the real
+        // prefix timings intact while relocating both FFT and communication
+        // (pack/unpack/wait) fields to their route indices.
+        let mut tail_timing = TransformTiming::default();
+        super::execute_forward_complex_tail_timed(
+            tail,
+            tail_transitions,
+            &mut workspace.intermediate,
+            &mut workspace.transpose,
+            destination,
+            &mut workspace.fft_scratch,
+            &mut workspace.complex_strided_line,
+            Some(&mut tail_timing),
+        )?;
+        // Stage zero of this helper is the already-computed real boundary:
+        // retain its kernel measurement and attach only its outgoing transition.
+        let boundary_fft = timing.stages[boundary].fft;
+        let boundary_calls = timing.stages[boundary].fft_calls;
+        for index in 0..tail.len() {
+            timing.stages[boundary + index] = tail_timing.stages[index];
+        }
+        timing.stages[boundary].fft = boundary_fft;
+        timing.stages[boundary].fft_calls = boundary_calls;
+        timing.stages[boundary].total = boundary_fft + timing.stages[boundary].transpose;
+    } else {
+        super::execute_forward_complex_tail_timed(
+            tail,
+            tail_transitions,
+            &mut workspace.intermediate,
+            &mut workspace.transpose,
+            destination,
+            &mut workspace.fft_scratch,
+            &mut workspace.complex_strided_line,
+            None,
+        )?;
+    }
     Ok(())
+}
+
+fn overlap_supported<R: FftReal, const N: usize, const M: usize>(
+    core: &TransformPlanCore<R, N, M>,
+    direction: Direction,
+) -> bool {
+    core.transitions.iter().all(|transition| {
+        let item = match direction {
+            Direction::Forward => &transition.forward,
+            Direction::Inverse | Direction::Backward => &transition.backward,
+        };
+        matches!(
+            item,
+            C2cTransition::Identity | C2cTransition::Local(_) | C2cTransition::PointToPoint(_)
+        )
+    })
+}
+
+fn execute_forward_overlap<R: FftReal, const N: usize, const M: usize>(
+    core: &Arc<TransformPlanCore<R, N, M>>,
+    source: &PencilArray<R, N, M>,
+    destination: &mut PencilArray<Complex<R>, N, M>,
+    workspace: &mut R2cWorkspace<R, N, M>,
+) -> Result<(), R2cError>
+where
+    Complex<R>: Equivalence,
+{
+    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
+    if boundary > 0 {
+        let real = workspace
+            .real_intermediate
+            .as_mut()
+            .ok_or(FftError::WorkspaceMismatch)?;
+        let view = source.view();
+        real.overwrite_with(core.stages[0].output.as_ref(), |mut target| {
+            target.as_mut_slice().copy_from_slice(view.as_slice());
+            Ok::<_, ()>(())
+        })
+        .expect("preflighted real prefix");
+
+        // The boundary RFFT belongs to the receive side of the last real
+        // transition.  This is the only way the real prefix can overlap its
+        // final redistribution (and also handles a boundary at the last stage).
+        let prefix = boundary - 1;
+        let rt = workspace
+            .real_transpose
+            .as_mut()
+            .ok_or(FftError::WorkspaceMismatch)?;
+        for index in 0..prefix {
+            super::execute_transition(&core.transitions[index].forward, real, rt)?;
+        }
+        let transition = &core.transitions[prefix].forward;
+        let stage = &core.stages[boundary];
+        match transition {
+            C2cTransition::PointToPoint(plan) => {
+                let stride = super::memory_stride(stage.input.as_ref(), stage.axis)?;
+                let real_source_line = if stride > 1 {
+                    workspace
+                        .real_source_line
+                        .as_mut()
+                        .expect("strided R2C source line was preflighted")
+                        .as_mut_slice()
+                } else {
+                    &mut []
+                };
+                let real_line = &mut workspace.real_line;
+                let complex_line = &mut workspace.complex_line;
+                let fft_scratch = &mut workspace.fft_scratch;
+                let intermediate = &mut workspace.intermediate;
+                intermediate
+                    .overwrite_with(stage.output.as_ref(), |mut target| {
+                        let callback = |data: &mut [R]| {
+                            if stride > 1 {
+                                execute_strided_real_forward(
+                                    stage.local.real_complex(),
+                                    stage.input.as_ref(),
+                                    stage.axis,
+                                    data,
+                                    target.as_mut_slice(),
+                                    real_source_line,
+                                    real_line,
+                                    complex_line,
+                                    fft_scratch,
+                                )
+                            } else {
+                                stage
+                                    .local
+                                    .real_complex()
+                                    .forward(data, target.as_mut_slice(), real_line, fft_scratch)
+                                    .map_err(R2cError::LocalR2c)
+                            }
+                        };
+                        plan.execute_in_place_with_callback(real, rt, callback)
+                            .map_err(map_r2c_overlap)
+                    })
+                    .map_err(|error| match error {
+                        OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
+                        OverwriteError::Writer(error) => error,
+                    })?;
+            }
+            C2cTransition::Identity | C2cTransition::Local(_) => {
+                super::execute_transition(transition, real, rt)?;
+                let active = real.active_view().map_err(FftError::Array)?;
+                let stride = super::memory_stride(stage.input.as_ref(), stage.axis)?;
+                let real_source_line = if stride > 1 {
+                    workspace
+                        .real_source_line
+                        .as_mut()
+                        .expect("strided R2C source line was preflighted")
+                        .as_mut_slice()
+                } else {
+                    &mut []
+                };
+                let real_line = &mut workspace.real_line;
+                let complex_line = &mut workspace.complex_line;
+                let fft_scratch = &mut workspace.fft_scratch;
+                workspace
+                    .intermediate
+                    .overwrite_with(stage.output.as_ref(), |mut target| {
+                        if stride > 1 {
+                            execute_strided_real_forward(
+                                stage.local.real_complex(),
+                                stage.input.as_ref(),
+                                stage.axis,
+                                active.as_slice(),
+                                target.as_mut_slice(),
+                                real_source_line,
+                                real_line,
+                                complex_line,
+                                fft_scratch,
+                            )
+                        } else {
+                            stage
+                                .local
+                                .real_complex()
+                                .forward(
+                                    active.as_slice(),
+                                    target.as_mut_slice(),
+                                    real_line,
+                                    fft_scratch,
+                                )
+                                .map_err(R2cError::LocalR2c)
+                        }
+                    })
+                    .map_err(|error| match error {
+                        OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
+                        OverwriteError::Writer(error) => error,
+                    })?;
+            }
+            C2cTransition::AllToAllv(_) => {
+                return Err(R2cError::Fft(FftError::OverlapUnsupported));
+            }
+        }
+    } else {
+        let stage = &core.stages[boundary];
+        let view = source.view();
+        let stride = super::memory_stride(stage.input.as_ref(), stage.axis)?;
+        let real_source_line = if stride > 1 {
+            workspace
+                .real_source_line
+                .as_mut()
+                .expect("strided R2C source line was preflighted")
+                .as_mut_slice()
+        } else {
+            &mut []
+        };
+        workspace
+            .intermediate
+            .overwrite_with(stage.output.as_ref(), |mut target| {
+                execute_strided_real_forward(
+                    stage.local.real_complex(),
+                    stage.input.as_ref(),
+                    stage.axis,
+                    view.as_slice(),
+                    target.as_mut_slice(),
+                    real_source_line,
+                    &mut workspace.real_line,
+                    &mut workspace.complex_line,
+                    &mut workspace.fft_scratch,
+                )
+            })
+            .map_err(|error| match error {
+                OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
+                OverwriteError::Writer(error) => error,
+            })?;
+    }
+    for index in boundary..core.transitions.len() {
+        let stage = &core.stages[index + 1];
+        match &core.transitions[index].forward {
+            C2cTransition::Identity => {
+                super::execute_complex_forward_in_place(
+                    &stage.local,
+                    stage.output.as_ref(),
+                    stage.axis,
+                    workspace
+                        .intermediate
+                        .active_view_mut()
+                        .map_err(FftError::Array)?
+                        .as_mut_slice(),
+                    &mut workspace.fft_scratch,
+                    &mut workspace.complex_strided_line,
+                )?;
+            }
+            C2cTransition::Local(plan) => {
+                plan.execute_in_place_with_transpose_workspace(
+                    &mut workspace.intermediate,
+                    &mut workspace.transpose,
+                )
+                .expect("distributed R2C local transition was preflighted");
+                super::execute_complex_forward_in_place(
+                    &stage.local,
+                    stage.output.as_ref(),
+                    stage.axis,
+                    workspace
+                        .intermediate
+                        .active_view_mut()
+                        .map_err(FftError::Array)?
+                        .as_mut_slice(),
+                    &mut workspace.fft_scratch,
+                    &mut workspace.complex_strided_line,
+                )?;
+            }
+            C2cTransition::PointToPoint(plan) => {
+                let callback = |data: &mut [Complex<R>]| {
+                    #[cfg(test)]
+                    super::consume_r2c_callback_injection()?;
+                    super::execute_complex_forward_in_place(
+                        &stage.local,
+                        stage.output.as_ref(),
+                        stage.axis,
+                        data,
+                        &mut workspace.fft_scratch,
+                        &mut workspace.complex_strided_line,
+                    )
+                };
+                plan.execute_in_place_with_callback(
+                    &mut workspace.intermediate,
+                    &mut workspace.transpose,
+                    callback,
+                )
+                .map_err(map_r2c_overlap)?;
+            }
+            C2cTransition::AllToAllv(_) => {
+                return Err(R2cError::Fft(FftError::OverlapUnsupported));
+            }
+        }
+    }
+    let active = workspace
+        .intermediate
+        .active_view()
+        .map_err(FftError::Array)?;
+    destination
+        .view_mut()
+        .as_mut_slice()
+        .copy_from_slice(active.as_slice());
+    Ok(())
+}
+
+fn map_r2c_overlap<E>(error: OverlapError<E>) -> R2cError
+where
+    E: Into<R2cError>,
+{
+    match error {
+        OverlapError::Transpose(error) => R2cError::Fft(FftError::Transpose(error)),
+        OverlapError::Callback(error) => error.into(),
+        OverlapError::PeerPanicked => {
+            R2cError::Fft(FftError::Overlap(Box::new(OverlapError::PeerPanicked)))
+        }
+        OverlapError::PeerCallbackFailed => R2cError::Fft(FftError::Overlap(Box::new(
+            OverlapError::PeerCallbackFailed,
+        ))),
+        OverlapError::CollectivePreconditionFailed => R2cError::Fft(FftError::Overlap(Box::new(
+            OverlapError::CollectivePreconditionFailed,
+        ))),
+    }
+}
+
+fn execute_reverse_overlap<R: FftReal, const N: usize, const M: usize>(
+    core: &Arc<TransformPlanCore<R, N, M>>,
+    source: &PencilArray<Complex<R>, N, M>,
+    destination: &mut PencilArray<R, N, M>,
+    workspace: &mut R2cWorkspace<R, N, M>,
+    normalize: bool,
+    threshold: f64,
+) -> Result<(), R2cError>
+where
+    Complex<R>: Equivalence,
+{
+    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
+    let last = core.stages.len() - 1;
+    let source_view = source.view();
+    let last_stage = &core.stages[last];
+    workspace
+        .intermediate
+        .overwrite_with(last_stage.output.as_ref(), |mut target| {
+            if boundary == last {
+                if target.as_mut_slice().len() != source_view.as_slice().len() {
+                    return Err(FftError::PreparationFailed);
+                }
+                target
+                    .as_mut_slice()
+                    .copy_from_slice(source_view.as_slice());
+                return Ok(());
+            }
+            super::execute_complex_reverse(
+                &last_stage.local,
+                last_stage.input.as_ref(),
+                last_stage.axis,
+                source_view.as_slice(),
+                target.as_mut_slice(),
+                &mut workspace.fft_scratch,
+                &mut workspace.complex_strided_line,
+                normalize,
+            )
+        })
+        .map_err(|error| match error {
+            OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
+            OverwriteError::Writer(error) => error.into(),
+        })?;
+
+    // Every complex transition except the handoff to C2R has the next local
+    // FFT in its receive callback.  Identity/local routes have no receive to
+    // overlap, but still execute the same next stage instead of rejecting the
+    // valid permute_dims=false layout.
+    for index in (boundary + 1..last).rev() {
+        let stage = &core.stages[index];
+        match &core.transitions[index].backward {
+            C2cTransition::Identity => {
+                super::execute_complex_reverse_in_place(
+                    &stage.local,
+                    stage.input.as_ref(),
+                    stage.axis,
+                    workspace
+                        .intermediate
+                        .active_view_mut()
+                        .map_err(FftError::Array)?
+                        .as_mut_slice(),
+                    &mut workspace.fft_scratch,
+                    &mut workspace.complex_strided_line,
+                    normalize,
+                )?;
+            }
+            C2cTransition::Local(plan) => {
+                plan.execute_in_place_with_transpose_workspace(
+                    &mut workspace.intermediate,
+                    &mut workspace.transpose,
+                )
+                .expect("distributed R2C local transition was preflighted");
+                super::execute_complex_reverse_in_place(
+                    &stage.local,
+                    stage.input.as_ref(),
+                    stage.axis,
+                    workspace
+                        .intermediate
+                        .active_view_mut()
+                        .map_err(FftError::Array)?
+                        .as_mut_slice(),
+                    &mut workspace.fft_scratch,
+                    &mut workspace.complex_strided_line,
+                    normalize,
+                )?;
+            }
+            C2cTransition::PointToPoint(plan) => {
+                let callback = |data: &mut [Complex<R>]| {
+                    super::execute_complex_reverse_in_place(
+                        &stage.local,
+                        stage.input.as_ref(),
+                        stage.axis,
+                        data,
+                        &mut workspace.fft_scratch,
+                        &mut workspace.complex_strided_line,
+                        normalize,
+                    )
+                };
+                plan.execute_in_place_with_callback(
+                    &mut workspace.intermediate,
+                    &mut workspace.transpose,
+                    callback,
+                )
+                .map_err(map_r2c_overlap)?;
+            }
+            C2cTransition::AllToAllv(_) => {
+                return Err(R2cError::Fft(FftError::OverlapUnsupported));
+            }
+        }
+    }
+
+    validate_boundary(core, &workspace.intermediate, normalize, threshold)?;
+    zero_accepted_boundary(core, &mut workspace.intermediate)?;
+    let stage = &core.stages[boundary];
+
+    // Keep the boundary C2R inside the receive callback.  In particular, do
+    // not wait for the complex send before starting the real work.
+    if boundary < last {
+        match &core.transitions[boundary].backward {
+            C2cTransition::PointToPoint(plan) => {
+                if boundary == 0 {
+                    let mut target = destination.view_mut();
+                    let callback = |data: &mut [Complex<R>]| {
+                        execute_boundary_real_reverse(
+                            stage,
+                            data,
+                            target.as_mut_slice(),
+                            &mut workspace.complex_strided_line,
+                            &mut workspace.complex_line,
+                            &mut workspace.real_line,
+                            &mut workspace.fft_scratch,
+                            normalize,
+                        )
+                    };
+                    plan.execute_in_place_with_callback(
+                        &mut workspace.intermediate,
+                        &mut workspace.transpose,
+                        callback,
+                    )
+                    .map_err(map_r2c_overlap)?;
+                    return Ok(());
+                }
+                let real = workspace
+                    .real_intermediate
+                    .as_mut()
+                    .ok_or(FftError::WorkspaceMismatch)?;
+                real.overwrite_with(stage.input.as_ref(), |mut target| {
+                    let callback = |data: &mut [Complex<R>]| {
+                        execute_boundary_real_reverse(
+                            stage,
+                            data,
+                            target.as_mut_slice(),
+                            &mut workspace.complex_strided_line,
+                            &mut workspace.complex_line,
+                            &mut workspace.real_line,
+                            &mut workspace.fft_scratch,
+                            normalize,
+                        )
+                    };
+                    plan.execute_in_place_with_callback(
+                        &mut workspace.intermediate,
+                        &mut workspace.transpose,
+                        callback,
+                    )
+                    .map_err(map_r2c_overlap)
+                })
+                .map_err(|error| match error {
+                    OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
+                    OverwriteError::Writer(error) => error,
+                })?;
+            }
+            transition => {
+                super::execute_transition(
+                    transition,
+                    &mut workspace.intermediate,
+                    &mut workspace.transpose,
+                )?;
+                execute_boundary_c2r_after_transition(
+                    core,
+                    stage,
+                    destination,
+                    workspace,
+                    boundary,
+                    normalize,
+                )?;
+            }
+        }
+    } else {
+        execute_boundary_c2r_after_transition(
+            core,
+            stage,
+            destination,
+            workspace,
+            boundary,
+            normalize,
+        )?;
+    }
+
+    if boundary == 0 {
+        return Ok(());
+    }
+    let real = workspace
+        .real_intermediate
+        .as_mut()
+        .ok_or(FftError::WorkspaceMismatch)?;
+    let real_transpose = workspace
+        .real_transpose
+        .as_mut()
+        .ok_or(FftError::WorkspaceMismatch)?;
+    for index in (0..boundary).rev() {
+        super::execute_transition(&core.transitions[index].backward, real, real_transpose)?;
+    }
+    let active = real.active_view().map_err(FftError::Array)?;
+    destination
+        .view_mut()
+        .as_mut_slice()
+        .copy_from_slice(active.as_slice());
+    Ok(())
+}
+
+fn execute_boundary_real_reverse<R: FftReal, const N: usize, const M: usize>(
+    stage: &TransformStage<R, N, M>,
+    source: &[Complex<R>],
+    destination: &mut [R],
+    complex_source_line: &mut [Complex<R>],
+    complex_line: &mut [Complex<R>],
+    real_line: &mut [R],
+    scratch: &mut [Complex<R>],
+    normalize: bool,
+) -> Result<(), R2cError>
+where
+    Complex<R>: Equivalence,
+{
+    execute_strided_real_reverse(
+        stage.local.real_complex(),
+        stage.output.as_ref(),
+        stage.axis,
+        source,
+        destination,
+        complex_source_line,
+        complex_line,
+        real_line,
+        scratch,
+        normalize,
+    )
+}
+
+fn execute_boundary_c2r_after_transition<R: FftReal, const N: usize, const M: usize>(
+    _core: &TransformPlanCore<R, N, M>,
+    stage: &TransformStage<R, N, M>,
+    destination: &mut PencilArray<R, N, M>,
+    workspace: &mut R2cWorkspace<R, N, M>,
+    boundary: usize,
+    normalize: bool,
+) -> Result<(), R2cError>
+where
+    Complex<R>: Equivalence,
+{
+    let active = workspace
+        .intermediate
+        .active_view()
+        .map_err(FftError::Array)?;
+    if boundary == 0 {
+        return execute_boundary_real_reverse(
+            stage,
+            active.as_slice(),
+            destination.view_mut().as_mut_slice(),
+            &mut workspace.complex_strided_line,
+            &mut workspace.complex_line,
+            &mut workspace.real_line,
+            &mut workspace.fft_scratch,
+            normalize,
+        );
+    }
+    let real = workspace
+        .real_intermediate
+        .as_mut()
+        .ok_or(FftError::WorkspaceMismatch)?;
+    real.overwrite_with(stage.input.as_ref(), |mut target| {
+        execute_boundary_real_reverse(
+            stage,
+            active.as_slice(),
+            target.as_mut_slice(),
+            &mut workspace.complex_strided_line,
+            &mut workspace.complex_line,
+            &mut workspace.real_line,
+            &mut workspace.fft_scratch,
+            normalize,
+        )
+    })
+    .map_err(|error| match error {
+        OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
+        OverwriteError::Writer(error) => error,
+    })
+}
+
+fn shift_tail_timing<const N: usize>(
+    report: &mut Option<&mut TransformTiming<N>>,
+    offset: usize,
+    count: usize,
+) {
+    if let Some(timing) = report.as_deref_mut() {
+        for index in (0..count).rev() {
+            timing.stages[offset + index] = timing.stages[index];
+        }
+        timing.stages[..offset].fill(super::StageTiming::default());
+    }
 }
 
 fn execute_inverse<R: FftReal, const N: usize, const M: usize>(
@@ -2130,12 +2998,13 @@ fn execute_inverse<R: FftReal, const N: usize, const M: usize>(
     workspace: &mut R2cWorkspace<R, N, M>,
     normalize_inverse: bool,
     raw_absolute_threshold: f64,
+    mut report: Option<&mut TransformTiming<N>>,
 ) -> Result<(), R2cError>
 where
     Complex<R>: Equivalence,
 {
     let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
-    super::execute_inverse_complex_tail(
+    super::execute_inverse_complex_tail_timed(
         &core.stages[boundary..],
         &core.transitions[boundary..],
         source,
@@ -2144,7 +3013,9 @@ where
         &mut workspace.fft_scratch,
         &mut workspace.complex_strided_line,
         normalize_inverse,
+        report.as_deref_mut(),
     )?;
+    shift_tail_timing(&mut report, boundary, core.stages.len() - boundary);
     validate_boundary(
         core,
         &workspace.intermediate,
@@ -2160,6 +3031,7 @@ where
     let stride = super::memory_stride(stage.output.as_ref(), stage.axis)?;
     if boundary == 0 {
         let mut destination_view = destination.view_mut();
+        let fft_started = Instant::now();
         if stride > 1 {
             execute_strided_real_reverse(
                 stage.local.real_complex(),
@@ -2188,6 +3060,7 @@ where
                 &mut workspace.fft_scratch,
             )?;
         }
+        super::record_fft_timing(&mut report, boundary, fft_started);
         return Ok(());
     }
 
@@ -2195,6 +3068,7 @@ where
         .real_intermediate
         .as_mut()
         .ok_or(FftError::WorkspaceMismatch)?;
+    let fft_started = Instant::now();
     real_intermediate
         .overwrite_with(stage.input.as_ref(), |mut target| {
             if stride > 1 {
@@ -2231,16 +3105,19 @@ where
             OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
             OverwriteError::Writer(error) => error,
         })?;
+    super::record_fft_timing(&mut report, boundary, fft_started);
     {
         let real_transpose = workspace
             .real_transpose
             .as_mut()
             .ok_or(FftError::WorkspaceMismatch)?;
         for index in (0..boundary).rev() {
-            super::execute_transition(
+            super::execute_transition_timed(
                 &core.transitions[index].backward,
                 real_intermediate,
                 real_transpose,
+                report.as_deref_mut(),
+                index,
             )?;
         }
     }
@@ -2357,6 +3234,7 @@ fn execute_in_place_forward<R: FftReal, const N: usize, const M: usize>(
     core: &Arc<TransformPlanCore<R, N, M>>,
     array: &mut R2cInPlaceArray<R, N, M>,
     workspace: &mut R2cInPlaceWorkspace<R, N, M>,
+    mut report: Option<&mut TransformTiming<N>>,
 ) -> Result<(), R2cError>
 where
     Complex<R>: Equivalence,
@@ -2372,29 +3250,40 @@ where
             .as_mut()
             .ok_or(FftError::WorkspaceMismatch)?;
         for index in 0..boundary {
-            super::execute_transition(&core.transitions[index].forward, &mut real, real_transpose)?;
+            super::execute_transition_timed(
+                &core.transitions[index].forward,
+                &mut real,
+                real_transpose,
+                report.as_deref_mut(),
+                index,
+            )?;
         }
     }
     array.storage = Some(R2cInPlaceStorage::Real(real));
     // Conversion is rank-local. Agree once for the complete handoff before
     // any rank can enter the first complex transpose.
+    let fft_started = Instant::now();
     agree_result(
         core.stages[0].input.topology().communicator(),
         convert_real_to_complex(core, array, workspace),
     )?;
+    super::record_fft_timing(&mut report, boundary, fft_started);
 
     let complex = match array.storage.as_mut() {
         Some(R2cInPlaceStorage::Complex(complex)) => complex,
         _ => return Err(FftError::StorageLayoutMismatch.into()),
     };
     for index in boundary..core.transitions.len() {
-        super::execute_transition(
+        super::execute_transition_timed(
             &core.transitions[index].forward,
             complex,
             &mut workspace.transpose,
+            report.as_deref_mut(),
+            index,
         )?;
         let stage = &core.stages[index + 1];
         let mut active = complex.active_view_mut().map_err(FftError::Array)?;
+        let fft_started = Instant::now();
         super::execute_complex_forward_in_place(
             &stage.local,
             stage.output.as_ref(),
@@ -2403,6 +3292,7 @@ where
             &mut workspace.fft_scratch,
             &mut workspace.complex_strided_line,
         )?;
+        super::record_fft_timing(&mut report, index + 1, fft_started);
     }
     let output = core
         .stages
@@ -2428,6 +3318,7 @@ fn execute_in_place_reverse<R: FftReal, const N: usize, const M: usize>(
     workspace: &mut R2cInPlaceWorkspace<R, N, M>,
     normalize_inverse: bool,
     raw_absolute_threshold: f64,
+    mut report: Option<&mut TransformTiming<N>>,
 ) -> Result<(), R2cError>
 where
     Complex<R>: Equivalence,
@@ -2446,6 +3337,7 @@ where
         if last > boundary {
             let stage = &core.stages[last];
             let mut active = complex.active_view_mut().map_err(FftError::Array)?;
+            let fft_started = Instant::now();
             super::execute_complex_reverse_in_place(
                 &stage.local,
                 stage.input.as_ref(),
@@ -2455,16 +3347,20 @@ where
                 &mut workspace.complex_strided_line,
                 normalize_inverse,
             )?;
+            super::record_fft_timing(&mut report, last, fft_started);
         }
         for index in (boundary..core.transitions.len()).rev() {
-            super::execute_transition(
+            super::execute_transition_timed(
                 &core.transitions[index].backward,
                 complex,
                 &mut workspace.transpose,
+                report.as_deref_mut(),
+                index,
             )?;
             if index != boundary {
                 let stage = &core.stages[index];
                 let mut active = complex.active_view_mut().map_err(FftError::Array)?;
+                let fft_started = Instant::now();
                 super::execute_complex_reverse_in_place(
                     &stage.local,
                     stage.input.as_ref(),
@@ -2474,6 +3370,7 @@ where
                     &mut workspace.complex_strided_line,
                     normalize_inverse,
                 )?;
+                super::record_fft_timing(&mut report, index, fft_started);
             }
         }
     }
@@ -2494,10 +3391,12 @@ where
     }
     // The real representation handoff is the one rank-local phase in the
     // reverse route. All ranks must agree before the real-prefix transpose.
+    let fft_started = Instant::now();
     agree_result(
         core.stages[0].input.topology().communicator(),
         convert_complex_to_real(core, array, workspace, normalize_inverse),
     )?;
+    super::record_fft_timing(&mut report, boundary, fft_started);
 
     let real = match array.storage.as_mut() {
         Some(R2cInPlaceStorage::Real(real)) => real,
@@ -2509,7 +3408,13 @@ where
             .as_mut()
             .ok_or(FftError::WorkspaceMismatch)?;
         for index in (0..boundary).rev() {
-            super::execute_transition(&core.transitions[index].backward, real, real_transpose)?;
+            super::execute_transition_timed(
+                &core.transitions[index].backward,
+                real,
+                real_transpose,
+                report.as_deref_mut(),
+                index,
+            )?;
         }
     }
     if !real
@@ -3671,11 +4576,8 @@ where
         .rposition(|&selected| selected)
         .expect("R2C core has a selected reduction axis");
     let stride = super::memory_stride(view.pencil(), reduction_axis)?;
-    let line_count =
-        super::strided_line_count(local_len, complex_len, stride).map_err(R2cError::Fft)?;
-    let line_block = complex_len
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
+    let local_axis_len = view.pencil().local_shape_logical()[reduction_axis];
+    let global_axis_start = view.pencil().local_ranges()[reduction_axis].start;
     let depth = normalization_depth(
         *core.stages[0].input.global_shape(),
         core.selection,
@@ -3702,51 +4604,57 @@ where
             .expect("validated extra and local lengths fit the intermediate");
         let values = &view.as_slice()[start..end];
         let mut local_max = [0.0_f64; 4];
-        for outer in 0..line_count {
-            let base = outer
-                .checked_mul(line_block)
-                .ok_or(FftError::PreparationFailed)?;
-            for inner in 0..stride {
-                for plane in 0..plane_count {
-                    let k = if plane == 0 { 0 } else { complex_len - 1 };
-                    let value = values[base + k * stride + inner];
-                    let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
-                    let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
-                    if !re.is_finite() || !im.is_finite() {
-                        invalid = true;
-                        continue;
-                    }
-                    let slot = plane * 2;
-                    local_max[slot] = local_max[slot].max(re.abs().max(im.abs()));
-                    local_max[slot + 1] = local_max[slot + 1].max(im.abs());
+        if local_len != 0 {
+            for (offset, value) in values.iter().enumerate() {
+                let coord = (offset / stride) % local_axis_len;
+                let k = global_axis_start + coord;
+                let plane = if k == 0 {
+                    Some(0)
+                } else if plane_count == 2 && k == complex_len - 1 {
+                    Some(1)
+                } else {
+                    None
+                };
+                let Some(plane) = plane else { continue };
+                let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
+                let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
+                if !re.is_finite() || !im.is_finite() {
+                    invalid = true;
+                    continue;
                 }
+                let slot = plane * 2;
+                local_max[slot] = local_max[slot].max(re.abs().max(im.abs()));
+                local_max[slot + 1] = local_max[slot + 1].max(im.abs());
             }
         }
         let mut global_max = [0.0_f64; 4];
         communicator.all_reduce_into(&local_max, &mut global_max, SystemOperation::max());
 
         let mut local_sum = [0.0_f64; 4];
-        for outer in 0..line_count {
-            let base = outer
-                .checked_mul(line_block)
-                .ok_or(FftError::PreparationFailed)?;
-            for inner in 0..stride {
-                for plane in 0..plane_count {
-                    let k = if plane == 0 { 0 } else { complex_len - 1 };
-                    let value = values[base + k * stride + inner];
-                    let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
-                    let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
-                    if !re.is_finite() || !im.is_finite() {
-                        continue;
-                    }
-                    let slot = plane * 2;
-                    let scale = global_max[slot];
-                    if scale != 0.0 && scale.is_finite() {
-                        let normalized_re = re / scale;
-                        let normalized_im = im / scale;
-                        local_sum[slot] += normalized_re * normalized_re;
-                        local_sum[slot + 1] += normalized_im * normalized_im;
-                    }
+        if local_len != 0 {
+            for (offset, value) in values.iter().enumerate() {
+                let coord = (offset / stride) % local_axis_len;
+                let k = global_axis_start + coord;
+                let plane = if k == 0 {
+                    Some(0)
+                } else if plane_count == 2 && k == complex_len - 1 {
+                    Some(1)
+                } else {
+                    None
+                };
+                let Some(plane) = plane else { continue };
+                let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
+                let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
+                if !re.is_finite() || !im.is_finite() {
+                    continue;
+                }
+                let slot = plane * 2;
+                let scale = global_max[slot];
+                if scale != 0.0 && scale.is_finite() {
+                    let normalized_re = re / scale;
+                    let normalized_im = im / scale;
+                    local_sum[slot] += normalized_re * normalized_re;
+                    local_sum[slot + 1] += normalized_im * normalized_im;
                 }
             }
         }
@@ -3793,11 +4701,8 @@ fn zero_accepted_boundary<R: FftReal, const N: usize, const M: usize>(
         .rposition(|&selected| selected)
         .expect("R2C core has a selected reduction axis");
     let stride = super::memory_stride(view.pencil(), reduction_axis)?;
-    let line_count =
-        super::strided_line_count(local_len, complex_len, stride).map_err(R2cError::Fft)?;
-    let line_block = complex_len
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
+    let local_axis_len = view.pencil().local_shape_logical()[reduction_axis];
+    let global_axis_start = view.pencil().local_ranges()[reduction_axis].start;
     let plane_count = if real_len % 2 == 0 { 2 } else { 1 };
     for batch in 0..core.extra_shape.element_count() {
         let start = batch
@@ -3807,14 +4712,12 @@ fn zero_accepted_boundary<R: FftReal, const N: usize, const M: usize>(
             .checked_add(local_len)
             .expect("validated extra and local lengths fit the intermediate");
         let values = &mut view.as_mut_slice()[start..end];
-        for outer in 0..line_count {
-            let base = outer
-                .checked_mul(line_block)
-                .ok_or(FftError::PreparationFailed)?;
-            for inner in 0..stride {
-                values[base + inner].im = R::zero();
-                if plane_count == 2 {
-                    values[base + (complex_len - 1) * stride + inner].im = R::zero();
+        if local_len != 0 {
+            for (offset, value) in values.iter_mut().enumerate() {
+                let coord = (offset / stride) % local_axis_len;
+                let k = global_axis_start + coord;
+                if k == 0 || (plane_count == 2 && k == complex_len - 1) {
+                    value.im = R::zero();
                 }
             }
         }

@@ -27,8 +27,9 @@ command -v timeout >/dev/null 2>&1 || {
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/pencil-fftw-reference.XXXXXX")
 FIXTURES="$WORK/fixtures"
+DIRECTION_FIXTURES="$WORK/direction-fixtures"
 JULIA_PROJECT="$WORK/project"
-mkdir -p "$FIXTURES" "$JULIA_PROJECT"
+mkdir -p "$FIXTURES" "$DIRECTION_FIXTURES" "$JULIA_PROJECT"
 if [[ -z "${JULIA_DEPOT_PATH:-}" ]]; then
     export JULIA_DEPOT_PATH="$WORK/depot"
 fi
@@ -60,6 +61,13 @@ fi
     -e 'using FFTW; String(FFTW.fftw_provider) == "fftw" || error("FFTW provider is not fftw"); Base.pkgversion(FFTW) == v"1.10.0" || error("FFTW.jl is not 1.10.0")'
 "$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" \
     "$GENERATOR" "$FIXTURES"
+"$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" \
+    "$PROJECT/directions_reference.jl" "$DIRECTION_FIXTURES"
+direction_files=("$DIRECTION_FIXTURES"/*.txt)
+[[ ${#direction_files[@]} -eq 5 ]] || {
+    printf 'expected exactly 5 direction reference files, found %s\n' "${#direction_files[@]}" >&2
+    exit 1
+}
 
 shopt -s nullglob
 fixture_entries=("$FIXTURES"/*)
@@ -117,14 +125,24 @@ if [[ "${PENCIL_FFTW_NO_OVERSUBSCRIBE:-0}" != 1 ]]; then
     fi
 fi
 
+run_direction_reference() {
+    local ranks=$1 directory=$2 log_file=$3
+    if ! timeout --kill-after=5s 120s "$MPIEXEC" "${mpi_flags[@]}" -n "$ranks" env PENCIL_FFTW_DIRECTION_FIXTURES="$directory" \
+        cargo test "${CARGO_TEST_ARGS[@]}" -- --ignored fftw_direction_reference --nocapture --test-threads=1 >"$log_file" 2>&1; then
+        cat "$log_file" >&2
+        return 1
+    fi
+    [[ $(grep -Fc 'PENCIL_FFTW_DIRECTION_REFERENCE_RAN fixtures=5 configurations=40' "$log_file") -eq 1 ]]
+}
+
 run_reference() {
     local ranks=$1
     local fixture_directory=$2
     local log_file=$3
     if ! timeout --kill-after=5s 120s "$MPIEXEC" "${mpi_flags[@]}" -n "$ranks" \
-        env PENCIL_FFTW_FIXTURES="$fixture_directory" \
+        env -u PENCIL_FFTW_DIRECTION_FIXTURES PENCIL_FFTW_FIXTURES="$fixture_directory" \
         cargo test "${CARGO_TEST_ARGS[@]}" -- \
-            --ignored --nocapture --test-threads=1 >"$log_file" 2>&1; then
+            --ignored fftw_reference_matrix --nocapture --test-threads=1 >"$log_file" 2>&1; then
         cat "$log_file" >&2
         return 1
     fi
@@ -134,6 +152,98 @@ run_reference() {
         return 1
     fi
 }
+
+for ranks in 1 4 6; do
+    run_direction_reference "$ranks" "$DIRECTION_FIXTURES" "$WORK/direction-positive-$ranks.log"
+done
+printf 'direction references accepted at MPI ranks 1, 4, and 6\n'
+# Direction-matrix omissions and MixedR2C outputs must fail, not merely parse.
+for corruption in missing duplicate r2c-forward r2c-inverse r2c-backward r2c-sign r2c-real-imaginary; do
+    directory="$WORK/direction-$corruption"
+    mkdir "$directory"
+    cp -- "${direction_files[@]}" "$directory/"
+    case "$corruption" in
+        missing) rm "$directory/mixed_r2c_odd.txt" ;;
+        duplicate) cp "$directory/mixed_r2c_even.txt" "$directory/mixed_r2c_odd.txt" ;;
+        *) "$JULIA" --startup-file=no --project="$PROJECT" -e '
+            path, kind = ARGS
+            lines = readlines(path)
+            if kind == "r2c-sign"
+                i = findfirst(line -> startswith(line, "directions "), lines)
+                lines[i] = replace(lines[i], "backward" => "forward")
+            elseif kind == "r2c-real-imaginary"
+                i = findfirst(line -> startswith(line, "section input "), lines)
+                values = split(lines[i+1]); values[2] = "1.0"
+                lines[i+1] = join(values, " ")
+            else
+                section = replace(kind, "r2c-" => "") * "_expected"
+                i = findfirst(line -> startswith(line, "section " * section * " "), lines)
+                values = split(lines[i+1]); values[1] = string(parse(Float64, values[1]) + 100)
+                lines[i+1] = join(values, " ")
+            end
+            write(path, join(lines, "\n") * "\n")
+        ' "$directory/mixed_r2c_even.txt" "$corruption" ;;
+    esac
+    if run_direction_reference 1 "$directory" "$WORK/$corruption.log"; then
+        printf 'checker accepted direction corruption: %s\n' "$corruption" >&2
+        exit 1
+    fi
+    printf 'direction corruption rejected: %s\n' "$corruption"
+done
+DIRECTION_CORRUPT="$WORK/direction-corrupt"
+mkdir -p "$DIRECTION_CORRUPT"
+cp -- "$DIRECTION_FIXTURES"/*.txt "$DIRECTION_CORRUPT/"
+first_direction=$(find "$DIRECTION_CORRUPT" -name '*.txt' | sort | head -n1)
+"$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" -e '
+path = ARGS[1]; lines = readlines(path);
+for i in eachindex(lines)
+    if startswith(lines[i], "section forward_expected ")
+        words = split(lines[i + 1]); words[1] = string(parse(Float64, words[1]) + 1.0); lines[i + 1] = join(words, " "); break
+    end
+end
+open(path, "w") do io; write(io, join(lines, "\n"), "\n"); end
+' "$first_direction"
+if run_direction_reference 1 "$DIRECTION_CORRUPT" "$WORK/direction-corrupt.log"; then
+    printf 'checker accepted a corrupted direction reference\n' >&2
+    exit 1
+fi
+printf 'corrupted direction forward_expected rejected as intended\n'
+DIRECTION_BACKWARD_CORRUPT="$WORK/direction-backward-corrupt"
+mkdir -p "$DIRECTION_BACKWARD_CORRUPT"
+cp -- "$DIRECTION_FIXTURES"/*.txt "$DIRECTION_BACKWARD_CORRUPT/"
+first_direction_backward=$(find "$DIRECTION_BACKWARD_CORRUPT" -name '*.txt' | sort | head -n1)
+"$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" -e '
+path = ARGS[1]; lines = readlines(path);
+for i in eachindex(lines)
+    if startswith(lines[i], "section backward_expected ")
+        words = split(lines[i + 1]); words[1] = string(parse(Float64, words[1]) + 1.0); lines[i + 1] = join(words, " "); break
+    end
+end
+open(path, "w") do io; write(io, join(lines, "\n"), "\n"); end
+' "$first_direction_backward"
+if run_direction_reference 1 "$DIRECTION_BACKWARD_CORRUPT" "$WORK/direction-backward-corrupt.log"; then
+    printf 'checker accepted corrupted direction backward_expected\n' >&2
+    exit 1
+fi
+printf 'corrupted direction backward_expected rejected as intended\n'
+DIRECTION_SIGN_CORRUPT="$WORK/direction-sign-corrupt"
+mkdir -p "$DIRECTION_SIGN_CORRUPT"
+cp -- "$DIRECTION_FIXTURES"/*.txt "$DIRECTION_SIGN_CORRUPT/"
+first_direction_sign=$(find "$DIRECTION_SIGN_CORRUPT" -name '*.txt' | sort | head -n1)
+"$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" -e '
+path = ARGS[1]; lines = readlines(path);
+for i in eachindex(lines)
+    if startswith(lines[i], "directions ")
+        words = split(lines[i]); words[2] = "sideways"; lines[i] = join(words, " "); break
+    end
+end
+open(path, "w") do io; write(io, join(lines, "\n"), "\n"); end
+' "$first_direction_sign"
+if run_direction_reference 1 "$DIRECTION_SIGN_CORRUPT" "$WORK/direction-sign-corrupt.log"; then
+    printf 'checker accepted corrupted direction metadata\n' >&2
+    exit 1
+fi
+printf 'corrupted direction metadata rejected as intended\n'
 
 for ranks in 1 4 6; do
     printf '\n== Julia/FFTW reference: %s MPI ranks ==\n' "$ranks"

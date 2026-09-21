@@ -319,7 +319,10 @@ pub use pointwise::{
     PointwiseError, pointwise2, pointwise2_in_place, pointwise2_in_place_views, pointwise2_views,
 };
 pub use topology::MpiTopology;
-pub use transpose::{TransposeError, TransposeWorkspace, TransposeWorkspaceRequirements};
+pub use transpose::{
+    OverlapError, TransposeError, TransposeTiming, TransposeWorkspace,
+    TransposeWorkspaceRequirements,
+};
 
 /// Compatibility alias for the canonical [`TransposeError`].
 pub use transpose::TransposeError as AllToAllvTransposeError;

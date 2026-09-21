@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use mpi::{
     collective::CommunicatorCollectives,
@@ -141,6 +141,63 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
         Ok(())
     }
 
+    /// Executes the transpose and returns local pack, collective wait, unpack,
+    /// and total wall-clock timings.
+    pub fn execute_views_with_timing<T>(
+        &self,
+        source: PencilArrayView<'_, T, N, M>,
+        mut destination: PencilArrayViewMut<'_, T, N, M>,
+        workspace: &mut TransposeWorkspace<T>,
+    ) -> Result<crate::TransposeTiming, TransposeError>
+    where
+        T: Equivalence + Copy,
+    {
+        let total = Instant::now();
+        let communicator = self.core.source().topology().cartesian();
+        agree_execute_descriptor::<_, T, N, M>(
+            &self.core,
+            communicator,
+            source.extra_shape(),
+            destination.extra_shape(),
+            CommunicationMode::AllToAllv.timed_views_operation(),
+        )?;
+        let local = self
+            .core
+            .prepare_execution(&source, &destination, workspace);
+        if !collective_valid(communicator, local.is_ok()) {
+            return Err(local
+                .err()
+                .unwrap_or(TransposeError::CollectivePreconditionFailed));
+        }
+        let prepared = local.expect("collective execution preflight succeeded");
+        let extra_count = source.extra_shape().element_count();
+        let mut timing = crate::TransposeTiming::default();
+        let started = Instant::now();
+        pack_source(
+            self.core.peers(),
+            self.core.source().as_ref(),
+            source.as_slice(),
+            &mut workspace.send_buffer[..prepared.requirements.send_len],
+            prepared.requirements.send_len,
+            extra_count,
+        );
+        timing.pack = started.elapsed();
+        let started = Instant::now();
+        execute_exchange(&self.core, &prepared, workspace);
+        timing.collective_wait = started.elapsed();
+        let started = Instant::now();
+        unpack_destination(
+            self.core.peers(),
+            self.core.destination().as_ref(),
+            destination.as_mut_slice(),
+            &workspace.receive_buffer[..prepared.requirements.receive_len],
+            extra_count,
+        );
+        timing.unpack = started.elapsed();
+        timing.total = total.elapsed();
+        Ok(timing)
+    }
+
     /// Executes the transpose by replacing the active layout in shared storage.
     ///
     /// Every rank must call this method in the same order on the same source
@@ -202,6 +259,63 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
             extra_count,
         );
         Ok(())
+    }
+
+    /// Executes the in-place transpose and returns local phase timings.
+    pub fn execute_in_place_with_timing<T>(
+        &self,
+        array: &mut ManyPencilArray<T, N, M>,
+        workspace: &mut TransposeWorkspace<T>,
+    ) -> Result<crate::TransposeTiming, TransposeError>
+    where
+        T: Equivalence + Copy,
+    {
+        let total = Instant::now();
+        let communicator = self.core.source().topology().cartesian();
+        agree_execute_descriptor::<_, T, N, M>(
+            &self.core,
+            communicator,
+            array.extra_shape(),
+            array.extra_shape(),
+            CommunicationMode::AllToAllv.timed_in_place_operation(),
+        )?;
+        let local = prepare_in_place(&self.core, array, workspace);
+        if !collective_valid(communicator, local.is_ok()) {
+            return Err(local
+                .err()
+                .unwrap_or(TransposeError::CollectivePreconditionFailed));
+        }
+        let prepared = local.expect("collective in-place preflight succeeded");
+        let extra_count = array.extra_shape().element_count();
+        let mut timing = crate::TransposeTiming::default();
+        let started = Instant::now();
+        {
+            let source = array.active_view().expect("validated active source");
+            pack_source(
+                self.core.peers(),
+                self.core.source().as_ref(),
+                source.as_slice(),
+                &mut workspace.send_buffer[..prepared.exchange.requirements.send_len],
+                prepared.exchange.requirements.send_len,
+                extra_count,
+            );
+        }
+        timing.pack = started.elapsed();
+        let started = Instant::now();
+        execute_exchange(&self.core, &prepared.exchange, workspace);
+        timing.collective_wait = started.elapsed();
+        let started = Instant::now();
+        finish_in_place(
+            &self.core,
+            array,
+            prepared.destination_index,
+            &prepared.exchange,
+            &workspace.receive_buffer[..prepared.exchange.requirements.receive_len],
+            extra_count,
+        );
+        timing.unpack = started.elapsed();
+        timing.total = total.elapsed();
+        Ok(timing)
     }
 }
 

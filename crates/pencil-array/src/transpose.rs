@@ -3,6 +3,7 @@ use std::{
     mem::{align_of, size_of},
     ops::Range,
     sync::Arc,
+    time::Duration,
 };
 
 use mpi::{
@@ -27,6 +28,13 @@ pub(crate) const OPERATION_ALLTOALLV_IN_PLACE: u64 = 3;
 const OPERATION_POINT_TO_POINT_NEW: u64 = 4;
 const OPERATION_POINT_TO_POINT_VIEWS: u64 = 5;
 const OPERATION_POINT_TO_POINT_IN_PLACE: u64 = 6;
+// Keep additive array operations outside the FFT protocol's operation range.
+const OPERATION_POINT_TO_POINT_CALLBACK: u64 = 0x10001;
+const OPERATION_POINT_TO_POINT_TIMED_VIEWS: u64 = 0x10002;
+const OPERATION_POINT_TO_POINT_TIMED_IN_PLACE: u64 = 0x10003;
+const OPERATION_ALLTOALLV_TIMED_VIEWS: u64 = 0x10004;
+const OPERATION_ALLTOALLV_TIMED_IN_PLACE: u64 = 0x10005;
+const OPERATION_POINT_TO_POINT_CALLBACK_IN_PLACE: u64 = 0x10006;
 const INVALID_AXIS: u64 = u64::MAX;
 const HEADER_WORDS: usize = 5;
 pub(crate) const POINT_TO_POINT_RESERVED_TAG: mpi::Tag = 0x5054;
@@ -57,6 +65,34 @@ impl CommunicationMode {
         match self {
             Self::AllToAllv => OPERATION_ALLTOALLV_IN_PLACE,
             Self::PointToPoint => OPERATION_POINT_TO_POINT_IN_PLACE,
+        }
+    }
+
+    pub(crate) fn timed_views_operation(self) -> u64 {
+        match self {
+            Self::PointToPoint => OPERATION_POINT_TO_POINT_TIMED_VIEWS,
+            Self::AllToAllv => OPERATION_ALLTOALLV_TIMED_VIEWS,
+        }
+    }
+
+    pub(crate) fn timed_in_place_operation(self) -> u64 {
+        match self {
+            Self::PointToPoint => OPERATION_POINT_TO_POINT_TIMED_IN_PLACE,
+            Self::AllToAllv => OPERATION_ALLTOALLV_TIMED_IN_PLACE,
+        }
+    }
+
+    pub(crate) fn callback_operation(self) -> u64 {
+        match self {
+            Self::PointToPoint => OPERATION_POINT_TO_POINT_CALLBACK,
+            Self::AllToAllv => OPERATION_ALLTOALLV_VIEWS,
+        }
+    }
+
+    pub(crate) fn callback_in_place_operation(self) -> u64 {
+        match self {
+            Self::PointToPoint => OPERATION_POINT_TO_POINT_CALLBACK_IN_PLACE,
+            Self::AllToAllv => OPERATION_ALLTOALLV_IN_PLACE,
         }
     }
 }
@@ -130,6 +166,45 @@ pub enum TransposeError {
     /// A local array validation failed.
     #[error(transparent)]
     Array(#[from] ArrayError),
+}
+
+/// Error returned by the callback-based point-to-point overlap APIs.
+#[derive(Debug, Error)]
+pub enum OverlapError<E> {
+    /// The local transpose failed before or during communication.
+    #[error(transparent)]
+    Transpose(#[from] TransposeError),
+    /// The callback returned an error on this rank.
+    #[error("the overlap callback failed")]
+    Callback(E),
+    /// Another rank's callback panicked. The origin resumes unwinding after agreement.
+    #[error("the overlap callback panicked on another rank")]
+    PeerPanicked,
+    /// Another rank's callback returned an error.
+    #[error("the overlap callback failed on another rank")]
+    PeerCallbackFailed,
+    /// A callback result could not be agreed by the full Cartesian communicator.
+    #[error("the overlap callback result could not be agreed collectively")]
+    CollectivePreconditionFailed,
+}
+
+/// Timing collected by a profiled distributed transpose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransposeTiming {
+    /// Time spent packing local source data.
+    pub pack: Duration,
+    /// Time spent posting point-to-point receives.
+    pub post_receive: Duration,
+    /// Time spent waiting for point-to-point receives.
+    pub receive_wait: Duration,
+    /// Time spent in the Alltoallv collective.
+    pub collective_wait: Duration,
+    /// Time spent unpacking received data.
+    pub unpack: Duration,
+    /// Time spent waiting for point-to-point sends.
+    pub send_wait: Duration,
+    /// Total local wall-clock time, including preflight.
+    pub total: Duration,
 }
 
 /// Initialized send and receive storage shared by Alltoallv and point-to-point
