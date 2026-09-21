@@ -6,6 +6,8 @@ PencilArrays.jl, with a separately layered FFT implementation.
 The workspace contains the `pencil-array` core crate, the local FFT
 `pencil-fft` crate, and the separate `pencil-io` crate. `pencil-array` is
 intentionally independent of RustFFT, RealFFT, FFTW, and any FFT-specific API.
+This draft additionally contains the optional `pencil-cuda` crate described below;
+it does not change the CPU default.
 The local `pencil-fft` path accepts flat slices, uses RustFFT/RealFFT, and is
 independent of MPI and `pencil-array`. Local C2C provides unnormalized
 forward and positive-sign `backward` transforms plus normalized `inverse`. An
@@ -402,6 +404,24 @@ ldd target/debug/deps/hdf5_io-* | grep -E 'lib(hdf5|mpi|open-rte|open-pal)'
 mpiexec --version
 pkg-config --modversion hdf5-openmpi
 ```
+
+## Experimental CUDA draft — hardware unverified
+
+`pencil-cuda` dynamically loads CUDA Driver/cuFFT, so host-only builds require
+neither CUDA headers nor NVRTC. Its default local path is MPI-free; the optional
+`distributed` feature adds GPU-resident arrays and host-staged MPI C2C/R2C/C2R
+for `f32`/`f64`, including normalized inverse and raw backward. Local transforms
+execute actual cuFFT calls, never a CPU FFT fallback. Packing and communication
+are host-staged, not CUDA-aware MPI or an allocation-free/device-only pipeline.
+
+This is **draft-only, not a GPU-validated release**. CUDA/cuFFT hardware is not
+available in the implementation environment. Host checks, MPI preflight tests,
+compilation and static FFI review do not establish numerical/PTX/ABI correctness.
+Run the explicit local and distributed 1/4/6-rank hardware matrices before
+releasing GPU support. GPU R2R/DHT/mixed transforms, distributed in-place and
+padded real in-place execution are not implemented; existing CPU APIs remain.
+See [`crates/pencil-cuda/README.md`](crates/pencil-cuda/README.md) for commands,
+resource-failure policy and memory/traffic limits.
 
 ## Prerequisites
 

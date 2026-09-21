@@ -1,0 +1,24 @@
+[package]
+name = "pencil-cuda"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+distributed = ["dep:mpi", "dep:pencil-array", "dep:pencil-fft", "pencil-fft/distributed"]
+
+[dependencies]
+libloading = "=0.8.9"
+num-complex = "0.4.6"
+thiserror.workspace = true
+mpi = { workspace = true, optional = true }
+pencil-array = { path = "../pencil-array", optional = true }
+pencil-fft = { path = "../pencil-fft", optional = true }
+
+[dev-dependencies]
+
+[[test]]
+name = "host"
+path = "tests/host.rs"
