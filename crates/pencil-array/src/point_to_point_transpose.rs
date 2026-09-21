@@ -1,13 +1,39 @@
-use std::sync::Arc;
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
+    time::Instant,
+};
+
+#[cfg(test)]
+thread_local! {
+    static EVENT_TRACE: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_trace_start() {
+    EVENT_TRACE.with(|trace| trace.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(crate) fn test_trace_event(event: &'static str) {
+    EVENT_TRACE.with(|trace| trace.borrow_mut().push(event));
+}
+
+#[cfg(test)]
+pub(crate) fn test_trace_finish() -> Vec<&'static str> {
+    EVENT_TRACE.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
+}
 
 use mpi::{datatype::Equivalence, request::scope, traits::*};
 
 use crate::{
     ExtraShape, ManyPencilArray, Pencil, PencilArrayView, PencilArrayViewMut,
     transpose::{
-        CommunicationMode, POINT_TO_POINT_RESERVED_TAG, PreparedExchange, TransposeError,
-        TransposePlanCore, TransposeWorkspace, TransposeWorkspaceRequirements, collective_valid,
-        finish_in_place, pack_source, prepare_in_place, unpack_destination,
+        CommunicationMode, OverlapError, POINT_TO_POINT_RESERVED_TAG, PreparedExchange,
+        TransposeError, TransposePlanCore, TransposeTiming, TransposeWorkspace,
+        TransposeWorkspaceRequirements, collective_valid, finish_in_place, pack_source,
+        prepare_in_place, unpack_destination,
     },
 };
 
@@ -148,6 +174,209 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
         Ok(())
     }
 
+    /// Executes `execute_views` and returns wall-clock timings for its local phases.
+    pub fn execute_views_with_timing<T>(
+        &self,
+        source: PencilArrayView<'_, T, N, M>,
+        mut destination: PencilArrayViewMut<'_, T, N, M>,
+        workspace: &mut TransposeWorkspace<T>,
+    ) -> Result<TransposeTiming, TransposeError>
+    where
+        T: Equivalence + Copy,
+    {
+        let total = Instant::now();
+        let communicator = self.core.source().topology().cartesian();
+        crate::transpose::agree_execute_descriptor::<_, T, N, M>(
+            &self.core,
+            communicator,
+            source.extra_shape(),
+            destination.extra_shape(),
+            CommunicationMode::PointToPoint.timed_views_operation(),
+        )?;
+        let local_preflight = self
+            .core
+            .prepare_execution(&source, &destination, workspace);
+        if !collective_valid(communicator, local_preflight.is_ok()) {
+            return Err(local_preflight
+                .err()
+                .unwrap_or(TransposeError::CollectivePreconditionFailed));
+        }
+        let prepared = local_preflight.expect("collective point-to-point preflight succeeded");
+        let extra_count = source.extra_shape().element_count();
+        let mut timing = TransposeTiming::default();
+        execute_point_to_point_exchange_timed(
+            &self.core,
+            communicator,
+            source.as_slice(),
+            &prepared,
+            workspace,
+            extra_count,
+            &mut timing,
+        )?;
+        let unpack = Instant::now();
+        unpack_destination(
+            self.core.peers(),
+            self.core.destination().as_ref(),
+            destination.as_mut_slice(),
+            &workspace.receive_buffer[..prepared.requirements.receive_len],
+            extra_count,
+        );
+        timing.unpack = unpack.elapsed();
+        timing.total = total.elapsed();
+        Ok(timing)
+    }
+
+    /// Runs a local callback after receive completion and unpacking, before send waits.
+    /// Callback errors are agreed across the Cartesian communicator. Panics drain
+    /// sends and are agreed before the origin resumes unwinding and peers return
+    /// `OverlapError::PeerPanicked`. The callback must not call MPI.
+    pub fn execute_views_with_callback<T, F, E>(
+        &self,
+        source: PencilArrayView<'_, T, N, M>,
+        mut destination: PencilArrayViewMut<'_, T, N, M>,
+        workspace: &mut TransposeWorkspace<T>,
+        callback: F,
+    ) -> Result<(), OverlapError<E>>
+    where
+        T: Equivalence + Copy,
+        F: FnOnce(&mut [T]) -> Result<(), E>,
+        E: std::fmt::Debug,
+    {
+        let communicator = self.core.source().topology().cartesian();
+        crate::transpose::agree_execute_descriptor::<_, T, N, M>(
+            &self.core,
+            communicator,
+            source.extra_shape(),
+            destination.extra_shape(),
+            CommunicationMode::PointToPoint.callback_operation(),
+        )
+        .map_err(OverlapError::Transpose)?;
+        let local = self
+            .core
+            .prepare_execution(&source, &destination, workspace);
+        if !collective_valid(communicator, local.is_ok()) {
+            return Err(local.err().map_or(
+                OverlapError::CollectivePreconditionFailed,
+                OverlapError::Transpose,
+            ));
+        }
+        let prepared = local.expect("collective point-to-point preflight succeeded");
+        let extra_count = source.extra_shape().element_count();
+        execute_point_to_point_exchange_callback(
+            &self.core,
+            communicator,
+            &prepared,
+            workspace,
+            extra_count,
+            |send_buffer| {
+                pack_source(
+                    self.core.peers(),
+                    self.core.source().as_ref(),
+                    source.as_slice(),
+                    send_buffer,
+                    prepared.requirements.send_len,
+                    extra_count,
+                );
+            },
+            |receive_buffer| {
+                unpack_destination(
+                    self.core.peers(),
+                    self.core.destination().as_ref(),
+                    destination.as_mut_slice(),
+                    receive_buffer,
+                    extra_count,
+                );
+                #[cfg(test)]
+                crate::point_to_point_transpose::test_trace_event("unpack");
+                callback(destination.as_mut_slice())
+            },
+        )
+    }
+
+    /// Executes the in-place transpose, then runs a callback on the destination.
+    ///
+    /// The array is poisoned before the destination is unpacked. It is committed
+    /// only when the callback succeeds on every rank; callback errors leave it
+    /// poisoned and peers report `PeerCallbackFailed`. A callback panic drains
+    /// sends before the origin resumes unwinding.
+    pub fn execute_in_place_with_callback<T, F, E>(
+        &self,
+        array: &mut ManyPencilArray<T, N, M>,
+        workspace: &mut TransposeWorkspace<T>,
+        callback: F,
+    ) -> Result<(), OverlapError<E>>
+    where
+        T: Equivalence + Copy,
+        F: FnOnce(&mut [T]) -> Result<(), E>,
+        E: std::fmt::Debug,
+    {
+        let communicator = self.core.source().topology().cartesian();
+        crate::transpose::agree_execute_descriptor::<_, T, N, M>(
+            &self.core,
+            communicator,
+            array.extra_shape(),
+            array.extra_shape(),
+            CommunicationMode::PointToPoint.callback_in_place_operation(),
+        )
+        .map_err(OverlapError::Transpose)?;
+        let local = prepare_in_place(&self.core, array, workspace);
+        if !collective_valid(communicator, local.is_ok()) {
+            return Err(local.err().map_or(
+                OverlapError::CollectivePreconditionFailed,
+                OverlapError::Transpose,
+            ));
+        }
+        let prepared = local.expect("collective in-place preflight succeeded");
+        let extra_count = array.extra_shape().element_count();
+        // The transport reserves and agrees before invoking pack. Delay poisoning
+        // until then so reservation failure is still an atomic preflight failure.
+        let guard_cell = std::cell::RefCell::new(None);
+        let result = execute_point_to_point_exchange_callback(
+            &self.core,
+            communicator,
+            &prepared.exchange,
+            workspace,
+            extra_count,
+            |send_buffer| {
+                let mut guard = array
+                    .begin_in_place_write()
+                    .expect("in-place callback preflight validated active state");
+                pack_source(
+                    self.core.peers(),
+                    self.core.source().as_ref(),
+                    guard.storage_mut(),
+                    send_buffer,
+                    prepared.exchange.requirements.send_len,
+                    extra_count,
+                );
+                *guard_cell.borrow_mut() = Some(guard);
+            },
+            |receive_buffer| {
+                let mut guard = guard_cell.borrow_mut();
+                let destination = &mut guard.as_mut().expect("packing created guard").storage_mut()
+                    [..prepared.exchange.requirements.receive_len];
+                unpack_destination(
+                    self.core.peers(),
+                    self.core.destination().as_ref(),
+                    destination,
+                    receive_buffer,
+                    extra_count,
+                );
+                #[cfg(test)]
+                crate::point_to_point_transpose::test_trace_event("unpack");
+                callback(destination)
+            },
+        );
+        if result.is_ok() {
+            guard_cell
+                .into_inner()
+                .expect("successful callback created guard")
+                .commit(prepared.destination_index)
+                .map_err(|error| OverlapError::Transpose(error.into()))?;
+        }
+        result
+    }
+
     /// Executes the transpose by replacing the active layout in shared storage.
     ///
     /// Every rank must call this method in the same order on the same source
@@ -210,6 +439,59 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
         );
         Ok(())
     }
+
+    /// Executes the in-place transpose and reports local phase timings.
+    pub fn execute_in_place_with_timing<T>(
+        &self,
+        array: &mut ManyPencilArray<T, N, M>,
+        workspace: &mut TransposeWorkspace<T>,
+    ) -> Result<TransposeTiming, TransposeError>
+    where
+        T: Equivalence + Copy,
+    {
+        let total = Instant::now();
+        let communicator = self.core.source().topology().cartesian();
+        crate::transpose::agree_execute_descriptor::<_, T, N, M>(
+            &self.core,
+            communicator,
+            array.extra_shape(),
+            array.extra_shape(),
+            CommunicationMode::PointToPoint.timed_in_place_operation(),
+        )?;
+        let local = prepare_in_place(&self.core, array, workspace);
+        if !collective_valid(communicator, local.is_ok()) {
+            return Err(local
+                .err()
+                .unwrap_or(TransposeError::CollectivePreconditionFailed));
+        }
+        let prepared = local.expect("collective in-place preflight succeeded");
+        let extra_count = array.extra_shape().element_count();
+        let mut timing = TransposeTiming::default();
+        {
+            let source = array.active_view().expect("validated active source");
+            execute_point_to_point_exchange_timed(
+                &self.core,
+                communicator,
+                source.as_slice(),
+                &prepared.exchange,
+                workspace,
+                extra_count,
+                &mut timing,
+            )?;
+        }
+        let unpack = Instant::now();
+        finish_in_place(
+            &self.core,
+            array,
+            prepared.destination_index,
+            &prepared.exchange,
+            &workspace.receive_buffer[..prepared.exchange.requirements.receive_len],
+            extra_count,
+        );
+        timing.unpack = unpack.elapsed();
+        timing.total = total.elapsed();
+        Ok(timing)
+    }
 }
 
 fn execute_point_to_point_exchange<C, T, const N: usize, const M: usize>(
@@ -219,6 +501,135 @@ fn execute_point_to_point_exchange<C, T, const N: usize, const M: usize>(
     prepared: &PreparedExchange,
     workspace: &mut TransposeWorkspace<T>,
     extra_count: usize,
+) -> Result<(), TransposeError>
+where
+    C: CommunicatorCollectives,
+    T: Equivalence + Copy,
+{
+    execute_point_to_point_exchange_timed(
+        plan,
+        communicator,
+        source_storage,
+        prepared,
+        workspace,
+        extra_count,
+        &mut TransposeTiming::default(),
+    )
+}
+
+fn execute_point_to_point_exchange_callback<C, T, P, F, E, const N: usize, const M: usize>(
+    plan: &TransposePlanCore<N, M>,
+    communicator: &C,
+    prepared: &PreparedExchange,
+    workspace: &mut TransposeWorkspace<T>,
+    extra_count: usize,
+    pack: P,
+    callback: F,
+) -> Result<(), OverlapError<E>>
+where
+    C: CommunicatorCollectives,
+    T: Equivalence + Copy,
+    P: FnOnce(&mut [T]),
+    F: FnOnce(&mut [T]) -> Result<(), E>,
+    E: std::fmt::Debug,
+{
+    let (receive_slots, send_slots) = plan.request_counts(prepared);
+    let send_buffer = &mut workspace.send_buffer[..prepared.requirements.send_len];
+    let receive_buffer = &mut workspace.receive_buffer[..prepared.requirements.receive_len];
+    let sub = plan
+        .source()
+        .topology()
+        .subcommunicator(plan.changed_topology_axis());
+
+    let callback_result = scope(|send_scope| {
+        let mut sends = Vec::new();
+        // Reserve the actual request vectors before packing or posting.
+        scope(|receive_scope| {
+            let mut receives = Vec::new();
+            let receive_reserved = receives.try_reserve(receive_slots).is_ok();
+            let send_reserved = sends.try_reserve(send_slots).is_ok();
+            if !collective_valid(communicator, receive_reserved && send_reserved) {
+                return Err(OverlapError::CollectivePreconditionFailed);
+            }
+            pack(send_buffer);
+            let mut receive_tail = &mut receive_buffer[..];
+            for peer in plan.peers() {
+                let count = peer
+                    .receive_spatial_len
+                    .checked_mul(extra_count)
+                    .expect("validated count");
+                if count == 0 {
+                    continue;
+                }
+                let (segment, rest) = receive_tail.split_at_mut(count);
+                receive_tail = rest;
+                receives.push(
+                    sub.process_at_rank(peer.peer_rank)
+                        .immediate_receive_into_with_tag(
+                            receive_scope,
+                            segment,
+                            POINT_TO_POINT_RESERVED_TAG,
+                        ),
+                );
+            }
+            let mut send_tail = &send_buffer[..];
+            for peer in plan.peers() {
+                let count = peer
+                    .send_spatial_len
+                    .checked_mul(extra_count)
+                    .expect("validated count");
+                if count == 0 {
+                    continue;
+                }
+                let (segment, rest) = send_tail.split_at(count);
+                send_tail = rest;
+                sends.push(sub.process_at_rank(peer.peer_rank).immediate_send_with_tag(
+                    send_scope,
+                    segment,
+                    POINT_TO_POINT_RESERVED_TAG,
+                ));
+            }
+            for request in receives {
+                request.wait_without_status();
+            }
+            Ok(())
+        })?;
+        let result = catch_unwind(AssertUnwindSafe(|| callback(receive_buffer)));
+        #[cfg(test)]
+        test_trace_event("send_wait");
+        for request in sends {
+            request.wait_without_status();
+        }
+        Ok::<_, OverlapError<E>>(result)
+    })?;
+    let local_status: i32 = match callback_result {
+        Ok(Ok(())) => 0,
+        Ok(Err(_)) => 1,
+        Err(_) => 2,
+    };
+    let mut status = 0i32;
+    communicator.all_reduce_into(
+        &local_status,
+        &mut status,
+        mpi::collective::SystemOperation::max(),
+    );
+    match callback_result {
+        Ok(Ok(())) if status == 0 => Ok(()),
+        Ok(Err(error)) if status == 1 => Err(OverlapError::Callback(error)),
+        Err(payload) => std::panic::resume_unwind(payload),
+        _ if status == 2 => Err(OverlapError::PeerPanicked),
+        _ => Err(OverlapError::PeerCallbackFailed),
+    }
+}
+
+fn execute_point_to_point_exchange_timed<C, T, const N: usize, const M: usize>(
+    plan: &TransposePlanCore<N, M>,
+    communicator: &C,
+    source_storage: &[T],
+    prepared: &PreparedExchange,
+    workspace: &mut TransposeWorkspace<T>,
+    extra_count: usize,
+    timing: &mut TransposeTiming,
 ) -> Result<(), TransposeError>
 where
     C: CommunicatorCollectives,
@@ -239,6 +650,7 @@ where
             };
         }
 
+        let started = Instant::now();
         pack_source(
             plan.peers(),
             plan.source().as_ref(),
@@ -247,6 +659,8 @@ where
             prepared.requirements.send_len,
             extra_count,
         );
+        timing.pack = started.elapsed();
+        let started = Instant::now();
 
         let subcommunicator = plan
             .source()
@@ -269,6 +683,7 @@ where
             receive_requests.push(request);
         }
 
+        timing.post_receive = started.elapsed();
         let send_buffer = &workspace.send_buffer[..prepared.requirements.send_len];
         let mut send_tail = send_buffer;
         for peer in plan.peers() {
@@ -287,12 +702,16 @@ where
             send_requests.push(request);
         }
 
+        let started = Instant::now();
         for request in receive_requests {
             request.wait_without_status();
         }
+        timing.receive_wait = started.elapsed();
+        let started = Instant::now();
         for request in send_requests {
             request.wait_without_status();
         }
+        timing.send_wait = started.elapsed();
         Ok(())
     })
 }

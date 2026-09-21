@@ -802,13 +802,13 @@ where
 }
 
 #[derive(Debug)]
-struct FileGuard {
-    raw: ffi::MPI_File,
+pub(crate) struct FileGuard {
+    pub(crate) raw: ffi::MPI_File,
 }
 
 #[derive(Debug)]
-struct DatatypeGuard {
-    raw: ffi::MPI_Datatype,
+pub(crate) struct DatatypeGuard {
+    pub(crate) raw: ffi::MPI_Datatype,
 }
 
 fn open_file_collective(
@@ -881,7 +881,7 @@ pub(crate) fn aggregate_cleanup_result<C: CommunicatorCollectives>(
     }
 }
 
-fn finish_comm(
+pub(crate) fn finish_comm(
     comm: &mpi::topology::CartesianCommunicator,
     mut duplicate: CommGuard,
 ) -> Option<IoError> {
@@ -897,7 +897,7 @@ fn finish_comm(
     None
 }
 
-fn finish_resources(
+pub(crate) fn finish_resources(
     comm: &mpi::topology::CartesianCommunicator,
     mut duplicate: CommGuard,
     mut file: FileGuard,
@@ -1545,14 +1545,14 @@ fn valid_type_pair(code: u64, width: u64) -> bool {
     )
 }
 
-struct MpiLayout {
-    global: Vec<c_int>,
-    local: Vec<c_int>,
-    starts: Vec<c_int>,
-    empty: bool,
+pub(crate) struct MpiLayout {
+    pub(crate) global: Vec<c_int>,
+    pub(crate) local: Vec<c_int>,
+    pub(crate) starts: Vec<c_int>,
+    pub(crate) empty: bool,
 }
 
-fn build_layout<const N: usize>(
+pub(crate) fn build_layout<const N: usize>(
     global: &[usize; N],
     extra: &[usize],
     local_shape: &[usize; N],

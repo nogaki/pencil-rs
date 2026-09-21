@@ -150,7 +150,7 @@ jobs:
       - name: Run distributed C2C/R2C/C2R FFT suite (Alltoallv/P2P) on six ranks
         run: timeout --foreground 120s mpiexec --oversubscribe -n 6 cargo test -p pencil-fft --features distributed --test distributed_c2c --locked -- --nocapture --test-threads=1
 
-      - name: Run R2R, mixed, and phase-failure tests with exact filters
+      - name: Run FFT, array-operation, named-I/O, and execution-contract matrices
         run: |
           set -euo pipefail
           log=$(mktemp)
@@ -179,12 +179,47 @@ jobs:
               cargo test -p pencil-fft --features distributed --lib --locked \
                 distributed::tests::in_place_transaction_poison_survives_error_and_panic -- \
                 --exact --nocapture --test-threads=1
+            for suite in array_ops timing_overlap; do
+              run_one timeout --kill-after=5s 240s \
+                mpiexec --oversubscribe -n "$n" \
+                cargo test -p pencil-array --test "$suite" --locked -- \
+                  --nocapture --test-threads=1
+            done
+            for suite in timing_overlap r2c_timing_overlap r2r_timing_overlap mixed_timing_overlap; do
+              run_one timeout --kill-after=5s 240s \
+                mpiexec --oversubscribe -n "$n" \
+                cargo test -p pencil-fft --features distributed --test "$suite" --locked -- \
+                  --nocapture --test-threads=1
+            done
+            for suite in named_mpi named_hdf5; do
+              run_one timeout --kill-after=5s 240s \
+                mpiexec --oversubscribe -n "$n" \
+                cargo test -p pencil-io --features parallel-hdf5 --test "$suite" --locked -- \
+                  --nocapture --test-threads=1
+            done
           done
           # MPI is initialized once in this separate one-rank test process.
           run_one timeout --kill-after=5s 120s \
             cargo test -p pencil-fft --features distributed --lib --locked \
               distributed::r2r::tests::in_place_error_panic_backend_and_short_workspace_poison_contracts -- \
               --ignored --exact --nocapture --test-threads=1
+
+      - name: Check legacy error-enum compatibility and per-axis Fourier signs
+        run: |
+          set -euo pipefail
+          cargo test -p pencil-fft --features distributed --test legacy_error_compat --locked
+          cargo build -p pencil-fft --features distributed --example mpi_directions --locked
+          log=$(mktemp)
+          trap 'rm -f "$log"' EXIT
+          for n in 1 4 6; do
+            if ! timeout --kill-after=5s 240s mpiexec --oversubscribe -n "$n" \
+                target/debug/examples/mpi_directions >"$log" 2>&1; then
+              cat "$log"
+              exit 1
+            fi
+            cat "$log"
+            grep -Fq "mpi_directions: PASSED ($n ranks)" "$log"
+          done
 
       - name: Run pencil-io MPI-IO tests
         run: |

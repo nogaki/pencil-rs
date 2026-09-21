@@ -3,8 +3,9 @@
 
 //! Collective native MPI-IO for [`pencil_array`] views.
 //!
-//! The MPI backend stores one versioned little-endian row-major payload per
-//! file.  Local buffers are packed in logical `[extra..., spatial...]` order;
+//! The original [`write_mpi`] / [`read_mpi`] APIs store one versioned
+//! little-endian row-major payload per file. Local buffers are packed in logical
+//! `[extra..., spatial...]` order;
 //! the packing is local and never gathers data at rank zero.  Readers may use
 //! a different process grid or memory-axis permutation.
 //!
@@ -22,9 +23,18 @@
 //! a native parallel HDF5 file.  It uses one versioned dataset at
 //! `/pencil_io_v1/data`; that is a self-describing HDF5 representation, not a
 //! binary-compatible Julia PencilIO custom format.
+//!
+//! [`write_mpi_named`], [`append_mpi_named`], and [`read_mpi_named`] add a separate
+//! append-only named-dataset container. Append creates a new name without
+//! overwriting earlier committed records. The optional HDF5 named APIs likewise
+//! use per-dataset metadata and commit markers. Names are UTF-8 keys rather than
+//! filesystem paths; duplicate names fail before mutation. [`NamedIoError`]
+//! preserves underlying native/commit errors. Neither format promises recovery
+//! from process loss or crash-atomic HDF5 journaling.
 
 mod format;
 mod mpi_io;
+mod named_mpi;
 
 mod ffi;
 
@@ -33,9 +43,10 @@ mod hdf5_io;
 
 pub use format::IoElement;
 pub use mpi_io::{read_mpi, write_mpi};
+pub use named_mpi::{append_mpi_named, read_mpi_named, write_mpi_named};
 
 #[cfg(feature = "parallel-hdf5")]
-pub use hdf5_io::{read_hdf5, write_hdf5};
+pub use hdf5_io::{append_hdf5_named, read_hdf5, read_hdf5_named, write_hdf5, write_hdf5_named};
 
 use thiserror::Error;
 
@@ -126,6 +137,26 @@ pub enum IoError {
     },
 }
 
+/// Errors specific to named datasets.
+#[derive(Debug, Clone, Error)]
+pub enum NamedIoError {
+    /// The name is empty, too long, or contains a NUL byte.
+    #[error("invalid dataset name")]
+    InvalidName,
+    /// The requested name is already present.
+    #[error("dataset name already exists")]
+    DuplicateName,
+    /// The requested name is not present.
+    #[error("dataset name was not found")]
+    NotFound,
+    /// The append container has an incomplete or malformed tail.
+    #[error("dataset container has an invalid tail")]
+    InvalidTail,
+    /// The underlying collective I/O operation failed.
+    #[error(transparent)]
+    Io(#[from] IoError),
+}
+
 /// The on-file format version used by both backends.
 const FORMAT_VERSION: u64 = 1;
 
@@ -153,6 +184,12 @@ const OP_READ_MPI: u64 = 2;
 const OP_WRITE_HDF5: u64 = 3;
 #[cfg(feature = "parallel-hdf5")]
 const OP_READ_HDF5: u64 = 4;
+#[cfg(feature = "parallel-hdf5")]
+const OP_WRITE_HDF5_NAMED: u64 = 5;
+#[cfg(feature = "parallel-hdf5")]
+const OP_APPEND_HDF5_NAMED: u64 = 6;
+#[cfg(feature = "parallel-hdf5")]
+const OP_READ_HDF5_NAMED: u64 = 7;
 
 #[cfg(test)]
 mod tests {
@@ -518,6 +555,63 @@ mod tests {
             assert_i32_values(&destination);
             world.barrier();
         }
+
+        #[cfg(feature = "parallel-hdf5")]
+        {
+            let named_path = directory.join("named-uncertain.h5");
+            root_status(&world, || reset(&named_path));
+            world.barrier();
+            let result = crate::hdf5_io::write_named(&named_path, "A/温度", source.view(), true);
+            assert!(
+                result.is_err(),
+                "named HDF5 uncertainty must propagate collectively"
+            );
+            let before = destination.as_slice().to_vec();
+            let handler_before = crate::ffi::test_comm_errhandler_token(
+                destination.pencil().topology().communicator().as_raw(),
+            )
+            .unwrap();
+            crate::hdf5_io::read_named(&named_path, "A/温度", destination.view_mut(), true)
+                .expect_err("named HDF5 post-cleanup failure");
+            assert_eq!(destination.as_slice(), before);
+            assert_eq!(
+                handler_before,
+                crate::ffi::test_comm_errhandler_token(
+                    destination.pencil().topology().communicator().as_raw(),
+                )
+                .unwrap()
+            );
+            super::read_hdf5_named(&named_path, "A/温度", destination.view_mut()).unwrap();
+            assert_i32_values(&destination);
+        }
+
+        let named_path = directory.join("named-uncertain.pio");
+        root_status(&world, || reset(&named_path));
+        world.barrier();
+        let named_error =
+            crate::named_mpi::write_with_commit_uncertainty(&named_path, "A/温度", source.view())
+                .expect_err("named post-marker uncertainty");
+        assert!(matches!(
+            named_error,
+            super::NamedIoError::Io(IoError::CommitUncertain { .. })
+        ));
+        let before = destination.as_slice().to_vec();
+        let handler_before = crate::ffi::test_comm_errhandler_token(
+            destination.pencil().topology().communicator().as_raw(),
+        )
+        .unwrap();
+        crate::named_mpi::read_with_cleanup_failure(&named_path, "A/温度", destination.view_mut())
+            .expect_err("named post-cleanup failure");
+        assert_eq!(destination.as_slice(), before);
+        assert_eq!(
+            handler_before,
+            crate::ffi::test_comm_errhandler_token(
+                destination.pencil().topology().communicator().as_raw(),
+            )
+            .unwrap()
+        );
+        super::read_mpi_named(&named_path, "A/温度", destination.view_mut()).unwrap();
+        assert_i32_values(&destination);
 
         cleanup_owned_temp_dir(&world, &directory);
     }

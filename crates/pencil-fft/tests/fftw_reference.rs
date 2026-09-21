@@ -13,8 +13,8 @@ use mpi::{
 use pencil_array::{ExtraShape, MpiTopology, Pencil, SpatialAxis};
 use pencil_fft::{
     AxisR2rKind, AxisSelection, AxisTransform, C2cPlan, Complex, DhtPlan, DistributedLayout,
-    FftReal, MixedC2cPlan, MixedR2cPlan, R2cPlan, R2rKind, R2rPlan, R2rScalar, R2rState,
-    TransposeMethod,
+    FftReal, FourierDirection, FourierDirections, MixedC2cPlan, MixedR2cPlan, R2cPlan, R2rKind,
+    R2rPlan, R2rScalar, R2rState, TransposeMethod,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +53,18 @@ enum R2rAxisKind {
 enum Precision {
     F32,
     F64,
+}
+
+struct DirectionFixture {
+    case: String,
+    shape: Vec<usize>,
+    transforms: Vec<R2rAxisKind>,
+    directions: Vec<FourierDirection>,
+    input: Vec<Complex<f64>>,
+    inverse_input: Vec<Complex<f64>>,
+    forward: Vec<Complex<f64>>,
+    inverse: Vec<Complex<f64>>,
+    backward: Vec<Complex<f64>>,
 }
 
 struct Fixture {
@@ -270,6 +282,150 @@ fn section_kind(element_kind: ElementKind) -> &'static str {
         ElementKind::Real => "real",
         ElementKind::Complex => "complex",
     }
+}
+
+fn parse_direction_fixture(text: &str) -> Result<DirectionFixture, String> {
+    let lines: Vec<_> = text.lines().map(str::trim).collect();
+    let mut cursor = 0;
+    if next(&lines, &mut cursor, "version")? != "PENCIL_FFTW_DIRECTION_REFERENCE 1" {
+        return Err("invalid direction reference version header".into());
+    }
+    let runtime: Vec<_> = next(&lines, &mut cursor, "runtime")?
+        .split_whitespace()
+        .collect();
+    if runtime.len() != 5
+        || runtime[0] != "runtime"
+        || runtime_value(runtime[1], "julia")? != "1.12.6"
+        || runtime_value(runtime[2], "fftw_jl")? != "1.10.0"
+        || runtime_value(runtime[3], "native")?.is_empty()
+        || runtime_value(runtime[4], "provider")? != "fftw"
+    {
+        return Err("reference runtime metadata is not the pinned FFTW setup".into());
+    }
+    let case = field(next(&lines, &mut cursor, "case")?, "case")?.to_owned();
+    let shape = shape(next(&lines, &mut cursor, "shape")?, "shape")?;
+    if !(2..=4).contains(&shape.len()) {
+        return Err("shape: expected 2 to 4 dimensions".into());
+    }
+    let transform_words: Vec<_> = next(&lines, &mut cursor, "transforms")?
+        .split_whitespace()
+        .collect();
+    if transform_words.first().copied() != Some("transforms")
+        || transform_words.len() != shape.len() + 1
+    {
+        return Err("transforms: expected one value per axis".into());
+    }
+    let transforms = transform_words[1..]
+        .iter()
+        .map(|word| parse_r2r_axis_kind(word))
+        .collect::<Result<Vec<_>, _>>()?;
+    if transforms.iter().any(|kind| {
+        !matches!(
+            kind,
+            R2rAxisKind::Fft
+                | R2rAxisKind::Rfft
+                | R2rAxisKind::None
+                | R2rAxisKind::DctI
+                | R2rAxisKind::DctII
+                | R2rAxisKind::DctIII
+                | R2rAxisKind::DctIV
+                | R2rAxisKind::DstI
+                | R2rAxisKind::DstII
+                | R2rAxisKind::DstIII
+                | R2rAxisKind::DstIV
+                | R2rAxisKind::Dht
+        )
+    }) {
+        return Err("transforms: invalid kind".into());
+    }
+    let direction_words: Vec<_> = next(&lines, &mut cursor, "directions")?
+        .split_whitespace()
+        .collect();
+    if direction_words.first().copied() != Some("directions")
+        || direction_words.len() != shape.len() + 1
+    {
+        return Err("directions: expected one value per axis".into());
+    }
+    let directions = direction_words[1..]
+        .iter()
+        .map(|word| match *word {
+            "forward" => Ok(FourierDirection::Forward),
+            "backward" => Ok(FourierDirection::Backward),
+            other => Err(format!("directions: invalid value {other:?}")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if transforms
+        .iter()
+        .zip(&directions)
+        .any(|(kind, sign)| *kind != R2rAxisKind::Fft && *sign != FourierDirection::Forward)
+    {
+        return Err("non-FFT backward sign".into());
+    }
+    let mut output_shape = shape.clone();
+    let boundaries: Vec<_> = transforms
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| **kind == R2rAxisKind::Rfft)
+        .map(|(axis, _)| axis)
+        .collect();
+    if boundaries.len() > 1 {
+        return Err("multiple RFFT axes".into());
+    }
+    if let Some(&axis) = boundaries.first() {
+        if transforms[..axis]
+            .iter()
+            .any(|k| !matches!(k, R2rAxisKind::Fft | R2rAxisKind::None))
+            || transforms[axis + 1..].contains(&R2rAxisKind::Fft)
+        {
+            return Err("invalid RFFT graph".into());
+        }
+        output_shape[axis] = shape[axis] / 2 + 1;
+    }
+    let output_count = product(&output_shape, "output shape")?;
+    let count = product(&shape, "shape")?;
+    let input = section(&lines, &mut cursor, "input", "complex", count)?;
+    let inverse_input = section(
+        &lines,
+        &mut cursor,
+        "inverse_input",
+        "complex",
+        output_count,
+    )?;
+    let forward = section(
+        &lines,
+        &mut cursor,
+        "forward_expected",
+        "complex",
+        output_count,
+    )?;
+    let inverse = section(&lines, &mut cursor, "inverse_expected", "complex", count)?;
+    let backward = section(&lines, &mut cursor, "backward_expected", "complex", count)?;
+    if !boundaries.is_empty()
+        && input
+            .iter()
+            .chain(&inverse)
+            .chain(&backward)
+            .any(|value| value.im != 0.0)
+    {
+        return Err("RFFT real sections must have zero imaginary parts".into());
+    }
+    if cursor != lines.len() {
+        return Err(format!(
+            "trailing direction reference tokens starting at {:?}",
+            lines[cursor]
+        ));
+    }
+    Ok(DirectionFixture {
+        case,
+        shape,
+        transforms,
+        directions,
+        input,
+        inverse_input,
+        forward,
+        inverse,
+        backward,
+    })
 }
 
 fn parse_fixture(text: &str) -> Result<Fixture, String> {
@@ -749,6 +905,70 @@ fn r2r_cases() -> Vec<(Vec<usize>, Vec<usize>, Vec<R2rAxisKind>)> {
             ],
         ),
     ]
+}
+
+fn direction_fixtures(directory: &Path) -> Vec<DirectionFixture> {
+    assert!(
+        directory.is_dir(),
+        "direction reference directory does not exist: {directory:?}"
+    );
+    let mut paths: Vec<_> = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    paths.sort();
+    assert_eq!(paths.len(), 5, "unexpected direction reference count");
+    let expected = [
+        "c2c_2d_3x4_forward-backward",
+        "c2c_3d_3x2x4_backward-forward-forward",
+        "mixed_c2c_3d_3x2x4_backward-forward-forward",
+        "mixed_r2c_even",
+        "mixed_r2c_odd",
+    ];
+    for (path, name) in paths.iter().zip(expected) {
+        assert_eq!(
+            path.file_stem().and_then(|s| s.to_str()),
+            Some(name),
+            "direction fixture matrix"
+        );
+    }
+
+    paths
+        .into_iter()
+        .map(|path| {
+            assert_eq!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("txt")
+            );
+            let fixture = parse_direction_fixture(&fs::read_to_string(&path).unwrap())
+                .unwrap_or_else(|error| panic!("invalid direction fixture {path:?}: {error}"));
+            assert_eq!(
+                path.file_stem().and_then(|s| s.to_str()),
+                Some(fixture.case.as_str())
+            );
+            assert_eq!(
+                fixture.input.len(),
+                product(&fixture.shape, "direction shape").unwrap()
+            );
+            assert_eq!(fixture.directions.len(), fixture.shape.len());
+            match fixture.directions.len() {
+                2 => {
+                    let _: FourierDirections<2> =
+                        FourierDirections::new(fixture.directions.clone().try_into().unwrap());
+                }
+                3 => {
+                    let _: FourierDirections<3> =
+                        FourierDirections::new(fixture.directions.clone().try_into().unwrap());
+                }
+                4 => {
+                    let _: FourierDirections<4> =
+                        FourierDirections::new(fixture.directions.clone().try_into().unwrap());
+                }
+                _ => unreachable!(),
+            }
+            fixture
+        })
+        .collect()
 }
 
 fn fixtures(directory: &Path) -> Vec<Fixture> {
@@ -2920,6 +3140,392 @@ fn parser_and_offset_self_check() {
     assert!(compare(1.0, 1.0, 1e-6, 1e-6, "equal").is_ok());
     assert!(compare(2.0, 1.0, 1e-6, 1e-6, "mismatch").is_err());
     assert!(compare(f64::NAN, 1.0, 1e-6, 1e-6, "nonfinite").is_err());
+}
+
+fn run_direction_c2c<R: Real, const N: usize, const M: usize>(
+    topology: Arc<MpiTopology<M>>,
+    fixture: &DirectionFixture,
+    method: TransposeMethod,
+    permute_dims: bool,
+) where
+    Complex<R>: Equivalence,
+{
+    let shape: [usize; N] = fixture.shape.clone().try_into().unwrap();
+    let directions = FourierDirections::new(fixture.directions.clone().try_into().unwrap());
+    let plan = C2cPlan::<R, N, M>::from_shape_with_layout(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        DistributedLayout {
+            transpose_method: method,
+            permute_dims,
+        },
+    )
+    .unwrap()
+    .with_fft_directions(directions)
+    .unwrap();
+    let layout = Layout {
+        input: shape,
+        output: shape,
+        extra: &[],
+        permute_dims,
+    };
+    let mut source = plan.allocate_input().unwrap();
+    let input_snap = snapshot(
+        plan.input_pencil(),
+        &ExtraShape::scalar(),
+        &layout,
+        false,
+        source.as_slice().len(),
+        "direction input",
+    );
+    fill_complex(source.as_mut_slice(), &input_snap, &fixture.input);
+    let mut output = plan.allocate_output().unwrap();
+    let output_snap = snapshot(
+        plan.output_pencil(),
+        &ExtraShape::scalar(),
+        &layout,
+        true,
+        output.as_slice().len(),
+        "direction output",
+    );
+    let mut workspace = plan.allocate_out_of_place_workspace().unwrap();
+    plan.forward(&source, &mut output, &mut workspace).unwrap();
+    for (v, &offset) in output.as_slice().iter().zip(&output_snap.offsets) {
+        let e = fixture.forward[offset];
+        compare(R::to_f64(v.re), e.re, 3e-5, 3e-5, "direction forward real").unwrap();
+        compare(R::to_f64(v.im), e.im, 3e-5, 3e-5, "direction forward imag").unwrap();
+    }
+    let mut spectrum = plan.allocate_output().unwrap();
+    fill_complex(
+        spectrum.as_mut_slice(),
+        &output_snap,
+        &fixture.inverse_input,
+    );
+    let mut inverse = plan.allocate_input().unwrap();
+    plan.inverse(&spectrum, &mut inverse, &mut workspace)
+        .unwrap();
+    let mut backward = plan.allocate_input().unwrap();
+    plan.backward(&spectrum, &mut backward, &mut workspace)
+        .unwrap();
+    for ((a, b), &offset) in inverse
+        .as_slice()
+        .iter()
+        .zip(backward.as_slice())
+        .zip(&input_snap.offsets)
+    {
+        let e = fixture.inverse[offset];
+        compare(R::to_f64(a.re), e.re, 3e-5, 3e-5, "direction inverse real").unwrap();
+        compare(R::to_f64(a.im), e.im, 3e-5, 3e-5, "direction inverse imag").unwrap();
+        let e = fixture.backward[offset];
+        compare(R::to_f64(b.re), e.re, 3e-5, 3e-5, "direction backward real").unwrap();
+        compare(R::to_f64(b.im), e.im, 3e-5, 3e-5, "direction backward imag").unwrap();
+    }
+}
+
+fn run_direction_mixed<R: Real, const N: usize, const M: usize>(
+    topology: Arc<MpiTopology<M>>,
+    fixture: &DirectionFixture,
+    method: TransposeMethod,
+    permute_dims: bool,
+) where
+    Complex<R>: Equivalence,
+{
+    let shape: [usize; N] = fixture.shape.clone().try_into().unwrap();
+    let directions = FourierDirections::new(fixture.directions.clone().try_into().unwrap());
+    let transforms: [AxisTransform; N] = fixture
+        .transforms
+        .iter()
+        .map(|kind| match kind {
+            R2rAxisKind::Fft => AxisTransform::Fft,
+            R2rAxisKind::DctII => AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DctII)),
+            R2rAxisKind::Dht => AxisTransform::R2r(AxisR2rKind::Dht),
+            _ => panic!("unsupported direction transform"),
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let plan = MixedC2cPlan::<R, N, M>::from_shape_with_layout(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        transforms,
+        DistributedLayout {
+            transpose_method: method,
+            permute_dims,
+        },
+    )
+    .unwrap()
+    .with_fft_directions(directions)
+    .unwrap();
+    let layout = Layout {
+        input: shape,
+        output: shape,
+        extra: &[],
+        permute_dims,
+    };
+    let mut source = plan.allocate_input().unwrap();
+    let input_snap = snapshot(
+        plan.input_pencil(),
+        &ExtraShape::scalar(),
+        &layout,
+        false,
+        source.as_slice().len(),
+        "direction input",
+    );
+    fill_complex(source.as_mut_slice(), &input_snap, &fixture.input);
+    let mut output = plan.allocate_output().unwrap();
+    let output_snap = snapshot(
+        plan.output_pencil(),
+        &ExtraShape::scalar(),
+        &layout,
+        true,
+        output.as_slice().len(),
+        "direction output",
+    );
+    let mut workspace = plan.allocate_out_of_place_workspace().unwrap();
+    plan.forward(&source, &mut output, &mut workspace).unwrap();
+    for (v, &offset) in output.as_slice().iter().zip(&output_snap.offsets) {
+        let e = fixture.forward[offset];
+        compare(R::to_f64(v.re), e.re, 3e-5, 3e-5, "direction forward real").unwrap();
+        compare(R::to_f64(v.im), e.im, 3e-5, 3e-5, "direction forward imag").unwrap();
+    }
+    let mut spectrum = plan.allocate_output().unwrap();
+    fill_complex(
+        spectrum.as_mut_slice(),
+        &output_snap,
+        &fixture.inverse_input,
+    );
+    let mut inverse = plan.allocate_input().unwrap();
+    plan.inverse(&spectrum, &mut inverse, &mut workspace)
+        .unwrap();
+    let mut backward = plan.allocate_input().unwrap();
+    plan.backward(&spectrum, &mut backward, &mut workspace)
+        .unwrap();
+    for ((a, b), &offset) in inverse
+        .as_slice()
+        .iter()
+        .zip(backward.as_slice())
+        .zip(&input_snap.offsets)
+    {
+        let e = fixture.inverse[offset];
+        compare(R::to_f64(a.re), e.re, 3e-5, 3e-5, "direction inverse real").unwrap();
+        compare(R::to_f64(a.im), e.im, 3e-5, 3e-5, "direction inverse imag").unwrap();
+        let e = fixture.backward[offset];
+        compare(R::to_f64(b.re), e.re, 3e-5, 3e-5, "direction backward real").unwrap();
+        compare(R::to_f64(b.im), e.im, 3e-5, 3e-5, "direction backward imag").unwrap();
+    }
+}
+
+fn run_direction_real<R: Real, const N: usize, const M: usize>(
+    topology: Arc<MpiTopology<M>>,
+    fixture: &DirectionFixture,
+    method: TransposeMethod,
+    permute_dims: bool,
+) where
+    Complex<R>: Equivalence,
+{
+    let shape: [usize; N] = fixture.shape.clone().try_into().unwrap();
+    let directions = FourierDirections::new(fixture.directions.clone().try_into().unwrap());
+    let transforms: [AxisTransform; N] = fixture
+        .transforms
+        .iter()
+        .map(|kind| match kind {
+            R2rAxisKind::Rfft => AxisTransform::Rfft,
+            R2rAxisKind::None => AxisTransform::None,
+            R2rAxisKind::Fft => AxisTransform::Fft,
+            R2rAxisKind::DctII => AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DctII)),
+            R2rAxisKind::Dht => AxisTransform::R2r(AxisR2rKind::Dht),
+            _ => panic!("unsupported direction transform"),
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let plan = MixedR2cPlan::<R, N, M>::from_shape_with_layout(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        transforms,
+        DistributedLayout {
+            transpose_method: method,
+            permute_dims,
+        },
+    )
+    .unwrap()
+    .with_fft_directions(directions)
+    .unwrap();
+    let layout = Layout {
+        input: shape,
+        output: *plan.output_pencil().global_shape(),
+        extra: &[],
+        permute_dims,
+    };
+    let mut source = plan.allocate_input().unwrap();
+    let input_snap = snapshot(
+        plan.input_pencil(),
+        &ExtraShape::scalar(),
+        &layout,
+        false,
+        source.as_slice().len(),
+        "direction input",
+    );
+    fill_real(source.as_mut_slice(), &input_snap, &fixture.input);
+    let mut output = plan.allocate_output().unwrap();
+    let output_snap = snapshot(
+        plan.output_pencil(),
+        &ExtraShape::scalar(),
+        &layout,
+        true,
+        output.as_slice().len(),
+        "direction output",
+    );
+    let mut workspace = plan.allocate_workspace().unwrap();
+    plan.forward(&source, &mut output, &mut workspace).unwrap();
+    for (v, &offset) in output.as_slice().iter().zip(&output_snap.offsets) {
+        let e = fixture.forward[offset];
+        compare(R::to_f64(v.re), e.re, 3e-5, 3e-5, "direction forward real").unwrap();
+        compare(R::to_f64(v.im), e.im, 3e-5, 3e-5, "direction forward imag").unwrap();
+    }
+    let mut spectrum = plan.allocate_output().unwrap();
+    fill_complex(
+        spectrum.as_mut_slice(),
+        &output_snap,
+        &fixture.inverse_input,
+    );
+    let mut inverse = plan.allocate_input().unwrap();
+    plan.inverse(&spectrum, &mut inverse, &mut workspace)
+        .unwrap();
+    let mut backward = plan.allocate_input().unwrap();
+    plan.backward(&spectrum, &mut backward, &mut workspace)
+        .unwrap();
+    for ((a, b), &offset) in inverse
+        .as_slice()
+        .iter()
+        .zip(backward.as_slice())
+        .zip(&input_snap.offsets)
+    {
+        let e = fixture.inverse[offset];
+        compare(R::to_f64(*a), e.re, 3e-5, 3e-5, "direction inverse real").unwrap();
+        compare(0.0, e.im, 3e-5, 3e-5, "direction inverse imag").unwrap();
+        let e = fixture.backward[offset];
+        compare(R::to_f64(*b), e.re, 3e-5, 3e-5, "direction backward real").unwrap();
+        compare(0.0, e.im, 3e-5, 3e-5, "direction backward imag").unwrap();
+    }
+}
+
+#[test]
+#[ignore = "opt-in local Julia/FFTW cross-validation; run tools/fftw-reference/check.sh"]
+fn fftw_direction_reference_parser() {
+    println!("PENCIL_FFTW_DIRECTION_REFERENCE_STARTED");
+    let directory = env::var_os("PENCIL_FFTW_DIRECTION_FIXTURES")
+        .map(PathBuf::from)
+        .expect("PENCIL_FFTW_DIRECTION_FIXTURES is required for the opted-in direction test");
+    let fixtures = direction_fixtures(&directory);
+    let universe = mpi::initialize().expect("MPI initialization failed");
+    let world = universe.world();
+    let size = usize::try_from(world.size()).unwrap();
+    let topology = MpiTopology::<1>::new(&world, [size]).unwrap();
+    for fixture in &fixtures {
+        println!(
+            "PENCIL_FFTW_DIRECTION_REFERENCE_STARTED case={}",
+            fixture.case
+        );
+        assert!(!fixture.case.is_empty());
+        for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
+            for permute_dims in [false, true] {
+                match fixture.shape.len() {
+                    2 => {
+                        if fixture.transforms.contains(&R2rAxisKind::Rfft) {
+                            run_direction_real::<f32, 2, 1>(
+                                Arc::clone(&topology),
+                                fixture,
+                                method,
+                                permute_dims,
+                            );
+                            run_direction_real::<f64, 2, 1>(
+                                Arc::clone(&topology),
+                                fixture,
+                                method,
+                                permute_dims,
+                            );
+                        } else if fixture.transforms.iter().all(|k| *k == R2rAxisKind::Fft) {
+                            run_direction_c2c::<f32, 2, 1>(
+                                Arc::clone(&topology),
+                                fixture,
+                                method,
+                                permute_dims,
+                            );
+                            run_direction_c2c::<f64, 2, 1>(
+                                Arc::clone(&topology),
+                                fixture,
+                                method,
+                                permute_dims,
+                            );
+                        } else {
+                            run_direction_mixed::<f32, 2, 1>(
+                                Arc::clone(&topology),
+                                fixture,
+                                method,
+                                permute_dims,
+                            );
+                            run_direction_mixed::<f64, 2, 1>(
+                                Arc::clone(&topology),
+                                fixture,
+                                method,
+                                permute_dims,
+                            );
+                        }
+                    }
+                    3 => {
+                        if fixture.transforms.contains(&R2rAxisKind::Rfft) {
+                            run_direction_real::<f32, 3, 1>(
+                                Arc::clone(&topology),
+                                fixture,
+                                method,
+                                permute_dims,
+                            );
+                            run_direction_real::<f64, 3, 1>(
+                                Arc::clone(&topology),
+                                fixture,
+                                method,
+                                permute_dims,
+                            );
+                        } else if fixture.transforms.iter().all(|k| *k == R2rAxisKind::Fft) {
+                            run_direction_c2c::<f32, 3, 1>(
+                                Arc::clone(&topology),
+                                fixture,
+                                method,
+                                permute_dims,
+                            );
+                            run_direction_c2c::<f64, 3, 1>(
+                                Arc::clone(&topology),
+                                fixture,
+                                method,
+                                permute_dims,
+                            );
+                        } else {
+                            run_direction_mixed::<f32, 3, 1>(
+                                Arc::clone(&topology),
+                                fixture,
+                                method,
+                                permute_dims,
+                            );
+                            run_direction_mixed::<f64, 3, 1>(
+                                Arc::clone(&topology),
+                                fixture,
+                                method,
+                                permute_dims,
+                            );
+                        }
+                    }
+                    _ => panic!("unsupported direction rank"),
+                }
+            }
+        }
+    }
+    if world.rank() == 0 {
+        println!("PENCIL_FFTW_DIRECTION_REFERENCE_RAN fixtures=5 configurations=40");
+    }
 }
 
 #[test]

@@ -48,20 +48,27 @@ function _dht_axis(a, dim)
     return out
 end
 
-function _axis_forward(a, dim, kind)
+function _axis_forward(a, dim, kind; positive=false)
     kind == :none && return a
-    kind == :fft && return FFTW.plan_fft(a, [dim]; flags=FFTW.ESTIMATE, num_threads=1) * a
+    if kind == :fft
+        plan = positive ?
+            FFTW.plan_bfft(a, [dim]; flags=FFTW.ESTIMATE, num_threads=1) :
+            FFTW.plan_fft(a, [dim]; flags=FFTW.ESTIMATE, num_threads=1)
+        return plan * a
+    end
     kind == :dht && return _dht_axis(a, dim)
     code = _R2R_CODES[kind]
     return FFTW.plan_r2r(a, [code], [dim]; flags=FFTW.ESTIMATE, num_threads=1) * a
 end
 
-function _axis_reverse(a, dim, kind, backward)
+function _axis_reverse(a, dim, kind, backward; positive=false)
     kind == :none && return a
     if kind == :fft
-        plan = backward ? FFTW.plan_bfft(a, [dim]; flags=FFTW.ESTIMATE, num_threads=1) :
-            FFTW.plan_ifft(a, [dim]; flags=FFTW.ESTIMATE, num_threads=1)
-        return plan * a
+        plan = positive ? FFTW.plan_fft(a, [dim]; flags=FFTW.ESTIMATE, num_threads=1) :
+            (backward ? FFTW.plan_bfft(a, [dim]; flags=FFTW.ESTIMATE, num_threads=1) :
+                FFTW.plan_ifft(a, [dim]; flags=FFTW.ESTIMATE, num_threads=1))
+        raw = plan * a
+        return positive && !backward ? raw ./ size(a, dim) : raw
     end
     if kind == :dht
         raw = _dht_axis(a, dim)
@@ -73,22 +80,35 @@ function _axis_reverse(a, dim, kind, backward)
     return backward ? raw : raw ./ _r2r_factor(kind, size(a, dim))
 end
 
+function _check_directions(transforms, directions)
+    length(directions) == length(transforms) || error("directions rank mismatch")
+    for (kind, sign) in zip(transforms, directions)
+        sign in (:forward, :backward) || error("invalid direction")
+        kind != :fft && sign != :forward && error("non-FFT backward sign")
+    end
+end
+
 """Reference C2C mixed transform for a Julia array in reversed Rust order."""
-function mixed_c2c_reference(input, transforms; backward=false, inverse=false)
+function mixed_c2c_reference(input, transforms; backward=false, inverse=false, directions=nothing)
     any(==( :rfft), transforms) && error("C2C cannot contain :rfft")
+    directions === nothing && (directions = fill(:forward, length(transforms)))
+    _check_directions(transforms, directions)
     output = copy(input)
     n = length(transforms)
     for rust_axis in n:-1:1
         dim = n - rust_axis + 1
+        positive = directions[rust_axis] == :backward
+        directions[rust_axis] in (:forward, :backward) || error("invalid direction")
         output = backward || inverse ?
-            _axis_reverse(output, dim, transforms[rust_axis], backward) :
-            _axis_forward(output, dim, transforms[rust_axis])
+            _axis_reverse(output, dim, transforms[rust_axis], backward; positive=positive) :
+            _axis_forward(output, dim, transforms[rust_axis]; positive=positive)
     end
     return output
 end
 
 """Reference R2C/C2R mixed transform with one :rfft boundary."""
-function mixed_r2c_reference(input, transforms; backward=false, inverse=false, real_n=nothing)
+function mixed_r2c_reference(input, transforms; backward=false, inverse=false, real_n=nothing, directions=fill(:forward, length(transforms)))
+    _check_directions(transforms, directions)
     boundaries = findall(==( :rfft), transforms)
     length(boundaries) == 1 || error("R2C requires exactly one :rfft")
     boundary = only(boundaries)
@@ -101,7 +121,7 @@ function mixed_r2c_reference(input, transforms; backward=false, inverse=false, r
             if rust_axis == boundary
                 output = FFTW.plan_rfft(output, [dim]; flags=FFTW.ESTIMATE, num_threads=1) * output
             else
-                output = _axis_forward(output, dim, transforms[rust_axis])
+                output = _axis_forward(output, dim, transforms[rust_axis]; positive=directions[rust_axis] == :backward)
             end
         end
         return output
@@ -115,7 +135,7 @@ function mixed_r2c_reference(input, transforms; backward=false, inverse=false, r
                 FFTW.brfft(copy(output), n_real, [dim]) :
                 FFTW.plan_irfft(output, n_real, [dim]; flags=FFTW.ESTIMATE, num_threads=1) * output
         else
-            output = _axis_reverse(output, dim, kind, backward)
+            output = _axis_reverse(output, dim, kind, backward; positive=directions[rust_axis] == :backward)
         end
     end
     return output

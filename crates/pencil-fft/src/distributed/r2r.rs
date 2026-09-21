@@ -2,36 +2,70 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::{mem::size_of, sync::Arc};
+// Keep overlap calls in their own operation-word namespace. These values are
+// part of the five-word execution header and must not collide with any other
+// distributed API.
+const OPERATION_R2R_FORWARD_OVERLAP: u64 = 61;
+const OPERATION_R2R_INVERSE_OVERLAP: u64 = 62;
+const OPERATION_R2R_BACKWARD_OVERLAP: u64 = 63;
+const OPERATION_DHT_FORWARD_OVERLAP: u64 = 64;
+const OPERATION_DHT_INVERSE_OVERLAP: u64 = 65;
+const OPERATION_DHT_BACKWARD_OVERLAP: u64 = 66;
+const OPERATION_R2R_FORWARD_TIMED: u64 = 103;
+const OPERATION_R2R_INVERSE_TIMED: u64 = 104;
+const OPERATION_R2R_BACKWARD_TIMED: u64 = 105;
+const OPERATION_R2R_FORWARD_IN_PLACE_TIMED: u64 = 106;
+const OPERATION_R2R_INVERSE_IN_PLACE_TIMED: u64 = 107;
+const OPERATION_R2R_BACKWARD_IN_PLACE_TIMED: u64 = 108;
+const OPERATION_DHT_FORWARD_TIMED: u64 = 109;
+const OPERATION_DHT_INVERSE_TIMED: u64 = 110;
+const OPERATION_DHT_BACKWARD_TIMED: u64 = 111;
+const OPERATION_DHT_FORWARD_IN_PLACE_TIMED: u64 = 112;
+const OPERATION_DHT_INVERSE_IN_PLACE_TIMED: u64 = 113;
+const OPERATION_DHT_BACKWARD_IN_PLACE_TIMED: u64 = 114;
+
+use std::{mem::size_of, sync::Arc, time::Instant};
+
+impl From<FftError> for FftOverlapError<R2rError> {
+    fn from(error: FftError) -> Self {
+        Self::Operation(error.into())
+    }
+}
 
 use super::{
-    AxisSelection, C2cStageTransition, Direction, DistributedLayout, FftError, INVALID_WORD,
-    OPERATION_R2R_BACKWARD, OPERATION_R2R_BACKWARD_IN_PLACE, OPERATION_R2R_FORWARD,
+    AxisSelection, C2cStageTransition, Direction, DistributedLayout, FftError, FftOverlapError,
+    INVALID_WORD, OPERATION_R2R_BACKWARD, OPERATION_R2R_BACKWARD_IN_PLACE, OPERATION_R2R_FORWARD,
     OPERATION_R2R_FORWARD_IN_PLACE, OPERATION_R2R_INVERSE, OPERATION_R2R_INVERSE_IN_PLACE,
-    R2rError, RouteCandidate, StagePreparation, TransformStage, TransposeMethod,
+    R2rError, RouteCandidate, StagePreparation, TransformStage, TransformTiming, TransposeMethod,
     agree_execution_descriptor_ref, agree_header, agree_result, build_route, build_transitions,
-    collective_descriptor, collective_valid, descriptor_len, execute_transition, initialized_vec,
-    map_array_allocation, validate_input, validate_workspace_lengths_values,
+    collective_descriptor, collective_valid, descriptor_len, execute_transition,
+    execute_transition_timed, initialized_vec, map_array_allocation, validate_input,
+    validate_workspace_lengths_values,
 };
 use crate::{
     Complex, LocalDhtPlan, LocalR2rError, LocalR2rPlan, R2rKind, R2rScalar, r2r::AxisR2rKind,
 };
 use mpi::datatype::Equivalence;
 use pencil_array::{
-    ExtraShape, ManyPencilArray, MpiTopology, OverwriteError, Pencil, PencilArray, PencilArrayView,
-    PencilArrayViewMut, TransposeWorkspace,
+    ExtraShape, ManyPencilArray, MpiTopology, OverlapError, OverwriteError, Pencil, PencilArray,
+    PencilArrayView, PencilArrayViewMut, TransposeWorkspace,
 };
 
 /// An immutable, checked distributed FFTW-compatible DCT/DST plan.
 ///
 /// `None` entries are identity stages. Discrete Hartley and mixed-axis
-/// construction is separate from this legacy API.
+/// construction is separate from this legacy API. Out-of-place overlap is
+/// available with [`Self::forward_with_overlap`], [`Self::inverse_with_overlap`],
+/// and [`Self::backward_with_overlap`].
 #[derive(Debug)]
 pub struct R2rPlan<T: R2rScalar, const N: usize, const M: usize> {
     core: Arc<R2rCore<T, N, M>>,
 }
 
 /// A distributed separable discrete Hartley transform plan.
+///
+/// Out-of-place overlap is available through the `*_with_overlap` methods and
+/// requires point-to-point transitions.
 #[derive(Debug)]
 pub struct DhtPlan<T: R2rScalar, const N: usize, const M: usize> {
     core: Arc<R2rCore<T, N, M>>,
@@ -439,7 +473,7 @@ where
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
     ) -> Result<(), R2rError> {
-        self.execute(Direction::Forward, source, destination, workspace)
+        self.execute(Direction::Forward, source, destination, workspace, None)
     }
 
     /// Computes the normalized self-paired inverse transforms.
@@ -449,7 +483,7 @@ where
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
     ) -> Result<(), R2rError> {
-        self.execute(Direction::Inverse, source, destination, workspace)
+        self.execute(Direction::Inverse, source, destination, workspace, None)
     }
 
     /// Computes the raw self-paired backward transforms.
@@ -459,7 +493,118 @@ where
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
     ) -> Result<(), R2rError> {
-        self.execute(Direction::Backward, source, destination, workspace)
+        self.execute(Direction::Backward, source, destination, workspace, None)
+    }
+
+    /// Computes forward, running the next local Hartley stage after unpacking
+    /// and before send waits. Alltoallv plans reject collectively before data
+    /// is touched.
+    pub fn forward_with_overlap(
+        &self,
+        source: &PencilArray<T, N, M>,
+        destination: &mut PencilArray<T, N, M>,
+        workspace: &mut R2rWorkspace<T, N, M>,
+    ) -> Result<(), FftOverlapError<R2rError>> {
+        self.execute_overlap(Direction::Forward, source, destination, workspace)
+    }
+
+    /// Computes inverse, running the next local Hartley stage after unpacking
+    /// and before send waits. Alltoallv plans reject collectively before data
+    /// is touched.
+    pub fn inverse_with_overlap(
+        &self,
+        source: &PencilArray<T, N, M>,
+        destination: &mut PencilArray<T, N, M>,
+        workspace: &mut R2rWorkspace<T, N, M>,
+    ) -> Result<(), FftOverlapError<R2rError>> {
+        self.execute_overlap(Direction::Inverse, source, destination, workspace)
+    }
+
+    /// Computes backward, running the next local Hartley stage after unpacking
+    /// and before send waits. Alltoallv plans reject collectively before data
+    /// is touched.
+    pub fn backward_with_overlap(
+        &self,
+        source: &PencilArray<T, N, M>,
+        destination: &mut PencilArray<T, N, M>,
+        workspace: &mut R2rWorkspace<T, N, M>,
+    ) -> Result<(), FftOverlapError<R2rError>> {
+        self.execute_overlap(Direction::Backward, source, destination, workspace)
+    }
+
+    fn execute_overlap(
+        &self,
+        direction: Direction,
+        source: &PencilArray<T, N, M>,
+        destination: &mut PencilArray<T, N, M>,
+        workspace: &mut R2rWorkspace<T, N, M>,
+    ) -> Result<(), FftOverlapError<R2rError>> {
+        let communicator = self.input_pencil().topology().communicator();
+        let operation = match direction {
+            Direction::Forward => OPERATION_DHT_FORWARD_OVERLAP,
+            Direction::Inverse => OPERATION_DHT_INVERSE_OVERLAP,
+            Direction::Backward => OPERATION_DHT_BACKWARD_OVERLAP,
+        };
+        agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
+        let preflight = validate_r2r_out_of_place(
+            &self.core,
+            &workspace.core,
+            direction,
+            source,
+            destination,
+            &workspace.intermediate,
+            (
+                workspace.fft_scratch.len(),
+                workspace.transpose.send_len(),
+                workspace.transpose.receive_len(),
+            ),
+            workspace.embedding_line.len(),
+        )
+        .and_then(|()| {
+            if workspace.line_buffer.len() < self.core.strided_line_len {
+                Err(FftError::WorkspaceTooSmall {
+                    kind: "real line",
+                    required: self.core.strided_line_len,
+                    actual: workspace.line_buffer.len(),
+                }
+                .into())
+            } else {
+                Ok(())
+            }
+        });
+        if !collective_valid(communicator, preflight.is_ok()) {
+            return Err(preflight
+                .err()
+                .unwrap_or(R2rError::Fft(FftError::CollectivePreconditionFailed))
+                .into());
+        }
+        let supported = self.core.transitions.iter().all(|transition| {
+            matches!(
+                transition.forward,
+                super::C2cTransition::Identity
+                    | super::C2cTransition::Local(_)
+                    | super::C2cTransition::PointToPoint(_)
+            ) && matches!(
+                transition.backward,
+                super::C2cTransition::Identity
+                    | super::C2cTransition::Local(_)
+                    | super::C2cTransition::PointToPoint(_)
+            )
+        });
+        if !collective_valid(communicator, supported) {
+            return Err(FftOverlapError::UnsupportedTransport);
+        }
+        match direction {
+            Direction::Forward => {
+                execute_r2r_forward_overlap(&self.core, source, destination, workspace)
+            }
+            Direction::Inverse => {
+                execute_r2r_reverse_overlap(&self.core, source, destination, workspace, true)
+            }
+            Direction::Backward => {
+                execute_r2r_reverse_overlap(&self.core, source, destination, workspace, false)
+            }
+        }
     }
 
     /// Computes the selected Hartley transforms in place.
@@ -468,7 +613,7 @@ where
         array: &mut R2rInPlaceArray<T, N, M>,
         workspace: &mut R2rInPlaceWorkspace<T, N, M>,
     ) -> Result<(), R2rError> {
-        self.execute_in_place(Direction::Forward, array, workspace)
+        self.execute_in_place(Direction::Forward, array, workspace, None)
     }
 
     /// Computes the normalized inverse in place.
@@ -477,7 +622,7 @@ where
         array: &mut R2rInPlaceArray<T, N, M>,
         workspace: &mut R2rInPlaceWorkspace<T, N, M>,
     ) -> Result<(), R2rError> {
-        self.execute_in_place(Direction::Inverse, array, workspace)
+        self.execute_in_place(Direction::Inverse, array, workspace, None)
     }
 
     /// Computes the raw backward transform in place.
@@ -486,7 +631,54 @@ where
         array: &mut R2rInPlaceArray<T, N, M>,
         workspace: &mut R2rInPlaceWorkspace<T, N, M>,
     ) -> Result<(), R2rError> {
-        self.execute_in_place(Direction::Backward, array, workspace)
+        self.execute_in_place(Direction::Backward, array, workspace, None)
+    }
+
+    /// Computes the forward transform and returns timing information.
+    /// Computes the forward transform and returns timing information.
+    pub fn forward_with_timing(
+        &self,
+        source: &PencilArray<T, N, M>,
+        destination: &mut PencilArray<T, N, M>,
+        workspace: &mut R2rWorkspace<T, N, M>,
+    ) -> Result<TransformTiming<N>, R2rError> {
+        self.timed(Direction::Forward, source, destination, workspace)
+    }
+
+    /// Computes the normalized inverse transform and returns timing information.
+    /// Computes the normalized inverse transform and returns timing information.
+    pub fn inverse_with_timing(
+        &self,
+        source: &PencilArray<T, N, M>,
+        destination: &mut PencilArray<T, N, M>,
+        workspace: &mut R2rWorkspace<T, N, M>,
+    ) -> Result<TransformTiming<N>, R2rError> {
+        self.timed(Direction::Inverse, source, destination, workspace)
+    }
+
+    /// Computes the raw backward transform and returns timing information.
+    /// Computes the raw backward transform and returns timing information.
+    pub fn backward_with_timing(
+        &self,
+        source: &PencilArray<T, N, M>,
+        destination: &mut PencilArray<T, N, M>,
+        workspace: &mut R2rWorkspace<T, N, M>,
+    ) -> Result<TransformTiming<N>, R2rError> {
+        self.timed(Direction::Backward, source, destination, workspace)
+    }
+
+    fn timed(
+        &self,
+        direction: Direction,
+        source: &PencilArray<T, N, M>,
+        destination: &mut PencilArray<T, N, M>,
+        workspace: &mut R2rWorkspace<T, N, M>,
+    ) -> Result<TransformTiming<N>, R2rError> {
+        let started = Instant::now();
+        let mut timing = TransformTiming::default();
+        self.execute(direction, source, destination, workspace, Some(&mut timing))?;
+        timing.total = started.elapsed();
+        Ok(timing)
     }
 
     fn execute(
@@ -495,12 +687,31 @@ where
         source: &PencilArray<T, N, M>,
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
+        report: Option<&mut TransformTiming<N>>,
     ) -> Result<(), R2rError> {
         let communicator = self.input_pencil().topology().communicator();
         let operation = match direction {
-            Direction::Forward => super::OPERATION_DHT_FORWARD,
-            Direction::Inverse => super::OPERATION_DHT_INVERSE,
-            Direction::Backward => super::OPERATION_DHT_BACKWARD,
+            Direction::Forward => {
+                if report.is_some() {
+                    OPERATION_DHT_FORWARD_TIMED
+                } else {
+                    super::OPERATION_DHT_FORWARD
+                }
+            }
+            Direction::Inverse => {
+                if report.is_some() {
+                    OPERATION_DHT_INVERSE_TIMED
+                } else {
+                    super::OPERATION_DHT_INVERSE
+                }
+            }
+            Direction::Backward => {
+                if report.is_some() {
+                    OPERATION_DHT_BACKWARD_TIMED
+                } else {
+                    super::OPERATION_DHT_BACKWARD
+                }
+            }
         };
         agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
         let preflight = validate_r2r_out_of_place(
@@ -536,15 +747,58 @@ where
         }
         preflight.expect("distributed DHT out-of-place preflight succeeded");
         match direction {
-            Direction::Forward => execute_forward(&self.core, source, destination, workspace),
+            Direction::Forward => {
+                execute_forward(&self.core, source, destination, workspace, report)
+            }
             Direction::Inverse | Direction::Backward => execute_reverse(
                 &self.core,
                 source,
                 destination,
                 workspace,
                 matches!(direction, Direction::Inverse),
+                report,
             ),
         }
+    }
+
+    /// Computes the forward transform in place and returns timing information.
+    /// Computes the forward transform in place and returns timing information.
+    pub fn forward_in_place_with_timing(
+        &self,
+        array: &mut R2rInPlaceArray<T, N, M>,
+        workspace: &mut R2rInPlaceWorkspace<T, N, M>,
+    ) -> Result<TransformTiming<N>, R2rError> {
+        self.timed_in_place(Direction::Forward, array, workspace)
+    }
+    /// Computes the normalized inverse in place and returns timing information.
+    /// Computes the normalized inverse in place and returns timing information.
+    pub fn inverse_in_place_with_timing(
+        &self,
+        array: &mut R2rInPlaceArray<T, N, M>,
+        workspace: &mut R2rInPlaceWorkspace<T, N, M>,
+    ) -> Result<TransformTiming<N>, R2rError> {
+        self.timed_in_place(Direction::Inverse, array, workspace)
+    }
+    /// Computes the raw backward transform in place and returns timing information.
+    /// Computes the raw backward transform in place and returns timing information.
+    pub fn backward_in_place_with_timing(
+        &self,
+        array: &mut R2rInPlaceArray<T, N, M>,
+        workspace: &mut R2rInPlaceWorkspace<T, N, M>,
+    ) -> Result<TransformTiming<N>, R2rError> {
+        self.timed_in_place(Direction::Backward, array, workspace)
+    }
+    fn timed_in_place(
+        &self,
+        direction: Direction,
+        array: &mut R2rInPlaceArray<T, N, M>,
+        workspace: &mut R2rInPlaceWorkspace<T, N, M>,
+    ) -> Result<TransformTiming<N>, R2rError> {
+        let started = Instant::now();
+        let mut timing = TransformTiming::default();
+        self.execute_in_place(direction, array, workspace, Some(&mut timing))?;
+        timing.total = started.elapsed();
+        Ok(timing)
     }
 
     fn execute_in_place(
@@ -552,12 +806,31 @@ where
         direction: Direction,
         array: &mut R2rInPlaceArray<T, N, M>,
         workspace: &mut R2rInPlaceWorkspace<T, N, M>,
+        mut report: Option<&mut TransformTiming<N>>,
     ) -> Result<(), R2rError> {
         let communicator = self.input_pencil().topology().communicator();
         let operation = match direction {
-            Direction::Forward => super::OPERATION_DHT_FORWARD_IN_PLACE,
-            Direction::Inverse => super::OPERATION_DHT_INVERSE_IN_PLACE,
-            Direction::Backward => super::OPERATION_DHT_BACKWARD_IN_PLACE,
+            Direction::Forward => {
+                if report.is_some() {
+                    OPERATION_DHT_FORWARD_IN_PLACE_TIMED
+                } else {
+                    super::OPERATION_DHT_FORWARD_IN_PLACE
+                }
+            }
+            Direction::Inverse => {
+                if report.is_some() {
+                    OPERATION_DHT_INVERSE_IN_PLACE_TIMED
+                } else {
+                    super::OPERATION_DHT_INVERSE_IN_PLACE
+                }
+            }
+            Direction::Backward => {
+                if report.is_some() {
+                    OPERATION_DHT_BACKWARD_IN_PLACE_TIMED
+                } else {
+                    super::OPERATION_DHT_BACKWARD_IN_PLACE
+                }
+            }
         };
         agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
         let expected_state = match direction {
@@ -626,12 +899,15 @@ where
             workspace,
             target,
             |array, workspace| match direction {
-                Direction::Forward => execute_forward_in_place(&self.core, array, workspace),
+                Direction::Forward => {
+                    execute_forward_in_place(&self.core, array, workspace, report.as_deref_mut())
+                }
                 Direction::Inverse | Direction::Backward => execute_reverse_in_place(
                     &self.core,
                     array,
                     workspace,
                     matches!(direction, Direction::Inverse),
+                    report,
                 ),
             },
         )
@@ -980,7 +1256,7 @@ where
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
     ) -> Result<(), R2rError> {
-        self.execute(Direction::Forward, source, destination, workspace)
+        self.execute(Direction::Forward, source, destination, workspace, None)
     }
 
     /// Computes the paired normalized inverse transforms, preserving `source`.
@@ -990,7 +1266,7 @@ where
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
     ) -> Result<(), R2rError> {
-        self.execute(Direction::Inverse, source, destination, workspace)
+        self.execute(Direction::Inverse, source, destination, workspace, None)
     }
 
     /// Computes the paired raw backward transforms, preserving `source`.
@@ -1000,7 +1276,136 @@ where
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
     ) -> Result<(), R2rError> {
-        self.execute(Direction::Backward, source, destination, workspace)
+        self.execute(Direction::Backward, source, destination, workspace, None)
+    }
+
+    /// Computes forward with the next local stage after unpacking and before
+    /// point-to-point send waits. Alltoallv plans reject collectively first.
+    pub fn forward_with_overlap(
+        &self,
+        source: &PencilArray<T, N, M>,
+        destination: &mut PencilArray<T, N, M>,
+        workspace: &mut R2rWorkspace<T, N, M>,
+    ) -> Result<(), FftOverlapError<R2rError>> {
+        self.execute_overlap(Direction::Forward, source, destination, workspace)
+    }
+
+    /// Computes inverse with the next local stage after unpacking and before
+    /// point-to-point send waits. Alltoallv plans reject collectively first.
+    pub fn inverse_with_overlap(
+        &self,
+        source: &PencilArray<T, N, M>,
+        destination: &mut PencilArray<T, N, M>,
+        workspace: &mut R2rWorkspace<T, N, M>,
+    ) -> Result<(), FftOverlapError<R2rError>> {
+        self.execute_overlap(Direction::Inverse, source, destination, workspace)
+    }
+
+    /// Computes backward with the next local stage after unpacking and before
+    /// point-to-point send waits. Alltoallv plans reject collectively first.
+    pub fn backward_with_overlap(
+        &self,
+        source: &PencilArray<T, N, M>,
+        destination: &mut PencilArray<T, N, M>,
+        workspace: &mut R2rWorkspace<T, N, M>,
+    ) -> Result<(), FftOverlapError<R2rError>> {
+        self.execute_overlap(Direction::Backward, source, destination, workspace)
+    }
+
+    fn execute_overlap(
+        &self,
+        direction: Direction,
+        source: &PencilArray<T, N, M>,
+        destination: &mut PencilArray<T, N, M>,
+        workspace: &mut R2rWorkspace<T, N, M>,
+    ) -> Result<(), FftOverlapError<R2rError>> {
+        let communicator = self.input_pencil().topology().communicator();
+        let operation = match direction {
+            Direction::Forward => OPERATION_R2R_FORWARD_OVERLAP,
+            Direction::Inverse => OPERATION_R2R_INVERSE_OVERLAP,
+            Direction::Backward => OPERATION_R2R_BACKWARD_OVERLAP,
+        };
+        agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
+        let preflight = self.preflight(direction, source, destination, workspace);
+        if !collective_valid(communicator, preflight.is_ok()) {
+            return Err(preflight
+                .err()
+                .unwrap_or(R2rError::Fft(FftError::CollectivePreconditionFailed))
+                .into());
+        }
+        let supported = self.core.transitions.iter().all(|transition| {
+            matches!(
+                transition.forward,
+                super::C2cTransition::Identity
+                    | super::C2cTransition::Local(_)
+                    | super::C2cTransition::PointToPoint(_)
+            ) && matches!(
+                transition.backward,
+                super::C2cTransition::Identity
+                    | super::C2cTransition::Local(_)
+                    | super::C2cTransition::PointToPoint(_)
+            )
+        });
+        if !collective_valid(communicator, supported) {
+            return Err(FftOverlapError::UnsupportedTransport);
+        }
+        match direction {
+            Direction::Forward => {
+                execute_r2r_forward_overlap(&self.core, source, destination, workspace)
+            }
+            Direction::Inverse => {
+                execute_r2r_reverse_overlap(&self.core, source, destination, workspace, true)
+            }
+            Direction::Backward => {
+                execute_r2r_reverse_overlap(&self.core, source, destination, workspace, false)
+            }
+        }
+    }
+
+    /// Computes the selected raw forward transforms in one state-checked buffer.
+    /// Computes the forward transform and returns timing information.
+    /// Computes the forward transform and returns timing information.
+    pub fn forward_with_timing(
+        &self,
+        source: &PencilArray<T, N, M>,
+        destination: &mut PencilArray<T, N, M>,
+        workspace: &mut R2rWorkspace<T, N, M>,
+    ) -> Result<TransformTiming<N>, R2rError> {
+        self.timed(Direction::Forward, source, destination, workspace)
+    }
+    /// Computes the normalized inverse transform and returns timing information.
+    /// Computes the normalized inverse transform and returns timing information.
+    pub fn inverse_with_timing(
+        &self,
+        source: &PencilArray<T, N, M>,
+        destination: &mut PencilArray<T, N, M>,
+        workspace: &mut R2rWorkspace<T, N, M>,
+    ) -> Result<TransformTiming<N>, R2rError> {
+        self.timed(Direction::Inverse, source, destination, workspace)
+    }
+    /// Computes the raw backward transform and returns timing information.
+    /// Computes the raw backward transform and returns timing information.
+    pub fn backward_with_timing(
+        &self,
+        source: &PencilArray<T, N, M>,
+        destination: &mut PencilArray<T, N, M>,
+        workspace: &mut R2rWorkspace<T, N, M>,
+    ) -> Result<TransformTiming<N>, R2rError> {
+        self.timed(Direction::Backward, source, destination, workspace)
+    }
+
+    fn timed(
+        &self,
+        direction: Direction,
+        source: &PencilArray<T, N, M>,
+        destination: &mut PencilArray<T, N, M>,
+        workspace: &mut R2rWorkspace<T, N, M>,
+    ) -> Result<TransformTiming<N>, R2rError> {
+        let started = Instant::now();
+        let mut timing = TransformTiming::default();
+        self.execute(direction, source, destination, workspace, Some(&mut timing))?;
+        timing.total = started.elapsed();
+        Ok(timing)
     }
 
     /// Computes the selected raw forward transforms in one state-checked buffer.
@@ -1009,7 +1414,7 @@ where
         array: &mut R2rInPlaceArray<T, N, M>,
         workspace: &mut R2rInPlaceWorkspace<T, N, M>,
     ) -> Result<(), R2rError> {
-        self.execute_in_place(Direction::Forward, array, workspace)
+        self.execute_in_place(Direction::Forward, array, workspace, None)
     }
 
     /// Computes the paired normalized inverse in one state-checked buffer.
@@ -1018,7 +1423,7 @@ where
         array: &mut R2rInPlaceArray<T, N, M>,
         workspace: &mut R2rInPlaceWorkspace<T, N, M>,
     ) -> Result<(), R2rError> {
-        self.execute_in_place(Direction::Inverse, array, workspace)
+        self.execute_in_place(Direction::Inverse, array, workspace, None)
     }
 
     /// Computes the paired raw backward transform in one state-checked buffer.
@@ -1027,7 +1432,50 @@ where
         array: &mut R2rInPlaceArray<T, N, M>,
         workspace: &mut R2rInPlaceWorkspace<T, N, M>,
     ) -> Result<(), R2rError> {
-        self.execute_in_place(Direction::Backward, array, workspace)
+        self.execute_in_place(Direction::Backward, array, workspace, None)
+    }
+
+    /// Runs forward in place and returns measured timing.
+    /// Computes the forward transform in place and returns timing information.
+    /// Computes the forward transform in place and returns timing information.
+    pub fn forward_in_place_with_timing(
+        &self,
+        array: &mut R2rInPlaceArray<T, N, M>,
+        workspace: &mut R2rInPlaceWorkspace<T, N, M>,
+    ) -> Result<TransformTiming<N>, R2rError> {
+        self.timed_in_place(Direction::Forward, array, workspace)
+    }
+    /// Runs inverse in place and returns measured timing.
+    /// Computes the normalized inverse in place and returns timing information.
+    /// Computes the normalized inverse in place and returns timing information.
+    pub fn inverse_in_place_with_timing(
+        &self,
+        array: &mut R2rInPlaceArray<T, N, M>,
+        workspace: &mut R2rInPlaceWorkspace<T, N, M>,
+    ) -> Result<TransformTiming<N>, R2rError> {
+        self.timed_in_place(Direction::Inverse, array, workspace)
+    }
+    /// Runs backward in place and returns measured timing.
+    /// Computes the raw backward transform in place and returns timing information.
+    /// Computes the raw backward transform in place and returns timing information.
+    pub fn backward_in_place_with_timing(
+        &self,
+        array: &mut R2rInPlaceArray<T, N, M>,
+        workspace: &mut R2rInPlaceWorkspace<T, N, M>,
+    ) -> Result<TransformTiming<N>, R2rError> {
+        self.timed_in_place(Direction::Backward, array, workspace)
+    }
+    fn timed_in_place(
+        &self,
+        direction: Direction,
+        array: &mut R2rInPlaceArray<T, N, M>,
+        workspace: &mut R2rInPlaceWorkspace<T, N, M>,
+    ) -> Result<TransformTiming<N>, R2rError> {
+        let started = Instant::now();
+        let mut timing = TransformTiming::default();
+        self.execute_in_place(direction, array, workspace, Some(&mut timing))?;
+        timing.total = started.elapsed();
+        Ok(timing)
     }
 
     fn construct(
@@ -1161,12 +1609,31 @@ where
         source: &PencilArray<T, N, M>,
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
+        report: Option<&mut TransformTiming<N>>,
     ) -> Result<(), R2rError> {
         let communicator = self.input_pencil().topology().communicator();
         let operation = match direction {
-            Direction::Forward => OPERATION_R2R_FORWARD,
-            Direction::Inverse => OPERATION_R2R_INVERSE,
-            Direction::Backward => OPERATION_R2R_BACKWARD,
+            Direction::Forward => {
+                if report.is_some() {
+                    OPERATION_R2R_FORWARD_TIMED
+                } else {
+                    OPERATION_R2R_FORWARD
+                }
+            }
+            Direction::Inverse => {
+                if report.is_some() {
+                    OPERATION_R2R_INVERSE_TIMED
+                } else {
+                    OPERATION_R2R_INVERSE
+                }
+            }
+            Direction::Backward => {
+                if report.is_some() {
+                    OPERATION_R2R_BACKWARD_TIMED
+                } else {
+                    OPERATION_R2R_BACKWARD
+                }
+            }
         };
         agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
         let preflight = self.preflight(direction, source, destination, workspace);
@@ -1177,13 +1644,16 @@ where
         }
         preflight.expect("distributed R2R out-of-place preflight succeeded");
         match direction {
-            Direction::Forward => execute_forward(&self.core, source, destination, workspace),
+            Direction::Forward => {
+                execute_forward(&self.core, source, destination, workspace, report)
+            }
             Direction::Inverse | Direction::Backward => execute_reverse(
                 &self.core,
                 source,
                 destination,
                 workspace,
                 matches!(direction, Direction::Inverse),
+                report,
             ),
         }
     }
@@ -1225,12 +1695,31 @@ where
         direction: Direction,
         array: &mut R2rInPlaceArray<T, N, M>,
         workspace: &mut R2rInPlaceWorkspace<T, N, M>,
+        mut report: Option<&mut TransformTiming<N>>,
     ) -> Result<(), R2rError> {
         let communicator = self.input_pencil().topology().communicator();
         let operation = match direction {
-            Direction::Forward => OPERATION_R2R_FORWARD_IN_PLACE,
-            Direction::Inverse => OPERATION_R2R_INVERSE_IN_PLACE,
-            Direction::Backward => OPERATION_R2R_BACKWARD_IN_PLACE,
+            Direction::Forward => {
+                if report.is_some() {
+                    OPERATION_R2R_FORWARD_IN_PLACE_TIMED
+                } else {
+                    OPERATION_R2R_FORWARD_IN_PLACE
+                }
+            }
+            Direction::Inverse => {
+                if report.is_some() {
+                    OPERATION_R2R_INVERSE_IN_PLACE_TIMED
+                } else {
+                    OPERATION_R2R_INVERSE_IN_PLACE
+                }
+            }
+            Direction::Backward => {
+                if report.is_some() {
+                    OPERATION_R2R_BACKWARD_IN_PLACE_TIMED
+                } else {
+                    OPERATION_R2R_BACKWARD_IN_PLACE
+                }
+            }
         };
         agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
         let preflight = self.preflight_in_place(direction, array, workspace);
@@ -1249,12 +1738,15 @@ where
             workspace,
             target,
             |array, workspace| match direction {
-                Direction::Forward => execute_forward_in_place(&self.core, array, workspace),
+                Direction::Forward => {
+                    execute_forward_in_place(&self.core, array, workspace, report.as_deref_mut())
+                }
                 Direction::Inverse | Direction::Backward => execute_reverse_in_place(
                     &self.core,
                     array,
                     workspace,
                     matches!(direction, Direction::Inverse),
+                    report,
                 ),
             },
         )
@@ -1487,11 +1979,177 @@ fn build_r2r_descriptor<T: R2rScalar, const N: usize, const M: usize>(
     Ok(descriptor)
 }
 
+fn execute_r2r_forward_overlap<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
+    core: &Arc<R2rCore<T, N, M>>,
+    source: &PencilArray<T, N, M>,
+    destination: &mut PencilArray<T, N, M>,
+    workspace: &mut R2rWorkspace<T, N, M>,
+) -> Result<(), FftOverlapError<R2rError>> {
+    let source_view = source.view();
+    let stage = &core.stages[0];
+    workspace
+        .intermediate
+        .overwrite_with(stage.output.as_ref(), |mut target| {
+            execute_local_forward(
+                &stage.local,
+                stage.output.as_ref(),
+                stage.axis,
+                source_view.as_slice(),
+                target.as_mut_slice(),
+                &mut workspace.embedding_line,
+                &mut workspace.fft_scratch,
+                &mut workspace.line_buffer,
+            )
+        })
+        .map_err(map_overwrite_error)?;
+    for (index, transition) in core.transitions.iter().enumerate() {
+        let stage = &core.stages[index + 1];
+        let super::C2cTransition::PointToPoint(plan) = &transition.forward else {
+            execute_transition(
+                &transition.forward,
+                &mut workspace.intermediate,
+                &mut workspace.transpose,
+            )?;
+            execute_local_forward_in_place(
+                &stage.local,
+                stage.output.as_ref(),
+                stage.axis,
+                workspace
+                    .intermediate
+                    .active_view_mut()
+                    .map_err(FftError::Array)?
+                    .as_mut_slice(),
+                &mut workspace.embedding_line,
+                &mut workspace.fft_scratch,
+                &mut workspace.line_buffer,
+            )?;
+            continue;
+        };
+        let callback = |data: &mut [T]| {
+            execute_local_forward_in_place(
+                &stage.local,
+                stage.output.as_ref(),
+                stage.axis,
+                data,
+                &mut workspace.embedding_line,
+                &mut workspace.fft_scratch,
+                &mut workspace.line_buffer,
+            )
+        };
+        plan.execute_in_place_with_callback(
+            &mut workspace.intermediate,
+            &mut workspace.transpose,
+            callback,
+        )
+        .map_err(map_r2r_overlap)?;
+    }
+    let active = workspace
+        .intermediate
+        .active_view()
+        .map_err(FftError::Array)?;
+    destination
+        .view_mut()
+        .as_mut_slice()
+        .copy_from_slice(active.as_slice());
+    Ok(())
+}
+
+fn execute_r2r_reverse_overlap<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
+    core: &Arc<R2rCore<T, N, M>>,
+    source: &PencilArray<T, N, M>,
+    destination: &mut PencilArray<T, N, M>,
+    workspace: &mut R2rWorkspace<T, N, M>,
+    normalize: bool,
+) -> Result<(), FftOverlapError<R2rError>> {
+    let source_view = source.view();
+    let last = core.stages.len() - 1;
+    let stage = &core.stages[last];
+    workspace
+        .intermediate
+        .overwrite_with(stage.output.as_ref(), |mut target| {
+            execute_local_reverse(
+                &stage.local,
+                stage.input.as_ref(),
+                stage.axis,
+                source_view.as_slice(),
+                target.as_mut_slice(),
+                &mut workspace.embedding_line,
+                &mut workspace.fft_scratch,
+                &mut workspace.line_buffer,
+                normalize,
+            )
+        })
+        .map_err(map_overwrite_error)?;
+    for (index, transition) in core.transitions.iter().enumerate().rev() {
+        let stage = &core.stages[index];
+        let super::C2cTransition::PointToPoint(plan) = &transition.backward else {
+            execute_transition(
+                &transition.backward,
+                &mut workspace.intermediate,
+                &mut workspace.transpose,
+            )?;
+            execute_local_reverse_in_place(
+                &stage.local,
+                stage.input.as_ref(),
+                stage.axis,
+                workspace
+                    .intermediate
+                    .active_view_mut()
+                    .map_err(FftError::Array)?
+                    .as_mut_slice(),
+                &mut workspace.embedding_line,
+                &mut workspace.fft_scratch,
+                &mut workspace.line_buffer,
+                normalize,
+            )?;
+            continue;
+        };
+        let callback = |data: &mut [T]| {
+            execute_local_reverse_in_place(
+                &stage.local,
+                stage.input.as_ref(),
+                stage.axis,
+                data,
+                &mut workspace.embedding_line,
+                &mut workspace.fft_scratch,
+                &mut workspace.line_buffer,
+                normalize,
+            )
+        };
+        plan.execute_in_place_with_callback(
+            &mut workspace.intermediate,
+            &mut workspace.transpose,
+            callback,
+        )
+        .map_err(map_r2r_overlap)?;
+    }
+    let active = workspace
+        .intermediate
+        .active_view()
+        .map_err(FftError::Array)?;
+    destination
+        .view_mut()
+        .as_mut_slice()
+        .copy_from_slice(active.as_slice());
+    Ok(())
+}
+
+fn map_r2r_overlap<E: Into<R2rError>>(error: OverlapError<E>) -> FftOverlapError<R2rError> {
+    FftOverlapError::Overlap(match error {
+        OverlapError::Transpose(error) => OverlapError::Transpose(error),
+        OverlapError::Callback(error) => OverlapError::Callback(error.into()),
+        OverlapError::PeerPanicked => OverlapError::PeerPanicked,
+        OverlapError::PeerCallbackFailed => OverlapError::PeerCallbackFailed,
+        OverlapError::CollectivePreconditionFailed => OverlapError::CollectivePreconditionFailed,
+    })
+}
+
 fn execute_forward<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
     core: &Arc<R2rCore<T, N, M>>,
     source: &PencilArray<T, N, M>,
     destination: &mut PencilArray<T, N, M>,
     workspace: &mut R2rWorkspace<T, N, M>,
+    mut report: Option<&mut TransformTiming<N>>,
 ) -> Result<(), R2rError> {
     let source_view = source.view();
     let stage = &core.stages[0];
@@ -1501,7 +2159,7 @@ fn execute_forward<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
         let fft_scratch = &mut workspace.fft_scratch;
         intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
-                execute_local_forward(
+                execute_local_forward_timed(
                     &stage.local,
                     stage.output.as_ref(),
                     stage.axis,
@@ -1510,16 +2168,20 @@ fn execute_forward<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
                     embedding_line,
                     fft_scratch,
                     &mut workspace.line_buffer,
+                    &mut report,
+                    0,
                 )
             })
             .map_err(map_overwrite_error)?;
     }
     let last = core.stages.len() - 1;
     for index in 0..core.transitions.len() {
-        execute_transition(
+        execute_transition_timed(
             &core.transitions[index].forward,
             &mut workspace.intermediate,
             &mut workspace.transpose,
+            report.as_deref_mut(),
+            index,
         )?;
         let stage = &core.stages[index + 1];
         if index + 1 == last {
@@ -1528,7 +2190,7 @@ fn execute_forward<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
                 .active_view()
                 .map_err(FftError::Array)?;
             let mut destination_view = destination.view_mut();
-            execute_local_forward(
+            execute_local_forward_timed(
                 &stage.local,
                 stage.output.as_ref(),
                 stage.axis,
@@ -1537,13 +2199,15 @@ fn execute_forward<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
                 &mut workspace.embedding_line,
                 &mut workspace.fft_scratch,
                 &mut workspace.line_buffer,
+                &mut report,
+                index + 1,
             )?;
         } else {
             let mut active = workspace
                 .intermediate
                 .active_view_mut()
                 .map_err(FftError::Array)?;
-            execute_local_forward_in_place(
+            execute_local_forward_in_place_timed(
                 &stage.local,
                 stage.output.as_ref(),
                 stage.axis,
@@ -1551,6 +2215,8 @@ fn execute_forward<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
                 &mut workspace.embedding_line,
                 &mut workspace.fft_scratch,
                 &mut workspace.line_buffer,
+                &mut report,
+                index + 1,
             )?;
         }
     }
@@ -1563,6 +2229,7 @@ fn execute_reverse<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
     destination: &mut PencilArray<T, N, M>,
     workspace: &mut R2rWorkspace<T, N, M>,
     normalize: bool,
+    mut report: Option<&mut TransformTiming<N>>,
 ) -> Result<(), R2rError> {
     let source_view = source.view();
     let last = core.stages.len() - 1;
@@ -1573,7 +2240,7 @@ fn execute_reverse<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
         let fft_scratch = &mut workspace.fft_scratch;
         intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
-                execute_local_reverse(
+                execute_local_reverse_timed(
                     &stage.local,
                     stage.input.as_ref(),
                     stage.axis,
@@ -1583,15 +2250,19 @@ fn execute_reverse<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
                     fft_scratch,
                     &mut workspace.line_buffer,
                     normalize,
+                    &mut report,
+                    last,
                 )
             })
             .map_err(map_overwrite_error)?;
     }
     for index in (0..core.transitions.len()).rev() {
-        execute_transition(
+        execute_transition_timed(
             &core.transitions[index].backward,
             &mut workspace.intermediate,
             &mut workspace.transpose,
+            report.as_deref_mut(),
+            index,
         )?;
         if index != 0 {
             let stage = &core.stages[index];
@@ -1599,7 +2270,7 @@ fn execute_reverse<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
                 .intermediate
                 .active_view_mut()
                 .map_err(FftError::Array)?;
-            execute_local_reverse_in_place(
+            execute_local_reverse_in_place_timed(
                 &stage.local,
                 stage.input.as_ref(),
                 stage.axis,
@@ -1608,6 +2279,8 @@ fn execute_reverse<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
                 &mut workspace.fft_scratch,
                 &mut workspace.line_buffer,
                 normalize,
+                &mut report,
+                index,
             )?;
         }
     }
@@ -1617,7 +2290,7 @@ fn execute_reverse<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
         .active_view()
         .map_err(FftError::Array)?;
     let mut destination_view = destination.view_mut();
-    execute_local_reverse(
+    execute_local_reverse_timed(
         &stage.local,
         stage.input.as_ref(),
         stage.axis,
@@ -1627,6 +2300,8 @@ fn execute_reverse<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
         &mut workspace.fft_scratch,
         &mut workspace.line_buffer,
         normalize,
+        &mut report,
+        0,
     )
 }
 
@@ -1634,11 +2309,12 @@ fn execute_forward_in_place<T: R2rScalar + Equivalence, const N: usize, const M:
     core: &Arc<R2rCore<T, N, M>>,
     array: &mut R2rInPlaceArray<T, N, M>,
     workspace: &mut R2rInPlaceWorkspace<T, N, M>,
+    mut report: Option<&mut TransformTiming<N>>,
 ) -> Result<(), R2rError> {
     {
         let stage = &core.stages[0];
         let mut active = array.array.active_view_mut().map_err(FftError::Array)?;
-        execute_local_forward_in_place(
+        execute_local_forward_in_place_timed(
             &stage.local,
             stage.output.as_ref(),
             stage.axis,
@@ -1646,17 +2322,21 @@ fn execute_forward_in_place<T: R2rScalar + Equivalence, const N: usize, const M:
             &mut workspace.embedding_line,
             &mut workspace.fft_scratch,
             &mut workspace.line_buffer,
+            &mut report,
+            0,
         )?;
     }
     for (index, transition) in core.transitions.iter().enumerate() {
-        execute_transition(
+        execute_transition_timed(
             &transition.forward,
             &mut array.array,
             &mut workspace.transpose,
+            report.as_deref_mut(),
+            index,
         )?;
         let stage = &core.stages[index + 1];
         let mut active = array.array.active_view_mut().map_err(FftError::Array)?;
-        execute_local_forward_in_place(
+        execute_local_forward_in_place_timed(
             &stage.local,
             stage.output.as_ref(),
             stage.axis,
@@ -1664,6 +2344,8 @@ fn execute_forward_in_place<T: R2rScalar + Equivalence, const N: usize, const M:
             &mut workspace.embedding_line,
             &mut workspace.fft_scratch,
             &mut workspace.line_buffer,
+            &mut report,
+            index + 1,
         )?;
     }
     Ok(())
@@ -1674,12 +2356,13 @@ fn execute_reverse_in_place<T: R2rScalar + Equivalence, const N: usize, const M:
     array: &mut R2rInPlaceArray<T, N, M>,
     workspace: &mut R2rInPlaceWorkspace<T, N, M>,
     normalize: bool,
+    mut report: Option<&mut TransformTiming<N>>,
 ) -> Result<(), R2rError> {
     let last = core.stages.len() - 1;
     {
         let stage = &core.stages[last];
         let mut active = array.array.active_view_mut().map_err(FftError::Array)?;
-        execute_local_reverse_in_place(
+        execute_local_reverse_in_place_timed(
             &stage.local,
             stage.input.as_ref(),
             stage.axis,
@@ -1688,17 +2371,21 @@ fn execute_reverse_in_place<T: R2rScalar + Equivalence, const N: usize, const M:
             &mut workspace.fft_scratch,
             &mut workspace.line_buffer,
             normalize,
+            &mut report,
+            last,
         )?;
     }
     for (index, transition) in core.transitions.iter().enumerate().rev() {
-        execute_transition(
+        execute_transition_timed(
             &transition.backward,
             &mut array.array,
             &mut workspace.transpose,
+            report.as_deref_mut(),
+            index,
         )?;
         let stage = &core.stages[index];
         let mut active = array.array.active_view_mut().map_err(FftError::Array)?;
-        execute_local_reverse_in_place(
+        execute_local_reverse_in_place_timed(
             &stage.local,
             stage.input.as_ref(),
             stage.axis,
@@ -1707,6 +2394,8 @@ fn execute_reverse_in_place<T: R2rScalar + Equivalence, const N: usize, const M:
             &mut workspace.fft_scratch,
             &mut workspace.line_buffer,
             normalize,
+            &mut report,
+            index,
         )?;
     }
     Ok(())
@@ -2403,6 +3092,104 @@ fn execute_local_reverse_in_place<T: R2rScalar, const N: usize, const M: usize>(
             normalize,
         ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_local_forward_timed<T: R2rScalar, const N: usize, const M: usize>(
+    local: &R2rLocal<T>,
+    pencil: &Pencil<N, M>,
+    axis: usize,
+    source: &[T],
+    destination: &mut [T],
+    embedding: &mut [Complex<T::Real>],
+    scratch: &mut [Complex<T::Real>],
+    line: &mut [T],
+    report: &mut Option<&mut TransformTiming<N>>,
+    index: usize,
+) -> Result<(), R2rError> {
+    let started = Instant::now();
+    let result = execute_local_forward(
+        local,
+        pencil,
+        axis,
+        source,
+        destination,
+        embedding,
+        scratch,
+        line,
+    );
+    super::record_fft_timing(report, index, started);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_local_forward_in_place_timed<T: R2rScalar, const N: usize, const M: usize>(
+    local: &R2rLocal<T>,
+    pencil: &Pencil<N, M>,
+    axis: usize,
+    data: &mut [T],
+    embedding: &mut [Complex<T::Real>],
+    scratch: &mut [Complex<T::Real>],
+    line: &mut [T],
+    report: &mut Option<&mut TransformTiming<N>>,
+    index: usize,
+) -> Result<(), R2rError> {
+    let started = Instant::now();
+    let result =
+        execute_local_forward_in_place(local, pencil, axis, data, embedding, scratch, line);
+    super::record_fft_timing(report, index, started);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_local_reverse_timed<T: R2rScalar, const N: usize, const M: usize>(
+    local: &R2rLocal<T>,
+    pencil: &Pencil<N, M>,
+    axis: usize,
+    source: &[T],
+    destination: &mut [T],
+    embedding: &mut [Complex<T::Real>],
+    scratch: &mut [Complex<T::Real>],
+    line: &mut [T],
+    normalize: bool,
+    report: &mut Option<&mut TransformTiming<N>>,
+    index: usize,
+) -> Result<(), R2rError> {
+    let started = Instant::now();
+    let result = execute_local_reverse(
+        local,
+        pencil,
+        axis,
+        source,
+        destination,
+        embedding,
+        scratch,
+        line,
+        normalize,
+    );
+    super::record_fft_timing(report, index, started);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_local_reverse_in_place_timed<T: R2rScalar, const N: usize, const M: usize>(
+    local: &R2rLocal<T>,
+    pencil: &Pencil<N, M>,
+    axis: usize,
+    data: &mut [T],
+    embedding: &mut [Complex<T::Real>],
+    scratch: &mut [Complex<T::Real>],
+    line: &mut [T],
+    normalize: bool,
+    report: &mut Option<&mut TransformTiming<N>>,
+    index: usize,
+) -> Result<(), R2rError> {
+    let started = Instant::now();
+    let result = execute_local_reverse_in_place(
+        local, pencil, axis, data, embedding, scratch, line, normalize,
+    );
+    super::record_fft_timing(report, index, started);
+    result
 }
 
 #[allow(clippy::too_many_arguments)]

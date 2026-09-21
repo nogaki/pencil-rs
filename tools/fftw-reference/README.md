@@ -43,7 +43,7 @@ populate or precompile into its first entry. Startup files are disabled and
 user preferences are never edited. Open MPI/OpenRTE gets `--oversubscribe` unless
 `PENCIL_FFTW_NO_OVERSUBSCRIBE=1` is set.
 
-The runner generates exactly 82 temporary, non-empty fixtures by default:
+The runner generates exactly 82 legacy temporary, non-empty fixtures:
 the original 28 C2C/R2C fixtures, 24 R2R fixtures (six cases × real and
 complex `f32`/`f64`), 16 DHT fixtures (four cases × real and complex
 `f32`/`f64`), and 14 mixed-axis C2C/R2C fixtures. The mixed fixtures include
@@ -64,6 +64,37 @@ context. Missing Julia, MPI, fixtures, or matrix members is a failure, never a
 skip. The runner uses Cargo's selected toolchain and target directory; it never
 selects an executable by filename or timestamp. Set `RUSTUP_TOOLCHAIN=1.85.0`
 to run the reference matrix with an installed MSRV toolchain.
+
+## Per-axis Fourier directions
+
+A separate `directions_reference.jl` generator preserves the 82 legacy fixtures
+and 272 base policy/layout runs unchanged. It adds exactly 5 direction fixtures:
+2 C2C, 1 mixed C2C (FFT/DCT/DHT), and 2 mixed R2C (odd/even real axis with a
+positive-sign complex suffix). Each runs both precisions, transports, and
+memory policies: 40 additional configurations per MPI size (1, 4, and 6).
+Forward, independent inverse input, normalized inverse, and raw backward are
+compared numerically. Missing/duplicate fixtures, altered signs, and altered
+expected outputs must fail.
+
+Direction format 1 starts with `PENCIL_FFTW_DIRECTION_REFERENCE 1`, the pinned
+runtime line, then `case`, `shape`, `transforms`, and `directions` (one
+`forward`/`backward` per logical axis). The same five counted sections follow,
+all serialized as complex pairs (real sections have zero imaginary parts).
+The single RFFT axis determines reduced section lengths; non-FFT axes require
+`forward`. `backward` configures an unscaled positive forward exponent, with
+opposite signs for the paired inverse/raw-backward operations.
+
+The standalone numerical regression also exercises in-place execution, partial
+selection, core identity, and rank-dependent configuration rejection:
+
+```bash
+cargo build -p pencil-fft --features distributed --example mpi_directions
+for ranks in 1 4 6; do
+    timeout --kill-after=5s 120s mpiexec -n "$ranks" target/debug/examples/mpi_directions
+done
+```
+
+Each successful run emits exactly one `mpi_directions: PASSED` marker.
 
 ## Isolated MSRV check
 

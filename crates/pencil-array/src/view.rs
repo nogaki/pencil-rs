@@ -349,14 +349,19 @@ mod tests {
     use super::{PencilArrayView, PencilArrayViewMut};
     use crate::{
         ArrayError, AxisPermutation, ExtraShape, LocalTransposeError, LocalTransposePlan,
-        ManyPencilArray, MpiTopology, Pencil, TransposeWorkspace,
+        ManyPencilArray, MpiTopology, Pencil, PointToPointTransposePlan, TransposeWorkspace,
+        point_to_point_transpose::{test_trace_event, test_trace_finish, test_trace_start},
     };
 
     #[test]
     fn views_validate_storage_and_expose_permuted_local_layout() {
         let universe = mpi::initialize().expect("MPI initialization failed");
         let world = universe.world();
-        assert_eq!(world.size(), 1, "run this unit test with one MPI rank");
+        if world.size() != 1 {
+            let topology = MpiTopology::<1>::new(&world, [world.size() as usize]).unwrap();
+            check_callback_schedule(&topology);
+            return;
+        }
 
         let topology = MpiTopology::<1>::new(&world, [1]).unwrap();
         let pencil = Pencil::<2, 1>::new_permuted(
@@ -547,5 +552,56 @@ mod tests {
             short_workspace.receive_buffer.capacity(),
             short_receive_capacity
         );
+
+        check_callback_schedule(&topology);
+    }
+
+    fn check_callback_schedule(topology: &Arc<MpiTopology<1>>) {
+        let callback_source_pencil =
+            Pencil::<2, 1>::new(Arc::clone(topology), [2, 3], [0]).unwrap();
+        let callback_destination_pencil = Pencil::<2, 1>::new_permuted(
+            Arc::clone(topology),
+            [2, 3],
+            [1],
+            AxisPermutation::new([1, 0]).unwrap(),
+        )
+        .unwrap();
+        let callback_plan = PointToPointTransposePlan::new(
+            Arc::clone(&callback_source_pencil),
+            Arc::clone(&callback_destination_pencil),
+        )
+        .unwrap();
+        let callback_requirements = callback_plan
+            .workspace_requirements(&ExtraShape::new([2]).unwrap())
+            .unwrap();
+        let mut callback_workspace = TransposeWorkspace::from_vecs(
+            vec![0; callback_requirements.send_len],
+            vec![0; callback_requirements.receive_len],
+        );
+        let callback_source = vec![0_i32; callback_source_pencil.local_len() * 2];
+        let mut callback_destination = vec![0_i32; callback_destination_pencil.local_len() * 2];
+        test_trace_start();
+        callback_plan
+            .execute_views_with_callback(
+                PencilArrayView::new(
+                    &callback_source_pencil,
+                    &ExtraShape::new([2]).unwrap(),
+                    &callback_source,
+                )
+                .unwrap(),
+                PencilArrayViewMut::new(
+                    &callback_destination_pencil,
+                    &ExtraShape::new([2]).unwrap(),
+                    &mut callback_destination,
+                )
+                .unwrap(),
+                &mut callback_workspace,
+                |_values| {
+                    test_trace_event("callback");
+                    Ok::<_, ()>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(test_trace_finish(), ["unpack", "callback", "send_wait"]);
     }
 }

@@ -24,12 +24,18 @@
 //! backward with a selected-axis reduction. `AxisSelection` keeps the full
 //! canonical route while making unselected stages identities; C2C also retains
 //! its state-checked single-buffer API; distributed R2C also provides a
-//! state-checked single-allocation real/complex buffer. `R2rPlan` retains the
+//! state-checked single-allocation real/complex buffer. Point-to-point plans
+//! additionally expose `forward_with_overlap`, `inverse_with_overlap`, and
+//! `backward_with_overlap`; these run the next local stage after receive and
+//! unpack, before send completion, and collectively reject Alltoallv. `R2rPlan`
+//! retains the
 //! legacy per-axis `Option<R2rKind>` identity selection for the eight DCT/DST
 //! kinds, while `DhtPlan` separately handles selected-axis self-paired Hartley
 //! transforms. Both support real and complex `f32`/`f64`, checked transports,
 //! raw paired backward, normalized inverse, and the poisoned in-place state
-//! contract. All distributed plans support `N >= 2`, `1 <= M < N`, and checked
+//! contract. Profiling methods return [`TransformTiming`] with per-stage
+//! [`StageTiming`] measurements and call counters. All distributed plans
+//! support `N >= 2`, `1 <= M < N`, and checked
 //! Alltoallv or
 //! receive-before-send point-to-point transitions; legacy constructors default
 //! to Alltoallv. Plan construction and transform calls are collective on the
@@ -221,9 +227,10 @@ pub use distributed::mixed::{
 #[cfg(feature = "distributed")]
 pub use distributed::{
     AxisSelection, AxisSelectionError, C2cInPlaceArray, C2cInPlaceWorkspace,
-    C2cOutOfPlaceWorkspace, C2cPlan, C2cState, DhtPlan, DistributedLayout, FftError, R2cError,
-    R2cInPlaceArray, R2cInPlaceWorkspace, R2cPlan, R2cWorkspace, R2rError, R2rInPlaceArray,
-    R2rInPlaceWorkspace, R2rPlan, R2rState, R2rWorkspace, TransposeMethod,
+    C2cOutOfPlaceWorkspace, C2cPlan, C2cState, DhtPlan, DistributedLayout, FftError,
+    FftOverlapError, FourierDirection, FourierDirections, R2cError, R2cInPlaceArray,
+    R2cInPlaceWorkspace, R2cPlan, R2cWorkspace, R2rError, R2rInPlaceArray, R2rInPlaceWorkspace,
+    R2rPlan, R2rState, R2rWorkspace, StageGeometry, StageTiming, TransformTiming, TransposeMethod,
 };
 
 /// Errors returned by local C2C plan construction and execution.
@@ -261,6 +268,8 @@ pub struct LocalC2cPlan<R: FftReal> {
     scratch_len: usize,
     forward: Arc<dyn Fft<R>>,
     inverse: Arc<dyn Fft<R>>,
+    /// Whether the public forward operation uses the positive exponent.
+    positive_forward: bool,
 }
 
 impl<R: FftReal> fmt::Debug for LocalC2cPlan<R> {
@@ -281,6 +290,13 @@ impl<R: FftReal> LocalC2cPlan<R> {
     /// `Complex<R>` slice. Backend resource failures or backend panics are not
     /// converted into [`LocalC2cError`].
     pub fn new(line_len: usize) -> Result<Self, LocalC2cError> {
+        Self::new_with_sign(line_len, false)
+    }
+
+    pub(crate) fn new_with_sign(
+        line_len: usize,
+        positive_forward: bool,
+    ) -> Result<Self, LocalC2cError> {
         validate_line_len::<R>(line_len)?;
 
         let mut planner = FftPlanner::<R>::new();
@@ -297,6 +313,7 @@ impl<R: FftReal> LocalC2cPlan<R> {
             scratch_len,
             forward,
             inverse,
+            positive_forward,
         })
     }
 
@@ -329,8 +346,12 @@ impl<R: FftReal> LocalC2cPlan<R> {
             return Ok(());
         }
 
-        self.forward
-            .process_immutable_with_scratch(src, dst, scratch);
+        let fft = if self.positive_forward {
+            &self.inverse
+        } else {
+            &self.forward
+        };
+        fft.process_immutable_with_scratch(src, dst, scratch);
         Ok(())
     }
 
@@ -351,8 +372,12 @@ impl<R: FftReal> LocalC2cPlan<R> {
             return Ok(());
         }
 
-        self.inverse
-            .process_immutable_with_scratch(src, dst, scratch);
+        let fft = if self.positive_forward {
+            &self.forward
+        } else {
+            &self.inverse
+        };
+        fft.process_immutable_with_scratch(src, dst, scratch);
         Ok(())
     }
 
@@ -389,7 +414,12 @@ impl<R: FftReal> LocalC2cPlan<R> {
             return Ok(());
         }
 
-        self.forward.process_with_scratch(data, scratch);
+        let fft = if self.positive_forward {
+            &self.inverse
+        } else {
+            &self.forward
+        };
+        fft.process_with_scratch(data, scratch);
         Ok(())
     }
 
@@ -408,7 +438,12 @@ impl<R: FftReal> LocalC2cPlan<R> {
             return Ok(());
         }
 
-        self.inverse.process_with_scratch(data, scratch);
+        let fft = if self.positive_forward {
+            &self.forward
+        } else {
+            &self.inverse
+        };
+        fft.process_with_scratch(data, scratch);
         Ok(())
     }
 

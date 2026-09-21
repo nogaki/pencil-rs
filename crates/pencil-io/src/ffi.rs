@@ -103,14 +103,23 @@ pub(crate) fn file_open(
     path: &CStr,
     write: bool,
 ) -> Result<ffi::MPI_File, i32> {
+    file_open_mode(comm, path, if write { 1 } else { 0 })
+}
+
+/// Open an existing file for read/write without creating or truncating it.
+pub(crate) fn file_open_update(comm: ffi::MPI_Comm, path: &CStr) -> Result<ffi::MPI_File, i32> {
+    file_open_mode(comm, path, 2)
+}
+
+fn file_open_mode(comm: ffi::MPI_Comm, path: &CStr, mode: i32) -> Result<ffi::MPI_File, i32> {
     // SAFETY: `path` is NUL-terminated for the duration of MPI_File_open,
     // `comm` is live, and all ranks enter the same collective call.
     unsafe {
         let mut file = ffi::RSMPI_FILE_NULL;
-        let mode = if write {
-            (ffi::MPI_MODE_WRONLY | ffi::MPI_MODE_CREATE | ffi::MPI_MODE_EXCL) as c_int
-        } else {
-            ffi::MPI_MODE_RDONLY as c_int
+        let mode = match mode {
+            1 => (ffi::MPI_MODE_WRONLY | ffi::MPI_MODE_CREATE | ffi::MPI_MODE_EXCL) as c_int,
+            2 => (ffi::MPI_MODE_RDWR) as c_int,
+            _ => ffi::MPI_MODE_RDONLY as c_int,
         };
         let code = ffi::MPI_File_open(comm, path.as_ptr(), mode, ffi::RSMPI_INFO_NULL, &mut file);
         if code == ffi::MPI_SUCCESS as c_int && file != ffi::RSMPI_FILE_NULL {
@@ -452,6 +461,20 @@ pub(crate) mod hdf5 {
         })
     }
 
+    pub(crate) fn file_open_update(fapl: Hid, path: &CStr) -> Result<Hid, i32> {
+        hdf5_metno::sync::sync(|| {
+            // SAFETY: HDF5 is serialized; fapl and path are live for this call.
+            unsafe {
+                let file = h5::h5f::H5Fopen(path.as_ptr(), h5::h5f::H5F_ACC_RDWR, fapl);
+                if hdf5_invalid(file) {
+                    Err(file as i32)
+                } else {
+                    Ok(file)
+                }
+            }
+        })
+    }
+
     pub(crate) fn file_flush(file: Hid) -> i32 {
         hdf5_metno::sync::sync(|| {
             // SAFETY: `file` is a live HDF5 file identifier and the scope is a
@@ -534,6 +557,20 @@ pub(crate) mod hdf5 {
                     Err(id as i32)
                 } else {
                     Ok(id)
+                }
+            }
+        })
+    }
+
+    pub(crate) fn link_exists(group: Hid, name: &CStr) -> Result<bool, i32> {
+        hdf5_metno::sync::sync(|| {
+            // SAFETY: group and name are live for this metadata query.
+            unsafe {
+                let result = h5::h5l::H5Lexists(group, name.as_ptr(), h5::h5p::H5P_DEFAULT);
+                if result < 0 {
+                    Err(result as i32)
+                } else {
+                    Ok(result > 0)
                 }
             }
         })
@@ -894,6 +931,43 @@ pub(crate) mod hdf5 {
                     },
                 )
             }
+        })
+    }
+
+    pub(crate) fn type_create_string(size: usize, abort_comm: ffi::MPI_Comm) -> Result<Hid, i32> {
+        hdf5_metno::sync::sync(|| unsafe {
+            let datatype = h5::h5t::H5Tcopy(*hdf5_metno::globals::H5T_C_S1);
+            if hdf5_invalid(datatype) {
+                return Err(datatype as i32);
+            }
+            let valid = h5::h5t::H5Tset_size(datatype, size) >= 0
+                && h5::h5t::H5Tset_cset(datatype, h5::h5t::H5T_cset_t::H5T_CSET_UTF8) >= 0
+                && h5::h5t::H5Tset_strpad(datatype, h5::h5t::H5T_str_t::H5T_STR_NULLTERM) >= 0;
+            if valid {
+                Ok(datatype)
+            } else {
+                if h5::h5t::H5Tclose(datatype) < 0 {
+                    super::abort_fail_stop(abort_comm);
+                }
+                Err(-1)
+            }
+        })
+    }
+
+    pub(crate) fn type_size(type_id: Hid) -> Result<usize, i32> {
+        hdf5_metno::sync::sync(|| unsafe {
+            let size = h5::h5t::H5Tget_size(type_id);
+            if size == 0 { Err(-1) } else { Ok(size) }
+        })
+    }
+
+    pub(crate) fn type_matches_string(type_id: Hid, size: usize) -> bool {
+        hdf5_metno::sync::sync(|| unsafe {
+            h5::h5t::H5Tget_class(type_id) == h5::h5t::H5T_class_t::H5T_STRING
+                && h5::h5t::H5Tget_size(type_id) == size
+                && h5::h5t::H5Tis_variable_str(type_id) == 0
+                && h5::h5t::H5Tget_cset(type_id) == h5::h5t::H5T_cset_t::H5T_CSET_UTF8
+                && h5::h5t::H5Tget_strpad(type_id) == h5::h5t::H5T_str_t::H5T_STR_NULLTERM
         })
     }
 

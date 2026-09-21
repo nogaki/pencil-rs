@@ -3,6 +3,7 @@ use std::ops::Range;
 use std::path::Path;
 
 use hdf5_metno_sys::h5::hsize_t;
+use mpi::collective::{CommunicatorCollectives, SystemOperation};
 use mpi::raw::AsRaw;
 use mpi::topology::Communicator;
 use pencil_array::{PencilArrayView, PencilArrayViewMut};
@@ -15,12 +16,90 @@ use crate::mpi_io::{
     descriptor_agreement, duplicate_comm,
 };
 use crate::{
-    COMMIT_MARKER, FORMAT_VERSION, INCOMPLETE_MARKER, IoError, MAX_PROTOCOL_RANK, OP_READ_HDF5,
-    OP_WRITE_HDF5,
+    COMMIT_MARKER, FORMAT_VERSION, INCOMPLETE_MARKER, IoError, MAX_PROTOCOL_RANK, NamedIoError,
+    OP_APPEND_HDF5_NAMED, OP_READ_HDF5, OP_READ_HDF5_NAMED, OP_WRITE_HDF5, OP_WRITE_HDF5_NAMED,
 };
+
+const MAX_NAME: usize = 1024;
+
+fn named_link<C: CommunicatorCollectives>(comm: &C, name: &str) -> Result<CString, NamedIoError> {
+    let valid = !name.is_empty() && name.len() <= MAX_NAME && !name.as_bytes().contains(&0);
+    let n = name.len() as i64;
+    let mut lo = 0;
+    let mut hi = 0;
+    comm.all_reduce_into(&n, &mut lo, SystemOperation::min());
+    comm.all_reduce_into(&n, &mut hi, SystemOperation::max());
+    if lo != hi {
+        return Err(NamedIoError::Io(IoError::CollectiveDescriptorMismatch));
+    }
+    let ok = i32::from(valid);
+    let mut all_ok = 0;
+    comm.all_reduce_into(&ok, &mut all_ok, SystemOperation::min());
+    if all_ok == 0 {
+        return Err(NamedIoError::InvalidName);
+    }
+    let ranks = usize::try_from(comm.size())
+        .map_err(|_| NamedIoError::Io(IoError::SizeLimit { what: "MPI ranks" }))?;
+    let bytes_len = name
+        .len()
+        .checked_mul(ranks)
+        .ok_or(NamedIoError::Io(IoError::SizeLimit {
+            what: "named descriptor",
+        }))?;
+    if bytes_len > 64 * 1024 * 1024 {
+        return Err(IoError::SizeLimit {
+            what: "named descriptor allgather",
+        }
+        .into());
+    }
+    let mut bytes = Vec::new();
+    let reserve = bytes.try_reserve_exact(bytes_len);
+    if let Err(agreement) = agree_phase(
+        comm,
+        reserve.is_ok(),
+        "named descriptor allgather allocation",
+    ) {
+        return Err(NamedIoError::Io(if reserve.is_err() {
+            IoError::AllocationFailed {
+                requested: bytes_len,
+            }
+        } else {
+            agreement
+        }));
+    }
+    bytes.resize(bytes_len, 0);
+    comm.all_gather_into(name.as_bytes(), &mut bytes);
+    if bytes.chunks_exact(name.len()).any(|x| x != name.as_bytes()) {
+        return Err(NamedIoError::Io(IoError::CollectiveDescriptorMismatch));
+    }
+    let hex_len = name
+        .len()
+        .checked_mul(2)
+        .and_then(|len| len.checked_add(1))
+        .ok_or(NamedIoError::Io(IoError::SizeLimit {
+            what: "named descriptor",
+        }))?;
+    let mut hex = Vec::new();
+    let reserve = hex.try_reserve_exact(hex_len);
+    if let Err(agreement) = agree_phase(comm, reserve.is_ok(), "named link allocation") {
+        return Err(NamedIoError::Io(if reserve.is_err() {
+            IoError::AllocationFailed { requested: hex_len }
+        } else {
+            agreement
+        }));
+    }
+    for byte in name.bytes() {
+        hex.push(b"0123456789abcdef"[(byte >> 4) as usize]);
+        hex.push(b"0123456789abcdef"[(byte & 15) as usize]);
+    }
+    hex.push(0);
+    CString::from_vec_with_nul(hex).map_err(|_| NamedIoError::InvalidName)
+}
 
 const GROUP_NAME: &[u8] = b"/pencil_io_v1\0";
 const DATASET_NAME: &[u8] = b"data\0";
+const NAMED_GROUP: &[u8] = b"/pencil_io_named_v1\0";
+const NAME_ATTR: &[u8] = b"pencil_io_original_name\0";
 const ATTR_VERSION: &[u8] = b"pencil_io_version\0";
 const ATTR_COMMIT: &[u8] = b"pencil_io_commit\0";
 const ATTR_N: &[u8] = b"pencil_io_n\0";
@@ -48,13 +127,28 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    write_hdf5_inner(path, view, false)
+    write_hdf5_inner(
+        path,
+        view,
+        false,
+        cstr(GROUP_NAME),
+        cstr(DATASET_NAME),
+        false,
+        None,
+        OP_WRITE_HDF5,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_hdf5_inner<P, T, const N: usize, const M: usize>(
     path: P,
     view: PencilArrayView<'_, T, N, M>,
     inject_post_cleanup_failure: bool,
+    group_name: &CStr,
+    dataset_name: &CStr,
+    update: bool,
+    original_name: Option<&[u8]>,
+    operation: u64,
 ) -> Result<(), IoError>
 where
     P: AsRef<Path>,
@@ -64,7 +158,7 @@ where
     descriptor_agreement(
         comm,
         path.as_ref(),
-        OP_WRITE_HDF5,
+        operation,
         view.pencil().global_shape(),
         view.extra_shape().dimensions(),
         view.pencil().topology().process_grid(),
@@ -93,7 +187,7 @@ where
         Ok(fapl) => fapl,
         Err(error) => return Err(cleanup_comm_only(comm, duplicate, error)),
     };
-    let opened = match open_hdf5(comm, fapl, &path, true) {
+    let opened = match open_hdf5_mode(comm, fapl, &path, !update, update) {
         Ok(file) => file,
         Err(error) => return Err(cleanup_comm_only(comm, duplicate, error)),
     };
@@ -101,7 +195,11 @@ where
 
     let group = match collective_handle_phase(
         comm,
-        native::group_create(opened, cstr(GROUP_NAME)),
+        if update {
+            native::group_open(opened, group_name)
+        } else {
+            native::group_create(opened, group_name)
+        },
         "HDF5 group create",
     ) {
         Ok(group) => group,
@@ -135,7 +233,7 @@ where
         comm,
         native::dataset_create(
             resources.group.expect("group creation agreement"),
-            cstr(DATASET_NAME),
+            dataset_name,
             datatype,
             dataspace,
         ),
@@ -146,6 +244,17 @@ where
     };
     resources.dataset = Some(dataset);
 
+    if let Some(name) = original_name {
+        if let Err(error) = write_original_name(
+            comm,
+            duplicate.raw,
+            dataset,
+            name,
+            "HDF5 original-name attribute",
+        ) {
+            return Err(cleanup_ready(comm, duplicate, opened, resources, error));
+        }
+    }
     if let Err(error) = write_metadata(
         comm,
         dataset,
@@ -306,12 +415,213 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    write_hdf5_inner(path, view, true)
+    write_hdf5_inner(
+        path,
+        view,
+        true,
+        cstr(GROUP_NAME),
+        cstr(DATASET_NAME),
+        false,
+        None,
+        OP_WRITE_HDF5,
+    )
 }
 
-/// Reads one parallel HDF5 dataset collectively into a view without changing
-/// the destination until data transfer and every explicit close succeeds. Do
-/// not overlap the call with another operation on the topology communicator.
+/// Creates an exclusive named HDF5 container and writes its first dataset.
+/// UTF-8 keys (1..=1024 bytes, no NUL) are hex-encoded as link components.
+pub fn write_hdf5_named<P, S, T, const N: usize, const M: usize>(
+    path: P,
+    name: S,
+    view: PencilArrayView<'_, T, N, M>,
+) -> Result<(), NamedIoError>
+where
+    P: AsRef<Path>,
+    S: AsRef<str>,
+    T: IoElement,
+{
+    write_named(path.as_ref(), name.as_ref(), view, false)
+}
+
+pub(crate) fn write_named<T: IoElement, const N: usize, const M: usize>(
+    path: &Path,
+    name: &str,
+    view: PencilArrayView<'_, T, N, M>,
+    inject: bool,
+) -> Result<(), NamedIoError> {
+    let comm = view.pencil().topology().communicator();
+    descriptor_agreement(
+        comm,
+        path,
+        OP_WRITE_HDF5_NAMED,
+        view.pencil().global_shape(),
+        view.extra_shape().dimensions(),
+        view.pencil().topology().process_grid(),
+        view.pencil().permutation().axes(),
+        T::CODE,
+        T::WIDTH,
+    )
+    .map_err(NamedIoError::Io)?;
+    let link = named_link(comm, name)?;
+    let group = cstr(NAMED_GROUP);
+    write_hdf5_inner(
+        path,
+        view,
+        inject,
+        group,
+        &link,
+        false,
+        Some(name.as_bytes()),
+        OP_WRITE_HDF5_NAMED,
+    )
+    .map_err(NamedIoError::Io)
+}
+
+/// Appends a named dataset to an existing parallel HDF5 container.
+///
+/// The operation fails with [`NamedIoError::DuplicateName`] without changing
+/// the container when `name` already exists.
+pub fn append_hdf5_named<P, S, T, const N: usize, const M: usize>(
+    path: P,
+    name: S,
+    view: PencilArrayView<'_, T, N, M>,
+) -> Result<(), NamedIoError>
+where
+    P: AsRef<Path>,
+    S: AsRef<str>,
+    T: IoElement,
+{
+    let comm = view.pencil().topology().communicator();
+    descriptor_agreement(
+        comm,
+        path.as_ref(),
+        OP_APPEND_HDF5_NAMED,
+        view.pencil().global_shape(),
+        view.extra_shape().dimensions(),
+        view.pencil().topology().process_grid(),
+        view.pencil().permutation().axes(),
+        T::CODE,
+        T::WIDTH,
+    )
+    .map_err(NamedIoError::Io)?;
+    let link = named_link(comm, name.as_ref())?;
+    let pc = path_cstring(path.as_ref(), comm).map_err(NamedIoError::Io)?;
+    let dup = duplicate_comm(comm).map_err(NamedIoError::Io)?;
+    let fapl = match prepare_hdf5_fapl(comm, dup.raw) {
+        Ok(fapl) => fapl,
+        Err(error) => return Err(NamedIoError::Io(cleanup_comm_only(comm, dup, error))),
+    };
+    let file = match open_hdf5_mode(comm, fapl, &pc, false, true) {
+        Ok(file) => file,
+        Err(error) => return Err(NamedIoError::Io(cleanup_comm_only(comm, dup, error))),
+    };
+    let group = match collective_handle_phase(
+        comm,
+        native::group_open(file, cstr(NAMED_GROUP)),
+        "HDF5 named group open",
+    ) {
+        Ok(group) => group,
+        Err(error) => {
+            return Err(NamedIoError::Io(cleanup_ready(
+                comm,
+                dup,
+                file,
+                Hdf5Resources::default(),
+                error,
+            )));
+        }
+    };
+    let exists_result = native::link_exists(group, &link);
+    let query_agreement = agree_phase(comm, exists_result.is_ok(), "HDF5 named link query");
+    let cleanup = finish_hdf5(
+        comm,
+        dup,
+        file,
+        Hdf5Resources {
+            group: Some(group),
+            ..Default::default()
+        },
+    );
+    let exists = match query_agreement {
+        Ok(()) => {
+            exists_result.map_err(|c| NamedIoError::Io(hdf5_error("HDF5 named link query", c)))?
+        }
+        Err(error) => return Err(NamedIoError::Io(error)),
+    };
+    if let Some(error) = cleanup {
+        return Err(NamedIoError::Io(error));
+    }
+    let (all_exist, mixed) = collective_state(comm, exists);
+    if mixed {
+        return Err(IoError::CollectiveDescriptorMismatch.into());
+    }
+    if all_exist {
+        return Err(NamedIoError::DuplicateName);
+    }
+    write_hdf5_inner(
+        path,
+        view,
+        false,
+        cstr(NAMED_GROUP),
+        &link,
+        true,
+        Some(name.as_ref().as_bytes()),
+        OP_APPEND_HDF5_NAMED,
+    )
+    .map_err(NamedIoError::Io)
+}
+
+/// Reads a named dataset collectively without modifying the destination on failure.
+pub fn read_hdf5_named<P, S, T, const N: usize, const M: usize>(
+    path: P,
+    name: S,
+    view: PencilArrayViewMut<'_, T, N, M>,
+) -> Result<(), NamedIoError>
+where
+    P: AsRef<Path>,
+    S: AsRef<str>,
+    T: IoElement,
+{
+    read_named(path.as_ref(), name.as_ref(), view, false)
+}
+
+pub(crate) fn read_named<T: IoElement, const N: usize, const M: usize>(
+    path: &Path,
+    name: &str,
+    view: PencilArrayViewMut<'_, T, N, M>,
+    inject: bool,
+) -> Result<(), NamedIoError> {
+    let comm = view.pencil().topology().communicator();
+    descriptor_agreement(
+        comm,
+        path,
+        OP_READ_HDF5_NAMED,
+        view.pencil().global_shape(),
+        view.extra_shape().dimensions(),
+        view.pencil().topology().process_grid(),
+        view.pencil().permutation().axes(),
+        T::CODE,
+        T::WIDTH,
+    )
+    .map_err(NamedIoError::Io)?;
+    let link = named_link(comm, name)?;
+    read_hdf5_inner(
+        path,
+        view,
+        inject,
+        cstr(NAMED_GROUP),
+        &link,
+        Some(name.as_bytes()),
+        OP_READ_HDF5_NAMED,
+    )
+    .map_err(|error| match error {
+        IoError::MetadataMismatch {
+            field: "named dataset missing",
+        } => NamedIoError::NotFound,
+        other => NamedIoError::Io(other),
+    })
+}
+
+/// Reads the version-1 HDF5 dataset collectively without modifying the destination on failure.
 pub fn read_hdf5<P, T, const N: usize, const M: usize>(
     path: P,
     view: PencilArrayViewMut<'_, T, N, M>,
@@ -320,13 +630,25 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_hdf5_inner(path, view, false)
+    read_hdf5_inner(
+        path,
+        view,
+        false,
+        cstr(GROUP_NAME),
+        cstr(DATASET_NAME),
+        None,
+        OP_READ_HDF5,
+    )
 }
 
 fn read_hdf5_inner<P, T, const N: usize, const M: usize>(
     path: P,
     mut view: PencilArrayViewMut<'_, T, N, M>,
     inject_post_cleanup_failure: bool,
+    group_name: &CStr,
+    dataset_name: &CStr,
+    expected_name: Option<&[u8]>,
+    operation: u64,
 ) -> Result<(), IoError>
 where
     P: AsRef<Path>,
@@ -336,7 +658,7 @@ where
     descriptor_agreement(
         comm,
         path.as_ref(),
-        OP_READ_HDF5,
+        operation,
         view.pencil().global_shape(),
         view.extra_shape().dimensions(),
         view.pencil().topology().process_grid(),
@@ -386,22 +708,62 @@ where
 
     let group = match collective_handle_phase(
         comm,
-        native::group_open(opened, cstr(GROUP_NAME)),
+        native::group_open(opened, group_name),
         "HDF5 group open",
     ) {
         Ok(group) => group,
         Err(error) => return Err(cleanup_ready(comm, duplicate, opened, resources, error)),
     };
     resources.group = Some(group);
+    if expected_name.is_some() {
+        let exists = native::link_exists(group, dataset_name);
+        if let Err(error) = agree_phase(comm, exists.is_ok(), "HDF5 named lookup") {
+            return Err(cleanup_ready(comm, duplicate, opened, resources, error));
+        }
+        let present = exists.expect("named lookup agreed");
+        if agree_phase(comm, present, "HDF5 named presence").is_err() {
+            return Err(cleanup_ready(
+                comm,
+                duplicate,
+                opened,
+                resources,
+                IoError::MetadataMismatch {
+                    field: "named dataset missing",
+                },
+            ));
+        }
+    }
     let dataset = match collective_handle_phase(
         comm,
-        native::dataset_open(group, cstr(DATASET_NAME)),
+        native::dataset_open(group, dataset_name),
         "HDF5 dataset open",
     ) {
         Ok(dataset) => dataset,
         Err(error) => return Err(cleanup_ready(comm, duplicate, opened, resources, error)),
     };
     resources.dataset = Some(dataset);
+    if let Some(expected) = expected_name {
+        let actual = match read_original_name(comm, dataset, "HDF5 original-name metadata read") {
+            Ok(actual) => actual,
+            Err(error) => return Err(cleanup_ready(comm, duplicate, opened, resources, error)),
+        };
+        let ok = actual == expected;
+        if let Err(agreement) = agree_phase(comm, ok, "HDF5 original-name metadata") {
+            return Err(cleanup_ready(
+                comm,
+                duplicate,
+                opened,
+                resources,
+                if ok {
+                    agreement
+                } else {
+                    IoError::MetadataMismatch {
+                        field: "original name",
+                    }
+                },
+            ));
+        }
+    }
 
     macro_rules! read_attr {
         ($name:expr, $expected:expr, $max:expr, $phase:expr) => {
@@ -677,7 +1039,15 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_hdf5_inner(path, view, true)
+    read_hdf5_inner(
+        path,
+        view,
+        true,
+        cstr(GROUP_NAME),
+        cstr(DATASET_NAME),
+        None,
+        OP_READ_HDF5,
+    )
 }
 
 #[derive(Debug, Default)]
@@ -735,11 +1105,25 @@ fn cleanup_fapl(
 
 fn open_hdf5(
     comm: &mpi::topology::CartesianCommunicator,
-    mut fapl: native::Hid,
+    fapl: native::Hid,
     path: &CString,
     write: bool,
 ) -> Result<native::Hid, IoError> {
-    let result = native::file_open(fapl, path.as_c_str(), write);
+    open_hdf5_mode(comm, fapl, path, write, false)
+}
+
+fn open_hdf5_mode(
+    comm: &mpi::topology::CartesianCommunicator,
+    mut fapl: native::Hid,
+    path: &CString,
+    write: bool,
+    update: bool,
+) -> Result<native::Hid, IoError> {
+    let result = if update {
+        native::file_open_update(fapl, path.as_c_str())
+    } else {
+        native::file_open(fapl, path.as_c_str(), write)
+    };
     // The FAPL is local and must be closed on every rank before any caller can
     // enter another HDF5 collective. Keep it retained until that agreement.
     let fapl_close = native::plist_close(&mut fapl);
@@ -949,6 +1333,157 @@ fn write_metadata<const N: usize, const M: usize>(
         "HDF5 permutation attribute",
     )?;
     Ok(())
+}
+
+fn write_original_name(
+    comm: &mpi::topology::CartesianCommunicator,
+    abort_comm: ffi::MPI_Comm,
+    object: native::Hid,
+    name: &[u8],
+    phase: &'static str,
+) -> Result<(), IoError> {
+    let size = name.len().checked_add(1).ok_or(IoError::SizeLimit {
+        what: "HDF5 original-name attribute",
+    });
+    let mut bytes = Vec::new();
+    let allocation = size.and_then(|size| {
+        bytes
+            .try_reserve_exact(size)
+            .map_err(|_| IoError::AllocationFailed { requested: size })
+    });
+    if let Err(agreement) = agree_phase(comm, allocation.is_ok(), "HDF5 original-name allocation") {
+        return Err(allocation.err().unwrap_or(agreement));
+    }
+    bytes.extend_from_slice(name);
+    bytes.push(0);
+    let size = bytes.len();
+    let mut handles = AttrHandles::default();
+    let (datatype, error) =
+        local_handle_phase(comm, native::type_create_string(size, abort_comm), phase);
+    handles.datatype = datatype;
+    if let Some(error) = error {
+        return Err(attr_error(comm, handles, error));
+    }
+    let (space, error) = local_handle_phase(comm, native::dataspace_scalar(), phase);
+    handles.space = space;
+    if let Some(error) = error {
+        return Err(attr_error(comm, handles, error));
+    }
+    let attr = collective_handle_phase(
+        comm,
+        native::attr_create(
+            object,
+            cstr(NAME_ATTR),
+            handles.datatype.expect("name datatype"),
+            handles.space.expect("name space"),
+        ),
+        phase,
+    );
+    handles.attr = match attr {
+        Ok(attr) => Some(attr),
+        Err(error) => return Err(attr_error(comm, handles, error)),
+    };
+    let code = native::attr_write(
+        handles.attr.expect("name attribute"),
+        handles.datatype.expect("name datatype"),
+        &bytes,
+    );
+    if let Err(agreement) = agree_phase(comm, code >= 0, phase) {
+        return Err(attr_error(
+            comm,
+            handles,
+            if code < 0 {
+                hdf5_error("H5Awrite", code)
+            } else {
+                agreement
+            },
+        ));
+    }
+    finish_attr_handles(comm, handles).map_or(Ok(()), Err)
+}
+
+fn read_original_name(
+    comm: &mpi::topology::CartesianCommunicator,
+    object: native::Hid,
+    phase: &'static str,
+) -> Result<Vec<u8>, IoError> {
+    let mut handles = AttrHandles::default();
+    let (attr, error) = local_handle_phase(comm, native::attr_open(object, cstr(NAME_ATTR)), phase);
+    handles.attr = attr;
+    if let Some(error) = error {
+        return Err(attr_error(comm, handles, error));
+    }
+    let attr = handles.attr.expect("name attribute");
+    let (datatype, error) = local_handle_phase(comm, native::attr_type(attr), phase);
+    handles.datatype = datatype;
+    if let Some(error) = error {
+        return Err(attr_error(comm, handles, error));
+    }
+    let datatype = handles.datatype.expect("name datatype");
+    let (space, error) = local_handle_phase(comm, native::attr_space(attr), phase);
+    handles.space = space;
+    if let Some(error) = error {
+        return Err(attr_error(comm, handles, error));
+    }
+    let space = handles.space.expect("name space");
+    let shape = native::attr_shape(space);
+    let size = native::type_size(datatype);
+    let valid = shape.is_ok_and(|shape| shape.is_empty())
+        && size.is_ok_and(|size| (1..=MAX_NAME + 1).contains(&size))
+        && size.is_ok_and(|size| native::type_matches_string(datatype, size));
+    if let Err(agreement) = agree_phase(comm, size.is_ok() && valid, phase) {
+        return Err(attr_error(
+            comm,
+            handles,
+            size.err()
+                .map(|code| hdf5_error("HDF5 name type", code))
+                .unwrap_or(agreement),
+        ));
+    }
+    let size = size.expect("name size agreement");
+    let mut bytes = Vec::new();
+    let allocation = bytes
+        .try_reserve_exact(size)
+        .map_err(|_| IoError::AllocationFailed { requested: size });
+    if let Err(agreement) = agree_phase(comm, allocation.is_ok(), phase) {
+        return Err(attr_error(
+            comm,
+            handles,
+            allocation.err().unwrap_or(agreement),
+        ));
+    }
+    bytes.resize(size, 0);
+    let code = native::attr_read(attr, datatype, &mut bytes);
+    if let Err(agreement) = agree_phase(comm, code >= 0, phase) {
+        return Err(attr_error(
+            comm,
+            handles,
+            if code < 0 {
+                hdf5_error("H5Aread", code)
+            } else {
+                agreement
+            },
+        ));
+    }
+    let valid = bytes.last() == Some(&0);
+    if let Err(agreement) = agree_phase(comm, valid, phase) {
+        return Err(attr_error(
+            comm,
+            handles,
+            if valid {
+                agreement
+            } else {
+                IoError::MetadataMismatch {
+                    field: "original name",
+                }
+            },
+        ));
+    }
+    bytes.pop();
+    if let Some(error) = finish_attr_handles(comm, handles) {
+        return Err(error);
+    }
+    Ok(bytes)
 }
 
 fn attr_phase(
