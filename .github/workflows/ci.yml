@@ -30,6 +30,16 @@ jobs:
             exit 1
           fi
 
+      - name: Check local CUDA host paths without MPI or CUDA hardware
+        run: |
+          set -euo pipefail
+          cargo test -p pencil-cuda --no-default-features --locked
+          cargo tree -p pencil-cuda --no-default-features --edges normal --locked | tee /tmp/pencil-cuda-local-tree.txt
+          if grep -Eq '(^|[[:space:]])(mpi|pencil-array|pencil-fft|rustfft|realfft)([[:space:]]|$)' /tmp/pencil-cuda-local-tree.txt; then
+            echo "local pencil-cuda unexpectedly depends on MPI or CPU FFT" >&2
+            exit 1
+          fi
+
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -191,6 +201,15 @@ jobs:
                 cargo test -p pencil-fft --features distributed --test "$suite" --locked -- \
                   --nocapture --test-threads=1
             done
+            run_one timeout --kill-after=5s 240s \
+              mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-cuda --features distributed --test distributed_host --locked -- \
+                --nocapture --test-threads=1
+            run_one timeout --kill-after=5s 240s \
+              mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-cuda --features distributed --lib --locked \
+                distributed_real::tests::mpi_helper_collective_geometry_and_projection -- \
+                --exact --nocapture --test-threads=1
             for suite in named_mpi named_hdf5; do
               run_one timeout --kill-after=5s 240s \
                 mpiexec --oversubscribe -n "$n" \
@@ -243,6 +262,12 @@ jobs:
             cargo test -p pencil-io --features parallel-hdf5 --lib \
               post_cleanup_errors_preserve_destination_and_valid_commits --locked \
               -- --nocapture --test-threads=1
+
+      - name: Compile all CUDA tests without requiring hardware execution
+        run: cargo test -p pencil-cuda --all-features --all-targets --no-run --locked
+
+      - name: Run CUDA all-feature Clippy
+        run: cargo clippy -p pencil-cuda --all-features --all-targets --locked -- -D warnings
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -303,3 +328,6 @@ jobs:
 
       - name: Check distributed FFT on minimum supported Rust
         run: cargo +1.85.0 check -p pencil-fft --features distributed --all-targets --locked
+
+      - name: Check CUDA optional distributed targets on minimum supported Rust
+        run: cargo +1.85.0 check -p pencil-cuda --all-features --all-targets --locked

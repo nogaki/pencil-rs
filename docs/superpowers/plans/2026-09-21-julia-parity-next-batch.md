@@ -19,7 +19,7 @@ User approved all seven categories after comparison with PencilArrays 0.19.11 an
 - [x] Per-axis FFT/BFFT signs. Add a direction value/configuration API that creates a fresh plan core, covering C2C and both mixed plans. Forward uses the configured complex sign; inverse/backward use its pair, only inverse normalizes. Positive-sign forward's inverse uses negative FFT followed by scaling. RFFT/R2R/identity stages do not silently acquire a Fourier sign. Keep closed `AxisTransform` and `DistributedLayout` unchanged; descriptors include directions, old workspaces reject the new core. Update independent Julia fixtures and corruption checks without shrinking the matrix.
 - [x] Per-stage timing. Fixed/const-N records, `std::time::Instant`, local-rank measurements for transform/pack/collective-or-receive-wait/send-wait/unpack/total. No implicit timing reductions or fallible post-start reporting allocation. Distinct new operation words for profiled entry points. Overlapped intervals need not sum to total.
 - [x] Genuine out-of-place P2P send/FFT overlap (matching Julia's overlap path; in-place profiling remains supported). Nested receive scope inside send scope, all reservations agreed before packing/posting, receives before sends, receive wait and scope end before unpack/callback, next FFT before send wait. Requests never escape their scope. Wait sends on callback error/unwind, then perform the same panic-status agreement on all ranks before a local panic is resumed or peers return a typed peer-panic error. Normal callback errors are collectively agreed before subsequent payloads; peer-panic paths must not enter another unmatched outer agreement. Keep existing synchronous entries unchanged and test scheduling, recovery and ownership.
-- [ ] Concrete CUDA support. New `pencil-cuda` with dynamic CUDA/cuFFT loading (`libloading = "=0.8.9"`), resident buffers and actual GPU FFTs, no disguised CPU fallback. Local C2C/R2C/C2R for f32/f64 and normalized/raw directions; optional `distributed` uses checked host-staged MPI, never root-gather FFT. Reuse immutable stage geometry through additive accessors rather than exposing internal executors. One audited unsafe FFI boundary, retained library/context lifetimes, checked sizes/strides/device ownership and statuses. CPU crates/default behavior unchanged.
+- [x] Concrete CUDA implementation (draft; hardware release gate remains open). New `pencil-cuda` with dynamic CUDA/cuFFT loading (`libloading = "=0.8.9"`), resident buffers and actual GPU FFTs, no disguised CPU fallback. Local C2C/R2C/C2R for f32/f64 and normalized/raw directions; optional `distributed` uses checked host-staged MPI, never root-gather FFT. Reuse immutable stage geometry through additive accessors rather than exposing internal executors. One audited unsafe FFI boundary, retained library/context lifetimes, checked sizes/strides/device ownership and statuses. CPU crates/default behavior unchanged.
 
 ## Verification
 
@@ -63,10 +63,16 @@ is recorded separately before publication.
 
 CUDA local and distributed code is implemented on the separate CUDA branch,
 including real cuFFT calls, resident arrays, host-staged MPI, normalization PTX,
-context/resource safeguards, and host/MPI checks. The CUDA checkbox remains open
-as a release gate: no real CUDA numerical/ABI/PTX execution is available here.
-Publish that work as a draft until the explicit hardware matrix passes, not as a
-validated GPU release. It does not claim GPU R2R/mixed transforms, CUDA-aware MPI,
+context/resource safeguards, and host/MPI checks. The implementation checkbox
+above is not release approval: no real CUDA numerical/ABI/PTX execution is
+available here. Publish this branch as a draft until the explicit hardware
+matrix passes, not as a validated GPU release.
+
+- [ ] CUDA hardware release gate: local numeric/resource tests and the 1/4/6-rank
+  distributed CUDA matrix, including valid peers plus one invalid device ordinal,
+  must pass on actual hardware before release.
+
+The CUDA implementation does not claim GPU R2R/mixed transforms, CUDA-aware MPI,
 distributed in-place execution, padded real in-place execution, or allocation-free
 GPU execution. Existing CPU implementations of those transform families remain.
 

@@ -37,7 +37,7 @@ cargo test -p pencil-cuda --lib -- --ignored --nocapture
 
 Explicit runs fail if CUDA/driver/cuFFT is absent; they never silently skip. Tests compare f32/f64 C2C and real transforms against independent CPU direct-DFT oracles (no CPU FFT dependency): odd/even/n=1, batches, partial blocks, normalized/raw, arbitrary valid spectra, preservation, C2C in-place, wrong contexts, and endpoint rejection before writes. Ignored library tests check ambient context restoration and unwind, inject errors after actual successful create/push/pop calls (including genuine constructor failure), and inject synchronization failure to check that no buffer/plan/module/context release occurs and libraries remain loaded. A control case checks normal releases. These are native GPU checks, not ABI mocks.
 
-Real-hardware status: **UNVERIFIED**. PTX execution and numerical results require an actual CUDA device. Local phase-1 validation is in `validation/`; phase-2 checks are in `logs/`.
+Real-hardware status: **UNVERIFIED**. PTX execution and numerical results require an actual CUDA device. Host-validation logs are local build artifacts, not checked-in hardware evidence. This implementation remains draft-only until the hardware release gate below is satisfied.
 
 ## Distributed API (`--features distributed`)
 

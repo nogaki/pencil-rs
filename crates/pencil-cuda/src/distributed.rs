@@ -4,6 +4,8 @@
 //! the input pencil topology. Use the same operation/order on every rank.
 //! Arrays and workspaces are resident/reusable; local packing and MPI use host
 //! memory, not CUDA-aware MPI. No CPU FFT execution or root gather is used.
+//! ponytail: per-stage host/device staging bounds this implementation's memory
+//! and transfer cost; a two-buffer pool and GPU packing need separate profiling.
 //!
 //! ```no_run
 //! use pencil_array::{MpiTopology, Pencil, ExtraShape};
