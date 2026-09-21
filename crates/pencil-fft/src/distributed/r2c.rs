@@ -21,9 +21,15 @@ use pencil_array::{
     PencilArray, PencilArrayView, PencilArrayViewMut, TransposeWorkspace,
 };
 
+impl From<FftError> for FftOverlapError<R2cError> {
+    fn from(error: FftError) -> Self {
+        Self::Operation(error.into())
+    }
+}
+
 use super::{
     AxisSelection, C2cTransition, DESCRIPTOR_SCHEMA, Direction, DistributedLayout, FftError,
-    FourierDirections, INVALID_WORD, LocalTransform, OPERATION_R2C_BACKWARD,
+    FftOverlapError, FourierDirections, INVALID_WORD, LocalTransform, OPERATION_R2C_BACKWARD,
     OPERATION_R2C_BACKWARD_IN_PLACE, OPERATION_R2C_FORWARD, OPERATION_R2C_FORWARD_IN_PLACE,
     OPERATION_R2C_INVERSE, OPERATION_R2C_INVERSE_IN_PLACE, OPERATION_R2C_PLAN, R2cError,
     StagePreparation, TransformPlanCore, TransformStage, TransformTiming, TransposeMethod,
@@ -812,23 +818,23 @@ where
         Ok(timing)
     }
 
-    /// Computes forward while running each next complex FFT from a P2P receive.
+    /// Computes forward while running each next complex FFT after receive/unpack completion and before the P2P send wait.
     pub fn forward_with_overlap(
         &self,
         source: &PencilArray<R, N, M>,
         destination: &mut PencilArray<Complex<R>, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
-    ) -> Result<(), R2cError> {
+    ) -> Result<(), FftOverlapError<R2cError>> {
         self.execute_overlap_forward(source, destination, workspace)
     }
 
-    /// Computes a normalized inverse while running each next complex FFT from a P2P receive.
+    /// Computes a normalized inverse while running each next complex FFT after receive/unpack completion and before the P2P send wait.
     pub fn inverse_with_overlap(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
         destination: &mut PencilArray<R, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
-    ) -> Result<(), R2cError> {
+    ) -> Result<(), FftOverlapError<R2cError>> {
         self.execute_overlap_reverse(Direction::Inverse, source, destination, workspace)
     }
 
@@ -839,7 +845,7 @@ where
         source: &PencilArray<Complex<R>, N, M>,
         destination: &mut PencilArray<R, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
-    ) -> Result<(), R2cError> {
+    ) -> Result<(), FftOverlapError<R2cError>> {
         self.execute_overlap_reverse(Direction::Backward, source, destination, workspace)
     }
 
@@ -1742,7 +1748,7 @@ where
         source: &PencilArray<R, N, M>,
         destination: &mut PencilArray<Complex<R>, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
-    ) -> Result<(), R2cError> {
+    ) -> Result<(), FftOverlapError<R2cError>> {
         let communicator = self.input_pencil().topology().communicator();
         agree_execution_descriptor_ref::<N, M>(
             communicator,
@@ -1753,13 +1759,14 @@ where
         if !collective_valid(communicator, preflight.is_ok()) {
             return Err(preflight
                 .err()
-                .unwrap_or(R2cError::Fft(FftError::CollectivePreconditionFailed)));
+                .unwrap_or(R2cError::Fft(FftError::CollectivePreconditionFailed))
+                .into());
         }
         if !collective_valid(
             communicator,
             overlap_supported(&self.core, Direction::Forward),
         ) {
-            return Err(R2cError::Fft(FftError::OverlapUnsupported));
+            return Err(FftOverlapError::UnsupportedTransport);
         }
         execute_forward_overlap(&self.core, source, destination, workspace)
     }
@@ -1770,7 +1777,7 @@ where
         source: &PencilArray<Complex<R>, N, M>,
         destination: &mut PencilArray<R, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
-    ) -> Result<(), R2cError> {
+    ) -> Result<(), FftOverlapError<R2cError>> {
         let communicator = self.input_pencil().topology().communicator();
         let operation = if matches!(direction, Direction::Inverse) {
             OPERATION_R2C_INVERSE_OVERLAP
@@ -1782,10 +1789,11 @@ where
         if !collective_valid(communicator, preflight.is_ok()) {
             return Err(preflight
                 .err()
-                .unwrap_or(R2cError::Fft(FftError::CollectivePreconditionFailed)));
+                .unwrap_or(R2cError::Fft(FftError::CollectivePreconditionFailed))
+                .into());
         }
         if !collective_valid(communicator, overlap_supported(&self.core, direction)) {
-            return Err(R2cError::Fft(FftError::OverlapUnsupported));
+            return Err(FftOverlapError::UnsupportedTransport);
         }
         execute_reverse_overlap(
             &self.core,
@@ -2429,7 +2437,7 @@ fn execute_forward_overlap<R: FftReal, const N: usize, const M: usize>(
     source: &PencilArray<R, N, M>,
     destination: &mut PencilArray<Complex<R>, N, M>,
     workspace: &mut R2cWorkspace<R, N, M>,
-) -> Result<(), R2cError>
+) -> Result<(), FftOverlapError<R2cError>>
 where
     Complex<R>: Equivalence,
 {
@@ -2502,7 +2510,9 @@ where
                             .map_err(map_r2c_overlap)
                     })
                     .map_err(|error| match error {
-                        OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
+                        OverwriteError::Array(error) => {
+                            FftOverlapError::Operation(R2cError::Fft(FftError::Array(error)))
+                        }
                         OverwriteError::Writer(error) => error,
                     })?;
             }
@@ -2556,7 +2566,7 @@ where
                     })?;
             }
             C2cTransition::AllToAllv(_) => {
-                return Err(R2cError::Fft(FftError::OverlapUnsupported));
+                return Err(FftOverlapError::UnsupportedTransport);
             }
         }
     } else {
@@ -2649,7 +2659,7 @@ where
                 .map_err(map_r2c_overlap)?;
             }
             C2cTransition::AllToAllv(_) => {
-                return Err(R2cError::Fft(FftError::OverlapUnsupported));
+                return Err(FftOverlapError::UnsupportedTransport);
             }
         }
     }
@@ -2664,23 +2674,14 @@ where
     Ok(())
 }
 
-fn map_r2c_overlap<E>(error: OverlapError<E>) -> R2cError
-where
-    E: Into<R2cError>,
-{
-    match error {
-        OverlapError::Transpose(error) => R2cError::Fft(FftError::Transpose(error)),
-        OverlapError::Callback(error) => error.into(),
-        OverlapError::PeerPanicked => {
-            R2cError::Fft(FftError::Overlap(Box::new(OverlapError::PeerPanicked)))
-        }
-        OverlapError::PeerCallbackFailed => R2cError::Fft(FftError::Overlap(Box::new(
-            OverlapError::PeerCallbackFailed,
-        ))),
-        OverlapError::CollectivePreconditionFailed => R2cError::Fft(FftError::Overlap(Box::new(
-            OverlapError::CollectivePreconditionFailed,
-        ))),
-    }
+fn map_r2c_overlap<E: Into<R2cError>>(error: OverlapError<E>) -> FftOverlapError<R2cError> {
+    FftOverlapError::Overlap(match error {
+        OverlapError::Transpose(error) => OverlapError::Transpose(error),
+        OverlapError::Callback(error) => OverlapError::Callback(error.into()),
+        OverlapError::PeerPanicked => OverlapError::PeerPanicked,
+        OverlapError::PeerCallbackFailed => OverlapError::PeerCallbackFailed,
+        OverlapError::CollectivePreconditionFailed => OverlapError::CollectivePreconditionFailed,
+    })
 }
 
 fn execute_reverse_overlap<R: FftReal, const N: usize, const M: usize>(
@@ -2690,7 +2691,7 @@ fn execute_reverse_overlap<R: FftReal, const N: usize, const M: usize>(
     workspace: &mut R2cWorkspace<R, N, M>,
     normalize: bool,
     threshold: f64,
-) -> Result<(), R2cError>
+) -> Result<(), FftOverlapError<R2cError>>
 where
     Complex<R>: Equivalence,
 {
@@ -2788,7 +2789,7 @@ where
                 .map_err(map_r2c_overlap)?;
             }
             C2cTransition::AllToAllv(_) => {
-                return Err(R2cError::Fft(FftError::OverlapUnsupported));
+                return Err(FftOverlapError::UnsupportedTransport);
             }
         }
     }
@@ -2849,7 +2850,9 @@ where
                     .map_err(map_r2c_overlap)
                 })
                 .map_err(|error| match error {
-                    OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
+                    OverwriteError::Array(error) => {
+                        FftOverlapError::Operation(R2cError::Fft(FftError::Array(error)))
+                    }
                     OverwriteError::Writer(error) => error,
                 })?;
             }

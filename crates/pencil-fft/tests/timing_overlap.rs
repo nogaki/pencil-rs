@@ -5,9 +5,9 @@ use std::sync::Arc;
 use mpi::traits::*;
 use pencil_array::{ExtraShape, MpiTopology, PencilArray};
 use pencil_fft::{
-    AxisR2rKind, AxisTransform, C2cPlan, Complex, DistributedLayout, FftError, FftReal,
-    FourierDirection, FourierDirections, MixedC2cPlan, MixedR2cPlan, R2cPlan, R2rKind, R2rPlan,
-    TransposeMethod,
+    AxisR2rKind, AxisTransform, C2cPlan, Complex, DistributedLayout, FftError, FftOverlapError,
+    FftReal, FourierDirection, FourierDirections, MixedC2cPlan, MixedR2cPlan, R2cPlan, R2rKind,
+    R2rPlan, TransposeMethod,
 };
 
 trait TestReal: FftReal + mpi::datatype::Equivalence + std::fmt::Debug {
@@ -185,7 +185,7 @@ fn run_case<R: TestReal>(
         let mut overlap = plan.allocate_output().unwrap();
         let before = overlap.as_slice().to_vec();
         let result = plan.forward_with_overlap(&source, &mut overlap, &mut workspace);
-        assert!(matches!(result, Err(FftError::OverlapUnsupported)));
+        assert!(matches!(result, Err(FftOverlapError::UnsupportedTransport)));
         assert_eq!(source.as_slice(), source_before.as_slice());
         assert_eq!(overlap.as_slice(), before.as_slice());
     }
@@ -231,7 +231,10 @@ fn run_case<R: TestReal>(
         let overlap_before = overlap_output.as_slice().to_vec();
         let overlap =
             plan.forward_with_overlap(&source, &mut overlap_output, &mut foreign_workspace);
-        assert!(matches!(overlap, Err(FftError::WorkspaceMismatch)));
+        assert!(matches!(
+            overlap,
+            Err(FftOverlapError::Operation(FftError::WorkspaceMismatch))
+        ));
         assert_eq!(overlap_output.as_slice(), overlap_before.as_slice());
     }
     // Deliberately disagree on the operation, not merely on a workspace.
@@ -386,12 +389,15 @@ fn assert_api_mismatch_recovery<R: TestReal>(
     let result = if rank_zero {
         plan.forward_with_timing(source, &mut destination, workspace)
             .map(|_| ())
+            .map_err(FftOverlapError::Operation)
     } else {
         plan.forward_with_overlap(source, &mut destination, workspace)
     };
     assert!(matches!(
         result,
-        Err(FftError::CollectiveDescriptorMismatch)
+        Err(FftOverlapError::Operation(
+            FftError::CollectiveDescriptorMismatch
+        ))
     ));
     assert_eq!(source.as_slice(), source_before);
     assert_eq!(destination.as_slice(), destination_before.as_slice());

@@ -3416,6 +3416,7 @@ fn run_direction_real<R: Real, const N: usize, const M: usize>(
 #[test]
 #[ignore = "opt-in local Julia/FFTW cross-validation; run tools/fftw-reference/check.sh"]
 fn fftw_direction_reference_parser() {
+    println!("PENCIL_FFTW_DIRECTION_REFERENCE_STARTED");
     let directory = env::var_os("PENCIL_FFTW_DIRECTION_FIXTURES")
         .map(PathBuf::from)
         .expect("PENCIL_FFTW_DIRECTION_FIXTURES is required for the opted-in direction test");
@@ -3425,6 +3426,10 @@ fn fftw_direction_reference_parser() {
     let size = usize::try_from(world.size()).unwrap();
     let topology = MpiTopology::<1>::new(&world, [size]).unwrap();
     for fixture in &fixtures {
+        println!(
+            "PENCIL_FFTW_DIRECTION_REFERENCE_STARTED case={}",
+            fixture.case
+        );
         assert!(!fixture.case.is_empty());
         for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
             for permute_dims in [false, true] {

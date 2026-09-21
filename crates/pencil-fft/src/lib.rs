@@ -228,9 +228,9 @@ pub use distributed::mixed::{
 pub use distributed::{
     AxisSelection, AxisSelectionError, C2cInPlaceArray, C2cInPlaceWorkspace,
     C2cOutOfPlaceWorkspace, C2cPlan, C2cState, DhtPlan, DistributedLayout, FftError,
-    FourierDirection, FourierDirections, R2cError, R2cInPlaceArray, R2cInPlaceWorkspace, R2cPlan,
-    R2cWorkspace, R2rError, R2rInPlaceArray, R2rInPlaceWorkspace, R2rPlan, R2rState, R2rWorkspace,
-    StageGeometry, StageTiming, TransformTiming, TransposeMethod,
+    FftOverlapError, FourierDirection, FourierDirections, R2cError, R2cInPlaceArray,
+    R2cInPlaceWorkspace, R2cPlan, R2cWorkspace, R2rError, R2rInPlaceArray, R2rInPlaceWorkspace,
+    R2rPlan, R2rState, R2rWorkspace, StageGeometry, StageTiming, TransformTiming, TransposeMethod,
 };
 
 /// Errors returned by local C2C plan construction and execution.

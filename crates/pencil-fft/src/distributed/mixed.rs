@@ -29,11 +29,17 @@ use crate::{
     LocalR2rPlan, R2cState, R2rScalar,
 };
 
+impl From<FftError> for FftOverlapError<MixedError> {
+    fn from(error: FftError) -> Self {
+        Self::Operation(error.into())
+    }
+}
+
 use super::{
-    C2cStageTransition, C2cState, Direction, DistributedLayout, FftError, FourierDirection,
-    FourierDirections, INVALID_WORD, LocalTransform, OPERATION_MIXED_C2C_BACKWARD,
-    OPERATION_MIXED_C2C_BACKWARD_IN_PLACE, OPERATION_MIXED_C2C_FORWARD,
-    OPERATION_MIXED_C2C_FORWARD_IN_PLACE, OPERATION_MIXED_C2C_INVERSE,
+    C2cStageTransition, C2cState, Direction, DistributedLayout, FftError, FftOverlapError,
+    FourierDirection, FourierDirections, INVALID_WORD, LocalTransform,
+    OPERATION_MIXED_C2C_BACKWARD, OPERATION_MIXED_C2C_BACKWARD_IN_PLACE,
+    OPERATION_MIXED_C2C_FORWARD, OPERATION_MIXED_C2C_FORWARD_IN_PLACE, OPERATION_MIXED_C2C_INVERSE,
     OPERATION_MIXED_C2C_INVERSE_IN_PLACE, OPERATION_MIXED_C2C_PLAN, OPERATION_MIXED_R2C_BACKWARD,
     OPERATION_MIXED_R2C_BACKWARD_IN_PLACE, OPERATION_MIXED_R2C_FORWARD,
     OPERATION_MIXED_R2C_FORWARD_IN_PLACE, OPERATION_MIXED_R2C_INVERSE,
@@ -752,33 +758,33 @@ where
         self.execute(Direction::Backward, source, destination, workspace, None)
     }
 
-    /// Computes forward while overlapping each point-to-point transpose with the next local kernel.
+    /// Computes forward with the next local kernel after receive/unpack completion and before P2P send waits.
     pub fn forward_with_overlap(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
         destination: &mut PencilArray<Complex<R>, N, M>,
         workspace: &mut MixedC2cWorkspace<R, N, M>,
-    ) -> Result<(), MixedError> {
+    ) -> Result<(), FftOverlapError<MixedError>> {
         self.execute_overlap(Direction::Forward, source, destination, workspace)
     }
 
-    /// Computes inverse while overlapping each point-to-point transpose with the next local kernel.
+    /// Computes inverse with the next local kernel after receive/unpack completion and before P2P send waits.
     pub fn inverse_with_overlap(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
         destination: &mut PencilArray<Complex<R>, N, M>,
         workspace: &mut MixedC2cWorkspace<R, N, M>,
-    ) -> Result<(), MixedError> {
+    ) -> Result<(), FftOverlapError<MixedError>> {
         self.execute_overlap(Direction::Inverse, source, destination, workspace)
     }
 
-    /// Computes backward while overlapping each point-to-point transpose with the next local kernel.
+    /// Computes backward with the next local kernel after receive/unpack completion and before P2P send waits.
     pub fn backward_with_overlap(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
         destination: &mut PencilArray<Complex<R>, N, M>,
         workspace: &mut MixedC2cWorkspace<R, N, M>,
-    ) -> Result<(), MixedError> {
+    ) -> Result<(), FftOverlapError<MixedError>> {
         self.execute_overlap(Direction::Backward, source, destination, workspace)
     }
 
@@ -1044,7 +1050,7 @@ where
         source: &PencilArray<Complex<R>, N, M>,
         destination: &mut PencilArray<Complex<R>, N, M>,
         workspace: &mut MixedC2cWorkspace<R, N, M>,
-    ) -> Result<(), MixedError> {
+    ) -> Result<(), FftOverlapError<MixedError>> {
         let communicator = self.input_pencil().topology().communicator();
         let operation = match direction {
             Direction::Forward => OPERATION_MIXED_C2C_FORWARD_OVERLAP,
@@ -1052,12 +1058,16 @@ where
             Direction::Backward => OPERATION_MIXED_C2C_BACKWARD_OVERLAP,
         };
         agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
+        if self.core.layout.transpose_method != TransposeMethod::PointToPoint {
+            return Err(FftOverlapError::UnsupportedTransport);
+        }
         let preflight =
             validate_mixed_c2c_oop(&self.core, direction, source, destination, workspace);
         if !collective_valid(communicator, preflight.is_ok()) {
             return Err(preflight
                 .err()
-                .unwrap_or(MixedError::Fft(FftError::CollectivePreconditionFailed)));
+                .unwrap_or(MixedError::Fft(FftError::CollectivePreconditionFailed))
+                .into());
         }
         preflight?;
         if !collective_valid(
@@ -1075,7 +1085,7 @@ where
                 )
             }),
         ) {
-            return Err(MixedError::Fft(FftError::OverlapUnsupported));
+            return Err(FftOverlapError::UnsupportedTransport);
         }
         execute_mixed_c2c_overlap(&self.core, direction, source, destination, workspace)
     }
@@ -2405,7 +2415,7 @@ fn execute_mixed_c2c_overlap<R: FftReal, const N: usize, const M: usize>(
     source: &PencilArray<Complex<R>, N, M>,
     destination: &mut PencilArray<Complex<R>, N, M>,
     workspace: &mut MixedC2cWorkspace<R, N, M>,
-) -> Result<(), MixedError>
+) -> Result<(), FftOverlapError<MixedError>>
 where
     Complex<R>: Equivalence,
 {
@@ -2556,20 +2566,14 @@ where
     Ok(())
 }
 
-fn map_mixed_overlap<E: Into<MixedError> + std::fmt::Debug>(error: OverlapError<E>) -> MixedError {
-    match error {
-        OverlapError::Transpose(e) => MixedError::Fft(e.into()),
-        OverlapError::Callback(e) => e.into(),
-        OverlapError::PeerPanicked => {
-            MixedError::Fft(FftError::Overlap(Box::new(OverlapError::PeerPanicked)))
-        }
-        OverlapError::PeerCallbackFailed => MixedError::Fft(FftError::Overlap(Box::new(
-            OverlapError::PeerCallbackFailed,
-        ))),
-        OverlapError::CollectivePreconditionFailed => MixedError::Fft(FftError::Overlap(Box::new(
-            OverlapError::CollectivePreconditionFailed,
-        ))),
-    }
+fn map_mixed_overlap<E: Into<MixedError>>(error: OverlapError<E>) -> FftOverlapError<MixedError> {
+    FftOverlapError::Overlap(match error {
+        OverlapError::Transpose(error) => OverlapError::Transpose(error),
+        OverlapError::Callback(error) => OverlapError::Callback(error.into()),
+        OverlapError::PeerPanicked => OverlapError::PeerPanicked,
+        OverlapError::PeerCallbackFailed => OverlapError::PeerCallbackFailed,
+        OverlapError::CollectivePreconditionFailed => OverlapError::CollectivePreconditionFailed,
+    })
 }
 
 fn validate_mixed_c2c_oop<R: FftReal, const N: usize, const M: usize>(
@@ -3154,31 +3158,31 @@ where
         self.execute_reverse_public(source, destination, workspace, false, None)
     }
 
-    /// Computes forward while overlapping each point-to-point transpose with the next local kernel.
+    /// Computes forward with the next local kernel after receive/unpack completion and before P2P send waits.
     pub fn forward_with_overlap(
         &self,
         source: &PencilArray<R, N, M>,
         destination: &mut PencilArray<Complex<R>, N, M>,
         workspace: &mut MixedR2cWorkspace<R, N, M>,
-    ) -> Result<(), MixedError> {
+    ) -> Result<(), FftOverlapError<MixedError>> {
         self.execute_forward_overlap(source, destination, workspace)
     }
-    /// Computes inverse while overlapping each point-to-point transpose with the next local kernel.
+    /// Computes inverse with the next local kernel after receive/unpack completion and before P2P send waits.
     pub fn inverse_with_overlap(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
         destination: &mut PencilArray<R, N, M>,
         workspace: &mut MixedR2cWorkspace<R, N, M>,
-    ) -> Result<(), MixedError> {
+    ) -> Result<(), FftOverlapError<MixedError>> {
         self.execute_reverse_overlap(source, destination, workspace, true)
     }
-    /// Computes backward while overlapping each point-to-point transpose with the next local kernel.
+    /// Computes backward with the next local kernel after receive/unpack completion and before P2P send waits.
     pub fn backward_with_overlap(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
         destination: &mut PencilArray<R, N, M>,
         workspace: &mut MixedR2cWorkspace<R, N, M>,
-    ) -> Result<(), MixedError> {
+    ) -> Result<(), FftOverlapError<MixedError>> {
         self.execute_reverse_overlap(source, destination, workspace, false)
     }
 
@@ -3541,19 +3545,23 @@ where
         source_real: &PencilArray<R, N, M>,
         destination_complex: &mut PencilArray<Complex<R>, N, M>,
         workspace: &mut MixedR2cWorkspace<R, N, M>,
-    ) -> Result<(), MixedError> {
+    ) -> Result<(), FftOverlapError<MixedError>> {
         let communicator = self.input_pencil().topology().communicator();
         agree_execution_descriptor_ref::<N, M>(
             communicator,
             OPERATION_MIXED_R2C_FORWARD_OVERLAP,
             &self.core.descriptor,
         )?;
+        if self.core.layout.transpose_method != TransposeMethod::PointToPoint {
+            return Err(FftOverlapError::UnsupportedTransport);
+        }
         let result =
             validate_mixed_r2c_forward(&self.core, source_real, destination_complex, workspace);
         if !collective_valid(communicator, result.is_ok()) {
             return Err(result
                 .err()
-                .unwrap_or(MixedError::Fft(FftError::CollectivePreconditionFailed)));
+                .unwrap_or(MixedError::Fft(FftError::CollectivePreconditionFailed))
+                .into());
         }
         result?;
         if !collective_valid(
@@ -3567,7 +3575,7 @@ where
                 )
             }),
         ) {
-            return Err(MixedError::Fft(FftError::OverlapUnsupported));
+            return Err(FftOverlapError::UnsupportedTransport);
         }
         execute_mixed_r2c_forward_overlap(&self.core, source_real, destination_complex, workspace)
     }
@@ -3578,7 +3586,7 @@ where
         destination: &mut PencilArray<R, N, M>,
         workspace: &mut MixedR2cWorkspace<R, N, M>,
         normalize: bool,
-    ) -> Result<(), MixedError> {
+    ) -> Result<(), FftOverlapError<MixedError>> {
         let communicator = self.input_pencil().topology().communicator();
         agree_execution_descriptor_ref::<N, M>(
             communicator,
@@ -3589,28 +3597,17 @@ where
             },
             &self.core.descriptor,
         )?;
+        if self.core.layout.transpose_method != TransposeMethod::PointToPoint {
+            return Err(FftOverlapError::UnsupportedTransport);
+        }
         let result = validate_mixed_r2c_reverse(&self.core, source, destination, workspace);
         if !collective_valid(communicator, result.is_ok()) {
             return Err(result
                 .err()
-                .unwrap_or(MixedError::Fft(FftError::CollectivePreconditionFailed)));
+                .unwrap_or(MixedError::Fft(FftError::CollectivePreconditionFailed))
+                .into());
         }
         result?;
-        if self
-            .core
-            .transitions
-            .iter()
-            .any(|t| !matches!(t.backward, super::C2cTransition::PointToPoint(_)))
-        {
-            return execute_mixed_r2c_reverse(
-                &self.core,
-                source,
-                destination,
-                workspace,
-                normalize,
-                None,
-            );
-        }
         if !collective_valid(
             communicator,
             self.core.transitions.iter().all(|t| {
@@ -3622,7 +3619,7 @@ where
                 )
             }),
         ) {
-            return Err(MixedError::Fft(FftError::OverlapUnsupported));
+            return Err(FftOverlapError::UnsupportedTransport);
         }
         execute_mixed_r2c_reverse_overlap(&self.core, source, destination, workspace, normalize)
     }
@@ -4658,7 +4655,7 @@ fn execute_mixed_r2c_forward_overlap<R: FftReal, const N: usize, const M: usize>
     source: &PencilArray<R, N, M>,
     destination: &mut PencilArray<Complex<R>, N, M>,
     workspace: &mut MixedR2cWorkspace<R, N, M>,
-) -> Result<(), MixedError>
+) -> Result<(), FftOverlapError<MixedError>>
 where
     Complex<R>: Equivalence,
 {
@@ -4667,7 +4664,7 @@ where
     if boundary == 0 {
         let stage = &core.stages[0];
         let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(plan)) = &stage.local else {
-            return Err(MixedError::Fft(FftError::PreparationFailed));
+            return Err(MixedError::Fft(FftError::PreparationFailed).into());
         };
         let source_view = source.view();
         let result = workspace
@@ -4694,7 +4691,7 @@ where
             .ok_or(MixedError::Fft(FftError::WorkspaceMismatch))?;
         let stage = &core.stages[0];
         let MixedR2cStageLocal::Real(local) = &stage.local else {
-            return Err(MixedError::Fft(FftError::PreparationFailed));
+            return Err(MixedError::Fft(FftError::PreparationFailed).into());
         };
         let source_view = source.view();
         let result = real
@@ -4729,7 +4726,7 @@ where
                 let stage = &core.stages[index + 1];
                 if index + 1 == boundary {
                     let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(rfft)) = &stage.local else {
-                        return Err(MixedError::Fft(FftError::PreparationFailed));
+                        return Err(MixedError::Fft(FftError::PreparationFailed).into());
                     };
                     let active = real.active_view().map_err(FftError::Array)?;
                     workspace
@@ -4750,7 +4747,7 @@ where
                         .map_err(map_overwrite)?;
                 } else {
                     let MixedR2cStageLocal::Real(local) = &stage.local else {
-                        return Err(MixedError::Fft(FftError::PreparationFailed));
+                        return Err(MixedError::Fft(FftError::PreparationFailed).into());
                     };
                     let mut active = real.active_view_mut().map_err(FftError::Array)?;
                     mixed_real_prefix_forward_in_place(
@@ -4766,12 +4763,12 @@ where
                 continue;
             }
             let super::C2cTransition::PointToPoint(plan) = &core.transitions[index].forward else {
-                return Err(MixedError::Fft(FftError::OverlapUnsupported));
+                return Err(FftOverlapError::UnsupportedTransport);
             };
             if index + 1 == boundary {
                 let stage = &core.stages[boundary];
                 let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(rfft)) = &stage.local else {
-                    return Err(MixedError::Fft(FftError::PreparationFailed));
+                    return Err(MixedError::Fft(FftError::PreparationFailed).into());
                 };
                 let callback = |data: &mut [R]| {
                     workspace
@@ -4804,7 +4801,7 @@ where
             } else {
                 let stage = &core.stages[index + 1];
                 let MixedR2cStageLocal::Real(local) = &stage.local else {
-                    return Err(MixedError::Fft(FftError::PreparationFailed));
+                    return Err(MixedError::Fft(FftError::PreparationFailed).into());
                 };
                 let callback = |data: &mut [R]| {
                     mixed_real_prefix_forward_in_place(
@@ -4846,7 +4843,7 @@ where
                 .active_view_mut()
                 .map_err(FftError::Array)?;
             let MixedR2cStageLocal::Complex(local) = &stage.local else {
-                return Err(MixedError::Fft(FftError::PreparationFailed));
+                return Err(MixedError::Fft(FftError::PreparationFailed).into());
             };
             mixed_complex_forward_in_place(
                 local,
@@ -4860,10 +4857,10 @@ where
             continue;
         }
         let super::C2cTransition::PointToPoint(plan) = &core.transitions[index].forward else {
-            return Err(MixedError::Fft(FftError::OverlapUnsupported));
+            return Err(FftOverlapError::UnsupportedTransport);
         };
         let MixedR2cStageLocal::Complex(local) = &stage.local else {
-            return Err(MixedError::Fft(FftError::PreparationFailed));
+            return Err(MixedError::Fft(FftError::PreparationFailed).into());
         };
         let callback = |data: &mut [Complex<R>]| {
             mixed_complex_forward_in_place(
@@ -4900,252 +4897,186 @@ fn execute_mixed_r2c_reverse_overlap<R: FftReal, const N: usize, const M: usize>
     destination: &mut PencilArray<R, N, M>,
     workspace: &mut MixedR2cWorkspace<R, N, M>,
     normalize: bool,
-) -> Result<(), MixedError>
+) -> Result<(), FftOverlapError<MixedError>>
 where
     Complex<R>: Equivalence,
 {
     let comm = core.stages[0].input.topology().communicator();
     let boundary = core.real_stage_index;
     let last = core.stages.len() - 1;
-    let source_view = source.view();
-    if boundary == last {
-        let stage = &core.stages[last];
-        let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(plan)) = &stage.local else {
-            return Err(MixedError::Fft(FftError::PreparationFailed));
-        };
-        let active = workspace
-            .intermediate
-            .overwrite_with(stage.output.as_ref(), |mut target| {
-                if target.as_mut_slice().len() != source_view.as_slice().len() {
-                    return Err(MixedError::Fft(FftError::PreparationFailed));
-                }
-                target
-                    .as_mut_slice()
-                    .copy_from_slice(source_view.as_slice());
-                Ok(())
-            })
-            .map_err(map_overwrite);
-        agree_result(comm, active)?;
-        let view = workspace
-            .intermediate
-            .active_view()
-            .map_err(FftError::Array)?;
-        let result = mixed_rfft_reverse(
-            plan,
-            stage.output.as_ref(),
-            stage.axis,
-            view.as_slice(),
-            destination.view_mut().as_mut_slice(),
-            &mut workspace.complex_source_line,
-            &mut workspace.complex_line,
-            &mut workspace.real_line,
-            &mut workspace.fft_scratch,
-            normalize,
-        );
-        return agree_result(comm, result);
-    }
     let stage = &core.stages[last];
-    let MixedR2cStageLocal::Complex(local) = &stage.local else {
-        return Err(MixedError::Fft(FftError::PreparationFailed));
-    };
     let result = workspace
         .intermediate
         .overwrite_with(stage.output.as_ref(), |mut target| {
-            mixed_complex_reverse(
-                local,
-                stage.input.as_ref(),
-                stage.axis,
-                source_view.as_slice(),
-                target.as_mut_slice(),
-                &mut workspace.embedding_line,
-                &mut workspace.fft_scratch,
-                &mut workspace.complex_strided_line,
-                normalize,
-            )
-        })
-        .map_err(map_overwrite);
-    agree_result(comm, result)?;
-    validate_mixed_boundary(core, &workspace.intermediate, normalize)?;
-    agree_result(comm, zero_mixed_boundary(core, &mut workspace.intermediate))?;
-    for index in (boundary..core.transitions.len()).rev() {
-        if index == boundary
-            && matches!(
-                core.transitions[index].backward,
-                super::C2cTransition::Identity | super::C2cTransition::Local(_)
-            )
-        {
-            super::execute_transition(
-                &core.transitions[index].backward,
-                &mut workspace.intermediate,
-                &mut workspace.transpose,
-            )
-            .map_err(MixedError::Fft)?;
-            let stage = &core.stages[boundary];
-            let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(rfft)) = &stage.local else {
-                return Err(MixedError::Fft(FftError::PreparationFailed));
-            };
-            let real = workspace
-                .real_intermediate
-                .as_mut()
-                .ok_or(MixedError::Fft(FftError::WorkspaceMismatch))?;
-            let active = workspace
-                .intermediate
-                .active_view()
-                .map_err(FftError::Array)?;
-            real.overwrite_with(stage.input.as_ref(), |mut out| {
-                mixed_rfft_reverse(
-                    rfft,
-                    stage.output.as_ref(),
-                    stage.axis,
-                    active.as_slice(),
-                    out.as_mut_slice(),
-                    &mut workspace.complex_source_line,
-                    &mut workspace.complex_line,
-                    &mut workspace.real_line,
-                    &mut workspace.fft_scratch,
-                    normalize,
-                )
-            })
-            .map_err(map_overwrite)?;
-            continue;
-        }
-        if index != boundary
-            && matches!(
-                core.transitions[index].backward,
-                super::C2cTransition::Identity | super::C2cTransition::Local(_)
-            )
-        {
-            super::execute_transition(
-                &core.transitions[index].backward,
-                &mut workspace.intermediate,
-                &mut workspace.transpose,
-            )
-            .map_err(MixedError::Fft)?;
-            let stage = &core.stages[index];
-            let mut active = workspace
-                .intermediate
-                .active_view_mut()
-                .map_err(FftError::Array)?;
-            let MixedR2cStageLocal::Complex(local) = &stage.local else {
-                return Err(MixedError::Fft(FftError::PreparationFailed));
-            };
-            mixed_complex_reverse_in_place(
-                local,
-                stage.input.as_ref(),
-                stage.axis,
-                active.as_mut_slice(),
-                &mut workspace.embedding_line,
-                &mut workspace.fft_scratch,
-                &mut workspace.complex_strided_line,
-                normalize,
-            )?;
-            continue;
-        }
-        let super::C2cTransition::PointToPoint(plan) = &core.transitions[index].backward else {
-            return Err(MixedError::Fft(FftError::OverlapUnsupported));
-        };
-        if index == boundary {
-            let stage = &core.stages[boundary];
-            let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(rfft)) = &stage.local else {
-                return Err(MixedError::Fft(FftError::PreparationFailed));
-            };
-            let real = workspace
-                .real_intermediate
-                .as_mut()
-                .ok_or(MixedError::Fft(FftError::WorkspaceMismatch))?;
-            let callback = |data: &mut [Complex<R>]| {
-                real.overwrite_with(stage.input.as_ref(), |mut out| {
-                    mixed_rfft_reverse(
-                        rfft,
-                        stage.output.as_ref(),
-                        stage.axis,
-                        data,
-                        out.as_mut_slice(),
-                        &mut workspace.complex_source_line,
-                        &mut workspace.complex_line,
-                        &mut workspace.real_line,
-                        &mut workspace.fft_scratch,
-                        normalize,
-                    )
-                })
-                .map_err(map_overwrite)
-            };
-            plan.execute_in_place_with_callback(
-                &mut workspace.intermediate,
-                &mut workspace.transpose,
-                callback,
-            )
-            .map_err(map_mixed_overlap)?;
-        } else {
-            let stage = &core.stages[index];
-            let MixedR2cStageLocal::Complex(local) = &stage.local else {
-                return Err(MixedError::Fft(FftError::PreparationFailed));
-            };
-            let callback = |data: &mut [Complex<R>]| {
-                mixed_complex_reverse_in_place(
+            if boundary == last {
+                target.as_mut_slice().copy_from_slice(source.as_slice());
+                Ok(())
+            } else {
+                let MixedR2cStageLocal::Complex(local) = &stage.local else {
+                    return Err(MixedError::Fft(FftError::PreparationFailed));
+                };
+                mixed_complex_reverse(
                     local,
                     stage.input.as_ref(),
                     stage.axis,
-                    data,
+                    source.as_slice(),
+                    target.as_mut_slice(),
                     &mut workspace.embedding_line,
                     &mut workspace.fft_scratch,
                     &mut workspace.complex_strided_line,
                     normalize,
                 )
-            };
-            plan.execute_in_place_with_callback(
-                &mut workspace.intermediate,
-                &mut workspace.transpose,
-                callback,
+            }
+        })
+        .map_err(map_overwrite);
+    agree_result(comm, result)?;
+    for index in (boundary + 1..core.transitions.len()).rev() {
+        let stage = &core.stages[index];
+        let MixedR2cStageLocal::Complex(local) = &stage.local else {
+            return Err(MixedError::Fft(FftError::PreparationFailed).into());
+        };
+        let mut transform = |data: &mut [Complex<R>]| {
+            mixed_complex_reverse_in_place(
+                local,
+                stage.input.as_ref(),
+                stage.axis,
+                data,
+                &mut workspace.embedding_line,
+                &mut workspace.fft_scratch,
+                &mut workspace.complex_strided_line,
+                normalize,
             )
-            .map_err(map_mixed_overlap)?;
+        };
+        match &core.transitions[index].backward {
+            super::C2cTransition::PointToPoint(plan) => {
+                plan.execute_in_place_with_callback(
+                    &mut workspace.intermediate,
+                    &mut workspace.transpose,
+                    |data| {
+                        let result = transform(data);
+                        #[cfg(test)]
+                        reverse_overlap_tests::callback()?;
+                        result
+                    },
+                )
+                .map_err(map_mixed_overlap)?;
+            }
+            transition => {
+                super::execute_transition(
+                    transition,
+                    &mut workspace.intermediate,
+                    &mut workspace.transpose,
+                )
+                .map_err(MixedError::Fft)?;
+                let result = transform(
+                    workspace
+                        .intermediate
+                        .active_view_mut()
+                        .map_err(FftError::Array)?
+                        .as_mut_slice(),
+                );
+                agree_result(comm, result)?;
+            }
         }
+    }
+    let stage = &core.stages[boundary];
+    let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(rfft)) = &stage.local else {
+        return Err(MixedError::Fft(FftError::PreparationFailed).into());
+    };
+    let mut convert = |data: &mut [Complex<R>]| {
+        validate_mixed_boundary_data(core, Ok((stage.output.as_ref(), data)), normalize)?;
+        zero_mixed_boundary_data(
+            core,
+            stage.output.local_len(),
+            memory_stride(stage.output.as_ref(), stage.axis)?,
+            data,
+        )?;
+        let mut transform = |out: &mut [R]| {
+            mixed_rfft_reverse(
+                rfft,
+                stage.output.as_ref(),
+                stage.axis,
+                data,
+                out,
+                &mut workspace.complex_source_line,
+                &mut workspace.complex_line,
+                &mut workspace.real_line,
+                &mut workspace.fft_scratch,
+                normalize,
+            )
+        };
+        if boundary == 0 {
+            transform(destination.view_mut().as_mut_slice())
+        } else {
+            workspace
+                .real_intermediate
+                .as_mut()
+                .ok_or(MixedError::Fft(FftError::WorkspaceMismatch))?
+                .overwrite_with(stage.input.as_ref(), |mut out| {
+                    transform(out.as_mut_slice())
+                })
+                .map_err(map_overwrite)
+        }
+    };
+    if boundary < last {
+        match &core.transitions[boundary].backward {
+            super::C2cTransition::PointToPoint(plan) => {
+                plan.execute_in_place_with_callback(
+                    &mut workspace.intermediate,
+                    &mut workspace.transpose,
+                    |data| {
+                        let result = convert(data);
+                        #[cfg(test)]
+                        reverse_overlap_tests::callback()?;
+                        result
+                    },
+                )
+                .map_err(map_mixed_overlap)?;
+            }
+            transition => {
+                super::execute_transition(
+                    transition,
+                    &mut workspace.intermediate,
+                    &mut workspace.transpose,
+                )
+                .map_err(MixedError::Fft)?;
+                let result = convert(
+                    workspace
+                        .intermediate
+                        .active_view_mut()
+                        .map_err(FftError::Array)?
+                        .as_mut_slice(),
+                );
+                agree_result(comm, result)?;
+            }
+        }
+    } else {
+        let result = convert(
+            workspace
+                .intermediate
+                .active_view_mut()
+                .map_err(FftError::Array)?
+                .as_mut_slice(),
+        );
+        agree_result(comm, result)?;
+    }
+    if boundary == 0 {
+        return Ok(());
     }
     let real = workspace
         .real_intermediate
         .as_mut()
         .ok_or(MixedError::Fft(FftError::WorkspaceMismatch))?;
+    let transpose = workspace
+        .real_transpose
+        .as_mut()
+        .ok_or(MixedError::Fft(FftError::WorkspaceMismatch))?;
     for index in (0..boundary).rev() {
-        if matches!(
-            core.transitions[index].backward,
-            super::C2cTransition::Identity | super::C2cTransition::Local(_)
-        ) {
-            super::execute_transition(
-                &core.transitions[index].backward,
-                real,
-                workspace
-                    .real_transpose
-                    .as_mut()
-                    .ok_or(MixedError::Fft(FftError::WorkspaceMismatch))?,
-            )
-            .map_err(MixedError::Fft)?;
-            if index != 0 {
-                let stage = &core.stages[index];
-                let mut active = real.active_view_mut().map_err(FftError::Array)?;
-                let MixedR2cStageLocal::Real(local) = &stage.local else {
-                    return Err(MixedError::Fft(FftError::PreparationFailed));
-                };
-                mixed_real_prefix_reverse_in_place(
-                    local,
-                    stage.input.as_ref(),
-                    stage.axis,
-                    active.as_mut_slice(),
-                    &mut workspace.embedding_line,
-                    &mut workspace.fft_scratch,
-                    &mut workspace.real_strided_line,
-                    normalize,
-                )?;
-            }
-            continue;
-        }
-        let super::C2cTransition::PointToPoint(plan) = &core.transitions[index].backward else {
-            return Err(MixedError::Fft(FftError::OverlapUnsupported));
-        };
         let stage = &core.stages[index];
         let MixedR2cStageLocal::Real(local) = &stage.local else {
-            return Err(MixedError::Fft(FftError::PreparationFailed));
+            return Err(MixedError::Fft(FftError::PreparationFailed).into());
         };
-        let callback = |data: &mut [R]| {
+        let mut transform = |data: &mut [R]| {
             mixed_real_prefix_reverse_in_place(
                 local,
                 stage.input.as_ref(),
@@ -5157,21 +5088,31 @@ where
                 normalize,
             )
         };
-        plan.execute_in_place_with_callback(
-            real,
-            workspace
-                .real_transpose
-                .as_mut()
-                .ok_or(MixedError::Fft(FftError::WorkspaceMismatch))?,
-            callback,
-        )
-        .map_err(map_mixed_overlap)?;
+        match &core.transitions[index].backward {
+            super::C2cTransition::PointToPoint(plan) => {
+                plan.execute_in_place_with_callback(real, transpose, |data| {
+                    let result = transform(data);
+                    #[cfg(test)]
+                    reverse_overlap_tests::callback()?;
+                    result
+                })
+                .map_err(map_mixed_overlap)?;
+            }
+            transition => {
+                super::execute_transition(transition, real, transpose).map_err(MixedError::Fft)?;
+                let result = transform(
+                    real.active_view_mut()
+                        .map_err(FftError::Array)?
+                        .as_mut_slice(),
+                );
+                agree_result(comm, result)?;
+            }
+        }
     }
-    let active = real.active_view().map_err(FftError::Array)?;
     destination
         .view_mut()
         .as_mut_slice()
-        .copy_from_slice(active.as_slice());
+        .copy_from_slice(real.active_view().map_err(FftError::Array)?.as_slice());
     Ok(())
 }
 
@@ -5384,11 +5325,31 @@ fn validate_mixed_boundary<R: FftReal, const N: usize, const M: usize>(
 where
     Complex<R>: Equivalence,
 {
+    match intermediate.active_view() {
+        Ok(view) => {
+            validate_mixed_boundary_data(core, Ok((view.pencil(), view.as_slice())), normalize)
+        }
+        Err(error) => validate_mixed_boundary_data(
+            core,
+            Err(MixedError::Fft(FftError::Array(error))),
+            normalize,
+        ),
+    }
+}
+
+fn validate_mixed_boundary_data<R: FftReal, const N: usize, const M: usize>(
+    core: &MixedR2cCore<R, N, M>,
+    input: Result<(&Pencil<N, M>, &[Complex<R>]), MixedError>,
+    normalize: bool,
+) -> Result<(), MixedError>
+where
+    Complex<R>: Equivalence,
+{
     let communicator = core.stages[0].input.topology().communicator();
     let preparation = (|| {
-        let view = intermediate.active_view().map_err(FftError::Array)?;
-        let local_len = view.pencil().local_len();
-        let stride = memory_stride(view.pencil(), core.stages[core.real_stage_index].axis)?;
+        let (pencil, data) = input?;
+        let local_len = pencil.local_len();
+        let stride = memory_stride(pencil, core.stages[core.real_stage_index].axis)?;
         let line_count = strided_line_count(local_len, core.complex_len, stride)?;
         let line_block = core
             .complex_len
@@ -5417,8 +5378,7 @@ where
             let end = start
                 .checked_add(local_len)
                 .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-            let values = view
-                .as_slice()
+            let values = data
                 .get(start..end)
                 .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
             let mut local_max = [0.0f64; 4];
@@ -5454,7 +5414,7 @@ where
             local_maxima.push(local_max);
         }
         Ok::<_, MixedError>((
-            view,
+            data,
             local_len,
             stride,
             line_count,
@@ -5467,7 +5427,7 @@ where
         ))
     })();
     let (
-        view,
+        data,
         local_len,
         stride,
         line_count,
@@ -5489,7 +5449,7 @@ where
         let end = start
             .checked_add(local_len)
             .expect("validated mixed boundary batch end");
-        let values = &view.as_slice()[start..end];
+        let values = &data[start..end];
         for outer in 0..line_count {
             let base = outer
                 .checked_mul(line_block)
@@ -5554,6 +5514,15 @@ fn zero_mixed_boundary<R: FftReal, const N: usize, const M: usize>(
     let mut view = intermediate.active_view_mut().map_err(FftError::Array)?;
     let local_len = view.pencil().local_len();
     let stride = memory_stride(view.pencil(), core.stages[core.real_stage_index].axis)?;
+    zero_mixed_boundary_data(core, local_len, stride, view.as_mut_slice())
+}
+
+fn zero_mixed_boundary_data<R: FftReal, const N: usize, const M: usize>(
+    core: &MixedR2cCore<R, N, M>,
+    local_len: usize,
+    stride: usize,
+    data: &mut [Complex<R>],
+) -> Result<(), MixedError> {
     let line_count = strided_line_count(local_len, core.complex_len, stride)?;
     let line_block = core
         .complex_len
@@ -5567,7 +5536,7 @@ fn zero_mixed_boundary<R: FftReal, const N: usize, const M: usize>(
         let end = start
             .checked_add(local_len)
             .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        let values = &mut view.as_mut_slice()[start..end];
+        let values = &mut data[start..end];
         for outer in 0..line_count {
             let base = outer
                 .checked_mul(line_block)
@@ -6931,4 +6900,173 @@ where
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod reverse_overlap_tests {
+    use super::*;
+    use mpi::topology::Communicator;
+    use std::cell::Cell;
+    thread_local! { static CALLBACKS: Cell<usize> = const { Cell::new(0) }; }
+
+    pub(super) fn callback() -> Result<(), MixedError> {
+        CALLBACKS.with(|count| count.set(count.get() + 1));
+        super::super::consume_c2c_callback_injection().map_err(MixedError::Fft)
+    }
+
+    #[test]
+    #[ignore = "MPI must be initialized in a separate test process"]
+    fn reverse_local_routes_run_callbacks_and_independent_spectrum() {
+        let universe = mpi::initialize().unwrap();
+        let world = universe.world();
+        let size = world.size() as usize;
+        assert!(matches!(size, 1 | 4 | 6));
+        let topology = pencil_array::MpiTopology::<2>::new(&world, [size, 1]).unwrap();
+        for permute_dims in [false, true] {
+            for boundary in 0..4 {
+                let mut transforms = [AxisTransform::R2r(AxisR2rKind::Dht); 4];
+                transforms[..boundary].fill(AxisTransform::Fft);
+                transforms[boundary] = AxisTransform::Rfft;
+                let plan = MixedR2cPlan::<f64, 4, 2>::from_shape_with_layout(
+                    Arc::clone(&topology),
+                    [8, 9, 10, 12],
+                    ExtraShape::scalar(),
+                    transforms,
+                    DistributedLayout {
+                        permute_dims,
+                        transpose_method: TransposeMethod::PointToPoint,
+                    },
+                )
+                .unwrap();
+                let callbacks = plan
+                    .core
+                    .transitions
+                    .iter()
+                    .filter(|t| matches!(t.backward, super::super::C2cTransition::PointToPoint(_)))
+                    .count();
+                assert!(callbacks > 0);
+                assert!(
+                    plan.core.transitions.iter().any(|t| if permute_dims {
+                        matches!(t.backward, super::super::C2cTransition::Local(_))
+                    } else {
+                        matches!(t.backward, super::super::C2cTransition::Identity)
+                    }),
+                    "must exercise the requested local/identity segment as well"
+                );
+                let mut source = plan.allocate_output().unwrap();
+                source.as_mut_slice().fill(Complex::new(1.0, 0.0));
+                let mut destination = plan.allocate_input().unwrap();
+                let mut workspace = plan.allocate_workspace().unwrap();
+                for raw in [false, true] {
+                    CALLBACKS.with(|count| count.set(0));
+                    if raw {
+                        plan.backward_with_overlap(&source, &mut destination, &mut workspace)
+                            .unwrap();
+                    } else {
+                        plan.inverse_with_overlap(&source, &mut destination, &mut workspace)
+                            .unwrap();
+                    }
+                    assert_eq!(
+                        CALLBACKS.with(Cell::get),
+                        callbacks,
+                        "each P2P FFT must run inside the actual transpose callback"
+                    );
+                    // An independently specified constant half-spectrum is a unit impulse.
+                    // Raw FFT/DHT normalization is the product of all four extents.
+                    for i in 0..8 {
+                        for j in 0..9 {
+                            for k in 0..10 {
+                                for l in 0..12 {
+                                    if let Some(&actual) = destination.get_global(&[], [i, j, k, l])
+                                    {
+                                        let expected = if [i, j, k, l] == [0; 4] {
+                                            if raw { 8640.0 } else { 1.0 }
+                                        } else {
+                                            0.0
+                                        };
+                                        assert!(
+                                            (actual - expected).abs() < 1e-9,
+                                            "boundary={boundary} raw={raw} at {:?}: {actual} != {expected}",
+                                            [i, j, k, l]
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    assert!(
+                        source
+                            .as_slice()
+                            .iter()
+                            .all(|&x| x == Complex::new(1.0, 0.0))
+                    );
+                    use super::super::{C2C_CALLBACK_INJECTION, C2cCallbackInjection};
+                    for injection in [C2cCallbackInjection::Error, C2cCallbackInjection::Panic] {
+                        let mut failed_workspace = plan.allocate_workspace().unwrap();
+                        if world.rank() == 0 {
+                            C2C_CALLBACK_INJECTION.with(|slot| slot.set(Some(injection)));
+                        }
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if raw {
+                                plan.backward_with_overlap(
+                                    &source,
+                                    &mut destination,
+                                    &mut failed_workspace,
+                                )
+                            } else {
+                                plan.inverse_with_overlap(
+                                    &source,
+                                    &mut destination,
+                                    &mut failed_workspace,
+                                )
+                            }
+                        }));
+                        if matches!(injection, C2cCallbackInjection::Panic) && world.rank() == 0 {
+                            assert!(result.is_err());
+                        } else {
+                            match (injection, world.rank() == 0, result.unwrap().unwrap_err()) {
+                                (
+                                    C2cCallbackInjection::Error,
+                                    true,
+                                    FftOverlapError::Overlap(OverlapError::Callback(
+                                        MixedError::Fft(FftError::PreparationFailed),
+                                    )),
+                                ) => {}
+                                (
+                                    C2cCallbackInjection::Error,
+                                    false,
+                                    FftOverlapError::Overlap(OverlapError::PeerCallbackFailed),
+                                ) => {}
+                                (
+                                    C2cCallbackInjection::Panic,
+                                    false,
+                                    FftOverlapError::Overlap(OverlapError::PeerPanicked),
+                                ) => {}
+                                (_, _, error) => {
+                                    panic!("unexpected mixed callback result: {error:?}")
+                                }
+                            }
+                        }
+                        assert!(
+                            source
+                                .as_slice()
+                                .iter()
+                                .all(|&x| x == Complex::new(1.0, 0.0))
+                        );
+                        assert!(
+                            matches!(
+                                failed_workspace.intermediate.active_view(),
+                                Err(ArrayError::Poisoned)
+                            ) || failed_workspace.real_intermediate.as_ref().is_some_and(
+                                |real| matches!(real.active_view(), Err(ArrayError::Poisoned))
+                            )
+                        );
+                        world.barrier(); // No extra FFT agreement after callback Err/panic.
+                        plan.inverse(&source, &mut destination, &mut workspace)
+                            .unwrap();
+                    }
+                }
+            }
+        }
+    }
 }

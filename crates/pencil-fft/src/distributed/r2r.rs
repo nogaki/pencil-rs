@@ -26,9 +26,15 @@ const OPERATION_DHT_BACKWARD_IN_PLACE_TIMED: u64 = 114;
 
 use std::{mem::size_of, sync::Arc, time::Instant};
 
+impl From<FftError> for FftOverlapError<R2rError> {
+    fn from(error: FftError) -> Self {
+        Self::Operation(error.into())
+    }
+}
+
 use super::{
-    AxisSelection, C2cStageTransition, Direction, DistributedLayout, FftError, INVALID_WORD,
-    OPERATION_R2R_BACKWARD, OPERATION_R2R_BACKWARD_IN_PLACE, OPERATION_R2R_FORWARD,
+    AxisSelection, C2cStageTransition, Direction, DistributedLayout, FftError, FftOverlapError,
+    INVALID_WORD, OPERATION_R2R_BACKWARD, OPERATION_R2R_BACKWARD_IN_PLACE, OPERATION_R2R_FORWARD,
     OPERATION_R2R_FORWARD_IN_PLACE, OPERATION_R2R_INVERSE, OPERATION_R2R_INVERSE_IN_PLACE,
     R2rError, RouteCandidate, StagePreparation, TransformStage, TransformTiming, TransposeMethod,
     agree_execution_descriptor_ref, agree_header, agree_result, build_route, build_transitions,
@@ -498,7 +504,7 @@ where
         source: &PencilArray<T, N, M>,
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
-    ) -> Result<(), R2rError> {
+    ) -> Result<(), FftOverlapError<R2rError>> {
         self.execute_overlap(Direction::Forward, source, destination, workspace)
     }
 
@@ -510,7 +516,7 @@ where
         source: &PencilArray<T, N, M>,
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
-    ) -> Result<(), R2rError> {
+    ) -> Result<(), FftOverlapError<R2rError>> {
         self.execute_overlap(Direction::Inverse, source, destination, workspace)
     }
 
@@ -522,7 +528,7 @@ where
         source: &PencilArray<T, N, M>,
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
-    ) -> Result<(), R2rError> {
+    ) -> Result<(), FftOverlapError<R2rError>> {
         self.execute_overlap(Direction::Backward, source, destination, workspace)
     }
 
@@ -532,7 +538,7 @@ where
         source: &PencilArray<T, N, M>,
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
-    ) -> Result<(), R2rError> {
+    ) -> Result<(), FftOverlapError<R2rError>> {
         let communicator = self.input_pencil().topology().communicator();
         let operation = match direction {
             Direction::Forward => OPERATION_DHT_FORWARD_OVERLAP,
@@ -569,7 +575,8 @@ where
         if !collective_valid(communicator, preflight.is_ok()) {
             return Err(preflight
                 .err()
-                .unwrap_or(R2rError::Fft(FftError::CollectivePreconditionFailed)));
+                .unwrap_or(R2rError::Fft(FftError::CollectivePreconditionFailed))
+                .into());
         }
         let supported = self.core.transitions.iter().all(|transition| {
             matches!(
@@ -585,7 +592,7 @@ where
             )
         });
         if !collective_valid(communicator, supported) {
-            return Err(R2rError::Fft(FftError::OverlapUnsupported));
+            return Err(FftOverlapError::UnsupportedTransport);
         }
         match direction {
             Direction::Forward => {
@@ -1279,7 +1286,7 @@ where
         source: &PencilArray<T, N, M>,
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
-    ) -> Result<(), R2rError> {
+    ) -> Result<(), FftOverlapError<R2rError>> {
         self.execute_overlap(Direction::Forward, source, destination, workspace)
     }
 
@@ -1290,7 +1297,7 @@ where
         source: &PencilArray<T, N, M>,
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
-    ) -> Result<(), R2rError> {
+    ) -> Result<(), FftOverlapError<R2rError>> {
         self.execute_overlap(Direction::Inverse, source, destination, workspace)
     }
 
@@ -1301,7 +1308,7 @@ where
         source: &PencilArray<T, N, M>,
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
-    ) -> Result<(), R2rError> {
+    ) -> Result<(), FftOverlapError<R2rError>> {
         self.execute_overlap(Direction::Backward, source, destination, workspace)
     }
 
@@ -1311,7 +1318,7 @@ where
         source: &PencilArray<T, N, M>,
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
-    ) -> Result<(), R2rError> {
+    ) -> Result<(), FftOverlapError<R2rError>> {
         let communicator = self.input_pencil().topology().communicator();
         let operation = match direction {
             Direction::Forward => OPERATION_R2R_FORWARD_OVERLAP,
@@ -1323,7 +1330,8 @@ where
         if !collective_valid(communicator, preflight.is_ok()) {
             return Err(preflight
                 .err()
-                .unwrap_or(R2rError::Fft(FftError::CollectivePreconditionFailed)));
+                .unwrap_or(R2rError::Fft(FftError::CollectivePreconditionFailed))
+                .into());
         }
         let supported = self.core.transitions.iter().all(|transition| {
             matches!(
@@ -1339,7 +1347,7 @@ where
             )
         });
         if !collective_valid(communicator, supported) {
-            return Err(R2rError::Fft(FftError::OverlapUnsupported));
+            return Err(FftOverlapError::UnsupportedTransport);
         }
         match direction {
             Direction::Forward => {
@@ -1976,7 +1984,7 @@ fn execute_r2r_forward_overlap<T: R2rScalar + Equivalence, const N: usize, const
     source: &PencilArray<T, N, M>,
     destination: &mut PencilArray<T, N, M>,
     workspace: &mut R2rWorkspace<T, N, M>,
-) -> Result<(), R2rError> {
+) -> Result<(), FftOverlapError<R2rError>> {
     let source_view = source.view();
     let stage = &core.stages[0];
     workspace
@@ -2052,7 +2060,7 @@ fn execute_r2r_reverse_overlap<T: R2rScalar + Equivalence, const N: usize, const
     destination: &mut PencilArray<T, N, M>,
     workspace: &mut R2rWorkspace<T, N, M>,
     normalize: bool,
-) -> Result<(), R2rError> {
+) -> Result<(), FftOverlapError<R2rError>> {
     let source_view = source.view();
     let last = core.stages.len() - 1;
     let stage = &core.stages[last];
@@ -2126,23 +2134,14 @@ fn execute_r2r_reverse_overlap<T: R2rScalar + Equivalence, const N: usize, const
     Ok(())
 }
 
-fn map_r2r_overlap<E>(error: OverlapError<E>) -> R2rError
-where
-    E: Into<R2rError>,
-{
-    match error {
-        OverlapError::Transpose(error) => R2rError::Fft(FftError::Transpose(error)),
-        OverlapError::Callback(error) => error.into(),
-        OverlapError::PeerPanicked => {
-            R2rError::Fft(FftError::Overlap(Box::new(OverlapError::PeerPanicked)))
-        }
-        OverlapError::PeerCallbackFailed => R2rError::Fft(FftError::Overlap(Box::new(
-            OverlapError::PeerCallbackFailed,
-        ))),
-        OverlapError::CollectivePreconditionFailed => R2rError::Fft(FftError::Overlap(Box::new(
-            OverlapError::CollectivePreconditionFailed,
-        ))),
-    }
+fn map_r2r_overlap<E: Into<R2rError>>(error: OverlapError<E>) -> FftOverlapError<R2rError> {
+    FftOverlapError::Overlap(match error {
+        OverlapError::Transpose(error) => OverlapError::Transpose(error),
+        OverlapError::Callback(error) => OverlapError::Callback(error.into()),
+        OverlapError::PeerPanicked => OverlapError::PeerPanicked,
+        OverlapError::PeerCallbackFailed => OverlapError::PeerCallbackFailed,
+        OverlapError::CollectivePreconditionFailed => OverlapError::CollectivePreconditionFailed,
+    })
 }
 
 fn execute_forward<T: R2rScalar + Equivalence, const N: usize, const M: usize>(

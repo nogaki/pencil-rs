@@ -3,8 +3,9 @@
 
 //! Collective native MPI-IO for [`pencil_array`] views.
 //!
-//! The MPI backend stores one versioned little-endian row-major payload per
-//! file.  Local buffers are packed in logical `[extra..., spatial...]` order;
+//! The original [`write_mpi`] / [`read_mpi`] APIs store one versioned
+//! little-endian row-major payload per file. Local buffers are packed in logical
+//! `[extra..., spatial...]` order;
 //! the packing is local and never gathers data at rank zero.  Readers may use
 //! a different process grid or memory-axis permutation.
 //!
@@ -22,6 +23,14 @@
 //! a native parallel HDF5 file.  It uses one versioned dataset at
 //! `/pencil_io_v1/data`; that is a self-describing HDF5 representation, not a
 //! binary-compatible Julia PencilIO custom format.
+//!
+//! [`write_mpi_named`], [`append_mpi_named`], and [`read_mpi_named`] add a separate
+//! append-only named-dataset container. Append creates a new name without
+//! overwriting earlier committed records. The optional HDF5 named APIs likewise
+//! use per-dataset metadata and commit markers. Names are UTF-8 keys rather than
+//! filesystem paths; duplicate names fail before mutation. [`NamedIoError`]
+//! preserves underlying native/commit errors. Neither format promises recovery
+//! from process loss or crash-atomic HDF5 journaling.
 
 mod format;
 mod mpi_io;

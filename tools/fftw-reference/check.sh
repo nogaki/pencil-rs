@@ -127,13 +127,67 @@ fi
 
 run_direction_reference() {
     local ranks=$1 directory=$2 log_file=$3
-    if ! timeout --kill-after=5s 120s "$MPIEXEC" "${mpi_flags[@]}" -n "$ranks" env PENCIL_FFTW_DIRECTION_FIXTURES="$directory" \
-        cargo test "${CARGO_TEST_ARGS[@]}" -- --ignored fftw_direction_reference --nocapture --test-threads=1 >"$log_file" 2>&1; then
+    direction_status=0
+    timeout --kill-after=5s 120s "$MPIEXEC" "${mpi_flags[@]}" -n "$ranks" env PENCIL_FFTW_DIRECTION_FIXTURES="$directory" \
+        cargo test "${CARGO_TEST_ARGS[@]}" -- --ignored fftw_direction_reference --nocapture --test-threads=1 >"$log_file" 2>&1 || direction_status=$?
+    if ((direction_status != 0)); then
         cat "$log_file" >&2
-        return 1
+        return "$direction_status"
     fi
     [[ $(grep -Fc 'PENCIL_FFTW_DIRECTION_REFERENCE_RAN fixtures=5 configurations=40' "$log_file") -eq 1 ]]
 }
+
+# Accept only an executed Rust test rejecting the intended fixture, never a failed runner.
+check_direction_rejection() {
+    local status=$1 log=$2 case_name=$3 reason=$4
+    [[ $status == 101 || $status == 1 ]] || return 1
+    grep -Fq 'PENCIL_FFTW_DIRECTION_REFERENCE_STARTED' "$log" || return 1
+    grep -Eq '^test result: FAILED\. 0 passed; 1 failed;' "$log" || return 1
+    grep -Fxq '    fftw_direction_reference_parser' "$log" || return 1
+    if [[ -n $case_name ]]; then
+        [[ $(grep -F 'PENCIL_FFTW_DIRECTION_REFERENCE_STARTED case=' "$log" | tail -n1) == "PENCIL_FFTW_DIRECTION_REFERENCE_STARTED case=$case_name" ]] || return 1
+        grep -E "${reason}: actual=.*expected=.*bound=" "$log" >/dev/null || return 1
+    else
+        grep -Fq "$reason" "$log" || return 1
+    fi
+}
+
+require_direction_rejection() {
+    if ! check_direction_rejection "$direction_status" "$1" "$2" "$3"; then
+        cat "$1" >&2
+        printf 'direction rejection lacks intended test/reason evidence (status=%s)\n' "$direction_status" >&2
+        exit 1
+    fi
+}
+
+# Small executable guard regression: even plausible logs cannot hide runner failures.
+guard_log="$WORK/direction-guard.log"
+printf '%s\n' 'PENCIL_FFTW_DIRECTION_REFERENCE_STARTED' \
+    'PENCIL_FFTW_DIRECTION_REFERENCE_STARTED case=mixed_r2c_even' \
+    'direction forward real: actual=1 expected=2 bound=0.001' \
+    '    fftw_direction_reference_parser' \
+    'test result: FAILED. 0 passed; 1 failed;' >"$guard_log"
+for status in 101 1; do
+    check_direction_rejection "$status" "$guard_log" mixed_r2c_even 'direction forward real'
+done
+for status in 0 124 137 2 127; do
+    if check_direction_rejection "$status" "$guard_log" mixed_r2c_even 'direction forward real'; then
+        printf 'guard accepted invalid status %s\n' "$status" >&2; exit 1
+    fi
+done
+if check_direction_rejection 101 "$guard_log" c2c_2d_3x4_forward-backward 'direction forward real' \
+    || check_direction_rejection 101 "$guard_log" mixed_r2c_even 'direction backward real'; then
+    printf 'guard accepted wrong comparison context\n' >&2; exit 1
+fi
+grep -v 'PENCIL_FFTW_DIRECTION_REFERENCE_STARTED' "$guard_log" >"$guard_log.no-start"
+if check_direction_rejection 101 "$guard_log.no-start" '' 'actual='; then
+    printf 'guard accepted missing execution marker\n' >&2; exit 1
+fi
+printf '%s\n' 'error: could not compile pencil-fft' >"$guard_log"
+if check_direction_rejection 101 "$guard_log" '' 'could not compile'; then
+    printf 'guard accepted build failure\n' >&2; exit 1
+fi
+printf 'direction rejection guard checks passed\n'
 
 run_reference() {
     local ranks=$1
@@ -164,23 +218,33 @@ for corruption in missing duplicate r2c-forward r2c-inverse r2c-backward r2c-sig
     cp -- "${direction_files[@]}" "$directory/"
     case "$corruption" in
         missing) rm "$directory/mixed_r2c_odd.txt" ;;
-        duplicate) cp "$directory/mixed_r2c_even.txt" "$directory/mixed_r2c_odd.txt" ;;
-        *) "$JULIA" --startup-file=no --project="$PROJECT" -e '
+        duplicate)
+            if cmp -s "$directory/mixed_r2c_even.txt" "$directory/mixed_r2c_odd.txt"; then
+                printf 'duplicate corruption would not change fixture\n' >&2; exit 1
+            fi
+            cp "$directory/mixed_r2c_even.txt" "$directory/mixed_r2c_odd.txt" ;;
+        *) "$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" -e '
             path, kind = ARGS
             lines = readlines(path)
+            original = copy(lines)
             if kind == "r2c-sign"
-                i = findfirst(line -> startswith(line, "directions "), lines)
+                i = only(findall(line -> startswith(line, "directions "), lines))
+                count(==("backward"), split(lines[i])) == 1 || error("expected one backward sign")
                 lines[i] = replace(lines[i], "backward" => "forward")
             elseif kind == "r2c-real-imaginary"
-                i = findfirst(line -> startswith(line, "section input "), lines)
-                values = split(lines[i+1]); values[2] = "1.0"
+                i = only(findall(line -> startswith(line, "section input "), lines))
+                values = split(lines[i+1]); parse(Float64, values[2]) == 0 || error("input already imaginary")
+                values[2] = "1.0"
                 lines[i+1] = join(values, " ")
             else
                 section = replace(kind, "r2c-" => "") * "_expected"
-                i = findfirst(line -> startswith(line, "section " * section * " "), lines)
-                values = split(lines[i+1]); values[1] = string(parse(Float64, values[1]) + 100)
+                i = only(findall(line -> startswith(line, "section " * section * " "), lines))
+                values = split(lines[i+1]); old = parse(Float64, values[1])
+                values[1] = string(old + 100)
+                parse(Float64, values[1]) != old || error("unchanged value")
                 lines[i+1] = join(values, " ")
             end
+            count(lines .!= original) == 1 || error("corruption must change exactly one line")
             write(path, join(lines, "\n") * "\n")
         ' "$directory/mixed_r2c_even.txt" "$corruption" ;;
     esac
@@ -188,61 +252,69 @@ for corruption in missing duplicate r2c-forward r2c-inverse r2c-backward r2c-sig
         printf 'checker accepted direction corruption: %s\n' "$corruption" >&2
         exit 1
     fi
+    case "$corruption" in
+        missing) require_direction_rejection "$WORK/$corruption.log" '' 'unexpected direction reference count' ;;
+        duplicate)
+            require_direction_rejection "$WORK/$corruption.log" '' 'left: Some("mixed_r2c_odd")'
+            require_direction_rejection "$WORK/$corruption.log" '' 'right: Some("mixed_r2c_even")' ;;
+        r2c-real-imaginary) require_direction_rejection "$WORK/$corruption.log" '' 'RFFT real sections must have zero imaginary parts' ;;
+        r2c-sign) require_direction_rejection "$WORK/$corruption.log" mixed_r2c_even 'direction forward (real|imag)' ;;
+        *) require_direction_rejection "$WORK/$corruption.log" mixed_r2c_even "direction ${corruption#r2c-} real" ;;
+    esac
     printf 'direction corruption rejected: %s\n' "$corruption"
 done
 DIRECTION_CORRUPT="$WORK/direction-corrupt"
 mkdir -p "$DIRECTION_CORRUPT"
 cp -- "$DIRECTION_FIXTURES"/*.txt "$DIRECTION_CORRUPT/"
-first_direction=$(find "$DIRECTION_CORRUPT" -name '*.txt' | sort | head -n1)
+first_direction="$DIRECTION_CORRUPT/c2c_2d_3x4_forward-backward.txt"
 "$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" -e '
 path = ARGS[1]; lines = readlines(path);
-for i in eachindex(lines)
-    if startswith(lines[i], "section forward_expected ")
-        words = split(lines[i + 1]); words[1] = string(parse(Float64, words[1]) + 1.0); lines[i + 1] = join(words, " "); break
-    end
-end
+i = only(findall(line -> startswith(line, "section forward_expected "), lines))
+old = lines[i + 1]
+words = split(old); words[1] = string(parse(Float64, words[1]) + 1.0); lines[i + 1] = join(words, " ")
+parse(Float64, split(old)[1]) != parse(Float64, words[1]) || error("unchanged value")
 open(path, "w") do io; write(io, join(lines, "\n"), "\n"); end
 ' "$first_direction"
 if run_direction_reference 1 "$DIRECTION_CORRUPT" "$WORK/direction-corrupt.log"; then
     printf 'checker accepted a corrupted direction reference\n' >&2
     exit 1
 fi
+require_direction_rejection "$WORK/direction-corrupt.log" c2c_2d_3x4_forward-backward 'direction forward real'
 printf 'corrupted direction forward_expected rejected as intended\n'
 DIRECTION_BACKWARD_CORRUPT="$WORK/direction-backward-corrupt"
 mkdir -p "$DIRECTION_BACKWARD_CORRUPT"
 cp -- "$DIRECTION_FIXTURES"/*.txt "$DIRECTION_BACKWARD_CORRUPT/"
-first_direction_backward=$(find "$DIRECTION_BACKWARD_CORRUPT" -name '*.txt' | sort | head -n1)
+first_direction_backward="$DIRECTION_BACKWARD_CORRUPT/c2c_2d_3x4_forward-backward.txt"
 "$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" -e '
 path = ARGS[1]; lines = readlines(path);
-for i in eachindex(lines)
-    if startswith(lines[i], "section backward_expected ")
-        words = split(lines[i + 1]); words[1] = string(parse(Float64, words[1]) + 1.0); lines[i + 1] = join(words, " "); break
-    end
-end
+i = only(findall(line -> startswith(line, "section backward_expected "), lines))
+old = lines[i + 1]
+words = split(old); words[1] = string(parse(Float64, words[1]) + 1.0); lines[i + 1] = join(words, " ")
+parse(Float64, split(old)[1]) != parse(Float64, words[1]) || error("unchanged value")
 open(path, "w") do io; write(io, join(lines, "\n"), "\n"); end
 ' "$first_direction_backward"
 if run_direction_reference 1 "$DIRECTION_BACKWARD_CORRUPT" "$WORK/direction-backward-corrupt.log"; then
     printf 'checker accepted corrupted direction backward_expected\n' >&2
     exit 1
 fi
+require_direction_rejection "$WORK/direction-backward-corrupt.log" c2c_2d_3x4_forward-backward 'direction backward real'
 printf 'corrupted direction backward_expected rejected as intended\n'
 DIRECTION_SIGN_CORRUPT="$WORK/direction-sign-corrupt"
 mkdir -p "$DIRECTION_SIGN_CORRUPT"
 cp -- "$DIRECTION_FIXTURES"/*.txt "$DIRECTION_SIGN_CORRUPT/"
-first_direction_sign=$(find "$DIRECTION_SIGN_CORRUPT" -name '*.txt' | sort | head -n1)
+first_direction_sign="$DIRECTION_SIGN_CORRUPT/c2c_2d_3x4_forward-backward.txt"
 "$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" -e '
 path = ARGS[1]; lines = readlines(path);
-for i in eachindex(lines)
-    if startswith(lines[i], "directions ")
-        words = split(lines[i]); words[2] = "sideways"; lines[i] = join(words, " "); break
-    end
-end
+i = only(findall(line -> startswith(line, "directions "), lines))
+words = split(lines[i]); words[2] == "forward" || error("unexpected original sign")
+words[2] = "sideways"; lines[i] = join(words, " ")
 open(path, "w") do io; write(io, join(lines, "\n"), "\n"); end
 ' "$first_direction_sign"
 if run_direction_reference 1 "$DIRECTION_SIGN_CORRUPT" "$WORK/direction-sign-corrupt.log"; then
     printf 'checker accepted corrupted direction metadata\n' >&2
     exit 1
 fi
+require_direction_rejection "$WORK/direction-sign-corrupt.log" '' 'directions: invalid value "sideways"'
 printf 'corrupted direction metadata rejected as intended\n'
 
 for ranks in 1 4 6; do

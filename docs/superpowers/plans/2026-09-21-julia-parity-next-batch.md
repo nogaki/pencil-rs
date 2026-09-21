@@ -8,17 +8,17 @@ User approved all seven categories after comparison with PencilArrays 0.19.11 an
 - Keep default local CPU FFT MPI-free, array independent of FFT/I/O, and `pencil-fft` unsafe-free. Exact MSRV is Rust 1.85.0, independently of normal stable.
 - New collectives begin with the existing two five-word MIN/MAX header reductions. Agree exact descriptors before entry-specific collectives, allocation-dependent communication, or payloads. Callback semantics/associativity remain caller responsibilities.
 - Workers do not publish git changes. Parent integrates, reviews, verifies and publishes. Every worktree and MSRV build has a separate Cargo target directory.
-- Luna implementation plus independent Sol review. The attempted `gpt-5.6-luna-max` model was rejected by the account; the user was informed that the configured `gpt-5.6-luna` is used instead.
+- Luna initial implementation, Astra completion/regression tests, and independent Sol review. The attempted `gpt-5.6-luna-max` model was rejected by the account; the user was informed of both the configured Luna fallback and Astra completion.
 - CI billing/protection/concurrency settings are not changed. The existing September 2026 CI-success waiver is retained; do not claim CI success.
 
 ## Features and acceptance
 
 - [x] Checked pointwise/broadcast operations. Closures, output-specified and in-place forms; identical spatial layout/topology, equal extra rank with singleton-extra broadcasting, scalars via captures. Validate mapping/overflow before writes. No implicit spatial redistribution or expression-template engine. Callback panic may leave partial output; ordinary validation errors do not. New error type instead of changing `ArrayError`.
 - [x] Multi-input reductions. Two-input custom associative map/reduce with explicit neutral init, exact scalar/init/layout descriptor, deterministic rank-partial all-gather/fold (document O(P)); callbacks must not panic or call MPI. Sealed existing output scalars. Add checked/IEEE-consistent zip sum/norm and mapped min/max through existing policies, not unchecked generic arithmetic. No direct Many collective wrappers.
-- [ ] Named multiple datasets and append. Add a new named I/O API/error type; existing exclusive-create v1 APIs stay unchanged. Append adds a new named dataset, not in-place extent growth or overwrite. MPI container has distinct framing and independently committed append-only records; no supposedly atomic mutable global index. Prior committed records remain readable across incomplete tails; appending after an invalid tail may be refused, never truncate it. HDF5 opens existing files RDWR, stores named records with per-dataset metadata/commit and injective UTF-8 name encoding, and never replaces earlier datasets. Agree full names, reject duplicates before mutation, stage read results until cleanup succeeds. Preserve CommitUncertain/fail-stop distinctions; do not promise crash-atomic HDF5 journaling.
-- [ ] Per-axis FFT/BFFT signs. Add a direction value/configuration API that creates a fresh plan core, covering C2C and both mixed plans. Forward uses the configured complex sign; inverse/backward use its pair, only inverse normalizes. Positive-sign forward's inverse uses negative FFT followed by scaling. RFFT/R2R/identity stages do not silently acquire a Fourier sign. Keep closed `AxisTransform` and `DistributedLayout` unchanged; descriptors include directions, old workspaces reject the new core. Update independent Julia fixtures and corruption checks without shrinking the matrix.
-- [ ] Per-stage timing. Fixed/const-N records, `std::time::Instant`, local-rank measurements for transform/pack/collective-or-receive-wait/send-wait/unpack/total. No implicit timing reductions or fallible post-start reporting allocation. Distinct new operation words for profiled entry points. Overlapped intervals need not sum to total.
-- [ ] Genuine P2P send/FFT overlap. Nested receive scope inside send scope, all reservations agreed before packing/posting, receives before sends, receive wait and scope end before unpack/callback, next FFT before send wait. Requests never escape their scope. Wait sends on callback error/unwind, then perform the same panic-status agreement on all ranks before a local panic is resumed or peers return a typed peer-panic error. Normal callback errors are collectively agreed before subsequent payloads; peer-panic paths must not enter another unmatched outer agreement. Keep existing synchronous entries unchanged and test scheduling, recovery and ownership.
+- [x] Named multiple datasets and append. Add a new named I/O API/error type; existing exclusive-create v1 APIs stay unchanged. Append adds a new named dataset, not in-place extent growth or overwrite. MPI container has distinct framing and independently committed append-only records; no supposedly atomic mutable global index. Prior committed records remain readable across incomplete tails; appending after an invalid tail may be refused, never truncate it. HDF5 opens existing files RDWR, stores named records with per-dataset metadata/commit and injective UTF-8 name encoding, and never replaces earlier datasets. Agree full names, reject duplicates before mutation, stage read results until cleanup succeeds. Preserve CommitUncertain/fail-stop distinctions; do not promise crash-atomic HDF5 journaling.
+- [x] Per-axis FFT/BFFT signs. Add a direction value/configuration API that creates a fresh plan core, covering C2C and both mixed plans. Forward uses the configured complex sign; inverse/backward use its pair, only inverse normalizes. Positive-sign forward's inverse uses negative FFT followed by scaling. RFFT/R2R/identity stages do not silently acquire a Fourier sign. Keep closed `AxisTransform` and `DistributedLayout` unchanged; descriptors include directions, old workspaces reject the new core. Update independent Julia fixtures and corruption checks without shrinking the matrix.
+- [x] Per-stage timing. Fixed/const-N records, `std::time::Instant`, local-rank measurements for transform/pack/collective-or-receive-wait/send-wait/unpack/total. No implicit timing reductions or fallible post-start reporting allocation. Distinct new operation words for profiled entry points. Overlapped intervals need not sum to total.
+- [x] Genuine out-of-place P2P send/FFT overlap (matching Julia's overlap path; in-place profiling remains supported). Nested receive scope inside send scope, all reservations agreed before packing/posting, receives before sends, receive wait and scope end before unpack/callback, next FFT before send wait. Requests never escape their scope. Wait sends on callback error/unwind, then perform the same panic-status agreement on all ranks before a local panic is resumed or peers return a typed peer-panic error. Normal callback errors are collectively agreed before subsequent payloads; peer-panic paths must not enter another unmatched outer agreement. Keep existing synchronous entries unchanged and test scheduling, recovery and ownership.
 - [ ] Concrete CUDA support. New `pencil-cuda` with dynamic CUDA/cuFFT loading (`libloading = "=0.8.9"`), resident buffers and actual GPU FFTs, no disguised CPU fallback. Local C2C/R2C/C2R for f32/f64 and normalized/raw directions; optional `distributed` uses checked host-staged MPI, never root-gather FFT. Reuse immutable stage geometry through additive accessors rather than exposing internal executors. One audited unsafe FFI boundary, retained library/context lifetimes, checked sizes/strides/device ownership and statuses. CPU crates/default behavior unchanged.
 
 ## Verification
@@ -52,6 +52,23 @@ Worktree logs are in `logs/`; the isolated MSRV target is recorded in
   check and both integration-test builds: all passed. Logs: `logs/review-*.log`,
   executable build records: `logs/review-build.jsonl`; targets: this worktree's
   `target` and `target/msrv-review`. No commits/pushes.
+
+## Integration and release gates
+
+The six CPU categories have implementations, focused MPI checks, and independent
+Sol review. The integration additionally preserves the original closed `FftError`
+by returning the new `FftOverlapError<E>` only from overlap APIs; an exhaustive
+legacy-enum compatibility test guards this boundary. Parent full-tree validation
+is recorded separately before publication.
+
+CUDA local and distributed code is implemented on the separate CUDA branch,
+including real cuFFT calls, resident arrays, host-staged MPI, normalization PTX,
+context/resource safeguards, and host/MPI checks. The CUDA checkbox remains open
+as a release gate: no real CUDA numerical/ABI/PTX execution is available here.
+Publish that work as a draft until the explicit hardware matrix passes, not as a
+validated GPU release. It does not claim GPU R2R/mixed transforms, CUDA-aware MPI,
+distributed in-place execution, padded real in-place execution, or allocation-free
+GPU execution. Existing CPU implementations of those transform families remain.
 
 ## Worktree ownership
 

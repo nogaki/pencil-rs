@@ -91,6 +91,28 @@ logical `[extra..., spatial...]` row-major order on the root and `None`
 elsewhere; all ranks validate descriptors, counts, and root allocation before
 payload communication.
 
+## Checked pointwise operations and multi-input reductions
+
+`pointwise2` and `pointwise2_views` write a caller-provided output; the
+`pointwise2_in_place` and `pointwise2_in_place_views` forms update the left input
+without cloning it. Inputs must have the same spatial pencil layout and extra
+rank. An input extra extent may be one or the output extent, so extra axes can
+broadcast without expanding a temporary. Scalars can be captured by the closure.
+Traversal follows physical spatial storage order. These operations are local,
+not MPI collectives: they never redistribute a spatial singleton. Validation
+errors preserve the output and invoke no callback; a callback panic can leave
+partial output.
+
+`map_reduce2` adds two-input mapped reduction with an explicit neutral value and
+an associative reducer. It folds each rank locally, gathers one scalar partial
+per rank, then folds in rank order: the deliberate O(P) storage/communication
+cost avoids Rust callbacks inside MPI. Callback semantics, associativity and
+neutrality are caller obligations; callbacks must not panic or call MPI.
+`zip_sum_by` and `zip_norm_by` retain the existing checked-integer/IEEE and scaled
+norm policies. `min_by` and `max_by` reduce mapped values and return `None` for
+a globally empty input. New collective descriptors agree both layouts and exact
+neutral bits before invoking callbacks or exchanging typed data.
+
 ## Distributed R2C/C2R FFT
 
 `R2cPlan<R, N, M>` accepts a canonical real input pencil and a non-empty
@@ -228,6 +250,34 @@ plans are validated by composing those same one-axis references in route order.
 The reusable oracle is `tools/fftw-reference/mixed_reference.jl`; focused MPI
 coverage is in `crates/pencil-fft/tests/distributed_mixed.rs`.
 
+## Per-axis Fourier directions, timing, and send overlap
+
+`FourierDirections<N>` selects `FourierDirection::Forward` (negative exponent)
+or `Backward` (positive exponent) per complex FFT axis. `C2cPlan`,
+`MixedC2cPlan`, and `MixedR2cPlan` expose `with_fft_directions`; it collectively
+creates a fresh plan core, so allocate workspaces/in-place arrays from the
+returned plan. Existing constructors keep their original signs. A configured
+positive-sign forward pairs with a negative-sign reverse; only `inverse`
+normalizes. Identity, R2R and RFFT axes must retain the default direction.
+The existing closed `AxisTransform` and error enums remain unchanged.
+
+All distributed CPU plan families provide `forward_with_timing`,
+`inverse_with_timing`, `backward_with_timing`, and corresponding in-place
+methods. `TransformTiming<N>` stores local-rank, fixed-size route-stage records:
+local transform time/call count, transition time/call count, and pack/unpack and
+transport wait measurements. Reports use `std::time::Instant`; there is no
+implicit global timing reduction. Alltoallv records its collective wait rather
+than inventing separate receive/send waits.
+
+For point-to-point plans, the out-of-place `*_with_overlap` methods wait for
+receives and unpack first, execute the next local FFT while sends can still be
+outstanding, and then wait for every send. They return the additive
+`FftOverlapError<E>` rather than changing legacy error enums. Callback errors
+and panic status are agreed after requests are drained; this does not promise
+recovery from MPI failure or process loss. In-place overlap is not exposed;
+in-place profiling remains supported. Overlap on Alltoallv is rejected, and
+old, profiled and overlap calls have distinct collective operation words.
+
 ## Local Julia/FFTW reference validation
 
 The opt-in Milestone 9 checker generates temporary Julia 1.12.6/FFTW.jl
@@ -237,6 +287,10 @@ transpose methods and both memory-layout policies. It covers exactly 82
 format-7 fixtures and 136 base case/layout configurations per memory-layout
 policy (272 with both policies), including mixed-axis C2C/R2C and real/complex
 R2R and DHT `f32`/`f64`.
+A separate direction-format generator adds 5 signed-axis fixtures and 40
+configurations per MPI size, retaining all 82 legacy fixtures and 272 legacy
+configurations. Direction-specific corruption checks also verify that ignoring
+or altering Fourier signs is detected.
 The external comparison is explicitly opt-in; normal Rust tests need no Julia.
 See [`tools/fftw-reference/README.md`](tools/fftw-reference/README.md) and run
 `tools/fftw-reference/check.sh` only when Julia, FFTW.jl, and MPI are locally
@@ -272,6 +326,28 @@ and MPI libraries resolved by the build and runtime are the same ABI. The
 lockfile's shared `mpi-sys` dependency is not ABI evidence: the pair is
 validated only by inspecting the test executable's `ldd` output and recording
 runtime MPI and HDF5 versions from that same environment.
+
+### Named datasets and append
+
+`write_mpi_named`, `append_mpi_named`, and `read_mpi_named` provide an append-only
+multi-dataset container separate from the original single-dataset format.
+Append adds a new name; it never overwrites an earlier dataset. Each record has
+its own checked framing and commit marker. Earlier committed records remain
+readable when a later tail is malformed or incomplete, while further append is
+refused until that invalid tail is handled outside this API. There is no
+artificial global 1 GiB limit; native per-rank count, dimension and file-offset
+limits still apply.
+
+The optional HDF5 counterparts are `write_hdf5_named`, `append_hdf5_named`, and
+`read_hdf5_named`. They use `/pencil_io_named_v1` with injectively encoded UTF-8
+keys, original-name attributes, and per-dataset metadata/commit markers. Append
+opens the file read/write without truncation. Names are keys, not filesystem
+paths; duplicate names are rejected before mutation. `NamedIoError` preserves
+underlying `IoError` values, including commit uncertainty. Both backends retain
+staged reads that update the destination only after successful cleanup. HDF5
+is not a crash-atomic journal, and neither backend promises process-loss
+recovery. The original exclusive-create v1 APIs and file representations remain
+unchanged; no Julia PencilIO wire compatibility is claimed.
 
 Run the MPI-IO integration test at the required 1/4/6 rank matrix:
 

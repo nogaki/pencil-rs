@@ -5,9 +5,30 @@ use std::sync::Arc;
 use mpi::traits::*;
 use pencil_array::{ExtraShape, MpiTopology};
 use pencil_fft::{
-    AxisTransform, Complex, DistributedLayout, FftError, FftReal, FourierDirection,
-    FourierDirections, MixedC2cPlan, MixedError, MixedR2cPlan, TransformTiming, TransposeMethod,
+    AxisTransform, Complex, DistributedLayout, FftError, FftOverlapError, FftReal,
+    FourierDirection, FourierDirections, MixedC2cPlan, MixedError, MixedR2cPlan, TransformTiming,
+    TransposeMethod,
 };
+
+// Debug includes the private workspace buffers and active ownership state.
+macro_rules! reject_unsupported {
+    ($plan:ident, $src:ident, $dst:ident, $ws:ident, $overlap:ident, $ordinary:ident) => {{
+        let before = (
+            $src.as_slice().to_vec(),
+            $dst.as_slice().to_vec(),
+            format!("{:?}", $ws),
+        );
+        let result = $plan.$overlap(&$src, &mut $dst, &mut $ws);
+        assert!(
+            matches!(result, Err(FftOverlapError::UnsupportedTransport)),
+            "{result:?}"
+        );
+        assert_eq!($src.as_slice(), before.0);
+        assert_eq!($dst.as_slice(), before.1);
+        assert_eq!(format!("{:?}", $ws), before.2);
+        $plan.$ordinary(&$src, &mut $dst, &mut $ws).unwrap();
+    }};
+}
 
 trait Real: FftReal + mpi::datatype::Equivalence {
     fn from_f64(x: f64) -> Self;
@@ -188,6 +209,12 @@ where
     }
 
     check_c2c_spectrum(&output);
+    if layout.transpose_method == TransposeMethod::AllToAllv {
+        reject_unsupported!(plan, input, output, ws, forward_with_overlap, forward);
+        let mut recovered = plan.allocate_input().unwrap();
+        reject_unsupported!(plan, output, recovered, ws, inverse_with_overlap, inverse);
+        reject_unsupported!(plan, output, recovered, ws, backward_with_overlap, backward);
+    }
     // The overlap path is only meaningful for point-to-point routes. Compare it
     // with the independently executed established (non-overlapped) kernel.
     if layout.transpose_method == TransposeMethod::PointToPoint {
@@ -289,6 +316,12 @@ fn r2c_case<R: Real>(
         check_timing(&f.unwrap());
     }
     check_r2c_spectrum(&output, boundary);
+    if layout.transpose_method == TransposeMethod::AllToAllv {
+        reject_unsupported!(plan, input, output, ws, forward_with_overlap, forward);
+        let mut recovered = plan.allocate_input().unwrap();
+        reject_unsupported!(plan, output, recovered, ws, inverse_with_overlap, inverse);
+        reject_unsupported!(plan, output, recovered, ws, backward_with_overlap, backward);
+    }
     if layout.transpose_method == TransposeMethod::PointToPoint {
         let mut overlap = plan.allocate_output().unwrap();
         plan.forward_with_overlap(&input, &mut overlap, &mut ws)

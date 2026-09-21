@@ -102,7 +102,12 @@ fn consume_c2c_callback_injection() -> Result<(), FftError> {
 fn consume_r2c_callback_injection() -> Result<(), FftError> {
     let injection = R2C_CALLBACK_INJECTION.with(|slot| slot.take());
     match injection {
-        Some(R2cCallbackInjection::Error) => Err(FftError::PreparationFailed),
+        Some(R2cCallbackInjection::Error) => {
+            Err(FftError::LocalC2c(LocalC2cError::ScratchTooSmall {
+                required: 7,
+                actual: 3,
+            }))
+        }
         Some(R2cCallbackInjection::Panic) => panic!("injected R2C overlap callback panic"),
         None => Ok(()),
     }
@@ -272,14 +277,6 @@ pub enum FftError {
     #[error("distributed FFT preparation failed")]
     PreparationFailed,
 
-    /// The overlap route does not support Alltoallv transitions.
-    #[error("distributed FFT overlap does not support Alltoallv transpose")]
-    OverlapUnsupported,
-
-    /// An overlap callback failed or another rank panicked.
-    #[error(transparent)]
-    Overlap(Box<OverlapError<FftError>>),
-
     /// A requested initialized allocation could not be made.
     #[error("failed to allocate {required} elements")]
     AllocationFailed {
@@ -310,6 +307,26 @@ pub enum FftError {
     /// The array crate rejected a process-local transition.
     #[error(transparent)]
     LocalTranspose(#[from] LocalTransposeError),
+}
+
+/// Errors returned only by the out-of-place `*_with_overlap` APIs.
+#[derive(Debug, Error)]
+pub enum FftOverlapError<E: std::fmt::Debug> {
+    /// The base transform operation failed validation or execution.
+    #[error(transparent)]
+    Operation(E),
+    /// Alltoallv transitions do not support overlap.
+    #[error("distributed FFT overlap does not support Alltoallv transpose")]
+    UnsupportedTransport,
+    /// A transpose or local callback failed, or a peer callback failed or panicked.
+    #[error(transparent)]
+    Overlap(OverlapError<E>),
+}
+
+impl<E: std::fmt::Debug> From<E> for FftOverlapError<E> {
+    fn from(error: E) -> Self {
+        Self::Operation(error)
+    }
 }
 
 /// Errors returned by the distributed real-to-half-complex API.
@@ -1272,7 +1289,8 @@ where
         self.execute(Direction::Backward, source, destination, workspace, None)
     }
 
-    /// Computes forward while running the next local FFT during each P2P receive.
+    /// Computes forward, running the next local FFT after receive/unpack
+    /// completion and before the P2P send wait.
     /// A successful return has no pending network requests, including partial
     /// final sends.
     pub fn forward_with_overlap(
@@ -1280,11 +1298,12 @@ where
         source: &PencilArray<Complex<R>, N, M>,
         destination: &mut PencilArray<Complex<R>, N, M>,
         workspace: &mut C2cOutOfPlaceWorkspace<R, N, M>,
-    ) -> Result<(), FftError> {
+    ) -> Result<(), FftOverlapError<FftError>> {
         self.execute_overlap(Direction::Forward, source, destination, workspace)
     }
 
-    /// Computes inverse while running the next local FFT during each P2P receive.
+    /// Computes inverse, running the next local FFT after receive/unpack
+    /// completion and before the P2P send wait.
     /// A successful return has no pending network requests, including partial
     /// final sends.
     pub fn inverse_with_overlap(
@@ -1292,11 +1311,12 @@ where
         source: &PencilArray<Complex<R>, N, M>,
         destination: &mut PencilArray<Complex<R>, N, M>,
         workspace: &mut C2cOutOfPlaceWorkspace<R, N, M>,
-    ) -> Result<(), FftError> {
+    ) -> Result<(), FftOverlapError<FftError>> {
         self.execute_overlap(Direction::Inverse, source, destination, workspace)
     }
 
-    /// Computes backward while running the next local FFT during each P2P receive.
+    /// Computes backward, running the next local FFT after receive/unpack
+    /// completion and before the P2P send wait.
     /// A successful return has no pending network requests, including partial
     /// final sends.
     pub fn backward_with_overlap(
@@ -1304,7 +1324,7 @@ where
         source: &PencilArray<Complex<R>, N, M>,
         destination: &mut PencilArray<Complex<R>, N, M>,
         workspace: &mut C2cOutOfPlaceWorkspace<R, N, M>,
-    ) -> Result<(), FftError> {
+    ) -> Result<(), FftOverlapError<FftError>> {
         self.execute_overlap(Direction::Backward, source, destination, workspace)
     }
 
@@ -1683,7 +1703,7 @@ where
         source: &PencilArray<Complex<R>, N, M>,
         destination: &mut PencilArray<Complex<R>, N, M>,
         workspace: &mut C2cOutOfPlaceWorkspace<R, N, M>,
-    ) -> Result<(), FftError> {
+    ) -> Result<(), FftOverlapError<FftError>> {
         let communicator = self.input_pencil().topology().communicator();
         let operation = match direction {
             Direction::Forward => OPERATION_FORWARD_OVERLAP,
@@ -1695,7 +1715,8 @@ where
         if !collective_valid(communicator, local.is_ok()) {
             return Err(local
                 .err()
-                .unwrap_or(FftError::CollectivePreconditionFailed));
+                .unwrap_or(FftError::CollectivePreconditionFailed)
+                .into());
         }
         let overlap_supported = self.core.transitions.iter().all(|transition| {
             !matches!(transition.forward, C2cTransition::AllToAllv(_))
@@ -1703,7 +1724,7 @@ where
         });
         // This agreement is deliberately before stage-zero writes or payload.
         if !collective_valid(communicator, overlap_supported) {
-            return Err(FftError::OverlapUnsupported);
+            return Err(FftOverlapError::UnsupportedTransport);
         }
         match direction {
             Direction::Forward => {
@@ -2643,7 +2664,7 @@ fn execute_forward_overlap<R: FftReal, const N: usize, const M: usize>(
     source: &PencilArray<Complex<R>, N, M>,
     destination: &mut PencilArray<Complex<R>, N, M>,
     workspace: &mut C2cOutOfPlaceWorkspace<R, N, M>,
-) -> Result<(), FftError>
+) -> Result<(), FftOverlapError<FftError>>
 where
     Complex<R>: Equivalence,
 {
@@ -2708,7 +2729,7 @@ where
                     &mut workspace.line_buffer,
                 )?;
             }
-            C2cTransition::AllToAllv(_) => return Err(FftError::OverlapUnsupported),
+            C2cTransition::AllToAllv(_) => return Err(FftOverlapError::UnsupportedTransport),
         }
     }
     let active = workspace
@@ -2728,7 +2749,7 @@ fn execute_inverse_overlap<R: FftReal, const N: usize, const M: usize>(
     destination: &mut PencilArray<Complex<R>, N, M>,
     workspace: &mut C2cOutOfPlaceWorkspace<R, N, M>,
     normalize_inverse: bool,
-) -> Result<(), FftError>
+) -> Result<(), FftOverlapError<FftError>>
 where
     Complex<R>: Equivalence,
 {
@@ -2797,7 +2818,7 @@ where
                     normalize_inverse,
                 )?;
             }
-            C2cTransition::AllToAllv(_) => return Err(FftError::OverlapUnsupported),
+            C2cTransition::AllToAllv(_) => return Err(FftOverlapError::UnsupportedTransport),
         }
     }
     let active = workspace
@@ -2811,21 +2832,14 @@ where
     Ok(())
 }
 
-fn map_overlap<E>(error: OverlapError<E>) -> FftError
-where
-    E: Into<FftError>,
-{
-    match error {
-        OverlapError::Transpose(error) => FftError::Transpose(error),
-        OverlapError::Callback(error) => error.into(),
-        OverlapError::PeerPanicked => FftError::Overlap(Box::new(OverlapError::PeerPanicked)),
-        OverlapError::PeerCallbackFailed => {
-            FftError::Overlap(Box::new(OverlapError::PeerCallbackFailed))
-        }
-        OverlapError::CollectivePreconditionFailed => {
-            FftError::Overlap(Box::new(OverlapError::CollectivePreconditionFailed))
-        }
-    }
+fn map_overlap<E: Into<FftError>>(error: OverlapError<E>) -> FftOverlapError<FftError> {
+    FftOverlapError::Overlap(match error {
+        OverlapError::Transpose(error) => OverlapError::Transpose(error),
+        OverlapError::Callback(error) => OverlapError::Callback(error.into()),
+        OverlapError::PeerPanicked => OverlapError::PeerPanicked,
+        OverlapError::PeerCallbackFailed => OverlapError::PeerCallbackFailed,
+        OverlapError::CollectivePreconditionFailed => OverlapError::CollectivePreconditionFailed,
+    })
 }
 
 fn execute_inverse<R: FftReal, const N: usize, const M: usize>(
@@ -3515,17 +3529,18 @@ mod tests {
     use super::{
         C2C_CALLBACK_INJECTION, C2cCallbackInjection, C2cInPlaceArray, C2cInPlaceWorkspace,
         C2cPlan, C2cState, C2cTransition, Complex, Direction, DistributedLayout, ExtraShape,
-        FftError, LocalC2cError, LocalC2cPlan, OPERATION_BACKWARD, OPERATION_BACKWARD_IN_PLACE,
-        OPERATION_DHT_BACKWARD, OPERATION_DHT_BACKWARD_IN_PLACE, OPERATION_DHT_FORWARD,
-        OPERATION_DHT_FORWARD_IN_PLACE, OPERATION_DHT_INVERSE, OPERATION_DHT_INVERSE_IN_PLACE,
-        OPERATION_DHT_PLAN, OPERATION_FORWARD, OPERATION_FORWARD_IN_PLACE, OPERATION_INVERSE,
-        OPERATION_INVERSE_IN_PLACE, OPERATION_PLAN, OPERATION_R2C_BACKWARD,
-        OPERATION_R2C_BACKWARD_IN_PLACE, OPERATION_R2C_FORWARD, OPERATION_R2C_FORWARD_IN_PLACE,
-        OPERATION_R2C_INVERSE, OPERATION_R2C_INVERSE_IN_PLACE, OPERATION_R2C_PLAN,
-        OPERATION_R2R_BACKWARD, OPERATION_R2R_BACKWARD_IN_PLACE, OPERATION_R2R_FORWARD,
-        OPERATION_R2R_FORWARD_IN_PLACE, OPERATION_R2R_INVERSE, OPERATION_R2R_INVERSE_IN_PLACE,
-        OPERATION_R2R_PLAN, OverlapError, R2C_CALLBACK_INJECTION, R2cCallbackInjection, R2cError,
-        R2cPlan, TransposeMethod, descriptor_len, run_in_place_transaction,
+        FftError, FftOverlapError, LocalC2cError, LocalC2cPlan, OPERATION_BACKWARD,
+        OPERATION_BACKWARD_IN_PLACE, OPERATION_DHT_BACKWARD, OPERATION_DHT_BACKWARD_IN_PLACE,
+        OPERATION_DHT_FORWARD, OPERATION_DHT_FORWARD_IN_PLACE, OPERATION_DHT_INVERSE,
+        OPERATION_DHT_INVERSE_IN_PLACE, OPERATION_DHT_PLAN, OPERATION_FORWARD,
+        OPERATION_FORWARD_IN_PLACE, OPERATION_INVERSE, OPERATION_INVERSE_IN_PLACE, OPERATION_PLAN,
+        OPERATION_R2C_BACKWARD, OPERATION_R2C_BACKWARD_IN_PLACE, OPERATION_R2C_FORWARD,
+        OPERATION_R2C_FORWARD_IN_PLACE, OPERATION_R2C_INVERSE, OPERATION_R2C_INVERSE_IN_PLACE,
+        OPERATION_R2C_PLAN, OPERATION_R2R_BACKWARD, OPERATION_R2R_BACKWARD_IN_PLACE,
+        OPERATION_R2R_FORWARD, OPERATION_R2R_FORWARD_IN_PLACE, OPERATION_R2R_INVERSE,
+        OPERATION_R2R_INVERSE_IN_PLACE, OPERATION_R2R_PLAN, OverlapError, R2C_CALLBACK_INJECTION,
+        R2cCallbackInjection, R2cError, R2cPlan, TransposeMethod, descriptor_len,
+        run_in_place_transaction,
     };
     use crate::{
         AxisR2rKind, AxisSelection, AxisTransform, MixedC2cPlan, MixedError, MixedR2cPlan, R2cState,
@@ -3659,12 +3674,18 @@ mod tests {
                 } else {
                     let error = result.unwrap().unwrap_err();
                     match (injection, world.rank() == 0, error) {
-                        (C2cCallbackInjection::Error, true, FftError::PreparationFailed) => {}
-                        (C2cCallbackInjection::Error, false, FftError::Overlap(error)) => {
-                            assert!(matches!(*error, OverlapError::PeerCallbackFailed))
+                        (
+                            C2cCallbackInjection::Error,
+                            true,
+                            FftOverlapError::Overlap(OverlapError::Callback(
+                                FftError::PreparationFailed,
+                            )),
+                        ) => {}
+                        (C2cCallbackInjection::Error, false, FftOverlapError::Overlap(error)) => {
+                            assert!(matches!(error, OverlapError::PeerCallbackFailed))
                         }
-                        (C2cCallbackInjection::Panic, false, FftError::Overlap(error)) => {
-                            assert!(matches!(*error, OverlapError::PeerPanicked))
+                        (C2cCallbackInjection::Panic, false, FftOverlapError::Overlap(error)) => {
+                            assert!(matches!(error, OverlapError::PeerPanicked))
                         }
                         _ => panic!("unexpected callback error"),
                     }
@@ -3993,6 +4014,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "MPI can be initialized only once per unit-test process; run this test explicitly"]
     fn r2c_overlap_callback_error_and_panic_map_per_rank() {
         let _mpi_test_lock = super::MPI_TEST_LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
@@ -4026,21 +4048,18 @@ mod tests {
                     (
                         R2cCallbackInjection::Error,
                         true,
-                        R2cError::Fft(FftError::PreparationFailed),
+                        FftOverlapError::Overlap(OverlapError::Callback(R2cError::Fft(
+                            FftError::LocalC2c(crate::LocalC2cError::ScratchTooSmall {
+                                required: 7,
+                                actual: 3,
+                            }),
+                        ))),
                     ) => {}
-                    (
-                        R2cCallbackInjection::Error,
-                        false,
-                        R2cError::Fft(FftError::Overlap(error)),
-                    ) => {
-                        assert!(matches!(*error, OverlapError::PeerCallbackFailed))
+                    (R2cCallbackInjection::Error, false, FftOverlapError::Overlap(error)) => {
+                        assert!(matches!(error, OverlapError::PeerCallbackFailed))
                     }
-                    (
-                        R2cCallbackInjection::Panic,
-                        false,
-                        R2cError::Fft(FftError::Overlap(error)),
-                    ) => {
-                        assert!(matches!(*error, OverlapError::PeerPanicked))
+                    (R2cCallbackInjection::Panic, false, FftOverlapError::Overlap(error)) => {
+                        assert!(matches!(error, OverlapError::PeerPanicked))
                     }
                     _ => panic!("unexpected R2C callback error"),
                 }
