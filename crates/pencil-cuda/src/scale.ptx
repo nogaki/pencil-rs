@@ -1,0 +1,69 @@
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry scale32(.param .u64 ptr, .param .u64 count, .param .f32 factor) {
+ .reg .pred %p;
+ .reg .b32 %t, %b, %nt, %nb;
+ .reg .b64 %i, %stride, %n, %base, %addr, %left, %bt, %tt;
+ .reg .f32 %x, %f;
+ ld.param.u64 %base, [ptr];
+ ld.param.u64 %n, [count];
+ ld.param.f32 %f, [factor];
+ mov.u32 %t, %tid.x;
+ mov.u32 %b, %ctaid.x;
+ mov.u32 %nt, %ntid.x;
+ mov.u32 %nb, %nctaid.x;
+ mul.wide.u32 %bt, %b, %nt;
+ cvt.u64.u32 %tt, %t;
+ add.u64 %i, %bt, %tt;
+ mul.wide.u32 %stride, %nt, %nb;
+LOOP:
+ setp.ge.u64 %p, %i, %n;
+ @%p bra DONE;
+ shl.b64 %addr, %i, 2;
+ add.u64 %addr, %base, %addr;
+ ld.global.f32 %x, [%addr];
+ mul.rn.f32 %x, %x, %f;
+ st.global.f32 [%addr], %x;
+ sub.u64 %left, %n, %i;
+ setp.le.u64 %p, %left, %stride;
+ @%p bra DONE;
+ add.u64 %i, %i, %stride;
+ bra LOOP;
+DONE:
+ ret;
+}
+
+.visible .entry scale64(.param .u64 ptr, .param .u64 count, .param .f64 factor) {
+ .reg .pred %p;
+ .reg .b32 %t, %b, %nt, %nb;
+ .reg .b64 %i, %stride, %n, %base, %addr, %left, %bt, %tt;
+ .reg .f64 %x, %f;
+ ld.param.u64 %base, [ptr];
+ ld.param.u64 %n, [count];
+ ld.param.f64 %f, [factor];
+ mov.u32 %t, %tid.x;
+ mov.u32 %b, %ctaid.x;
+ mov.u32 %nt, %ntid.x;
+ mov.u32 %nb, %nctaid.x;
+ mul.wide.u32 %bt, %b, %nt;
+ cvt.u64.u32 %tt, %t;
+ add.u64 %i, %bt, %tt;
+ mul.wide.u32 %stride, %nt, %nb;
+LOOP:
+ setp.ge.u64 %p, %i, %n;
+ @%p bra DONE;
+ shl.b64 %addr, %i, 3;
+ add.u64 %addr, %base, %addr;
+ ld.global.f64 %x, [%addr];
+ mul.rn.f64 %x, %x, %f;
+ st.global.f64 [%addr], %x;
+ sub.u64 %left, %n, %i;
+ setp.le.u64 %p, %left, %stride;
+ @%p bra DONE;
+ add.u64 %i, %i, %stride;
+ bra LOOP;
+DONE:
+ ret;
+}
