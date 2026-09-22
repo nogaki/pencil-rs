@@ -23,6 +23,10 @@ const OPERATION_DHT_BACKWARD_TIMED: u64 = 111;
 const OPERATION_DHT_FORWARD_IN_PLACE_TIMED: u64 = 112;
 const OPERATION_DHT_INVERSE_IN_PLACE_TIMED: u64 = 113;
 const OPERATION_DHT_BACKWARD_IN_PLACE_TIMED: u64 = 114;
+#[cfg(feature = "fftw")]
+const OPERATION_R2R_PLAN_NATIVE: u64 = 129;
+#[cfg(feature = "fftw")]
+const OPERATION_DHT_PLAN_NATIVE: u64 = 130;
 
 use std::{mem::size_of, sync::Arc, time::Instant};
 
@@ -42,8 +46,11 @@ use super::{
     execute_transition_timed, initialized_vec, map_array_allocation, validate_input,
     validate_workspace_lengths_values,
 };
+#[cfg(feature = "fftw")]
+use crate::PlanOptions;
 use crate::{
-    Complex, LocalDhtPlan, LocalR2rError, LocalR2rPlan, R2rKind, R2rScalar, r2r::AxisR2rKind,
+    BackendInitError, Complex, LocalDhtPlan, LocalR2rError, LocalR2rPlan, R2rKind, R2rScalar,
+    r2r::AxisR2rKind,
 };
 use mpi::datatype::Equivalence;
 use pencil_array::{
@@ -342,6 +349,35 @@ where
         )
     }
 
+    #[cfg(feature = "fftw")]
+    #[allow(private_bounds)]
+    /// Collectively constructs native FFTW embedding plans with default layout.
+    pub fn from_shape_with_fftw(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        options: PlanOptions,
+    ) -> Result<Self, BackendInitError<R2rError>>
+    where
+        T::Real: crate::backend::FftwReal,
+    {
+        let input = Pencil::new(
+            Arc::clone(&topology),
+            global_shape,
+            std::array::from_fn(|axis| axis),
+        )
+        .map_err(FftError::Pencil);
+        Self::construct_with_backend(
+            topology,
+            global_shape,
+            extra_shape,
+            input,
+            AxisSelection::all(),
+            DistributedLayout::default(),
+            super::BackendChoice::Fftw(options),
+        )
+    }
+
     fn construct(
         topology: Arc<MpiTopology<M>>,
         global_shape: [usize; N],
@@ -350,7 +386,31 @@ where
         selection: AxisSelection<N>,
         layout: DistributedLayout,
     ) -> Result<Self, R2rError> {
-        let axis_kinds =
+        Self::construct_with_backend(
+            topology,
+            global_shape,
+            extra_shape,
+            input,
+            selection,
+            layout,
+            super::BackendChoice::RustFft,
+        )
+        .map_err(|error| match error {
+            BackendInitError::Local(error) => error,
+            _ => R2rError::Fft(FftError::PreparationFailed),
+        })
+    }
+
+    fn construct_with_backend(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        input: Result<Arc<Pencil<N, M>>, FftError>,
+        selection: AxisSelection<N>,
+        layout: DistributedLayout,
+        backend: super::BackendChoice,
+    ) -> Result<Self, BackendInitError<R2rError>> {
+        let axis_kinds: [Option<AxisR2rKind>; N] =
             std::array::from_fn(|axis| selection.contains(axis).then_some(AxisR2rKind::Dht));
         let core = R2rPlan::<T, N, M>::construct_core(
             topology,
@@ -360,7 +420,12 @@ where
             [None; N],
             axis_kinds,
             layout,
-            super::OPERATION_DHT_PLAN,
+            match backend {
+                super::BackendChoice::RustFft => super::OPERATION_DHT_PLAN,
+                #[cfg(feature = "fftw")]
+                super::BackendChoice::Fftw(_) => OPERATION_DHT_PLAN_NATIVE,
+            },
+            backend,
         )?;
         Ok(Self { core, selection })
     }
@@ -388,6 +453,56 @@ where
     /// Returns the transport and memory-layout policy used by this plan.
     pub fn layout(&self) -> DistributedLayout {
         self.core.layout
+    }
+
+    /// Returns the selected local backend.
+    pub fn backend_kind(&self) -> crate::BackendKind {
+        self.core.backend.kind()
+    }
+
+    #[cfg(feature = "fftw")]
+    /// Returns native planning options, or `None` for RustFFT.
+    pub fn options(&self) -> Option<PlanOptions> {
+        match self.core.backend {
+            super::BackendChoice::Fftw(options) => Some(options),
+            super::BackendChoice::RustFft => None,
+        }
+    }
+
+    #[cfg(feature = "fftw")]
+    #[allow(private_bounds)]
+    /// Rebuilds with native FFTW embedding plans, preserving configuration and invalidating old arrays/workspaces.
+    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<R2rError>>
+    where
+        T::Real: crate::backend::FftwReal,
+    {
+        let topology = Arc::clone(self.input_pencil().topology());
+        let shape = *self.input_pencil().global_shape();
+        let input = Pencil::new(
+            Arc::clone(&topology),
+            shape,
+            std::array::from_fn(|axis| axis),
+        )
+        .map_err(FftError::Pencil);
+        Self::construct_with_backend(
+            topology,
+            shape,
+            self.core.extra_shape.clone(),
+            input,
+            self.selection,
+            self.core.layout,
+            super::BackendChoice::Fftw(options),
+        )
+        .map(|mut plan| {
+            Arc::get_mut(&mut plan.core)
+                .expect("fresh core")
+                .strict_array_identity = true;
+            plan
+        })
+    }
+
+    pub(super) fn collection_descriptor(&self) -> &[u64] {
+        &self.core.descriptor
     }
 
     /// Allocates a zero-initialized local input array.
@@ -546,32 +661,7 @@ where
             Direction::Backward => OPERATION_DHT_BACKWARD_OVERLAP,
         };
         agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
-        let preflight = validate_r2r_out_of_place(
-            &self.core,
-            &workspace.core,
-            direction,
-            source,
-            destination,
-            &workspace.intermediate,
-            (
-                workspace.fft_scratch.len(),
-                workspace.transpose.send_len(),
-                workspace.transpose.receive_len(),
-            ),
-            workspace.embedding_line.len(),
-        )
-        .and_then(|()| {
-            if workspace.line_buffer.len() < self.core.strided_line_len {
-                Err(FftError::WorkspaceTooSmall {
-                    kind: "real line",
-                    required: self.core.strided_line_len,
-                    actual: workspace.line_buffer.len(),
-                }
-                .into())
-            } else {
-                Ok(())
-            }
-        });
+        let preflight = self.collection_preflight(direction, source, destination, workspace);
         if !collective_valid(communicator, preflight.is_ok()) {
             return Err(preflight
                 .err()
@@ -605,6 +695,96 @@ where
                 execute_r2r_reverse_overlap(&self.core, source, destination, workspace, false)
             }
         }
+    }
+
+    pub(super) fn collection_preflight(
+        &self,
+        direction: Direction,
+        source: &PencilArray<T, N, M>,
+        destination: &PencilArray<T, N, M>,
+        workspace: &R2rWorkspace<T, N, M>,
+    ) -> Result<(), R2rError> {
+        validate_r2r_out_of_place(
+            &self.core,
+            &workspace.core,
+            direction,
+            source,
+            destination,
+            &workspace.intermediate,
+            (
+                workspace.fft_scratch.len(),
+                workspace.transpose.send_len(),
+                workspace.transpose.receive_len(),
+            ),
+            workspace.embedding_line.len(),
+        )?;
+        if workspace.line_buffer.len() < self.core.strided_line_len {
+            return Err(FftError::WorkspaceTooSmall {
+                kind: "real line",
+                required: self.core.strided_line_len,
+                actual: workspace.line_buffer.len(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn collection_preflight_in_place(
+        &self,
+        direction: Direction,
+        array: &R2rInPlaceArray<T, N, M>,
+        workspace: &R2rInPlaceWorkspace<T, N, M>,
+    ) -> Result<(), R2rError> {
+        if !Arc::ptr_eq(&array.core, &self.core) {
+            return Err(FftError::Array(pencil_array::ArrayError::IncompatiblePencils).into());
+        }
+        if !Arc::ptr_eq(&workspace.core, &self.core) {
+            return Err(FftError::WorkspaceMismatch.into());
+        }
+        let expected_state = match direction {
+            Direction::Forward => super::R2rState::Input,
+            Direction::Inverse | Direction::Backward => super::R2rState::Output,
+        };
+        match array.state {
+            super::R2rState::Poisoned => {
+                return Err(FftError::Array(pencil_array::ArrayError::Poisoned).into());
+            }
+            state if state != expected_state => return Err(FftError::InputLayoutMismatch.into()),
+            _ => {}
+        }
+        if array.array.extra_shape() != &self.core.extra_shape {
+            return Err(FftError::ExtraShapeMismatch.into());
+        }
+        let expected = match direction {
+            Direction::Forward => self.input_pencil(),
+            Direction::Inverse | Direction::Backward => self.output_pencil(),
+        };
+        if !array
+            .array
+            .active_pencil()
+            .map_err(FftError::Array)?
+            .same_layout(expected.as_ref())
+        {
+            return Err(FftError::InputLayoutMismatch.into());
+        }
+        validate_workspace_lengths_values(
+            workspace.fft_scratch.len(),
+            self.core.fft_scratch_len,
+            workspace.transpose.send_len(),
+            self.core.transpose_send_len,
+            workspace.transpose.receive_len(),
+            self.core.transpose_receive_len,
+        )?;
+        validate_embedding_len(workspace.embedding_line.len(), self.core.embedding_len)?;
+        if workspace.line_buffer.len() < self.core.strided_line_len {
+            return Err(FftError::WorkspaceTooSmall {
+                kind: "real line",
+                required: self.core.strided_line_len,
+                actual: workspace.line_buffer.len(),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// Computes the selected Hartley transforms in place.
@@ -714,32 +894,7 @@ where
             }
         };
         agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
-        let preflight = validate_r2r_out_of_place(
-            &self.core,
-            &workspace.core,
-            direction,
-            source,
-            destination,
-            &workspace.intermediate,
-            (
-                workspace.fft_scratch.len(),
-                workspace.transpose.send_len(),
-                workspace.transpose.receive_len(),
-            ),
-            workspace.embedding_line.len(),
-        );
-        let preflight = preflight.and_then(|()| {
-            if workspace.line_buffer.len() < self.core.strided_line_len {
-                Err(FftError::WorkspaceTooSmall {
-                    kind: "real line",
-                    required: self.core.strided_line_len,
-                    actual: workspace.line_buffer.len(),
-                }
-                .into())
-            } else {
-                Ok(())
-            }
-        });
+        let preflight = self.collection_preflight(direction, source, destination, workspace);
         if !collective_valid(communicator, preflight.is_ok()) {
             return Err(preflight
                 .err()
@@ -833,57 +988,7 @@ where
             }
         };
         agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
-        let expected_state = match direction {
-            Direction::Forward => super::R2rState::Input,
-            Direction::Inverse | Direction::Backward => super::R2rState::Output,
-        };
-        let expected = match direction {
-            Direction::Forward => self.input_pencil(),
-            Direction::Inverse | Direction::Backward => self.output_pencil(),
-        };
-        let preflight = if !Arc::ptr_eq(&array.core, &self.core) {
-            Err(FftError::Array(pencil_array::ArrayError::IncompatiblePencils).into())
-        } else if !Arc::ptr_eq(&workspace.core, &self.core) {
-            Err(FftError::WorkspaceMismatch.into())
-        } else if array.state == super::R2rState::Poisoned {
-            Err(FftError::Array(pencil_array::ArrayError::Poisoned).into())
-        } else if array.state != expected_state {
-            Err(FftError::InputLayoutMismatch.into())
-        } else if array.array.extra_shape() != &self.core.extra_shape {
-            Err(FftError::ExtraShapeMismatch.into())
-        } else if !array
-            .array
-            .active_pencil()
-            .map_err(FftError::Array)?
-            .same_layout(expected.as_ref())
-        {
-            Err(FftError::InputLayoutMismatch.into())
-        } else {
-            validate_workspace_lengths_values(
-                workspace.fft_scratch.len(),
-                self.core.fft_scratch_len,
-                workspace.transpose.send_len(),
-                self.core.transpose_send_len,
-                workspace.transpose.receive_len(),
-                self.core.transpose_receive_len,
-            )
-            .map_err(R2rError::Fft)
-            .and_then(|()| {
-                validate_embedding_len(workspace.embedding_line.len(), self.core.embedding_len)
-            })
-            .and_then(|()| {
-                if workspace.line_buffer.len() < self.core.strided_line_len {
-                    Err(FftError::WorkspaceTooSmall {
-                        kind: "real line",
-                        required: self.core.strided_line_len,
-                        actual: workspace.line_buffer.len(),
-                    }
-                    .into())
-                } else {
-                    Ok(())
-                }
-            })
-        };
+        let preflight = self.collection_preflight_in_place(direction, array, workspace);
         if !collective_valid(communicator, preflight.is_ok()) {
             return Err(preflight
                 .err()
@@ -989,6 +1094,8 @@ struct R2rCore<T: R2rScalar, const N: usize, const M: usize> {
     strided_line_len: usize,
     transpose_send_len: usize,
     transpose_receive_len: usize,
+    backend: super::BackendChoice,
+    strict_array_identity: bool,
 }
 
 impl<T: R2rScalar, const N: usize, const M: usize> R2rPlan<T, N, M>
@@ -1143,6 +1250,36 @@ where
         Self::construct(topology, global_shape, extra_shape, input, kinds, layout)
     }
 
+    #[cfg(feature = "fftw")]
+    #[allow(private_bounds)]
+    /// Collectively constructs native FFTW embedding plans with default layout.
+    pub fn from_shape_with_fftw(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        kinds: [Option<R2rKind>; N],
+        options: PlanOptions,
+    ) -> Result<Self, BackendInitError<R2rError>>
+    where
+        T::Real: crate::backend::FftwReal,
+    {
+        let input = Pencil::new(
+            Arc::clone(&topology),
+            global_shape,
+            std::array::from_fn(|axis| axis),
+        )
+        .map_err(FftError::Pencil);
+        Self::construct_with_backend(
+            topology,
+            global_shape,
+            extra_shape,
+            input,
+            kinds,
+            DistributedLayout::default(),
+            super::BackendChoice::Fftw(options),
+        )
+    }
+
     /// Returns the canonical input pencil.
     pub fn input_pencil(&self) -> &Arc<Pencil<N, M>> {
         &self.core.stages[0].input
@@ -1158,6 +1295,10 @@ where
             .output
     }
 
+    pub(super) fn collection_descriptor(&self) -> &[u64] {
+        &self.core.descriptor
+    }
+
     /// Returns the exact extra shape required by this plan.
     pub fn extra_shape(&self) -> &ExtraShape {
         &self.core.extra_shape
@@ -1166,6 +1307,52 @@ where
     /// Returns the transport and memory-layout policy used by this plan.
     pub fn layout(&self) -> DistributedLayout {
         self.core.layout
+    }
+
+    /// Returns the selected local backend.
+    pub fn backend_kind(&self) -> crate::BackendKind {
+        self.core.backend.kind()
+    }
+
+    #[cfg(feature = "fftw")]
+    /// Returns native planning options, or `None` for RustFFT.
+    pub fn options(&self) -> Option<PlanOptions> {
+        match self.core.backend {
+            super::BackendChoice::Fftw(options) => Some(options),
+            super::BackendChoice::RustFft => None,
+        }
+    }
+
+    #[cfg(feature = "fftw")]
+    #[allow(private_bounds)]
+    /// Rebuilds with native FFTW embedding plans, preserving configuration and invalidating old arrays/workspaces.
+    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<R2rError>>
+    where
+        T::Real: crate::backend::FftwReal,
+    {
+        let topology = Arc::clone(self.input_pencil().topology());
+        let shape = *self.input_pencil().global_shape();
+        let input = Pencil::new(
+            Arc::clone(&topology),
+            shape,
+            std::array::from_fn(|axis| axis),
+        )
+        .map_err(FftError::Pencil);
+        Self::construct_with_backend(
+            topology,
+            shape,
+            self.core.extra_shape.clone(),
+            input,
+            self.core.kinds,
+            self.core.layout,
+            super::BackendChoice::Fftw(options),
+        )
+        .map(|mut plan| {
+            Arc::get_mut(&mut plan.core)
+                .expect("fresh core")
+                .strict_array_identity = true;
+            plan
+        })
     }
 
     /// Returns the per-logical-axis legacy FFTW transform kinds.
@@ -1486,7 +1673,32 @@ where
         kinds: [Option<R2rKind>; N],
         layout: DistributedLayout,
     ) -> Result<Self, R2rError> {
-        let axis_kinds = std::array::from_fn(|axis| kinds[axis].map(AxisR2rKind::Fftw));
+        Self::construct_with_backend(
+            topology,
+            global_shape,
+            extra_shape,
+            input,
+            kinds,
+            layout,
+            super::BackendChoice::RustFft,
+        )
+        .map_err(|error| match error {
+            BackendInitError::Local(error) => error,
+            _ => R2rError::Fft(FftError::PreparationFailed),
+        })
+    }
+
+    fn construct_with_backend(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        input: Result<Arc<Pencil<N, M>>, FftError>,
+        kinds: [Option<R2rKind>; N],
+        layout: DistributedLayout,
+        backend: super::BackendChoice,
+    ) -> Result<Self, BackendInitError<R2rError>> {
+        let axis_kinds: [Option<AxisR2rKind>; N] =
+            std::array::from_fn(|axis| kinds[axis].map(AxisR2rKind::Fftw));
         let core = Self::construct_core(
             topology,
             global_shape,
@@ -1495,7 +1707,12 @@ where
             kinds,
             axis_kinds,
             layout,
-            super::OPERATION_R2R_PLAN,
+            match backend {
+                super::BackendChoice::RustFft => super::OPERATION_R2R_PLAN,
+                #[cfg(feature = "fftw")]
+                super::BackendChoice::Fftw(_) => OPERATION_R2R_PLAN_NATIVE,
+            },
+            backend,
         )?;
         Ok(Self { core })
     }
@@ -1509,9 +1726,11 @@ where
         axis_kinds: [Option<AxisR2rKind>; N],
         layout: DistributedLayout,
         operation: u64,
-    ) -> Result<Arc<R2rCore<T, N, M>>, R2rError> {
+        backend: super::BackendChoice,
+    ) -> Result<Arc<R2rCore<T, N, M>>, BackendInitError<R2rError>> {
         let communicator = topology.communicator();
-        let expected_len = descriptor_len::<N, M>(&extra_shape);
+        let expected_len =
+            descriptor_len::<N, M>(&extra_shape).and_then(|length| length.checked_add(6));
         let descriptor = expected_len.and_then(|_| {
             build_r2r_descriptor::<T, N, M>(
                 &topology,
@@ -1521,6 +1740,11 @@ where
                 layout,
             )
             .ok()
+            .and_then(|mut descriptor| {
+                descriptor.try_reserve_exact(6).ok()?;
+                descriptor.extend(backend.descriptor_words::<T::Real>());
+                Some(descriptor)
+            })
         });
         let descriptor_len_word = expected_len
             .and_then(|length| u64::try_from(length).ok())
@@ -1533,7 +1757,9 @@ where
             descriptor_len_word,
         ];
         if !agree_header(communicator, header) {
-            return Err(R2rError::Fft(FftError::CollectiveDescriptorMismatch));
+            return Err(BackendInitError::Local(R2rError::Fft(
+                FftError::CollectiveDescriptorMismatch,
+            )));
         }
         let descriptor = collective_descriptor(communicator, descriptor, expected_len)?;
         let input = agree_result(communicator, validate_input(input, &topology, global_shape))?;
@@ -1542,10 +1768,15 @@ where
             communicator,
             build_route(Ok(input), &topology, global_shape, layout.permute_dims),
         )?;
-        let stages = agree_result(
-            communicator,
-            prepare_r2r_stages::<T, N, M>(&route, global_shape, axis_kinds),
-        )?;
+        let prepared =
+            prepare_r2r_stages_backend::<T, N, M>(&route, global_shape, axis_kinds, backend);
+        if !collective_valid(communicator, prepared.is_ok()) {
+            return Err(match prepared {
+                Err(error) => error,
+                Ok(_) => BackendInitError::PeerPreflight,
+            });
+        }
+        let stages = prepared.expect("collective backend preflight accepted");
 
         let layout_stages = agree_result(
             communicator,
@@ -1599,6 +1830,8 @@ where
             strided_line_len,
             transpose_send_len,
             transpose_receive_len,
+            backend,
+            strict_array_identity: backend.kind() == crate::BackendKind::Fftw,
         };
         Ok(Arc::new(core))
     }
@@ -1656,6 +1889,25 @@ where
                 report,
             ),
         }
+    }
+
+    pub(super) fn collection_preflight(
+        &self,
+        direction: Direction,
+        source: &PencilArray<T, N, M>,
+        destination: &PencilArray<T, N, M>,
+        workspace: &R2rWorkspace<T, N, M>,
+    ) -> Result<(), R2rError> {
+        self.preflight(direction, source, destination, workspace)
+    }
+
+    pub(super) fn collection_preflight_in_place(
+        &self,
+        direction: Direction,
+        array: &R2rInPlaceArray<T, N, M>,
+        workspace: &R2rInPlaceWorkspace<T, N, M>,
+    ) -> Result<(), R2rError> {
+        self.preflight_in_place(direction, array, workspace)
     }
 
     fn preflight(
@@ -1877,13 +2129,16 @@ fn validate_kinds<const N: usize>(
     Ok(())
 }
 
-fn prepare_r2r_stages<T: R2rScalar, const N: usize, const M: usize>(
+fn prepare_r2r_stages_backend<T: R2rScalar, const N: usize, const M: usize>(
     route: &RouteCandidate<N, M>,
     global_shape: [usize; N],
     kinds: [Option<AxisR2rKind>; N],
-) -> Result<R2rStagePreparation<T, N, M>, R2rError> {
+    backend: super::BackendChoice,
+) -> Result<R2rStagePreparation<T, N, M>, BackendInitError<R2rError>> {
     if route.stages.len() != N {
-        return Err(FftError::PreparationFailed.into());
+        return Err(BackendInitError::Local(R2rError::Fft(
+            FftError::PreparationFailed,
+        )));
     }
     let mut stages = Vec::new();
     stages
@@ -1899,14 +2154,48 @@ fn prepare_r2r_stages<T: R2rScalar, const N: usize, const M: usize>(
             .any(|distributed| distributed.index() == axis)
             || pencil.local_shape_logical()[axis] != global_shape[axis]
         {
-            return Err(FftError::PreparationFailed.into());
+            return Err(BackendInitError::Local(R2rError::Fft(
+                FftError::PreparationFailed,
+            )));
         }
         let local = match kinds[axis] {
             None => R2rLocal::Identity,
-            Some(AxisR2rKind::Fftw(kind)) => {
-                R2rLocal::Transform(LocalR2rPlan::new(global_shape[axis], kind)?)
-            }
-            Some(AxisR2rKind::Dht) => R2rLocal::Hartley(LocalDhtPlan::new(global_shape[axis])?),
+            Some(AxisR2rKind::Fftw(kind)) => match backend {
+                super::BackendChoice::RustFft => R2rLocal::Transform(
+                    LocalR2rPlan::new(global_shape[axis], kind)
+                        .map_err(|error| BackendInitError::Local(R2rError::LocalR2r(error)))?,
+                ),
+                #[cfg(feature = "fftw")]
+                super::BackendChoice::Fftw(options) => R2rLocal::Transform(
+                    LocalR2rPlan::new_fftw(global_shape[axis], kind, options).map_err(|error| {
+                        match error {
+                            BackendInitError::Local(error) => {
+                                BackendInitError::Local(R2rError::LocalR2r(error))
+                            }
+                            BackendInitError::Native(error) => BackendInitError::Native(error),
+                            BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
+                        }
+                    })?,
+                ),
+            },
+            Some(AxisR2rKind::Dht) => match backend {
+                super::BackendChoice::RustFft => R2rLocal::Hartley(
+                    LocalDhtPlan::new(global_shape[axis])
+                        .map_err(|error| BackendInitError::Local(R2rError::LocalR2r(error)))?,
+                ),
+                #[cfg(feature = "fftw")]
+                super::BackendChoice::Fftw(options) => {
+                    R2rLocal::Hartley(LocalDhtPlan::new_fftw(global_shape[axis], options).map_err(
+                        |error| match error {
+                            BackendInitError::Local(error) => {
+                                BackendInitError::Local(R2rError::LocalR2r(error))
+                            }
+                            BackendInitError::Native(error) => BackendInitError::Native(error),
+                            BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
+                        },
+                    )?)
+                }
+            },
         };
         embedding_len = embedding_len.max(local.embedding_len());
         fft_scratch_len = fft_scratch_len.max(local.scratch_len());
@@ -3219,10 +3508,16 @@ fn validate_r2r_out_of_place<T: R2rScalar, const N: usize, const M: usize>(
     if !source.pencil().same_layout(expected_source.as_ref()) {
         return Err(FftError::InputLayoutMismatch.into());
     }
+    if core.strict_array_identity && !Arc::ptr_eq(source.pencil(), expected_source) {
+        return Err(FftError::InputLayoutMismatch.into());
+    }
     if !destination
         .pencil()
         .same_layout(expected_destination.as_ref())
     {
+        return Err(FftError::OutputLayoutMismatch.into());
+    }
+    if core.strict_array_identity && !Arc::ptr_eq(destination.pencil(), expected_destination) {
         return Err(FftError::OutputLayoutMismatch.into());
     }
     if source.extra_shape() != &core.extra_shape || destination.extra_shape() != &core.extra_shape {

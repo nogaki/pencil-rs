@@ -12,10 +12,64 @@ use mpi::{
 };
 use pencil_array::{ExtraShape, MpiTopology, Pencil, SpatialAxis};
 use pencil_fft::{
-    AxisR2rKind, AxisSelection, AxisTransform, C2cPlan, Complex, DhtPlan, DistributedLayout,
-    FftReal, FourierDirection, FourierDirections, MixedC2cPlan, MixedR2cPlan, R2cPlan, R2rKind,
-    R2rPlan, R2rScalar, R2rState, TransposeMethod,
+    AxisR2rKind, AxisSelection, AxisTransform, BackendKind, C2cPlan, Complex, DhtPlan,
+    DistributedLayout, FftReal, FourierDirection, FourierDirections, MixedC2cPlan, MixedR2cPlan,
+    R2cPlan, R2rKind, R2rPlan, R2rScalar, R2rState, TransposeMethod,
 };
+#[cfg(feature = "fftw")]
+use pencil_fft::{PlanOptions, PlanningRigor};
+
+macro_rules! select_backend {
+    ($plan:expr) => {{
+        let plan = $plan;
+        let use_fftw = env::var("PENCIL_FFT_BACKEND").as_deref() == Ok("fftw");
+        #[cfg(not(feature = "fftw"))]
+        assert!(
+            !use_fftw,
+            "PENCIL_FFT_BACKEND=fftw requires the fftw feature"
+        );
+        #[cfg(feature = "fftw")]
+        let plan = if use_fftw {
+            plan.with_fftw(PlanOptions::new(PlanningRigor::Estimate, None).unwrap())
+                .unwrap()
+        } else {
+            plan
+        };
+        assert_eq!(
+            plan.backend_kind(),
+            if use_fftw {
+                BackendKind::Fftw
+            } else {
+                BackendKind::RustFft
+            }
+        );
+        plan
+    }};
+}
+
+// Exercise both public configuration orders against the same independent
+// Julia direction oracle; default to native planning before sign changes.
+macro_rules! select_directed_backend {
+    ($plan:expr, $directions:expr) => {{
+        let base = $plan;
+        let plan = if env::var("PENCIL_FFT_DIRECTION_ORDER").as_deref() == Ok("directions-first") {
+            select_backend!(base.with_fft_directions($directions).unwrap())
+        } else {
+            select_backend!(base)
+                .with_fft_directions($directions)
+                .unwrap()
+        };
+        assert_eq!(
+            plan.backend_kind(),
+            if env::var("PENCIL_FFT_BACKEND").as_deref() == Ok("fftw") {
+                BackendKind::Fftw
+            } else {
+                BackendKind::RustFft
+            }
+        );
+        plan
+    }};
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -1596,17 +1650,19 @@ fn c2c_case<R: Real, const N: usize, const M: usize>(
         permute_dims,
     };
     let selection = axis_selection::<N>(fixture);
-    let plan = C2cPlan::from_shape_with_selection_and_layout(
-        Arc::clone(topology),
-        shape,
-        extra.clone(),
-        selection,
-        DistributedLayout {
-            transpose_method: method,
-            permute_dims,
-        },
-    )
-    .unwrap();
+    let plan = select_backend!(
+        C2cPlan::from_shape_with_selection_and_layout(
+            Arc::clone(topology),
+            shape,
+            extra.clone(),
+            selection,
+            DistributedLayout {
+                transpose_method: method,
+                permute_dims,
+            },
+        )
+        .unwrap()
+    );
     let mut source = plan.allocate_input().unwrap();
     let source_snapshot = snap!(layout, source, false, "C2C source");
     ownership(source.pencil(), &source_snapshot, "C2C source");
@@ -1757,17 +1813,19 @@ fn mixed_c2c_case<R: Real, const N: usize, const M: usize>(
         extra: &fixture.extra,
         permute_dims,
     };
-    let plan = MixedC2cPlan::<R, N, M>::from_shape_with_layout(
-        Arc::clone(topology),
-        shape,
-        extra.clone(),
-        transforms,
-        DistributedLayout {
-            transpose_method: method,
-            permute_dims,
-        },
-    )
-    .unwrap();
+    let plan = select_backend!(
+        MixedC2cPlan::<R, N, M>::from_shape_with_layout(
+            Arc::clone(topology),
+            shape,
+            extra.clone(),
+            transforms,
+            DistributedLayout {
+                transpose_method: method,
+                permute_dims,
+            },
+        )
+        .unwrap()
+    );
     assert_eq!(plan.transforms(), transforms);
     let mut source = plan.allocate_input().unwrap();
     let source_snapshot = snap!(layout, source, false, "mixed C2C source");
@@ -1936,17 +1994,19 @@ fn r2c_case<R: Real, const N: usize, const M: usize>(
         extra: &fixture.extra,
         permute_dims,
     };
-    let plan = R2cPlan::from_shape_with_selection_and_layout(
-        Arc::clone(topology),
-        input_shape,
-        extra.clone(),
-        selection,
-        DistributedLayout {
-            transpose_method: method,
-            permute_dims,
-        },
-    )
-    .unwrap();
+    let plan = select_backend!(
+        R2cPlan::from_shape_with_selection_and_layout(
+            Arc::clone(topology),
+            input_shape,
+            extra.clone(),
+            selection,
+            DistributedLayout {
+                transpose_method: method,
+                permute_dims,
+            },
+        )
+        .unwrap()
+    );
     let mut source = plan.allocate_input().unwrap();
     let source_snapshot = snap!(layout, source, false, "R2C source");
     ownership(source.pencil(), &source_snapshot, "R2C source");
@@ -2108,17 +2168,19 @@ fn mixed_r2c_case<R: Real, const N: usize, const M: usize>(
         extra: &fixture.extra,
         permute_dims,
     };
-    let plan = MixedR2cPlan::<R, N, M>::from_shape_with_layout(
-        Arc::clone(topology),
-        input_shape,
-        extra.clone(),
-        transforms,
-        DistributedLayout {
-            transpose_method: method,
-            permute_dims,
-        },
-    )
-    .unwrap();
+    let plan = select_backend!(
+        MixedR2cPlan::<R, N, M>::from_shape_with_layout(
+            Arc::clone(topology),
+            input_shape,
+            extra.clone(),
+            transforms,
+            DistributedLayout {
+                transpose_method: method,
+                permute_dims,
+            },
+        )
+        .unwrap()
+    );
     assert_eq!(plan.transforms(), transforms);
     let reduction_axis = fixture
         .axis_kinds
@@ -2291,17 +2353,19 @@ fn r2r_case<T: R2rValue, const N: usize, const M: usize>(
         permute_dims,
     };
     let kinds = r2r_kinds::<N>(fixture);
-    let plan = R2rPlan::<T, N, M>::from_shape_with_layout(
-        Arc::clone(topology),
-        shape,
-        extra.clone(),
-        kinds,
-        DistributedLayout {
-            transpose_method: method,
-            permute_dims,
-        },
-    )
-    .unwrap();
+    let plan = select_backend!(
+        R2rPlan::<T, N, M>::from_shape_with_layout(
+            Arc::clone(topology),
+            shape,
+            extra.clone(),
+            kinds,
+            DistributedLayout {
+                transpose_method: method,
+                permute_dims,
+            },
+        )
+        .unwrap()
+    );
     assert_eq!(plan.kinds(), kinds);
     let mut source = plan.allocate_input().unwrap();
     let source_snapshot = snap!(layout, source, false, "R2R source");
@@ -2504,17 +2568,19 @@ fn dht_case<T: R2rValue, const N: usize, const M: usize>(
         permute_dims,
     };
     let selection = axis_selection::<N>(fixture);
-    let plan = DhtPlan::<T, N, M>::from_shape_with_selection_and_layout(
-        Arc::clone(topology),
-        shape,
-        extra.clone(),
-        selection,
-        DistributedLayout {
-            transpose_method: method,
-            permute_dims,
-        },
-    )
-    .unwrap();
+    let plan = select_backend!(
+        DhtPlan::<T, N, M>::from_shape_with_selection_and_layout(
+            Arc::clone(topology),
+            shape,
+            extra.clone(),
+            selection,
+            DistributedLayout {
+                transpose_method: method,
+                permute_dims,
+            },
+        )
+        .unwrap()
+    );
     assert_eq!(plan.selection(), selection);
     let mut source = plan.allocate_input().unwrap();
     let source_snapshot = snap!(layout, source, false, "DHT source");
@@ -3152,18 +3218,19 @@ fn run_direction_c2c<R: Real, const N: usize, const M: usize>(
 {
     let shape: [usize; N] = fixture.shape.clone().try_into().unwrap();
     let directions = FourierDirections::new(fixture.directions.clone().try_into().unwrap());
-    let plan = C2cPlan::<R, N, M>::from_shape_with_layout(
-        Arc::clone(&topology),
-        shape,
-        ExtraShape::scalar(),
-        DistributedLayout {
-            transpose_method: method,
-            permute_dims,
-        },
-    )
-    .unwrap()
-    .with_fft_directions(directions)
-    .unwrap();
+    let plan = select_directed_backend!(
+        C2cPlan::<R, N, M>::from_shape_with_layout(
+            Arc::clone(&topology),
+            shape,
+            ExtraShape::scalar(),
+            DistributedLayout {
+                transpose_method: method,
+                permute_dims,
+            },
+        )
+        .unwrap(),
+        directions
+    );
     let layout = Layout {
         input: shape,
         output: shape,
@@ -3245,19 +3312,20 @@ fn run_direction_mixed<R: Real, const N: usize, const M: usize>(
         .collect::<Vec<_>>()
         .try_into()
         .unwrap();
-    let plan = MixedC2cPlan::<R, N, M>::from_shape_with_layout(
-        Arc::clone(&topology),
-        shape,
-        ExtraShape::scalar(),
-        transforms,
-        DistributedLayout {
-            transpose_method: method,
-            permute_dims,
-        },
-    )
-    .unwrap()
-    .with_fft_directions(directions)
-    .unwrap();
+    let plan = select_directed_backend!(
+        MixedC2cPlan::<R, N, M>::from_shape_with_layout(
+            Arc::clone(&topology),
+            shape,
+            ExtraShape::scalar(),
+            transforms,
+            DistributedLayout {
+                transpose_method: method,
+                permute_dims,
+            },
+        )
+        .unwrap(),
+        directions
+    );
     let layout = Layout {
         input: shape,
         output: shape,
@@ -3341,19 +3409,20 @@ fn run_direction_real<R: Real, const N: usize, const M: usize>(
         .collect::<Vec<_>>()
         .try_into()
         .unwrap();
-    let plan = MixedR2cPlan::<R, N, M>::from_shape_with_layout(
-        Arc::clone(&topology),
-        shape,
-        ExtraShape::scalar(),
-        transforms,
-        DistributedLayout {
-            transpose_method: method,
-            permute_dims,
-        },
-    )
-    .unwrap()
-    .with_fft_directions(directions)
-    .unwrap();
+    let plan = select_directed_backend!(
+        MixedR2cPlan::<R, N, M>::from_shape_with_layout(
+            Arc::clone(&topology),
+            shape,
+            ExtraShape::scalar(),
+            transforms,
+            DistributedLayout {
+                transpose_method: method,
+                permute_dims,
+            },
+        )
+        .unwrap(),
+        directions
+    );
     let layout = Layout {
         input: shape,
         output: *plan.output_pencil().global_shape(),

@@ -29,6 +29,9 @@ pub struct LocalDhtPlan<T: R2rScalar> {
     scratch_len: usize,
     fft: Arc<dyn Fft<T::Real>>,
     marker: PhantomData<T>,
+    backend: super::BackendKind,
+    #[cfg(feature = "fftw")]
+    backend_options: Option<super::PlanOptions>,
 }
 
 impl<T: R2rScalar> fmt::Debug for LocalDhtPlan<T> {
@@ -53,16 +56,61 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
 
         let mut planner = FftPlanner::<T::Real>::new();
         let fft = planner.plan_fft_forward(line_len);
+        Self::from_embedding(
+            line_len,
+            fft,
+            super::BackendKind::RustFft,
+            #[cfg(feature = "fftw")]
+            None,
+        )
+    }
+
+    fn from_embedding(
+        line_len: usize,
+        fft: Arc<dyn Fft<T::Real>>,
+        backend: super::BackendKind,
+        #[cfg(feature = "fftw")] backend_options: Option<super::PlanOptions>,
+    ) -> Result<Self, LocalR2rError> {
         let scratch_len = fft.get_inplace_scratch_len();
         validate_addressable(scratch_len, size_of::<Complex<T::Real>>())?;
-
         Ok(Self {
             line_len,
             embedding_len: line_len,
             scratch_len,
             fft,
             marker: PhantomData,
+            backend,
+            #[cfg(feature = "fftw")]
+            backend_options,
         })
+    }
+
+    /// Builds a plan using the runtime-loaded FFTW backend.
+    #[cfg(feature = "fftw")]
+    #[allow(private_bounds)]
+    pub fn new_fftw(
+        line_len: usize,
+        options: super::PlanOptions,
+    ) -> Result<Self, super::BackendInitError<LocalR2rError>>
+    where
+        T::Real: super::backend::FftwReal,
+    {
+        validate_lengths::<T>(line_len).map_err(super::BackendInitError::Local)?;
+        let fft = super::backend::c2c(line_len, rustfft::FftDirection::Forward, options)
+            .map_err(super::BackendInitError::Native)?;
+        Self::from_embedding(line_len, fft, super::BackendKind::Fftw, Some(options))
+            .map_err(super::BackendInitError::Local)
+    }
+
+    /// Returns the selected backend.
+    pub fn backend_kind(&self) -> super::BackendKind {
+        self.backend
+    }
+
+    /// Returns the FFTW options, when this plan uses FFTW.
+    #[cfg(feature = "fftw")]
+    pub fn backend_options(&self) -> Option<super::PlanOptions> {
+        self.backend_options
     }
 
     /// Returns the number of values in each transformed line.

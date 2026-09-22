@@ -27,6 +27,8 @@ impl From<FftError> for FftOverlapError<R2cError> {
     }
 }
 
+#[cfg(feature = "fftw")]
+use super::OPERATION_NATIVE_R2C_PLAN;
 use super::{
     AxisSelection, C2cTransition, DESCRIPTOR_SCHEMA, Direction, DistributedLayout, FftError,
     FftOverlapError, FourierDirections, INVALID_WORD, LocalTransform, OPERATION_R2C_BACKWARD,
@@ -35,13 +37,22 @@ use super::{
     StagePreparation, TransformPlanCore, TransformStage, TransformTiming, TransposeMethod,
     VALUE_KIND_R2C, agree_execution_descriptor_ref, agree_header, agree_result, build_descriptor,
     build_route, build_transitions, collective_valid, descriptor_len, initialized_vec,
-    map_array_allocation, prepare_complex_stage, registered_stage_pencils,
+    map_array_allocation, prepare_complex_stage_for_backend, registered_stage_pencils,
     strided_complex_line_len, validate_out_of_place, validate_workspace_lengths_values,
     zero_complex,
 };
+use crate::BackendInitError;
 #[cfg(test)]
 use crate::LocalR2cError;
+#[cfg(feature = "fftw")]
+use crate::PlanOptions;
 use crate::{Complex, FftReal, LocalR2cPlan, R2cState};
+
+impl From<FftError> for BackendInitError<R2cError> {
+    fn from(error: FftError) -> Self {
+        BackendInitError::Local(R2cError::Fft(error))
+    }
+}
 
 // 55..57 are C2C overlap words. Keep every operation descriptor unique.
 const OPERATION_R2C_FORWARD_OVERLAP: u64 = 73;
@@ -85,6 +96,16 @@ const OPERATION_R2C_BACKWARD_IN_PLACE_TIMED: u64 = 84;
 /// acceptance uses the same relative threshold as inverse and an absolute
 /// threshold multiplied by the product of selected complex-tail extents;
 /// extra dimensions and identity axes do not contribute.
+///
+/// The three `*_with_overlap` methods are out-of-place APIs; there are no
+/// in-place overlap variants. Their collective descriptor and preflight
+/// checks leave source, destination, and workspace unchanged. These are the
+/// high-level guarantees only: the lower-level transpose workspace contract
+/// remains separate. Once an in-place execution passes preflight, a failed or
+/// panicking opaque array is poisoned and cannot be retried; allocate a new
+/// in-place array. Validation success does not promise unchanged state after
+/// execution: mutation is permitted only where an operation's documentation
+/// explicitly says so.
 ///
 /// # Example
 ///
@@ -268,8 +289,11 @@ enum InPlaceTestHook {
 /// The allocation is represented as real scalars while the array is in
 /// [`R2cState::RealInput`] and as complex values while it is in
 /// [`R2cState::ComplexOutput`]. The public typed views expose only the active
-/// representation. A failed or panicking operation leaves the array poisoned;
-/// the backing owner may be absent after an interrupted representation handoff.
+/// representation. Preflight rejection leaves the array unchanged. Once
+/// execution begins, a failed or panicking operation leaves the array poisoned;
+/// it cannot be recovered by retrying, so callers must allocate a new in-place
+/// array. The backing owner may be absent after an interrupted representation
+/// handoff.
 #[derive(Debug)]
 pub struct R2cInPlaceArray<R: FftReal, const N: usize, const M: usize> {
     core: Arc<TransformPlanCore<R, N, M>>,
@@ -585,6 +609,20 @@ where
         )
     }
 
+    /// Returns the backend used by this plan.
+    pub fn backend_kind(&self) -> crate::BackendKind {
+        self.core.backend.kind()
+    }
+
+    /// Returns native planning options, or `None` for RustFFT.
+    #[cfg(feature = "fftw")]
+    pub fn options(&self) -> Option<PlanOptions> {
+        match self.core.backend {
+            super::BackendChoice::RustFft => None,
+            super::BackendChoice::Fftw(options) => Some(options),
+        }
+    }
+
     /// Returns the canonical real input pencil.
     pub fn input_pencil(&self) -> &Arc<Pencil<N, M>> {
         &self.core.stages[0].input
@@ -598,6 +636,10 @@ where
             .last()
             .expect("distributed R2C has at least two stages")
             .output
+    }
+
+    pub(super) fn collection_descriptor(&self) -> &[u64] {
+        &self.core.descriptor
     }
 
     /// Returns the exact extra shape required by this plan.
@@ -819,6 +861,13 @@ where
     }
 
     /// Computes forward while running each next complex FFT after receive/unpack completion and before the P2P send wait.
+    ///
+    /// Descriptor/preflight rejection leaves arrays and workspace unchanged.
+    /// After execution starts, sources remain unchanged but destinations may
+    /// be modified. A poisoned opaque FFT workspace must be reallocated;
+    /// retrying cannot recover it. Changed-but-valid storage is reusable only
+    /// where validity is explicitly contracted, not as a general recovery
+    /// rule. Low-level transpose recovery contracts are separate.
     pub fn forward_with_overlap(
         &self,
         source: &PencilArray<R, N, M>,
@@ -829,6 +878,8 @@ where
     }
 
     /// Computes a normalized inverse while running each next complex FFT after receive/unpack completion and before the P2P send wait.
+    /// State and recovery guarantees are those of [`Self::forward_with_overlap`],
+    /// not the low-level transpose contract.
     pub fn inverse_with_overlap(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
@@ -840,6 +891,8 @@ where
 
     /// Computes an unnormalized backward transform with local FFTs after
     /// receive/unpack completion and before point-to-point send waits.
+    /// State and recovery guarantees are those of [`Self::forward_with_overlap`],
+    /// not the low-level transpose contract.
     pub fn backward_with_overlap(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
@@ -991,6 +1044,66 @@ where
         Ok(timing)
     }
 
+    #[cfg(feature = "fftw")]
+    #[allow(private_bounds)]
+    /// Collectively constructs native FFTW plans with default selection and layout.
+    pub fn from_shape_with_fftw(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        options: PlanOptions,
+    ) -> Result<Self, BackendInitError<R2cError>>
+    where
+        R: crate::backend::FftwReal,
+    {
+        let input = Pencil::new(
+            Arc::clone(&topology),
+            global_shape,
+            std::array::from_fn(|axis| axis),
+        )
+        .map_err(FftError::Pencil);
+        Self::construct_with_backend(
+            topology,
+            global_shape,
+            extra_shape,
+            input,
+            AxisSelection::all(),
+            DistributedLayout::default(),
+            super::BackendChoice::Fftw(options),
+        )
+    }
+
+    /// Rebuilds this plan with FFTW while preserving its shape, layout, and
+    /// selected axes.
+    #[cfg(feature = "fftw")]
+    #[allow(private_bounds)]
+    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<R2cError>>
+    where
+        R: crate::backend::FftwReal,
+    {
+        let topology = Arc::clone(self.input_pencil().topology());
+        let shape = *self.input_pencil().global_shape();
+        let input = Pencil::new(
+            Arc::clone(&topology),
+            shape,
+            std::array::from_fn(|axis| axis),
+        )
+        .map_err(FftError::Pencil);
+        let mut plan = Self::construct_with_backend(
+            topology,
+            shape,
+            self.core.extra_shape.clone(),
+            input,
+            self.core.selection,
+            self.core.layout,
+            super::BackendChoice::Fftw(options),
+        )?;
+        Arc::get_mut(&mut plan.core)
+            .expect("fresh core")
+            .strict_array_identity = true;
+        Ok(plan)
+    }
+
     fn construct(
         topology: Arc<MpiTopology<M>>,
         global_shape: [usize; N],
@@ -999,8 +1112,38 @@ where
         selection: AxisSelection<N>,
         layout: DistributedLayout,
     ) -> Result<Self, R2cError> {
+        Self::construct_with_backend(
+            topology,
+            global_shape,
+            extra_shape,
+            input,
+            selection,
+            layout,
+            super::BackendChoice::RustFft,
+        )
+        .map_err(|error| match error {
+            BackendInitError::Local(error) => error,
+            #[cfg(feature = "fftw")]
+            BackendInitError::Native(_) | BackendInitError::PeerPreflight => {
+                R2cError::Fft(FftError::PreparationFailed)
+            }
+            #[cfg(not(feature = "fftw"))]
+            BackendInitError::PeerPreflight => R2cError::Fft(FftError::PreparationFailed),
+        })
+    }
+
+    fn construct_with_backend(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        input: Result<Arc<Pencil<N, M>>, FftError>,
+        selection: AxisSelection<N>,
+        layout: DistributedLayout,
+        backend: super::BackendChoice,
+    ) -> Result<Self, BackendInitError<R2cError>> {
         let communicator = topology.communicator();
-        let expected_len = descriptor_len::<N, M>(&extra_shape);
+        let expected_len =
+            descriptor_len::<N, M>(&extra_shape).and_then(|length| length.checked_add(6));
         let descriptor = expected_len.and_then(|_| {
             build_descriptor::<R, N, M>(
                 &topology,
@@ -1011,23 +1154,36 @@ where
                 layout,
             )
             .ok()
+            .and_then(|mut descriptor| {
+                descriptor.try_reserve_exact(6).ok()?;
+                descriptor.extend(backend.descriptor_words::<R>());
+                Some(descriptor)
+            })
         });
         let descriptor_len_word = expected_len
             .and_then(|length| u64::try_from(length).ok())
             .unwrap_or(INVALID_WORD);
         let header = [
             DESCRIPTOR_SCHEMA,
-            OPERATION_R2C_PLAN,
+            match backend {
+                super::BackendChoice::RustFft => OPERATION_R2C_PLAN,
+                #[cfg(feature = "fftw")]
+                super::BackendChoice::Fftw(_) => OPERATION_NATIVE_R2C_PLAN,
+            },
             u64::try_from(N).unwrap_or(INVALID_WORD),
             u64::try_from(M).unwrap_or(INVALID_WORD),
             descriptor_len_word,
         ];
         if !agree_header(communicator, header) {
-            return Err(R2cError::Fft(FftError::CollectiveDescriptorMismatch));
+            return Err(BackendInitError::Local(R2cError::Fft(
+                FftError::CollectiveDescriptorMismatch,
+            )));
         }
         let descriptor = super::collective_descriptor(communicator, descriptor, expected_len)?;
         if !collective_valid(communicator, !selection.is_empty()) {
-            return Err(R2cError::Fft(FftError::InvalidDimensions));
+            return Err(BackendInitError::Local(R2cError::Fft(
+                FftError::InvalidDimensions,
+            )));
         }
         let reduction_axis = selection
             .mask()
@@ -1074,22 +1230,29 @@ where
                 layout.permute_dims,
             ),
         )?;
-        let stages = agree_result(
-            communicator,
-            prepare_r2c_stages::<R, N, M>(
-                &original_route,
-                &reduced_route,
-                global_shape,
-                reduced_shape,
-                reduction_axis,
-                selection,
-                real_len,
-            ),
-        )?;
+        let prepared = prepare_r2c_stages::<R, N, M>(
+            &original_route,
+            &reduced_route,
+            global_shape,
+            reduced_shape,
+            reduction_axis,
+            selection,
+            real_len,
+            backend,
+        );
+        if !collective_valid(communicator, prepared.is_ok()) {
+            return Err(match prepared {
+                Err(error) => error,
+                Ok(_) => BackendInitError::PeerPreflight,
+            });
+        }
+        let stages = prepared.expect("collective backend preflight accepted");
         if original_route.distributed.len() != reduced_route.distributed.len()
             || original_route.distributed.len() != N.saturating_sub(1)
         {
-            return Err(R2cError::Fft(FftError::PreparationFailed));
+            return Err(BackendInitError::Local(R2cError::Fft(
+                FftError::PreparationFailed,
+            )));
         }
         let transition_count = original_route.distributed.len();
         let mut distributed = Vec::new();
@@ -1145,7 +1308,8 @@ where
             real_transpose_send_len,
             real_transpose_receive_len,
             directions: FourierDirections::default(),
-            strict_array_identity: false,
+            backend,
+            strict_array_identity: backend.kind() == crate::BackendKind::Fftw,
         };
         Ok(Self {
             core: Arc::new(core),
@@ -1162,10 +1326,13 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
     reduction_axis: usize,
     selection: AxisSelection<N>,
     real_len: usize,
-) -> Result<StagePreparation<R, N, M>, R2cError> {
+    backend: super::BackendChoice,
+) -> Result<StagePreparation<R, N, M>, BackendInitError<R2cError>> {
     let boundary = N - 1 - reduction_axis;
     if original_route.stages.len() != N || reduced_route.stages.len() != N {
-        return Err(R2cError::Fft(FftError::PreparationFailed));
+        return Err(BackendInitError::Local(R2cError::Fft(
+            FftError::PreparationFailed,
+        )));
     }
     let mut stages = Vec::new();
     stages
@@ -1175,13 +1342,20 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
     for index in 0..N {
         let axis = N - 1 - index;
         let stage = match index.cmp(&boundary) {
-            Ordering::Less => prepare_complex_stage(
+            Ordering::Less => prepare_complex_stage_for_backend(
                 &original_route.stages[index],
                 original_shape,
                 axis,
                 false,
                 FourierDirections::default(),
-            )?,
+                backend,
+            )
+            .map_err(|error| match error {
+                BackendInitError::Local(error) => BackendInitError::Local(error.into()),
+                #[cfg(feature = "fftw")]
+                BackendInitError::Native(error) => BackendInitError::Native(error),
+                BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
+            })?,
             Ordering::Equal => {
                 let pencil = &original_route.stages[index];
                 if pencil
@@ -1190,9 +1364,24 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
                     .any(|distributed| distributed.index() == reduction_axis)
                     || pencil.local_shape_logical()[reduction_axis] != real_len
                 {
-                    return Err(R2cError::Fft(FftError::PreparationFailed));
+                    return Err(BackendInitError::Local(R2cError::Fft(
+                        FftError::PreparationFailed,
+                    )));
                 }
-                let real = LocalR2cPlan::new(real_len).map_err(R2cError::LocalR2c)?;
+                let real = match backend {
+                    super::BackendChoice::RustFft => LocalR2cPlan::new(real_len)
+                        .map_err(|error| BackendInitError::Local(R2cError::LocalR2c(error)))?,
+                    #[cfg(feature = "fftw")]
+                    super::BackendChoice::Fftw(options) => {
+                        LocalR2cPlan::new_fftw(real_len, options).map_err(|error| match error {
+                            BackendInitError::Local(error) => {
+                                BackendInitError::Local(R2cError::LocalR2c(error))
+                            }
+                            BackendInitError::Native(error) => BackendInitError::Native(error),
+                            BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
+                        })?
+                    }
+                };
                 TransformStage {
                     axis: reduction_axis,
                     input: Arc::clone(&original_route.stages[index]),
@@ -1200,13 +1389,20 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
                     local: LocalTransform::RealComplex(real),
                 }
             }
-            Ordering::Greater => prepare_complex_stage(
+            Ordering::Greater => prepare_complex_stage_for_backend(
                 &reduced_route.stages[index],
                 reduced_shape,
                 axis,
                 selection.contains(axis),
                 FourierDirections::default(),
-            )?,
+                backend,
+            )
+            .map_err(|error| match error {
+                BackendInitError::Local(error) => BackendInitError::Local(error.into()),
+                #[cfg(feature = "fftw")]
+                BackendInitError::Native(error) => BackendInitError::Native(error),
+                BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
+            })?,
         };
         fft_scratch_len = fft_scratch_len.max(stage.local.scratch_len());
         stages.push(stage);
@@ -1920,7 +2116,7 @@ where
         result
     }
 
-    fn preflight_in_place(
+    pub(super) fn preflight_in_place(
         &self,
         direction: Direction,
         array: &R2cInPlaceArray<R, N, M>,
@@ -2121,7 +2317,7 @@ where
         Ok(())
     }
 
-    fn preflight_forward(
+    pub(super) fn preflight_forward(
         &self,
         source: &PencilArray<R, N, M>,
         destination: &PencilArray<Complex<R>, N, M>,
@@ -2130,7 +2326,7 @@ where
         self.preflight_common(Direction::Forward, source, destination, workspace)
     }
 
-    fn preflight_inverse(
+    pub(super) fn preflight_inverse(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
         destination: &PencilArray<R, N, M>,
@@ -4372,6 +4568,21 @@ pub(super) fn assert_poisoned_views_and_retries<const N: usize, const M: usize>(
             Err(R2cError::Fft(FftError::Array(ArrayError::Poisoned)))
         ));
         assert_eq!(array.state(), R2cState::Poisoned);
+        assert_eq!(format!("{array:?}"), array_before);
+        assert_eq!(format!("{workspace:?}"), workspace_before);
+        let arrays = std::slice::from_mut(array);
+        let result = match direction {
+            Direction::Forward => plan.forward_many_in_place(arrays, workspace),
+            Direction::Inverse => plan.inverse_many_in_place(arrays, workspace),
+            Direction::Backward => plan.backward_many_in_place(arrays, workspace),
+        };
+        assert!(matches!(
+            result,
+            Err(super::CollectionError::Member {
+                index: 0,
+                error: R2cError::Fft(FftError::Array(ArrayError::Poisoned))
+            })
+        ));
         assert_eq!(format!("{array:?}"), array_before);
         assert_eq!(format!("{workspace:?}"), workspace_before);
     }

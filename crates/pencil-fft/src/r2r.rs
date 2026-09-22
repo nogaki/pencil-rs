@@ -274,6 +274,9 @@ pub struct LocalR2rPlan<T: R2rScalar> {
     normalization_factor: usize,
     fft: Arc<dyn Fft<T::Real>>,
     marker: PhantomData<T>,
+    backend: super::BackendKind,
+    #[cfg(feature = "fftw")]
+    backend_options: Option<super::PlanOptions>,
 }
 
 impl<T: R2rScalar> fmt::Debug for LocalR2rPlan<T> {
@@ -300,9 +303,29 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         let (embedding_len, normalization_factor) = validate_lengths::<T>(line_len, kind)?;
         let mut planner = FftPlanner::<T::Real>::new();
         let fft = planner.plan_fft_forward(embedding_len);
+        Self::from_embedding(
+            line_len,
+            kind,
+            embedding_len,
+            normalization_factor,
+            fft,
+            super::BackendKind::RustFft,
+            #[cfg(feature = "fftw")]
+            None,
+        )
+    }
+
+    fn from_embedding(
+        line_len: usize,
+        kind: R2rKind,
+        embedding_len: usize,
+        normalization_factor: usize,
+        fft: Arc<dyn Fft<T::Real>>,
+        backend: super::BackendKind,
+        #[cfg(feature = "fftw")] backend_options: Option<super::PlanOptions>,
+    ) -> Result<Self, LocalR2rError> {
         let scratch_len = fft.get_inplace_scratch_len();
         validate_addressable(scratch_len, size_of::<Complex<T::Real>>())?;
-
         Ok(Self {
             line_len,
             kind,
@@ -311,7 +334,48 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
             normalization_factor,
             fft,
             marker: PhantomData,
+            backend,
+            #[cfg(feature = "fftw")]
+            backend_options,
         })
+    }
+
+    /// Builds a plan using the runtime-loaded FFTW backend.
+    #[cfg(feature = "fftw")]
+    #[allow(private_bounds)]
+    pub fn new_fftw(
+        line_len: usize,
+        kind: R2rKind,
+        options: super::PlanOptions,
+    ) -> Result<Self, super::BackendInitError<LocalR2rError>>
+    where
+        T::Real: super::backend::FftwReal,
+    {
+        let (embedding_len, normalization_factor) =
+            validate_lengths::<T>(line_len, kind).map_err(super::BackendInitError::Local)?;
+        let fft = super::backend::c2c(embedding_len, rustfft::FftDirection::Forward, options)
+            .map_err(super::BackendInitError::Native)?;
+        Self::from_embedding(
+            line_len,
+            kind,
+            embedding_len,
+            normalization_factor,
+            fft,
+            super::BackendKind::Fftw,
+            Some(options),
+        )
+        .map_err(super::BackendInitError::Local)
+    }
+
+    /// Returns the selected backend.
+    pub fn backend_kind(&self) -> super::BackendKind {
+        self.backend
+    }
+
+    /// Returns the FFTW options, when this plan uses FFTW.
+    #[cfg(feature = "fftw")]
+    pub fn backend_options(&self) -> Option<super::PlanOptions> {
+        self.backend_options
     }
 
     /// Returns the number of values in each logical input or output line.
