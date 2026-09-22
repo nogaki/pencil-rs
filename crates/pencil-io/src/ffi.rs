@@ -11,9 +11,122 @@ use std::ptr;
 
 use mpi::ffi;
 
+#[cfg(test)]
+thread_local! { static PAYLOAD_CALLS: std::cell::Cell<[usize;6]> = const { std::cell::Cell::new([0;6]) }; }
+#[cfg(test)]
+fn record_payload(index: usize) {
+    PAYLOAD_CALLS.with(|c| {
+        let mut n = c.get();
+        n[index] += 1;
+        c.set(n);
+    });
+}
+#[cfg(test)]
+pub(crate) fn test_payload_calls() -> [usize; 6] {
+    PAYLOAD_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! { static INFO_ARGUMENTS: std::cell::Cell<[i64;3]> = const { std::cell::Cell::new([-1;3]) }; }
+#[cfg(test)]
+pub(crate) fn test_info_arguments() -> [i64; 3] {
+    INFO_ARGUMENTS.with(std::cell::Cell::get)
+}
+#[cfg(test)]
+fn inspect_info_argument(info: ffi::MPI_Info, index: usize) {
+    let mut value = -1;
+    // SAFETY: this is the live info argument passed immediately to the native
+    // call. MPI_Info_get writes at most the fixed buffer length including NUL.
+    unsafe {
+        if info != ffi::RSMPI_INFO_NULL {
+            let mut bytes = [0 as std::os::raw::c_char; 64];
+            let mut flag = 0;
+            assert_eq!(
+                ffi::MPI_Info_get(
+                    info,
+                    c"cb_buffer_size".as_ptr(),
+                    63,
+                    bytes.as_mut_ptr(),
+                    &mut flag
+                ),
+                ffi::MPI_SUCCESS as i32
+            );
+            if flag != 0 {
+                value = CStr::from_ptr(bytes.as_ptr())
+                    .to_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+            }
+        }
+    }
+    INFO_ARGUMENTS.with(|c| {
+        let mut args = c.get();
+        args[index] = value;
+        c.set(args);
+    });
+}
+
 pub(crate) use mpi::ffi::{
-    MPI_Comm, MPI_Datatype, MPI_Errhandler, MPI_File, MPI_Offset, MPI_SUCCESS,
+    MPI_Comm, MPI_Datatype, MPI_Errhandler, MPI_File, MPI_Info, MPI_Offset, MPI_SUCCESS,
 };
+
+pub(crate) fn info_from_hints<I, K, V>(hints: I, abort_comm: MPI_Comm) -> Result<MPI_Info, i32>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    // SAFETY: MPI is initialized. Fixed, NUL-terminated buffers remain alive for
+    // each Info_set; all partial native handles are released or fail-stop.
+    unsafe {
+        let mut info = ffi::RSMPI_INFO_NULL;
+        let code = ffi::MPI_Info_create(&mut info);
+        if code != ffi::MPI_SUCCESS as c_int {
+            if info != ffi::RSMPI_INFO_NULL
+                && ffi::MPI_Info_free(&mut info) != ffi::MPI_SUCCESS as c_int
+            {
+                abort_fail_stop(abort_comm);
+            }
+            return Err(code);
+        }
+        for (key, value) in hints {
+            let (key, value) = (key.as_ref().as_bytes(), value.as_ref().as_bytes());
+            let mut k = [0u8; ffi::MPI_MAX_INFO_KEY as usize];
+            let mut v = [0u8; ffi::MPI_MAX_INFO_VAL as usize];
+            let code = if key.is_empty()
+                || value.is_empty()
+                || key.len() >= k.len()
+                || value.len() >= v.len()
+                || key.contains(&0)
+                || value.contains(&0)
+            {
+                ffi::MPI_ERR_ARG as c_int
+            } else {
+                k[..key.len()].copy_from_slice(key);
+                v[..value.len()].copy_from_slice(value);
+                ffi::MPI_Info_set(info, k.as_ptr().cast(), v.as_ptr().cast())
+            };
+            if code != ffi::MPI_SUCCESS as c_int {
+                if ffi::MPI_Info_free(&mut info) != ffi::MPI_SUCCESS as c_int {
+                    abort_fail_stop(abort_comm);
+                }
+                return Err(code);
+            }
+        }
+        Ok(info)
+    }
+}
+
+pub(crate) fn info_free(info: &mut MPI_Info) -> i32 {
+    // SAFETY: info is the uniquely owned live handle created by info_from_hints.
+    unsafe { ffi::MPI_Info_free(info) }
+}
+
+pub(crate) fn info_null() -> MPI_Info {
+    // SAFETY: MPI is initialized at all callers.
+    unsafe { ffi::RSMPI_INFO_NULL }
+}
 
 pub(crate) fn comm_dup(comm: ffi::MPI_Comm) -> Result<ffi::MPI_Comm, i32> {
     // SAFETY: `comm` is the live intracommunicator borrowed from a validated
@@ -103,15 +216,39 @@ pub(crate) fn file_open(
     path: &CStr,
     write: bool,
 ) -> Result<ffi::MPI_File, i32> {
-    file_open_mode(comm, path, if write { 1 } else { 0 })
+    file_open_mode(comm, path, if write { 1 } else { 0 }, unsafe {
+        ffi::RSMPI_INFO_NULL
+    })
+}
+
+pub(crate) fn file_open_with_info(
+    comm: ffi::MPI_Comm,
+    path: &CStr,
+    write: bool,
+    info: MPI_Info,
+) -> Result<ffi::MPI_File, i32> {
+    file_open_mode(comm, path, if write { 1 } else { 0 }, info)
 }
 
 /// Open an existing file for read/write without creating or truncating it.
 pub(crate) fn file_open_update(comm: ffi::MPI_Comm, path: &CStr) -> Result<ffi::MPI_File, i32> {
-    file_open_mode(comm, path, 2)
+    file_open_mode(comm, path, 2, unsafe { ffi::RSMPI_INFO_NULL })
 }
 
-fn file_open_mode(comm: ffi::MPI_Comm, path: &CStr, mode: i32) -> Result<ffi::MPI_File, i32> {
+pub(crate) fn file_open_update_with_info(
+    comm: ffi::MPI_Comm,
+    path: &CStr,
+    info: MPI_Info,
+) -> Result<ffi::MPI_File, i32> {
+    file_open_mode(comm, path, 2, info)
+}
+
+fn file_open_mode(
+    comm: ffi::MPI_Comm,
+    path: &CStr,
+    mode: i32,
+    info: MPI_Info,
+) -> Result<ffi::MPI_File, i32> {
     // SAFETY: `path` is NUL-terminated for the duration of MPI_File_open,
     // `comm` is live, and all ranks enter the same collective call.
     unsafe {
@@ -121,7 +258,9 @@ fn file_open_mode(comm: ffi::MPI_Comm, path: &CStr, mode: i32) -> Result<ffi::MP
             2 => (ffi::MPI_MODE_RDWR) as c_int,
             _ => ffi::MPI_MODE_RDONLY as c_int,
         };
-        let code = ffi::MPI_File_open(comm, path.as_ptr(), mode, ffi::RSMPI_INFO_NULL, &mut file);
+        #[cfg(test)]
+        inspect_info_argument(info, 0);
+        let code = ffi::MPI_File_open(comm, path.as_ptr(), mode, info, &mut file);
         if code == ffi::MPI_SUCCESS as c_int && file != ffi::RSMPI_FILE_NULL {
             Ok(file)
         } else {
@@ -160,23 +299,26 @@ pub(crate) fn file_sync(file: ffi::MPI_File) -> i32 {
     unsafe { ffi::MPI_File_sync(file) }
 }
 
-pub(crate) fn file_set_view(
+pub(crate) fn file_set_view_with_info(
     file: ffi::MPI_File,
     displacement: ffi::MPI_Offset,
     filetype: ffi::MPI_Datatype,
+    info: MPI_Info,
 ) -> i32 {
     // SAFETY: `file` and `filetype` are live; the static data representation and
     // null info handle are valid MPI constants.  The filetype was committed
     // by the caller or is the predefined byte type.
     unsafe {
         static DATAREP: &[u8] = b"native\0";
+        #[cfg(test)]
+        inspect_info_argument(info, 1);
         ffi::MPI_File_set_view(
             file,
             displacement,
             ffi::RSMPI_UINT8_T,
             filetype,
             DATAREP.as_ptr().cast(),
-            ffi::RSMPI_INFO_NULL,
+            info,
         )
     }
 }
@@ -258,6 +400,8 @@ pub(crate) fn file_read_at_all(
 }
 
 pub(crate) fn file_write_all(file: ffi::MPI_File, bytes: &[u8]) -> Result<usize, i32> {
+    #[cfg(test)]
+    record_payload(0);
     let count = c_int::try_from(bytes.len()).map_err(|_| ffi::MPI_ERR_COUNT as i32)?;
     // SAFETY: `bytes` remains borrowed for the collective call and the current
     // file view plus predefined byte datatype describe exactly its elements.
@@ -290,7 +434,72 @@ pub(crate) fn file_write_all(file: ffi::MPI_File, bytes: &[u8]) -> Result<usize,
     }
 }
 
+pub(crate) fn file_write_independent(file: ffi::MPI_File, bytes: &[u8]) -> Result<usize, i32> {
+    #[cfg(test)]
+    record_payload(1);
+    let count = c_int::try_from(bytes.len()).map_err(|_| ffi::MPI_ERR_COUNT as i32)?;
+    // SAFETY: live file and initialized readable byte slice remain valid through the call.
+    unsafe {
+        let mut status = MaybeUninit::<ffi::MPI_Status>::zeroed().assume_init();
+        let code = ffi::MPI_File_write(
+            file,
+            bytes.as_ptr().cast(),
+            count,
+            ffi::RSMPI_UINT8_T,
+            &mut status,
+        );
+        if code != ffi::MPI_SUCCESS as c_int {
+            return Err(code);
+        }
+        let mut actual = 0;
+        let code = ffi::MPI_Get_count(&status, ffi::RSMPI_UINT8_T, &mut actual);
+        if code != ffi::MPI_SUCCESS as c_int || actual < 0 {
+            return Err(if code == ffi::MPI_SUCCESS as c_int {
+                ffi::MPI_ERR_OTHER as i32
+            } else {
+                code
+            });
+        }
+        Ok(actual as usize)
+    }
+}
+
+pub(crate) fn file_read_independent(file: ffi::MPI_File, bytes: &mut [u8]) -> Result<usize, i32> {
+    #[cfg(test)]
+    record_payload(3);
+    let count = c_int::try_from(bytes.len()).map_err(|_| ffi::MPI_ERR_COUNT as i32)?;
+    unsafe {
+        let mut status = MaybeUninit::<ffi::MPI_Status>::zeroed().assume_init();
+        let code = ffi::MPI_File_read(
+            file,
+            if bytes.is_empty() {
+                ptr::null_mut()
+            } else {
+                bytes.as_mut_ptr().cast()
+            },
+            count,
+            ffi::RSMPI_UINT8_T,
+            &mut status,
+        );
+        if code != ffi::MPI_SUCCESS as c_int {
+            return Err(code);
+        }
+        let mut actual = 0;
+        let code = ffi::MPI_Get_count(&status, ffi::RSMPI_UINT8_T, &mut actual);
+        if code != ffi::MPI_SUCCESS as c_int || actual < 0 {
+            return Err(if code == ffi::MPI_SUCCESS as c_int {
+                ffi::MPI_ERR_OTHER as i32
+            } else {
+                code
+            });
+        }
+        Ok(actual as usize)
+    }
+}
+
 pub(crate) fn file_read_all(file: ffi::MPI_File, bytes: &mut [u8]) -> Result<usize, i32> {
+    #[cfg(test)]
+    record_payload(2);
     let count = c_int::try_from(bytes.len()).map_err(|_| ffi::MPI_ERR_COUNT as i32)?;
     // SAFETY: `bytes` is writable for the collective call and the current file
     // view plus predefined byte datatype describe exactly its elements.
@@ -427,12 +636,14 @@ pub(crate) mod hdf5 {
         })
     }
 
-    pub(crate) fn fapl_set_mpio(fapl: Hid, comm: ffi::MPI_Comm) -> i32 {
+    pub(crate) fn fapl_set_mpio(fapl: Hid, comm: ffi::MPI_Comm, info: ffi::MPI_Info) -> i32 {
         hdf5_metno::sync::sync(|| {
             // SAFETY: `fapl` is live, `comm` is the owned duplicate whose
             // MPI_ERRORS_RETURN handler remains installed through file open,
             // and the null info handle is a valid MPI constant.
-            unsafe { h5::h5p::H5Pset_fapl_mpio(fapl, comm, ffi::RSMPI_INFO_NULL) }
+            #[cfg(test)]
+            super::inspect_info_argument(info, 2);
+            unsafe { h5::h5p::H5Pset_fapl_mpio(fapl, comm, info) }
         })
     }
 
@@ -534,11 +745,31 @@ pub(crate) mod hdf5 {
         })
     }
 
+    pub(crate) fn dcpl_create() -> Result<Hid, i32> {
+        hdf5_metno::sync::sync(|| unsafe {
+            let id = h5::h5p::H5Pcreate(*hdf5_metno::globals::H5P_DATASET_CREATE);
+            if hdf5_invalid(id) {
+                Err(id as i32)
+            } else {
+                Ok(id)
+            }
+        })
+    }
+
+    pub(crate) fn dcpl_set_chunk(dcpl: Hid, dims: &[hsize_t]) -> i32 {
+        let rank = match c_int::try_from(dims.len()) {
+            Ok(v) => v,
+            Err(_) => return -1,
+        };
+        hdf5_metno::sync::sync(|| unsafe { h5::h5p::H5Pset_chunk(dcpl, rank, dims.as_ptr()) })
+    }
+
     pub(crate) fn dataset_create(
         group: Hid,
         name: &CStr,
         datatype: Hid,
         space: Hid,
+        dcpl: Hid,
     ) -> Result<Hid, i32> {
         hdf5_metno::sync::sync(|| {
             // SAFETY: all identifiers and the NUL-terminated name are live;
@@ -550,7 +781,7 @@ pub(crate) mod hdf5 {
                     datatype,
                     space,
                     h5::h5p::H5P_DEFAULT,
-                    h5::h5p::H5P_DEFAULT,
+                    dcpl,
                     h5::h5p::H5P_DEFAULT,
                 );
                 if hdf5_invalid(id) {
@@ -638,6 +869,28 @@ pub(crate) mod hdf5 {
                 } else {
                     Ok(id)
                 }
+            }
+        })
+    }
+
+    pub(crate) fn dataspace_chunked(dims: &[hsize_t], chunks: &[usize]) -> Result<Hid, i32> {
+        let mut max = [0 as hsize_t; crate::MAX_PROTOCOL_RANK];
+        if dims.len() != chunks.len() || dims.len() > max.len() {
+            return Err(-1);
+        }
+        for ((dst, &dim), &chunk) in max.iter_mut().zip(dims).zip(chunks) {
+            *dst = dim.max(chunk as hsize_t);
+        }
+        hdf5_metno::sync::sync(|| {
+            // SAFETY: dimensions and maxima have the checked equal rank. Each
+            // maximum accommodates both the current extent and the chunk.
+            let id = unsafe {
+                h5::h5s::H5Screate_simple(dims.len() as c_int, dims.as_ptr(), max.as_ptr())
+            };
+            if hdf5_invalid(id) {
+                Err(id as i32)
+            } else {
+                Ok(id)
             }
         })
     }
@@ -1057,7 +1310,7 @@ pub(crate) mod hdf5 {
         space_shape(space)
     }
 
-    pub(crate) fn xfer_create_collective(abort_comm: ffi::MPI_Comm) -> Result<Hid, i32> {
+    pub(crate) fn xfer_create(abort_comm: ffi::MPI_Comm, collective: bool) -> Result<Hid, i32> {
         hdf5_metno::sync::sync(|| {
             // SAFETY: the global dataset-transfer property-list class is live.
             unsafe {
@@ -1065,8 +1318,14 @@ pub(crate) mod hdf5 {
                 if hdf5_invalid(id) {
                     return Err(id as i32);
                 }
-                let code =
-                    h5::h5p::H5Pset_dxpl_mpio(id, h5::h5p::H5FD_mpio_xfer_t::H5FD_MPIO_COLLECTIVE);
+                let code = h5::h5p::H5Pset_dxpl_mpio(
+                    id,
+                    if collective {
+                        h5::h5p::H5FD_mpio_xfer_t::H5FD_MPIO_COLLECTIVE
+                    } else {
+                        h5::h5p::H5FD_mpio_xfer_t::H5FD_MPIO_INDEPENDENT
+                    },
+                );
                 if code < 0 {
                     let close_code = h5::h5p::H5Pclose(id);
                     if close_code < 0 {
@@ -1101,6 +1360,17 @@ pub(crate) mod hdf5 {
             // count in the explicit packed memory type, and all ranks call the
             // same collective HDF5 transfer.
             unsafe {
+                #[cfg(test)]
+                {
+                    use h5::h5p::H5FD_mpio_xfer_t;
+                    let mut actual = H5FD_mpio_xfer_t::H5FD_MPIO_COLLECTIVE;
+                    assert!(h5::h5p::H5Pget_dxpl_mpio(xfer, &mut actual) >= 0);
+                    super::record_payload(if actual == H5FD_mpio_xfer_t::H5FD_MPIO_INDEPENDENT {
+                        5
+                    } else {
+                        4
+                    });
+                }
                 if write {
                     h5::h5d::H5Dwrite(
                         dataset,

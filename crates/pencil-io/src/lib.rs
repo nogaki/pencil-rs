@@ -31,22 +31,48 @@
 //! filesystem paths; duplicate names fail before mutation. [`NamedIoError`]
 //! preserves underlying native/commit errors. Neither format promises recovery
 //! from process loss or crash-atomic HDF5 journaling.
+//!
+//! All ranks must participate even when an options API selects independent
+//! payload transfers. Writers (including appenders) to the same file require
+//! external serialization across jobs and communicators; no whole-file rollback
+//! is promised after a write failure. Raw input is explicitly requested through
+//! [`read_mpi_raw`], never inferred by the strict versioned readers.
 
+mod collections;
 mod format;
 mod mpi_io;
 mod named_mpi;
+mod options;
+mod raw;
 
 mod ffi;
 
 #[cfg(feature = "parallel-hdf5")]
 mod hdf5_io;
+#[cfg(feature = "parallel-hdf5")]
+mod hdf5_options;
 
+pub use collections::{CollectionIoError, read_mpi_collection, write_mpi_collection};
 pub use format::IoElement;
-pub use mpi_io::{read_mpi, write_mpi};
-pub use named_mpi::{append_mpi_named, read_mpi_named, write_mpi_named};
+pub use mpi_io::{read_mpi, read_mpi_with_options, write_mpi, write_mpi_with_options};
+pub use named_mpi::{
+    append_mpi_named, append_mpi_named_with_options, read_mpi_named, read_mpi_named_with_options,
+    write_mpi_named, write_mpi_named_with_options,
+};
+pub use options::{MpiIoMode, MpiIoOptions, RawByteOrder, RawReadOptions};
+pub use raw::read_mpi_raw;
 
 #[cfg(feature = "parallel-hdf5")]
-pub use hdf5_io::{append_hdf5_named, read_hdf5, read_hdf5_named, write_hdf5, write_hdf5_named};
+pub use collections::{read_hdf5_collection, write_hdf5_collection};
+#[cfg(feature = "parallel-hdf5")]
+pub use hdf5_io::{
+    append_hdf5_named, append_hdf5_named_with_options, read_hdf5, read_hdf5_named,
+    read_hdf5_named_with_options, write_hdf5, write_hdf5_named, write_hdf5_named_with_options,
+};
+#[cfg(feature = "parallel-hdf5")]
+pub use hdf5_options::{
+    Hdf5ReadOptions, Hdf5WriteOptions, read_hdf5_with_options, write_hdf5_with_options,
+};
 
 use thiserror::Error;
 
@@ -180,6 +206,7 @@ const MAX_PROTOCOL_RANK: usize = 1024;
 
 const OP_WRITE_MPI: u64 = 1;
 const OP_READ_MPI: u64 = 2;
+const OP_READ_RAW_MPI: u64 = 8;
 #[cfg(feature = "parallel-hdf5")]
 const OP_WRITE_HDF5: u64 = 3;
 #[cfg(feature = "parallel-hdf5")]
@@ -613,6 +640,103 @@ mod tests {
         super::read_mpi_named(&named_path, "A/温度", destination.view_mut()).unwrap();
         assert_i32_values(&destination);
 
+        // Verify actual native dispatch, not merely option descriptors or numerics.
+        let controls = super::MpiIoOptions::default()
+            .mode(super::MpiIoMode::Independent)
+            .hint("cb_buffer_size", "2097152");
+        let counts = crate::ffi::test_payload_calls();
+        let independent = directory.join("native-independent.pio");
+        super::write_mpi_with_options(&independent, source.view(), &controls).unwrap();
+        super::read_mpi_with_options(&independent, destination.view_mut(), &controls).unwrap();
+        let after = crate::ffi::test_payload_calls();
+        assert_eq!(&crate::ffi::test_info_arguments()[..2], &[2097152, 2097152]);
+        assert_eq!(
+            [
+                after[0] - counts[0],
+                after[1] - counts[1],
+                after[2] - counts[2],
+                after[3] - counts[3]
+            ],
+            [0, 1, 0, 1]
+        );
+        assert_i32_values(&destination);
+        let named = directory.join("native-independent-named.pio");
+        let counts = crate::ffi::test_payload_calls();
+        super::write_mpi_named_with_options(&named, "first", source.view(), &controls).unwrap();
+        super::append_mpi_named_with_options(&named, "second", source.view(), &controls).unwrap();
+        super::read_mpi_named_with_options(&named, "second", destination.view_mut(), &controls)
+            .unwrap();
+        let after = crate::ffi::test_payload_calls();
+        assert_eq!(
+            [
+                after[0] - counts[0],
+                after[1] - counts[1],
+                after[2] - counts[2],
+                after[3] - counts[3]
+            ],
+            [0, 2, 0, 1]
+        );
+        assert_i32_values(&destination);
+        let mut offset = 0u64;
+        if world.rank() == 0 {
+            let bytes = std::fs::read(&independent).unwrap();
+            offset = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
+        }
+        world.process_at_rank(0).broadcast_into(&mut offset);
+        destination.as_mut_slice().fill(-999);
+        let raw_before = destination.as_slice().to_vec();
+        let counts = crate::ffi::test_payload_calls();
+        let raw_controls = super::RawReadOptions::default()
+            .mode(super::MpiIoMode::Independent)
+            .byte_offset(offset)
+            .byte_order(super::RawByteOrder::Little);
+        crate::raw::read_raw_with_post_cleanup_failure(
+            &independent,
+            destination.view_mut(),
+            raw_controls.clone(),
+        )
+        .expect_err("raw cleanup fault");
+        assert_eq!(destination.as_slice(), raw_before);
+        super::read_mpi_raw(&independent, destination.view_mut(), raw_controls).unwrap();
+        let after = crate::ffi::test_payload_calls();
+        assert_eq!([after[2] - counts[2], after[3] - counts[3]], [0, 2]);
+        assert_i32_values(&destination);
+        #[cfg(feature = "parallel-hdf5")]
+        {
+            let counts = crate::ffi::test_payload_calls();
+            let path = directory.join("native-independent.h5");
+            super::write_hdf5_with_options(
+                &path,
+                source.view(),
+                &super::Hdf5WriteOptions::default()
+                    .mode(super::MpiIoMode::Independent)
+                    .hint("cb_buffer_size", "2097152"),
+            )
+            .unwrap();
+            super::read_hdf5_with_options(
+                &path,
+                destination.view_mut(),
+                &super::Hdf5ReadOptions::default()
+                    .mode(super::MpiIoMode::Independent)
+                    .hint("cb_buffer_size", "2097152"),
+            )
+            .unwrap();
+            let after = crate::ffi::test_payload_calls();
+            assert_eq!(crate::ffi::test_info_arguments()[2], 2097152);
+            assert_eq!([after[4] - counts[4], after[5] - counts[5]], [0, 2]);
+            assert_i32_values(&destination);
+            let named = directory.join("native-independent-named.h5");
+            let write = super::Hdf5WriteOptions::default().mode(super::MpiIoMode::Independent);
+            let read = super::Hdf5ReadOptions::default().mode(super::MpiIoMode::Independent);
+            let counts = crate::ffi::test_payload_calls();
+            super::write_hdf5_named_with_options(&named, "first", source.view(), &write).unwrap();
+            super::append_hdf5_named_with_options(&named, "second", source.view(), &write).unwrap();
+            super::read_hdf5_named_with_options(&named, "second", destination.view_mut(), &read)
+                .unwrap();
+            let after = crate::ffi::test_payload_calls();
+            assert_eq!([after[4] - counts[4], after[5] - counts[5]], [0, 3]);
+            assert_i32_values(&destination);
+        }
         cleanup_owned_temp_dir(&world, &directory);
     }
 

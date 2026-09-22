@@ -11,6 +11,7 @@ use crate::ffi;
 use pencil_array::{PencilArrayView, PencilArrayViewMut, SpatialAxis};
 
 use crate::format::{IoElement, element_count, pack_view, prepare_physical_values};
+use crate::options::{InfoGuard, MpiIoMode, MpiIoOptions, agree_options};
 use crate::{
     COMMIT_MARKER, FORMAT_VERSION, INCOMPLETE_MARKER, IO_NAMESPACE, IoError, MAX_DESCRIPTOR_BYTES,
     MAX_HEADER_BYTES, MAX_PROTOCOL_RANK, OP_READ_MPI, OP_WRITE_MPI,
@@ -185,13 +186,27 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    write_mpi_inner(path, view, false)
+    write_mpi_inner(path, view, false, None)
+}
+
+/// Option-bearing additive form of [`write_mpi`].
+pub fn write_mpi_with_options<P, T, const N: usize, const M: usize>(
+    path: P,
+    view: PencilArrayView<'_, T, N, M>,
+    options: &MpiIoOptions,
+) -> Result<(), IoError>
+where
+    P: AsRef<Path>,
+    T: IoElement,
+{
+    write_mpi_inner(path, view, false, Some(options))
 }
 
 fn write_mpi_inner<P, T, const N: usize, const M: usize>(
     path: P,
     view: PencilArrayView<'_, T, N, M>,
     inject_post_cleanup_failure: bool,
+    options: Option<&MpiIoOptions>,
 ) -> Result<(), IoError>
 where
     P: AsRef<Path>,
@@ -205,7 +220,7 @@ where
     descriptor_agreement(
         comm,
         path.as_ref(),
-        OP_WRITE_MPI,
+        if options.is_some() { 41 } else { OP_WRITE_MPI },
         global,
         extra,
         grid,
@@ -230,6 +245,18 @@ where
 
     // These are all local preparation phases.  Every rank completes them before
     // the communicator is duplicated or the next collective is entered.
+    let defaults = MpiIoOptions::default();
+    let controls = options.unwrap_or(&defaults);
+    if options.is_some() {
+        agree_options(comm, controls, &[])?;
+    }
+    let info = options
+        .map(|_| {
+            crate::options::agree_decomposition(view.pencil())?;
+            InfoGuard::new(comm, controls)
+        })
+        .transpose()?;
+    let native_info = info.as_ref().map_or_else(ffi::info_null, |i| i.raw);
     let header_result = Header::for_write(&view);
     let packed_result = pack_view(&view);
     let layout_result = build_layout(
@@ -258,7 +285,7 @@ where
 
     let duplicate = duplicate_comm(comm)?;
 
-    let file = match open_file_collective(comm, &duplicate, &path_c, true) {
+    let file = match open_file_collective(comm, &duplicate, &path_c, true, native_info) {
         Ok(file) => file,
         Err(error) => return Err(cleanup_comm_error(comm, duplicate, error)),
     };
@@ -338,7 +365,8 @@ where
     let filetype = datatype
         .as_ref()
         .map_or_else(ffi::byte_datatype, |datatype| datatype.raw);
-    let set_view = ffi::file_set_view(file.raw, header_offset, filetype).checked_success();
+    let set_view = ffi::file_set_view_with_info(file.raw, header_offset, filetype, native_info)
+        .checked_success();
     if let Err(agreement) = agree_phase(comm, set_view.is_ok(), "MPI-IO byte-subarray view") {
         let primary = IoError::WriteIncomplete {
             stage: "MPI_File_set_view",
@@ -351,7 +379,11 @@ where
         return Err(cleanup_result(cleanup, primary));
     }
 
-    let payload_write = ffi::file_write_all(file.raw, &packed);
+    let payload_write = if controls.mode == MpiIoMode::Independent {
+        ffi::file_write_independent(file.raw, &packed)
+    } else {
+        ffi::file_write_all(file.raw, &packed)
+    };
     let payload_ok = matches!(payload_write, Ok(actual) if actual == packed.len());
     if let Err(agreement) = agree_phase(comm, payload_ok, "MPI-IO payload write") {
         let primary = IoError::WriteIncomplete {
@@ -394,7 +426,8 @@ where
     // Explicit-offset MPI-IO offsets are expressed in the current view's
     // etypes.  Restore the byte view so the marker offset is truly at header
     // byte 24 rather than payload_offset + 24.
-    let marker_view = ffi::file_set_view(file.raw, 0, ffi::byte_datatype()).checked_success();
+    let marker_view = ffi::file_set_view_with_info(file.raw, 0, ffi::byte_datatype(), native_info)
+        .checked_success();
     if let Err(agreement) = agree_phase(comm, marker_view.is_ok(), "MPI-IO commit marker view") {
         let primary = IoError::WriteIncomplete {
             stage: "commit marker view",
@@ -444,6 +477,7 @@ where
     }
 
     let cleanup = finish_resources(comm, duplicate, file, datatype);
+    drop(info);
     let injected = if inject_post_cleanup_failure && comm.rank() == ROOT_RANK {
         Some(IoError::CommitUncertain {
             stage: "test post-marker cleanup result",
@@ -466,7 +500,7 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    write_mpi_inner(path, view, true)
+    write_mpi_inner(path, view, true, None)
 }
 
 /// Reads one MPI-IO file collectively into a view, committing the destination
@@ -479,13 +513,27 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_mpi_inner(path, view, false)
+    read_mpi_inner(path, view, false, None)
+}
+
+/// Option-bearing additive form of [`read_mpi`].
+pub fn read_mpi_with_options<P, T, const N: usize, const M: usize>(
+    path: P,
+    view: PencilArrayViewMut<'_, T, N, M>,
+    options: &MpiIoOptions,
+) -> Result<(), IoError>
+where
+    P: AsRef<Path>,
+    T: IoElement,
+{
+    read_mpi_inner(path, view, false, Some(options))
 }
 
 fn read_mpi_inner<P, T, const N: usize, const M: usize>(
     path: P,
     mut view: PencilArrayViewMut<'_, T, N, M>,
     inject_post_cleanup_failure: bool,
+    options: Option<&MpiIoOptions>,
 ) -> Result<(), IoError>
 where
     P: AsRef<Path>,
@@ -499,7 +547,7 @@ where
     descriptor_agreement(
         comm,
         path.as_ref(),
-        OP_READ_MPI,
+        if options.is_some() { 42 } else { OP_READ_MPI },
         global,
         extra,
         grid,
@@ -522,6 +570,18 @@ where
     }
     let path_c = path_c.expect("path agreement established");
 
+    let defaults = MpiIoOptions::default();
+    let controls = options.unwrap_or(&defaults);
+    if options.is_some() {
+        agree_options(comm, controls, &[])?;
+    }
+    let info = options
+        .map(|_| {
+            crate::options::agree_decomposition(view.pencil())?;
+            InfoGuard::new(comm, controls)
+        })
+        .transpose()?;
+    let native_info = info.as_ref().map_or_else(ffi::info_null, |i| i.raw);
     let global_shape = view.pencil().global_shape();
     let local_shape = view.local_spatial_shape();
     let layout_result = build_layout(
@@ -553,7 +613,7 @@ where
 
     let duplicate = duplicate_comm(comm)?;
 
-    let file = match open_file_collective(comm, &duplicate, &path_c, false) {
+    let file = match open_file_collective(comm, &duplicate, &path_c, false, native_info) {
         Ok(file) => file,
         Err(error) => return Err(cleanup_comm_error(comm, duplicate, error)),
     };
@@ -743,7 +803,8 @@ where
     let filetype = datatype
         .as_ref()
         .map_or_else(ffi::byte_datatype, |datatype| datatype.raw);
-    let set_view = ffi::file_set_view(file.raw, header_offset, filetype).checked_success();
+    let set_view = ffi::file_set_view_with_info(file.raw, header_offset, filetype, native_info)
+        .checked_success();
     if let Err(agreement) = agree_phase(comm, set_view.is_ok(), "MPI-IO byte-subarray view") {
         let cleanup = finish_resources(comm, duplicate, file, datatype);
         let primary = set_view
@@ -756,7 +817,11 @@ where
         return Err(cleanup.unwrap_or(primary));
     }
 
-    let payload_read = ffi::file_read_all(file.raw, &mut staging);
+    let payload_read = if controls.mode == MpiIoMode::Independent {
+        ffi::file_read_independent(file.raw, &mut staging)
+    } else {
+        ffi::file_read_all(file.raw, &mut staging)
+    };
     let payload_ok = matches!(payload_read, Ok(actual) if actual == staging.len());
     if let Err(agreement) = agree_phase(comm, payload_ok, "MPI-IO payload read") {
         let cleanup = finish_resources(comm, duplicate, file, datatype);
@@ -774,6 +839,7 @@ where
     }
     let values = values_result.expect("read physical staging agreement established");
     let cleanup = finish_resources(comm, duplicate, file, datatype);
+    drop(info);
     let injected = if inject_post_cleanup_failure && comm.rank() == ROOT_RANK {
         Some(IoError::Native {
             operation: "test post-cleanup result",
@@ -798,7 +864,7 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_mpi_inner(path, view, true)
+    read_mpi_inner(path, view, true, None)
 }
 
 #[derive(Debug)]
@@ -816,8 +882,9 @@ fn open_file_collective(
     duplicate: &CommGuard,
     path: &std::ffi::CStr,
     write: bool,
+    info: ffi::MPI_Info,
 ) -> Result<FileGuard, IoError> {
-    let result = ffi::file_open(duplicate.raw, path, write);
+    let result = ffi::file_open_with_info(duplicate.raw, path, write, info);
     let (all_succeeded, mixed) = collective_state(comm, result.is_ok());
     if mixed {
         abort_unrecoverable(comm.as_raw(), "MPI_File_open partial native file handle");
@@ -838,7 +905,7 @@ fn open_file_collective(
     })
 }
 
-fn set_file_errors_return(file: &FileGuard) -> Result<(), i32> {
+pub(crate) fn set_file_errors_return(file: &FileGuard) -> Result<(), i32> {
     ffi::file_set_errors_return(file.raw).checked_success()
 }
 
@@ -1647,7 +1714,7 @@ fn to_offset(value: u64) -> Result<ffi::MPI_Offset, IoError> {
     })
 }
 
-fn path_bytes(path: &Path) -> Result<&[u8], IoError> {
+pub(crate) fn path_bytes(path: &Path) -> Result<&[u8], IoError> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;

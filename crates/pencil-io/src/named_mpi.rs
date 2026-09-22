@@ -18,6 +18,7 @@ use crate::ffi;
 use crate::format::{IoElement, element_count, pack_view, prepare_physical_values};
 use crate::mpi_io::agree_phase;
 use crate::mpi_io::{DatatypeGuard, build_layout, duplicate_comm, finish_resources};
+use crate::options::{InfoGuard, MpiIoMode, MpiIoOptions, agree_options};
 use crate::{COMMIT_MARKER, IoError, MAX_PROTOCOL_RANK, NamedIoError};
 
 const MAGIC: &[u8; 8] = b"PIONAM02";
@@ -29,6 +30,9 @@ const MAX_NAME: usize = 1024;
 const OP_WRITE: u64 = 0x101;
 const OP_READ: u64 = 0x102;
 const OP_APPEND: u64 = 0x103;
+const OP_WRITE_OPTIONS: u64 = 51;
+const OP_APPEND_OPTIONS: u64 = 52;
+const OP_READ_OPTIONS: u64 = 53;
 
 fn u64at(b: &[u8], p: usize) -> Option<u64> {
     b.get(p..p + 8)
@@ -97,8 +101,17 @@ fn open<C: CommunicatorCollectives + Communicator>(
     raw: ffi::MPI_Comm,
     p: &CString,
     mode: u8,
+    info: Option<&InfoGuard>,
 ) -> Result<ffi::MPI_File, NamedIoError> {
-    let r = if mode == 0 {
+    let r = if let Some(info) = info {
+        if mode == 0 {
+            ffi::file_open_with_info(raw, p, true, info.raw)
+        } else if mode == 1 {
+            ffi::file_open_with_info(raw, p, false, info.raw)
+        } else {
+            ffi::file_open_update_with_info(raw, p, info.raw)
+        }
+    } else if mode == 0 {
         ffi::file_open(raw, p, true)
     } else if mode == 1 {
         ffi::file_open(raw, p, false)
@@ -457,7 +470,30 @@ pub fn write_mpi_named<
     name: S,
     view: PencilArrayView<'_, T, N, M>,
 ) -> Result<(), NamedIoError> {
-    write_named(path.as_ref(), name.as_ref(), view, false, false)
+    write_named(path.as_ref(), name.as_ref(), view, false, false, None)
+}
+
+/// Create a named MPI container with explicit native controls.
+pub fn write_mpi_named_with_options<
+    P: AsRef<Path>,
+    S: AsRef<str>,
+    T: IoElement,
+    const N: usize,
+    const M: usize,
+>(
+    path: P,
+    name: S,
+    view: PencilArrayView<'_, T, N, M>,
+    options: &MpiIoOptions,
+) -> Result<(), NamedIoError> {
+    write_named(
+        path.as_ref(),
+        name.as_ref(),
+        view,
+        false,
+        false,
+        Some(options),
+    )
 }
 
 /// Appends an independently committed record without modifying the committed prefix.
@@ -473,7 +509,30 @@ pub fn append_mpi_named<
     name: S,
     view: PencilArrayView<'_, T, N, M>,
 ) -> Result<(), NamedIoError> {
-    write_named(path.as_ref(), name.as_ref(), view, true, false)
+    write_named(path.as_ref(), name.as_ref(), view, true, false, None)
+}
+
+/// Append a new name with native controls. Same-file writers require external serialization.
+pub fn append_mpi_named_with_options<
+    P: AsRef<Path>,
+    S: AsRef<str>,
+    T: IoElement,
+    const N: usize,
+    const M: usize,
+>(
+    path: P,
+    name: S,
+    view: PencilArrayView<'_, T, N, M>,
+    options: &MpiIoOptions,
+) -> Result<(), NamedIoError> {
+    write_named(
+        path.as_ref(),
+        name.as_ref(),
+        view,
+        true,
+        false,
+        Some(options),
+    )
 }
 
 fn write_named<T: IoElement, const N: usize, const M: usize>(
@@ -482,12 +541,23 @@ fn write_named<T: IoElement, const N: usize, const M: usize>(
     view: PencilArrayView<'_, T, N, M>,
     append: bool,
     inject_post_cleanup_failure: bool,
+    options: Option<&MpiIoOptions>,
 ) -> Result<(), NamedIoError> {
     let comm = view.pencil().topology().communicator();
     crate::mpi_io::descriptor_agreement(
         comm,
         path,
-        if append { OP_APPEND } else { OP_WRITE },
+        if options.is_some() {
+            if append {
+                OP_APPEND_OPTIONS
+            } else {
+                OP_WRITE_OPTIONS
+            }
+        } else if append {
+            OP_APPEND
+        } else {
+            OP_WRITE
+        },
         view.pencil().global_shape(),
         view.extra_shape().dimensions(),
         view.pencil().topology().process_grid(),
@@ -496,6 +566,9 @@ fn write_named<T: IoElement, const N: usize, const M: usize>(
         T::WIDTH,
     )?;
     name_bytes(comm, name)?;
+    if let Some(options) = options {
+        agree_options(comm, options, &[])?;
+    }
     let pc = prepared(comm, path_c(path), "named path preparation")?;
     let packed = prepared(comm, pack_view(&view), "named payload packing")?;
     let layout = prepared(
@@ -514,8 +587,20 @@ fn write_named<T: IoElement, const N: usize, const M: usize>(
     let record_result = record(name, &view, 0);
     agree_phase(comm, record_result.is_ok(), "named record preparation")?;
     let (head, record_len) = record_result?;
+    if options.is_some() {
+        crate::options::agree_decomposition(view.pencil())?;
+    }
+    let info = options
+        .map(|options| InfoGuard::new(comm, options))
+        .transpose()?;
     let duplicate = duplicate_comm(comm)?;
-    let file = match open(comm, duplicate.raw, &pc, if append { 2 } else { 0 }) {
+    let file = match open(
+        comm,
+        duplicate.raw,
+        &pc,
+        if append { 2 } else { 0 },
+        info.as_ref(),
+    ) {
         Ok(file) => file,
         Err(e) => {
             crate::mpi_io::finish_comm(comm, duplicate);
@@ -572,10 +657,19 @@ fn write_named<T: IoElement, const N: usize, const M: usize>(
             .map_or_else(ffi::byte_datatype, |dt| dt.raw);
         agree_phase(
             comm,
-            ffi::file_set_view(file, (offset + head.len()) as i64, ft) == ffi::MPI_SUCCESS as i32,
+            ffi::file_set_view_with_info(
+                file,
+                (offset + head.len()) as i64,
+                ft,
+                info.as_ref().map_or_else(ffi::info_null, |i| i.raw),
+            ) == ffi::MPI_SUCCESS as i32,
             "named payload view",
         )?;
-        let written = ffi::file_write_all(file, &packed);
+        let written = if options.is_some_and(|o| o.mode == MpiIoMode::Independent) {
+            ffi::file_write_independent(file, &packed)
+        } else {
+            ffi::file_write_all(file, &packed)
+        };
         agree_phase(
             comm,
             matches!(written, Ok(n) if n == packed.len()),
@@ -588,7 +682,12 @@ fn write_named<T: IoElement, const N: usize, const M: usize>(
         )?;
         agree_phase(
             comm,
-            ffi::file_set_view(file, 0, ffi::byte_datatype()) == ffi::MPI_SUCCESS as i32,
+            ffi::file_set_view_with_info(
+                file,
+                0,
+                ffi::byte_datatype(),
+                info.as_ref().map_or_else(ffi::info_null, |i| i.raw),
+            ) == ffi::MPI_SUCCESS as i32,
             "named marker view",
         )?;
         marker_attempted = true;
@@ -613,6 +712,7 @@ fn write_named<T: IoElement, const N: usize, const M: usize>(
     } else {
         cleanup
     };
+    drop(info);
     let cleanup = crate::mpi_io::aggregate_cleanup_result(comm, cleanup);
     if marker_attempted && (result.is_err() || cleanup.is_some()) {
         return Err(IoError::CommitUncertain {
@@ -657,7 +757,23 @@ pub fn read_mpi_named<
     name: S,
     view: PencilArrayViewMut<'_, T, N, M>,
 ) -> Result<(), NamedIoError> {
-    read_named(path.as_ref(), name.as_ref(), view, false)
+    read_named(path.as_ref(), name.as_ref(), view, false, None)
+}
+
+/// Read a named MPI payload with explicit native controls.
+pub fn read_mpi_named_with_options<
+    P: AsRef<Path>,
+    S: AsRef<str>,
+    T: IoElement,
+    const N: usize,
+    const M: usize,
+>(
+    path: P,
+    name: S,
+    view: PencilArrayViewMut<'_, T, N, M>,
+    options: &MpiIoOptions,
+) -> Result<(), NamedIoError> {
+    read_named(path.as_ref(), name.as_ref(), view, false, Some(options))
 }
 
 fn read_named<T: IoElement, const N: usize, const M: usize>(
@@ -665,12 +781,17 @@ fn read_named<T: IoElement, const N: usize, const M: usize>(
     name: &str,
     mut view: PencilArrayViewMut<'_, T, N, M>,
     inject_post_cleanup_failure: bool,
+    options: Option<&MpiIoOptions>,
 ) -> Result<(), NamedIoError> {
     let comm = view.pencil().topology().communicator();
     crate::mpi_io::descriptor_agreement(
         comm,
         path,
-        OP_READ,
+        if options.is_some() {
+            OP_READ_OPTIONS
+        } else {
+            OP_READ
+        },
         view.pencil().global_shape(),
         view.extra_shape().dimensions(),
         view.pencil().topology().process_grid(),
@@ -679,6 +800,9 @@ fn read_named<T: IoElement, const N: usize, const M: usize>(
         T::WIDTH,
     )?;
     name_bytes(comm, name)?;
+    if let Some(options) = options {
+        agree_options(comm, options, &[])?;
+    }
     let pc = prepared(comm, path_c(path), "named path preparation")?;
     let layout = prepared(
         comm,
@@ -697,8 +821,14 @@ fn read_named<T: IoElement, const N: usize, const M: usize>(
     });
     let size = prepared(comm, size, "named read size")?;
     let mut packed = allocate(comm, size)?;
+    if options.is_some() {
+        crate::options::agree_decomposition(view.pencil())?;
+    }
+    let info = options
+        .map(|options| InfoGuard::new(comm, options))
+        .transpose()?;
     let duplicate = duplicate_comm(comm)?;
-    let file = match open(comm, duplicate.raw, &pc, 1) {
+    let file = match open(comm, duplicate.raw, &pc, 1, info.as_ref()) {
         Ok(file) => file,
         Err(e) => {
             crate::mpi_io::finish_comm(comm, duplicate);
@@ -741,10 +871,19 @@ fn read_named<T: IoElement, const N: usize, const M: usize>(
             .map_or_else(ffi::byte_datatype, |dt| dt.raw);
         agree_phase(
             comm,
-            ffi::file_set_view(file, record.payload_offset as i64, ft) == ffi::MPI_SUCCESS as i32,
+            ffi::file_set_view_with_info(
+                file,
+                record.payload_offset as i64,
+                ft,
+                info.as_ref().map_or_else(ffi::info_null, |i| i.raw),
+            ) == ffi::MPI_SUCCESS as i32,
             "named read view",
         )?;
-        let read = ffi::file_read_all(file, &mut packed);
+        let read = if options.is_some_and(|o| o.mode == MpiIoMode::Independent) {
+            ffi::file_read_independent(file, &mut packed)
+        } else {
+            ffi::file_read_all(file, &mut packed)
+        };
         agree_phase(
             comm,
             matches!(read, Ok(n) if n == packed.len()),
@@ -770,6 +909,7 @@ fn read_named<T: IoElement, const N: usize, const M: usize>(
     } else {
         cleanup
     };
+    drop(info);
     let cleanup = crate::mpi_io::aggregate_cleanup_result(comm, cleanup);
     let physical = result?;
     if let Some(error) = cleanup {
@@ -785,7 +925,7 @@ pub(crate) fn read_with_cleanup_failure<T: IoElement, const N: usize, const M: u
     name: &str,
     view: PencilArrayViewMut<'_, T, N, M>,
 ) -> Result<(), NamedIoError> {
-    read_named(path, name, view, true)
+    read_named(path, name, view, true, None)
 }
 
 #[cfg(test)]
@@ -794,5 +934,5 @@ pub(crate) fn write_with_commit_uncertainty<T: IoElement, const N: usize, const 
     name: &str,
     view: PencilArrayView<'_, T, N, M>,
 ) -> Result<(), NamedIoError> {
-    write_named(path, name, view, false, true)
+    write_named(path, name, view, false, true, None)
 }
