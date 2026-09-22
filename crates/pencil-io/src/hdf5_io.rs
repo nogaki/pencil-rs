@@ -21,6 +21,27 @@ use crate::{
 };
 
 const MAX_NAME: usize = 1024;
+const OP_OPTIONS_WRITE_HDF5: u64 = 13;
+const OP_OPTIONS_READ_HDF5: u64 = 14;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Hdf5Settings<'a> {
+    pub collective: bool,
+    pub chunks: Option<&'a [usize]>,
+    pub hints: &'a [(String, String)],
+    pub explicit: bool,
+}
+
+impl<'a> Default for Hdf5Settings<'a> {
+    fn default() -> Self {
+        Self {
+            collective: true,
+            chunks: None,
+            hints: &[],
+            explicit: false,
+        }
+    }
+}
 
 fn named_link<C: CommunicatorCollectives>(comm: &C, name: &str) -> Result<CString, NamedIoError> {
     let valid = !name.is_empty() && name.len() <= MAX_NAME && !name.as_bytes().contains(&0);
@@ -136,6 +157,30 @@ where
         false,
         None,
         OP_WRITE_HDF5,
+        Hdf5Settings::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_hdf5_inner_options<P, T, const N: usize, const M: usize>(
+    path: P,
+    view: PencilArrayView<'_, T, N, M>,
+    settings: Hdf5Settings<'_>,
+) -> Result<(), IoError>
+where
+    P: AsRef<Path>,
+    T: IoElement,
+{
+    write_hdf5_inner(
+        path,
+        view,
+        false,
+        cstr(GROUP_NAME),
+        cstr(DATASET_NAME),
+        false,
+        None,
+        OP_OPTIONS_WRITE_HDF5,
+        settings,
     )
 }
 
@@ -149,6 +194,7 @@ fn write_hdf5_inner<P, T, const N: usize, const M: usize>(
     update: bool,
     original_name: Option<&[u8]>,
     operation: u64,
+    settings: Hdf5Settings<'_>,
 ) -> Result<(), IoError>
 where
     P: AsRef<Path>,
@@ -181,9 +227,13 @@ where
     }
     let mut packed = packed_result.expect("HDF5 preparation agreement established");
     let layout = layout_result.expect("HDF5 preparation agreement established");
+    if settings.explicit {
+        crate::options::agree_decomposition(view.pencil())?;
+    }
+    validate_options(comm, settings, layout.global.len(), T::WIDTH)?;
 
     let duplicate = duplicate_comm(comm)?;
-    let fapl = match prepare_hdf5_fapl(comm, duplicate.raw) {
+    let fapl = match prepare_hdf5_fapl(comm, duplicate.raw, settings.hints) {
         Ok(fapl) => fapl,
         Err(error) => return Err(cleanup_comm_only(comm, duplicate, error)),
     };
@@ -220,7 +270,10 @@ where
 
     let (dataspace, error) = local_handle_phase(
         comm,
-        native::dataspace_simple(&layout.global),
+        match settings.chunks {
+            Some(chunks) => native::dataspace_chunked(&layout.global, chunks),
+            None => native::dataspace_simple(&layout.global),
+        },
         "HDF5 dataspace create",
     );
     resources.dataspace = dataspace;
@@ -229,6 +282,31 @@ where
     }
     let dataspace = resources.dataspace.expect("dataspace creation agreement");
 
+    if let Some(chunks) = settings.chunks {
+        let (dcpl, error) = local_handle_phase(
+            comm,
+            native::dcpl_create(),
+            "HDF5 dataset-create property list",
+        );
+        resources.dcpl = dcpl;
+        if let Some(error) = error {
+            return Err(cleanup_ready(comm, duplicate, opened, resources, error));
+        }
+        let mut native_chunks = [0 as hsize_t; crate::MAX_PROTOCOL_RANK];
+        for (dst, &x) in native_chunks.iter_mut().zip(chunks) {
+            *dst = x as hsize_t;
+        }
+        if let Err(error) = phase_code(
+            comm,
+            native::dcpl_set_chunk(
+                resources.dcpl.expect("dcpl agreement"),
+                &native_chunks[..chunks.len()],
+            ),
+            "HDF5 chunk layout",
+        ) {
+            return Err(cleanup_ready(comm, duplicate, opened, resources, error));
+        }
+    }
     let dataset = match collective_handle_phase(
         comm,
         native::dataset_create(
@@ -236,6 +314,7 @@ where
             dataset_name,
             datatype,
             dataspace,
+            resources.dcpl.unwrap_or(0),
         ),
         "HDF5 dataset create",
     ) {
@@ -332,7 +411,7 @@ where
     }
     let (xfer, error) = local_handle_phase(
         comm,
-        native::xfer_create_collective(duplicate.raw),
+        native::xfer_create(duplicate.raw, settings.collective),
         "HDF5 collective transfer plist",
     );
     resources.xfer = xfer;
@@ -424,6 +503,7 @@ where
         false,
         None,
         OP_WRITE_HDF5,
+        Hdf5Settings::default(),
     )
 }
 
@@ -440,6 +520,54 @@ where
     T: IoElement,
 {
     write_named(path.as_ref(), name.as_ref(), view, false)
+}
+
+/// Creates a named HDF5 dataset using explicit native HDF5 controls.
+pub fn write_hdf5_named_with_options<P, S, T, const N: usize, const M: usize>(
+    path: P,
+    name: S,
+    view: PencilArrayView<'_, T, N, M>,
+    options: &crate::hdf5_options::Hdf5WriteOptions,
+) -> Result<(), NamedIoError>
+where
+    P: AsRef<Path>,
+    S: AsRef<str>,
+    T: IoElement,
+{
+    let comm = view.pencil().topology().communicator();
+    descriptor_agreement(
+        comm,
+        path.as_ref(),
+        71,
+        view.pencil().global_shape(),
+        view.extra_shape().dimensions(),
+        view.pencil().topology().process_grid(),
+        view.pencil().permutation().axes(),
+        T::CODE,
+        T::WIDTH,
+    )
+    .map_err(NamedIoError::Io)?;
+    crate::options::agree_decomposition(view.pencil()).map_err(NamedIoError::Io)?;
+    validate_options(
+        comm,
+        options.settings(),
+        N + view.extra_shape().dimensions().len(),
+        T::WIDTH,
+    )
+    .map_err(NamedIoError::Io)?;
+    let link = named_link(comm, name.as_ref())?;
+    write_hdf5_inner(
+        path,
+        view,
+        false,
+        cstr(NAMED_GROUP),
+        &link,
+        false,
+        Some(name.as_ref().as_bytes()),
+        71,
+        options.settings(),
+    )
+    .map_err(NamedIoError::Io)
 }
 
 pub(crate) fn write_named<T: IoElement, const N: usize, const M: usize>(
@@ -472,6 +600,7 @@ pub(crate) fn write_named<T: IoElement, const N: usize, const M: usize>(
         false,
         Some(name.as_bytes()),
         OP_WRITE_HDF5_NAMED,
+        Hdf5Settings::default(),
     )
     .map_err(NamedIoError::Io)
 }
@@ -506,7 +635,7 @@ where
     let link = named_link(comm, name.as_ref())?;
     let pc = path_cstring(path.as_ref(), comm).map_err(NamedIoError::Io)?;
     let dup = duplicate_comm(comm).map_err(NamedIoError::Io)?;
-    let fapl = match prepare_hdf5_fapl(comm, dup.raw) {
+    let fapl = match prepare_hdf5_fapl(comm, dup.raw, &[]) {
         Ok(fapl) => fapl,
         Err(error) => return Err(NamedIoError::Io(cleanup_comm_only(comm, dup, error))),
     };
@@ -566,6 +695,108 @@ where
         true,
         Some(name.as_ref().as_bytes()),
         OP_APPEND_HDF5_NAMED,
+        Hdf5Settings::default(),
+    )
+    .map_err(NamedIoError::Io)
+}
+
+/// Appends a named HDF5 dataset using explicit native HDF5 controls.
+pub fn append_hdf5_named_with_options<P, S, T, const N: usize, const M: usize>(
+    path: P,
+    name: S,
+    view: PencilArrayView<'_, T, N, M>,
+    options: &crate::hdf5_options::Hdf5WriteOptions,
+) -> Result<(), NamedIoError>
+where
+    P: AsRef<Path>,
+    S: AsRef<str>,
+    T: IoElement,
+{
+    let comm = view.pencil().topology().communicator();
+    descriptor_agreement(
+        comm,
+        path.as_ref(),
+        72,
+        view.pencil().global_shape(),
+        view.extra_shape().dimensions(),
+        view.pencil().topology().process_grid(),
+        view.pencil().permutation().axes(),
+        T::CODE,
+        T::WIDTH,
+    )
+    .map_err(NamedIoError::Io)?;
+    crate::options::agree_decomposition(view.pencil()).map_err(NamedIoError::Io)?;
+    validate_options(
+        comm,
+        options.settings(),
+        N + view.extra_shape().dimensions().len(),
+        T::WIDTH,
+    )
+    .map_err(NamedIoError::Io)?;
+    let link = named_link(comm, name.as_ref())?;
+    let pc = path_cstring(path.as_ref(), comm).map_err(NamedIoError::Io)?;
+    let dup = duplicate_comm(comm).map_err(NamedIoError::Io)?;
+    let fapl = match prepare_hdf5_fapl(comm, dup.raw, options.settings().hints) {
+        Ok(fapl) => fapl,
+        Err(error) => return Err(NamedIoError::Io(cleanup_comm_only(comm, dup, error))),
+    };
+    let file = match open_hdf5_mode(comm, fapl, &pc, false, true) {
+        Ok(file) => file,
+        Err(error) => return Err(NamedIoError::Io(cleanup_comm_only(comm, dup, error))),
+    };
+    let group = match collective_handle_phase(
+        comm,
+        native::group_open(file, cstr(NAMED_GROUP)),
+        "HDF5 named group open",
+    ) {
+        Ok(group) => group,
+        Err(error) => {
+            return Err(NamedIoError::Io(cleanup_ready(
+                comm,
+                dup,
+                file,
+                Hdf5Resources::default(),
+                error,
+            )));
+        }
+    };
+    let exists_result = native::link_exists(group, &link);
+    let query_agreement = agree_phase(comm, exists_result.is_ok(), "HDF5 named link query");
+    let cleanup = finish_hdf5(
+        comm,
+        dup,
+        file,
+        Hdf5Resources {
+            group: Some(group),
+            ..Default::default()
+        },
+    );
+    let exists = match query_agreement {
+        Ok(()) => {
+            exists_result.map_err(|c| NamedIoError::Io(hdf5_error("HDF5 named link query", c)))?
+        }
+        Err(error) => return Err(NamedIoError::Io(error)),
+    };
+    if let Some(error) = cleanup {
+        return Err(NamedIoError::Io(error));
+    }
+    let (all_exist, mixed) = collective_state(comm, exists);
+    if mixed {
+        return Err(IoError::CollectiveDescriptorMismatch.into());
+    }
+    if all_exist {
+        return Err(NamedIoError::DuplicateName);
+    }
+    write_hdf5_inner(
+        path,
+        view,
+        false,
+        cstr(NAMED_GROUP),
+        &link,
+        true,
+        Some(name.as_ref().as_bytes()),
+        72,
+        options.settings(),
     )
     .map_err(NamedIoError::Io)
 }
@@ -612,6 +843,59 @@ pub(crate) fn read_named<T: IoElement, const N: usize, const M: usize>(
         &link,
         Some(name.as_bytes()),
         OP_READ_HDF5_NAMED,
+        Hdf5Settings::default(),
+    )
+    .map_err(|error| match error {
+        IoError::MetadataMismatch {
+            field: "named dataset missing",
+        } => NamedIoError::NotFound,
+        other => NamedIoError::Io(other),
+    })
+}
+
+/// Reads a named HDF5 dataset using explicit native HDF5 controls.
+pub fn read_hdf5_named_with_options<P, S, T, const N: usize, const M: usize>(
+    path: P,
+    name: S,
+    view: PencilArrayViewMut<'_, T, N, M>,
+    options: &crate::hdf5_options::Hdf5ReadOptions,
+) -> Result<(), NamedIoError>
+where
+    P: AsRef<Path>,
+    S: AsRef<str>,
+    T: IoElement,
+{
+    let comm = view.pencil().topology().communicator();
+    descriptor_agreement(
+        comm,
+        path.as_ref(),
+        73,
+        view.pencil().global_shape(),
+        view.extra_shape().dimensions(),
+        view.pencil().topology().process_grid(),
+        view.pencil().permutation().axes(),
+        T::CODE,
+        T::WIDTH,
+    )
+    .map_err(NamedIoError::Io)?;
+    crate::options::agree_decomposition(view.pencil()).map_err(NamedIoError::Io)?;
+    validate_options(
+        comm,
+        options.settings(),
+        N + view.extra_shape().dimensions().len(),
+        T::WIDTH,
+    )
+    .map_err(NamedIoError::Io)?;
+    let link = named_link(comm, name.as_ref())?;
+    read_hdf5_inner(
+        path,
+        view,
+        false,
+        cstr(NAMED_GROUP),
+        &link,
+        Some(name.as_ref().as_bytes()),
+        73,
+        options.settings(),
     )
     .map_err(|error| match error {
         IoError::MetadataMismatch {
@@ -638,9 +922,32 @@ where
         cstr(DATASET_NAME),
         None,
         OP_READ_HDF5,
+        Hdf5Settings::default(),
     )
 }
 
+pub(crate) fn read_hdf5_inner_options<P, T, const N: usize, const M: usize>(
+    path: P,
+    view: PencilArrayViewMut<'_, T, N, M>,
+    settings: Hdf5Settings<'_>,
+) -> Result<(), IoError>
+where
+    P: AsRef<Path>,
+    T: IoElement,
+{
+    read_hdf5_inner(
+        path,
+        view,
+        false,
+        cstr(GROUP_NAME),
+        cstr(DATASET_NAME),
+        None,
+        OP_OPTIONS_READ_HDF5,
+        settings,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn read_hdf5_inner<P, T, const N: usize, const M: usize>(
     path: P,
     mut view: PencilArrayViewMut<'_, T, N, M>,
@@ -649,6 +956,7 @@ fn read_hdf5_inner<P, T, const N: usize, const M: usize>(
     dataset_name: &CStr,
     expected_name: Option<&[u8]>,
     operation: u64,
+    settings: Hdf5Settings<'_>,
 ) -> Result<(), IoError>
 where
     P: AsRef<Path>,
@@ -694,9 +1002,13 @@ where
         staging_result.expect("HDF5 preparation agreement established"),
         0,
     );
+    if settings.explicit {
+        crate::options::agree_decomposition(view.pencil())?;
+    }
+    validate_options(comm, settings, layout.global.len(), T::WIDTH)?;
 
     let duplicate = duplicate_comm(comm)?;
-    let fapl = match prepare_hdf5_fapl(comm, duplicate.raw) {
+    let fapl = match prepare_hdf5_fapl(comm, duplicate.raw, settings.hints) {
         Ok(fapl) => fapl,
         Err(error) => return Err(cleanup_comm_only(comm, duplicate, error)),
     };
@@ -968,7 +1280,7 @@ where
 
     let (xfer, error) = local_handle_phase(
         comm,
-        native::xfer_create_collective(duplicate.raw),
+        native::xfer_create(duplicate.raw, settings.collective),
         "HDF5 collective transfer plist",
     );
     resources.xfer = xfer;
@@ -1047,6 +1359,7 @@ where
         cstr(DATASET_NAME),
         None,
         OP_READ_HDF5,
+        Hdf5Settings::default(),
     )
 }
 
@@ -1059,11 +1372,58 @@ struct Hdf5Resources {
     file_space: Option<native::Hid>,
     mem_space: Option<native::Hid>,
     xfer: Option<native::Hid>,
+    dcpl: Option<native::Hid>,
+}
+
+fn validate_options(
+    comm: &mpi::topology::CartesianCommunicator,
+    settings: Hdf5Settings<'_>,
+    rank: usize,
+    width: usize,
+) -> Result<(), IoError> {
+    // Legacy calls retain their original collective sequence and native defaults.
+    if !settings.explicit {
+        return Ok(());
+    }
+    let mut extra = [0u64; crate::MAX_PROTOCOL_RANK + 2];
+    let valid = if let Some(chunks) = settings.chunks {
+        let bytes = chunks
+            .iter()
+            .try_fold(width as u64, |n, &x| n.checked_mul(x as u64));
+        chunks.len() == rank
+            && chunks.len() <= hdf5_metno_sys::h5s::H5S_MAX_RANK as usize
+            && chunks.iter().all(|&x| x > 0 && x <= u32::MAX as usize)
+            && bytes.is_some_and(|n| n < (1u64 << 32))
+    } else {
+        true
+    };
+    agree_phase(comm, valid, "HDF5 chunk validation")?;
+    let len = if let Some(chunks) = settings.chunks {
+        extra[0] = 1;
+        extra[1] = chunks.len() as u64;
+        for (dst, &x) in extra[2..].iter_mut().zip(chunks) {
+            *dst = x as u64;
+        }
+        chunks.len() + 2
+    } else {
+        2
+    };
+    crate::options::agree_controls(
+        comm,
+        if settings.collective {
+            crate::MpiIoMode::Collective
+        } else {
+            crate::MpiIoMode::Independent
+        },
+        settings.hints,
+        &extra[..len],
+    )
 }
 
 fn prepare_hdf5_fapl(
     comm: &mpi::topology::CartesianCommunicator,
     duplicate: ffi::MPI_Comm,
+    hints: &[(String, String)],
 ) -> Result<native::Hid, IoError> {
     let (fapl, error) = local_handle_phase(
         comm,
@@ -1074,7 +1434,20 @@ fn prepare_hdf5_fapl(
         return Err(cleanup_fapl(comm, fapl, error));
     }
     let fapl = fapl.expect("HDF5 file-access property-list creation agreement");
-    let set_code = native::fapl_set_mpio(fapl, duplicate);
+    let info = if hints.is_empty() {
+        None
+    } else {
+        match crate::options::InfoGuard::from_hints(comm, hints) {
+            Ok(info) => Some(info),
+            Err(error) => return Err(cleanup_fapl(comm, Some(fapl), error)),
+        }
+    };
+    let set_code = native::fapl_set_mpio(
+        fapl,
+        duplicate,
+        info.as_ref().map_or_else(ffi::info_null, |i| i.raw),
+    );
+    drop(info); // H5Pset_fapl_mpio retains its own copy.
     if let Err(agreement) = agree_phase(
         comm,
         set_code >= 0,
@@ -1908,6 +2281,7 @@ fn finish_hdf5(
         };
     }
     close!(&mut resources.xfer, native::plist_close, "H5Pclose");
+    close!(&mut resources.dcpl, native::plist_close, "H5Pclose");
     close!(
         &mut resources.mem_space,
         native::dataspace_close,

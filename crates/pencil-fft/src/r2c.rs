@@ -253,6 +253,9 @@ pub struct LocalR2cPlan<R: FftReal> {
     scratch_len: usize,
     forward: Arc<dyn RealToComplex<R>>,
     inverse: Arc<dyn ComplexToReal<R>>,
+    backend: super::BackendKind,
+    #[cfg(feature = "fftw")]
+    backend_options: Option<super::PlanOptions>,
 }
 
 impl<R: FftReal> fmt::Debug for LocalR2cPlan<R> {
@@ -279,15 +282,77 @@ impl<R: FftReal> LocalR2cPlan<R> {
         let mut planner = RealFftPlanner::<R>::new();
         let forward = planner.plan_fft_forward(real_len);
         let inverse = planner.plan_fft_inverse(real_len);
-        let scratch_len = forward.get_scratch_len().max(inverse.get_scratch_len());
+        Self::from_plans(
+            real_len,
+            complex_len,
+            forward,
+            inverse,
+            super::BackendKind::RustFft,
+            #[cfg(feature = "fftw")]
+            None,
+        )
+    }
 
+    fn from_plans(
+        real_len: usize,
+        complex_len: usize,
+        forward: Arc<dyn RealToComplex<R>>,
+        inverse: Arc<dyn ComplexToReal<R>>,
+        backend: super::BackendKind,
+        #[cfg(feature = "fftw")] backend_options: Option<super::PlanOptions>,
+    ) -> Result<Self, LocalR2cError> {
+        let scratch_len = forward.get_scratch_len().max(inverse.get_scratch_len());
         Ok(Self {
             real_len,
             complex_len,
             scratch_len,
             forward,
             inverse,
+            backend,
+            #[cfg(feature = "fftw")]
+            backend_options,
         })
+    }
+
+    /// Builds a plan using the runtime-loaded FFTW backend.
+    #[cfg(feature = "fftw")]
+    #[allow(private_bounds)]
+    pub fn new_fftw(
+        real_len: usize,
+        options: super::PlanOptions,
+    ) -> Result<Self, super::BackendInitError<LocalR2cError>>
+    where
+        R: super::backend::FftwReal,
+    {
+        let complex_len =
+            validate_lengths::<R>(real_len).map_err(super::BackendInitError::Local)?;
+        #[cfg(all(test, feature = "distributed"))]
+        crate::distributed::fftw_tests::before_factory()
+            .map_err(super::BackendInitError::Native)?;
+        let forward =
+            pencil_fftw::plan_r2c(real_len, options).map_err(super::BackendInitError::Native)?;
+        let inverse =
+            pencil_fftw::plan_c2r(real_len, options).map_err(super::BackendInitError::Native)?;
+        Self::from_plans(
+            real_len,
+            complex_len,
+            forward,
+            inverse,
+            super::BackendKind::Fftw,
+            Some(options),
+        )
+        .map_err(super::BackendInitError::Local)
+    }
+
+    /// Returns the selected backend.
+    pub fn backend_kind(&self) -> super::BackendKind {
+        self.backend
+    }
+
+    /// Returns the FFTW options, when this plan uses FFTW.
+    #[cfg(feature = "fftw")]
+    pub fn backend_options(&self) -> Option<super::PlanOptions> {
+        self.backend_options
     }
 
     /// Returns the number of real values in each input or output line.

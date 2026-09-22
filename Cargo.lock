@@ -487,6 +487,18 @@ dependencies = [
  "mpi",
  "num-complex",
  "pencil-array",
+ "pencil-fftw",
+ "realfft",
+ "rustfft",
+ "thiserror",
+]
+
+[[package]]
+name = "pencil-fftw"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "num-complex",
  "realfft",
  "rustfft",
  "thiserror",

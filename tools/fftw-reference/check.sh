@@ -8,6 +8,17 @@ GENERATOR="$PROJECT/generate.jl"
 JULIA=${JULIA:-julia}
 MPIEXEC=${MPIEXEC:-mpiexec}
 
+# Validate selectors before invoking Julia, Cargo, or the MPI launcher.
+case "${PENCIL_FFT_BACKEND-rustfft}" in
+    rustfft) features=distributed ;;
+    fftw) features=distributed,fftw ;;
+    *) printf 'invalid PENCIL_FFT_BACKEND: %s\n' "$PENCIL_FFT_BACKEND" >&2; exit 1 ;;
+esac
+case "${PENCIL_FFT_DIRECTION_ORDER-native-first}" in
+    native-first|directions-first) ;;
+    *) printf 'invalid PENCIL_FFT_DIRECTION_ORDER: %s\n' "$PENCIL_FFT_DIRECTION_ORDER" >&2; exit 1 ;;
+esac
+
 JULIA_BIN=$(command -v "$JULIA" 2>/dev/null) || {
     printf 'missing Julia executable: %s\n' "$JULIA" >&2
     exit 1
@@ -110,7 +121,7 @@ done
 CARGO_TEST_ARGS=(
     --manifest-path "$ROOT/Cargo.toml"
     --package pencil-fft
-    --features distributed
+    --features "$features"
     --test fftw_reference
     --locked
 )
@@ -193,10 +204,12 @@ run_reference() {
     local ranks=$1
     local fixture_directory=$2
     local log_file=$3
-    if ! timeout --kill-after=5s 120s "$MPIEXEC" "${mpi_flags[@]}" -n "$ranks" \
+    reference_status=0
+    timeout --kill-after=5s 120s "$MPIEXEC" "${mpi_flags[@]}" -n "$ranks" \
         env -u PENCIL_FFTW_DIRECTION_FIXTURES PENCIL_FFTW_FIXTURES="$fixture_directory" \
         cargo test "${CARGO_TEST_ARGS[@]}" -- \
-            --ignored fftw_reference_matrix --nocapture --test-threads=1 >"$log_file" 2>&1; then
+            --ignored fftw_reference_matrix --nocapture --test-threads=1 >"$log_file" 2>&1 || reference_status=$?
+    if ((reference_status != 0)); then
         cat "$log_file" >&2
         return 1
     fi
@@ -466,7 +479,10 @@ corrupt(ARGS[15], ARGS[16])
 check_corruption_log() {
     local log_file=$1
     local context=${2:-}
-    if ! grep -Fq 'PENCIL_FFTW_REFERENCE_MATRIX_STARTED' "$log_file" \
+    if [[ $reference_status != 101 && $reference_status != 1 ]] \
+        || ! grep -Eq '^test result: FAILED\. 0 passed; 1 failed;' "$log_file" \
+        || ! grep -Fxq '    fftw_reference_matrix' "$log_file" \
+        || ! grep -Fq 'PENCIL_FFTW_REFERENCE_MATRIX_STARTED' "$log_file" \
         || ! grep -Fq 'actual=' "$log_file" \
         || ! grep -Fq 'expected=' "$log_file" \
         || ! grep -Fq 'bound=' "$log_file"; then

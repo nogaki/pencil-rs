@@ -8,6 +8,7 @@ license.workspace = true
 [features]
 default = []
 distributed = ["dep:mpi", "dep:pencil-array", "mpi/complex"]
+fftw = ["dep:pencil-fftw"]
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["extern_crate_alloc"] }
@@ -17,6 +18,7 @@ rustfft = "~6.4.1"
 thiserror.workspace = true
 mpi = { workspace = true, optional = true }
 pencil-array = { path = "../pencil-array", optional = true }
+pencil-fftw = { path = "../pencil-fftw", optional = true }
 
 [[test]]
 name = "distributed_c2c"
@@ -37,3 +39,17 @@ required-features = ["distributed"]
 name = "fftw_reference"
 path = "tests/fftw_reference.rs"
 required-features = ["distributed"]
+
+[[test]]
+name = "fftw_local"
+path = "tests/fftw_local.rs"
+required-features = ["fftw"]
+
+[[test]]
+name = "legacy_local_error_compat"
+path = "tests/legacy_local_error_compat.rs"
+
+[[test]]
+name = "fftw_distributed"
+path = "tests/fftw_distributed.rs"
+required-features = ["distributed", "fftw"]

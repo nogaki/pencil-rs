@@ -43,6 +43,20 @@
 //! noncollective. Allocation failures must be coordinated by callers before
 //! the next collective call. The default feature set remains MPI-free.
 //!
+//! # Optional native FFTW
+//!
+//! The `fftw` feature enables explicit `new_fftw` local constructors and
+//! distributed `with_fftw` rebuilds. Existing constructors always use RustFFT,
+//! including when both features are enabled. Native initialization errors are
+//! reported by [`BackendInitError`]; there is no fallback to RustFFT.
+//! DCT/DST and Hartley plans retain the existing embedding kernels, using
+//! native complex FFTs rather than native FFTW DCT/DST plans.
+//!
+//! The Rust wrapper is MIT-licensed. FFTW is a separately loaded native library
+//! licensed under the GPL or a commercial license; enabling or distributing
+//! this integration does not remove those native licensing obligations. No
+//! native FFTW source or binaries are bundled here.
+//!
 //! # Example
 //!
 //! ```
@@ -128,6 +142,14 @@ use rustfft::{Fft, FftPlanner};
 pub use num_complex::Complex;
 
 mod private {
+    #[cfg(feature = "fftw")]
+    pub trait FftwBound: pencil_fftw::Real {}
+    #[cfg(feature = "fftw")]
+    impl<T: pencil_fftw::Real> FftwBound for T {}
+    #[cfg(not(feature = "fftw"))]
+    pub trait FftwBound {}
+    #[cfg(not(feature = "fftw"))]
+    impl<T> FftwBound for T {}
     use super::Complex;
 
     #[cfg(feature = "distributed")]
@@ -195,18 +217,23 @@ mod private {
 ///
 /// This trait is sealed and is implemented only for `f32` and `f64`.
 pub trait FftReal:
-    private::Sealed + private::DistributedReal + Copy + Send + Sync + 'static
+    private::Sealed + private::DistributedReal + private::FftwBound + Copy + Send + Sync + 'static
 {
 }
 
 impl FftReal for f32 {}
 impl FftReal for f64 {}
 
+mod backend;
 mod dht;
 mod r2c;
 mod r2r;
 
+pub use backend::BackendInitError;
+pub use backend::BackendKind;
 pub use dht::LocalDhtPlan;
+#[cfg(feature = "fftw")]
+pub use pencil_fftw::{FftwError, PlanOptions, PlanningRigor, runtime_version};
 pub use r2c::{
     LocalR2cError, LocalR2cInPlaceArray, LocalR2cInPlaceWorkspace, LocalR2cPlan, R2cState,
 };
@@ -227,8 +254,8 @@ pub use distributed::mixed::{
 #[cfg(feature = "distributed")]
 pub use distributed::{
     AxisSelection, AxisSelectionError, C2cInPlaceArray, C2cInPlaceWorkspace,
-    C2cOutOfPlaceWorkspace, C2cPlan, C2cState, DhtPlan, DistributedLayout, FftError,
-    FftOverlapError, FourierDirection, FourierDirections, R2cError, R2cInPlaceArray,
+    C2cOutOfPlaceWorkspace, C2cPlan, C2cState, CollectionError, DhtPlan, DistributedLayout,
+    FftError, FftOverlapError, FourierDirection, FourierDirections, R2cError, R2cInPlaceArray,
     R2cInPlaceWorkspace, R2cPlan, R2cWorkspace, R2rError, R2rInPlaceArray, R2rInPlaceWorkspace,
     R2rPlan, R2rState, R2rWorkspace, StageGeometry, StageTiming, TransformTiming, TransposeMethod,
 };
@@ -270,6 +297,9 @@ pub struct LocalC2cPlan<R: FftReal> {
     inverse: Arc<dyn Fft<R>>,
     /// Whether the public forward operation uses the positive exponent.
     positive_forward: bool,
+    backend: BackendKind,
+    #[cfg(feature = "fftw")]
+    backend_options: Option<PlanOptions>,
 }
 
 impl<R: FftReal> fmt::Debug for LocalC2cPlan<R> {
@@ -293,6 +323,31 @@ impl<R: FftReal> LocalC2cPlan<R> {
         Self::new_with_sign(line_len, false)
     }
 
+    fn from_plans(
+        line_len: usize,
+        positive_forward: bool,
+        forward: Arc<dyn Fft<R>>,
+        inverse: Arc<dyn Fft<R>>,
+        backend: BackendKind,
+        #[cfg(feature = "fftw")] backend_options: Option<PlanOptions>,
+    ) -> Result<Self, LocalC2cError> {
+        let scratch_len = forward
+            .get_immutable_scratch_len()
+            .max(forward.get_inplace_scratch_len())
+            .max(inverse.get_immutable_scratch_len())
+            .max(inverse.get_inplace_scratch_len());
+        Ok(Self {
+            line_len,
+            scratch_len,
+            forward,
+            inverse,
+            positive_forward,
+            backend,
+            #[cfg(feature = "fftw")]
+            backend_options,
+        })
+    }
+
     pub(crate) fn new_with_sign(
         line_len: usize,
         positive_forward: bool,
@@ -302,19 +357,65 @@ impl<R: FftReal> LocalC2cPlan<R> {
         let mut planner = FftPlanner::<R>::new();
         let forward = planner.plan_fft_forward(line_len);
         let inverse = planner.plan_fft_inverse(line_len);
-        let scratch_len = forward
-            .get_immutable_scratch_len()
-            .max(forward.get_inplace_scratch_len())
-            .max(inverse.get_immutable_scratch_len())
-            .max(inverse.get_inplace_scratch_len());
-
-        Ok(Self {
+        Self::from_plans(
             line_len,
-            scratch_len,
+            positive_forward,
             forward,
             inverse,
+            BackendKind::RustFft,
+            #[cfg(feature = "fftw")]
+            None,
+        )
+    }
+
+    /// Builds a plan using the runtime-loaded FFTW backend.
+    #[cfg(feature = "fftw")]
+    #[allow(private_bounds)]
+    pub fn new_fftw(
+        line_len: usize,
+        options: PlanOptions,
+    ) -> Result<Self, BackendInitError<LocalC2cError>>
+    where
+        R: backend::FftwReal,
+    {
+        Self::new_fftw_with_sign(line_len, false, options)
+    }
+
+    #[cfg(feature = "fftw")]
+    #[allow(private_bounds)]
+    pub(crate) fn new_fftw_with_sign(
+        line_len: usize,
+        positive_forward: bool,
+        options: PlanOptions,
+    ) -> Result<Self, BackendInitError<LocalC2cError>>
+    where
+        R: backend::FftwReal,
+    {
+        validate_line_len::<R>(line_len).map_err(BackendInitError::Local)?;
+        let forward = backend::c2c(line_len, rustfft::FftDirection::Forward, options)
+            .map_err(BackendInitError::Native)?;
+        let inverse = backend::c2c(line_len, rustfft::FftDirection::Inverse, options)
+            .map_err(BackendInitError::Native)?;
+        Self::from_plans(
+            line_len,
             positive_forward,
-        })
+            forward,
+            inverse,
+            BackendKind::Fftw,
+            Some(options),
+        )
+        .map_err(BackendInitError::Local)
+    }
+
+    /// Returns the selected backend.
+    pub fn backend_kind(&self) -> BackendKind {
+        self.backend
+    }
+
+    /// Returns the FFTW options, when this plan uses FFTW.
+    #[cfg(feature = "fftw")]
+    pub fn backend_options(&self) -> Option<PlanOptions> {
+        self.backend_options
     }
 
     /// Returns the number of complex values in each transformed line.

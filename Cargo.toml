@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pencil-array", "crates/pencil-fft", "crates/pencil-io"]
+members = ["crates/pencil-array", "crates/pencil-fft", "crates/pencil-io", "crates/pencil-fftw"]
 resolver = "3"
 
 [workspace.package]

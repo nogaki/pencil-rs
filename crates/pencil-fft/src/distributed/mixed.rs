@@ -24,6 +24,9 @@ use pencil_array::{
 };
 use thiserror::Error;
 
+use crate::BackendInitError;
+#[cfg(feature = "fftw")]
+use crate::PlanOptions;
 use crate::{
     Complex, FftReal, LocalC2cError, LocalC2cPlan, LocalR2cError, LocalR2cPlan, LocalR2rError,
     LocalR2rPlan, R2cState, R2rScalar,
@@ -36,25 +39,28 @@ impl From<FftError> for FftOverlapError<MixedError> {
 }
 
 use super::{
-    C2cStageTransition, C2cState, Direction, DistributedLayout, FftError, FftOverlapError,
-    FourierDirection, FourierDirections, INVALID_WORD, LocalTransform,
+    BackendChoice, C2cStageTransition, C2cState, Direction, DistributedLayout, FftError,
+    FftOverlapError, FourierDirection, FourierDirections, INVALID_WORD, LocalTransform,
     OPERATION_MIXED_C2C_BACKWARD, OPERATION_MIXED_C2C_BACKWARD_IN_PLACE,
     OPERATION_MIXED_C2C_FORWARD, OPERATION_MIXED_C2C_FORWARD_IN_PLACE, OPERATION_MIXED_C2C_INVERSE,
-    OPERATION_MIXED_C2C_INVERSE_IN_PLACE, OPERATION_MIXED_C2C_PLAN, OPERATION_MIXED_R2C_BACKWARD,
+    OPERATION_MIXED_C2C_INVERSE_IN_PLACE, OPERATION_MIXED_R2C_BACKWARD,
     OPERATION_MIXED_R2C_BACKWARD_IN_PLACE, OPERATION_MIXED_R2C_FORWARD,
     OPERATION_MIXED_R2C_FORWARD_IN_PLACE, OPERATION_MIXED_R2C_INVERSE,
-    OPERATION_MIXED_R2C_INVERSE_IN_PLACE, OPERATION_MIXED_R2C_PLAN, RouteCandidate,
-    StagePreparation, TransformStage, TransformTiming, TransposeMethod, VALUE_KIND_C2C,
-    VALUE_KIND_R2C, agree_execution_descriptor_ref, agree_header, agree_result, build_route,
-    build_transitions, collective_descriptor, collective_valid, initialized_vec,
-    map_array_allocation, memory_stride, strided_line_count, validate_input,
-    validate_workspace_lengths_values, zero_complex,
+    OPERATION_MIXED_R2C_INVERSE_IN_PLACE, RouteCandidate, StagePreparation, TransformStage,
+    TransformTiming, TransposeMethod, VALUE_KIND_C2C, VALUE_KIND_R2C,
+    agree_execution_descriptor_ref, agree_header, agree_result, build_route, build_transitions,
+    collective_descriptor, collective_valid, initialized_vec, map_array_allocation, memory_stride,
+    strided_line_count, validate_input, validate_workspace_lengths_values, zero_complex,
 };
 
 use crate::r2r::AxisR2rKind;
 
 // Kept separate from the homogeneous overlap words: the five-word outer
 // descriptor agreement must reject a mixed/non-mixed call before P2P starts.
+#[cfg(feature = "fftw")]
+const OPERATION_MIXED_C2C_PLAN_NATIVE: u64 = 131;
+#[cfg(feature = "fftw")]
+const OPERATION_MIXED_R2C_PLAN_NATIVE: u64 = 132;
 const OPERATION_MIXED_C2C_FORWARD_OVERLAP: u64 = 85;
 const OPERATION_MIXED_C2C_INVERSE_OVERLAP: u64 = 86;
 const OPERATION_MIXED_C2C_BACKWARD_OVERLAP: u64 = 87;
@@ -114,6 +120,12 @@ pub enum MixedError {
     /// The constrained Fourier boundary was not sufficiently real.
     #[error("distributed mixed inverse spectrum has an invalid constrained boundary plane")]
     InvalidSpectrum,
+}
+
+impl From<FftError> for BackendInitError<MixedError> {
+    fn from(error: FftError) -> Self {
+        Self::Local(MixedError::Fft(error))
+    }
 }
 
 /// Completion state for a [`MixedC2cInPlaceArray`].
@@ -238,6 +250,7 @@ struct MixedC2cCore<R: FftReal, const N: usize, const M: usize> {
     transpose_send_len: usize,
     transpose_receive_len: usize,
     directions: FourierDirections<N>,
+    backend: BackendChoice,
     // Reconfigured plans reject arrays belonging to the prior core; legacy
     // constructors retain their existing layout-compatible array contract.
     strict_array_identity: bool,
@@ -280,6 +293,7 @@ struct MixedR2cCore<R: FftReal, const N: usize, const M: usize> {
     real_transpose_receive_len: usize,
     raw_absolute_threshold: f64,
     directions: FourierDirections<N>,
+    backend: BackendChoice,
     // Reconfigured plans reject arrays belonging to the prior core; legacy
     // constructors retain their existing layout-compatible array contract.
     strict_array_identity: bool,
@@ -527,7 +541,7 @@ where
         &self,
         directions: FourierDirections<N>,
     ) -> Result<Self, MixedError> {
-        let mut plan = Self::construct(
+        let mut plan = Self::construct_with_backend(
             Arc::clone(self.input_pencil().topology()),
             *self.input_pencil().global_shape(),
             self.core.extra_shape.clone(),
@@ -540,7 +554,17 @@ where
             self.core.transforms,
             self.core.layout,
             directions,
-        )?;
+            self.core.backend,
+        )
+        .map_err(|error| match error {
+            BackendInitError::Local(error) => error,
+            #[cfg(feature = "fftw")]
+            BackendInitError::Native(_) | BackendInitError::PeerPreflight => {
+                MixedError::Fft(FftError::PreparationFailed)
+            }
+            #[cfg(not(feature = "fftw"))]
+            BackendInitError::PeerPreflight => MixedError::Fft(FftError::PreparationFailed),
+        })?;
         Arc::get_mut(&mut plan.core)
             .expect("fresh core")
             .strict_array_identity = true;
@@ -641,6 +665,63 @@ where
     /// Returns the configured Fourier signs.
     pub fn fft_directions(&self) -> FourierDirections<N> {
         self.core.directions
+    }
+
+    /// Returns the selected local backend.
+    pub fn backend_kind(&self) -> crate::BackendKind {
+        self.core.backend.kind()
+    }
+
+    pub(super) fn collection_descriptor(&self) -> &[u64] {
+        &self.core.descriptor
+    }
+
+    #[cfg(feature = "fftw")]
+    /// Returns native planning options, or `None` for RustFFT.
+    pub fn options(&self) -> Option<PlanOptions> {
+        match self.core.backend {
+            BackendChoice::Fftw(options) => Some(options),
+            BackendChoice::RustFft => None,
+        }
+    }
+
+    pub(super) fn collection_preflight_forward(
+        &self,
+        source: &PencilArray<Complex<R>, N, M>,
+        destination: &PencilArray<Complex<R>, N, M>,
+        workspace: &MixedC2cWorkspace<R, N, M>,
+    ) -> Result<(), MixedError> {
+        validate_mixed_c2c_oop(
+            &self.core,
+            Direction::Forward,
+            source,
+            destination,
+            workspace,
+        )
+    }
+
+    pub(super) fn collection_preflight_inverse(
+        &self,
+        source: &PencilArray<Complex<R>, N, M>,
+        destination: &PencilArray<Complex<R>, N, M>,
+        workspace: &MixedC2cWorkspace<R, N, M>,
+    ) -> Result<(), MixedError> {
+        validate_mixed_c2c_oop(
+            &self.core,
+            Direction::Inverse,
+            source,
+            destination,
+            workspace,
+        )
+    }
+
+    pub(super) fn collection_preflight_in_place(
+        &self,
+        direction: super::Direction,
+        array: &MixedC2cInPlaceArray<R, N, M>,
+        workspace: &MixedC2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<(), MixedError> {
+        validate_mixed_c2c_ip(&self.core, direction, array, workspace)
     }
 
     /// Allocates a zero-initialized complex input array.
@@ -912,9 +993,97 @@ where
         layout: DistributedLayout,
         directions: FourierDirections<N>,
     ) -> Result<Self, MixedError> {
+        Self::construct_with_backend(
+            topology,
+            global_shape,
+            extra_shape,
+            input,
+            transforms,
+            layout,
+            directions,
+            BackendChoice::RustFft,
+        )
+        .map_err(|error| match error {
+            BackendInitError::Local(error) => error,
+            _ => MixedError::Fft(FftError::PreparationFailed),
+        })
+    }
+
+    #[cfg(feature = "fftw")]
+    #[allow(private_bounds)]
+    /// Builds a mixed plan from a shape using FFTW.
+    pub fn from_shape_with_fftw(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        transforms: [AxisTransform; N],
+        options: PlanOptions,
+    ) -> Result<Self, BackendInitError<MixedError>>
+    where
+        R: crate::backend::FftwReal,
+    {
+        let input = Pencil::new(
+            Arc::clone(&topology),
+            global_shape,
+            std::array::from_fn(|axis| axis),
+        )
+        .map_err(FftError::Pencil);
+        Self::construct_with_backend(
+            topology,
+            global_shape,
+            extra_shape,
+            input,
+            transforms,
+            DistributedLayout::default(),
+            FourierDirections::default(),
+            BackendChoice::Fftw(options),
+        )
+    }
+
+    #[cfg(feature = "fftw")]
+    #[allow(private_bounds)]
+    /// Rebuilds this mixed plan using FFTW.
+    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<MixedError>>
+    where
+        R: crate::backend::FftwReal,
+    {
+        let topology = Arc::clone(self.input_pencil().topology());
+        let shape = *self.input_pencil().global_shape();
+        let input = Pencil::new(
+            Arc::clone(&topology),
+            shape,
+            std::array::from_fn(|axis| axis),
+        )
+        .map_err(FftError::Pencil);
+        let mut plan = Self::construct_with_backend(
+            topology,
+            shape,
+            self.core.extra_shape.clone(),
+            input,
+            self.core.transforms,
+            self.core.layout,
+            self.core.directions,
+            BackendChoice::Fftw(options),
+        )?;
+        Arc::get_mut(&mut plan.core)
+            .expect("fresh core")
+            .strict_array_identity = true;
+        Ok(plan)
+    }
+
+    fn construct_with_backend(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        input: Result<Arc<Pencil<N, M>>, FftError>,
+        transforms: [AxisTransform; N],
+        layout: DistributedLayout,
+        directions: FourierDirections<N>,
+        backend: BackendChoice,
+    ) -> Result<Self, BackendInitError<MixedError>> {
         let communicator = topology.communicator();
         let expected_len =
-            mixed_descriptor_len::<N, M>(&extra_shape).and_then(|length| length.checked_add(N));
+            mixed_descriptor_len::<N, M>(&extra_shape).and_then(|length| length.checked_add(N + 6));
         let descriptor = expected_len.and_then(|_| {
             build_mixed_descriptor::<R, N, M>(
                 &topology,
@@ -928,17 +1097,26 @@ where
                 layout,
             )
             .ok()
-            .map(|mut descriptor| {
+            .and_then(|mut descriptor| {
+                descriptor.try_reserve_exact(N + 6).ok()?;
+                descriptor.extend(backend.descriptor_words::<R>());
                 descriptor.extend(directions.0.iter().map(|direction| match direction {
                     FourierDirection::Forward => 0,
                     FourierDirection::Backward => 1,
                 }));
-                descriptor
+                Some(descriptor)
             })
         });
-        let header = mixed_header::<N, M>(OPERATION_MIXED_C2C_PLAN, N, M, expected_len);
+        let operation = match backend {
+            BackendChoice::RustFft => super::OPERATION_MIXED_C2C_PLAN,
+            #[cfg(feature = "fftw")]
+            BackendChoice::Fftw(_) => OPERATION_MIXED_C2C_PLAN_NATIVE,
+        };
+        let header = mixed_header::<N, M>(operation, N, M, expected_len);
         if !agree_header(communicator, header) {
-            return Err(MixedError::Fft(FftError::CollectiveDescriptorMismatch));
+            return Err(BackendInitError::Local(MixedError::Fft(
+                FftError::CollectiveDescriptorMismatch,
+            )));
         }
         let descriptor = collective_descriptor(communicator, descriptor, expected_len)?;
         agree_result(communicator, validate_c2c_graph(transforms))?;
@@ -951,12 +1129,18 @@ where
             communicator,
             build_route(Ok(input), &topology, global_shape, layout.permute_dims),
         )?;
-        let (stages, embedding_len, fft_scratch_len, strided_line_len) = agree_result(
-            communicator,
-            prepare_mixed_c2c_stages(&route, global_shape, transforms, directions),
-        )?;
+        let prepared =
+            prepare_mixed_c2c_stages(&route, global_shape, transforms, directions, backend);
+        if !collective_valid(communicator, prepared.is_ok()) {
+            return Err(match prepared {
+                Err(error) => error,
+                Ok(_) => BackendInitError::PeerPreflight,
+            });
+        }
+        let (stages, embedding_len, fft_scratch_len, strided_line_len) =
+            prepared.expect("collective backend preflight accepted");
         let registered_pencils = agree_result(communicator, mixed_c2c_stage_pencils(&stages))?;
-        let layout_stages = mixed_layout_stages(&stages);
+        let layout_stages = agree_result(communicator, mixed_layout_stages(&stages))?;
         let stage_prep = StagePreparation {
             stages: layout_stages,
             fft_scratch_len: 0,
@@ -988,7 +1172,8 @@ where
                 transpose_send_len,
                 transpose_receive_len,
                 directions,
-                strict_array_identity: false,
+                backend,
+                strict_array_identity: backend.kind() == crate::BackendKind::Fftw,
             }),
         })
     }
@@ -1437,13 +1622,38 @@ fn map_overwrite<E: Into<MixedError>>(error: OverwriteError<E>) -> MixedError {
 fn mixed_r2r_local<T: R2rScalar>(
     kind: AxisR2rKind,
     length: usize,
-) -> Result<MixedR2rLocal<T>, MixedError> {
-    match kind {
-        AxisR2rKind::Fftw(kind) => Ok(MixedR2rLocal::Transform(
-            LocalR2rPlan::new(length, kind).map_err(MixedError::LocalR2r)?,
+    backend: BackendChoice,
+) -> Result<MixedR2rLocal<T>, BackendInitError<MixedError>> {
+    match (kind, backend) {
+        (AxisR2rKind::Fftw(kind), BackendChoice::RustFft) => Ok(MixedR2rLocal::Transform(
+            LocalR2rPlan::new(length, kind)
+                .map_err(MixedError::LocalR2r)
+                .map_err(BackendInitError::Local)?,
         )),
-        AxisR2rKind::Dht => Ok(MixedR2rLocal::Hartley(
-            crate::LocalDhtPlan::new(length).map_err(MixedError::LocalR2r)?,
+        (AxisR2rKind::Dht, BackendChoice::RustFft) => Ok(MixedR2rLocal::Hartley(
+            crate::LocalDhtPlan::new(length)
+                .map_err(MixedError::LocalR2r)
+                .map_err(BackendInitError::Local)?,
+        )),
+        #[cfg(feature = "fftw")]
+        (AxisR2rKind::Fftw(kind), BackendChoice::Fftw(options)) => Ok(MixedR2rLocal::Transform(
+            LocalR2rPlan::new_fftw(length, kind, options).map_err(|error| match error {
+                BackendInitError::Local(error) => {
+                    BackendInitError::Local(MixedError::LocalR2r(error))
+                }
+                BackendInitError::Native(error) => BackendInitError::Native(error),
+                BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
+            })?,
+        )),
+        #[cfg(feature = "fftw")]
+        (AxisR2rKind::Dht, BackendChoice::Fftw(options)) => Ok(MixedR2rLocal::Hartley(
+            crate::LocalDhtPlan::new_fftw(length, options).map_err(|error| match error {
+                BackendInitError::Local(error) => {
+                    BackendInitError::Local(MixedError::LocalR2r(error))
+                }
+                BackendInitError::Native(error) => BackendInitError::Native(error),
+                BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
+            })?,
         )),
     }
 }
@@ -1532,16 +1742,20 @@ fn validate_exact_pencil_registry<const N: usize, const M: usize>(
 
 fn mixed_layout_stages<R: FftReal, const N: usize, const M: usize>(
     stages: &[MixedC2cStage<R, N, M>],
-) -> Box<[TransformStage<R, N, M>]> {
-    stages
-        .iter()
-        .map(|stage| TransformStage {
-            axis: stage.axis,
-            input: Arc::clone(&stage.input),
-            output: Arc::clone(&stage.output),
-            local: LocalTransform::Identity,
+) -> Result<Box<[TransformStage<R, N, M>]>, MixedError> {
+    let mut result = Vec::new();
+    result.try_reserve_exact(stages.len()).map_err(|_| {
+        MixedError::Fft(FftError::AllocationFailed {
+            required: stages.len(),
         })
-        .collect()
+    })?;
+    result.extend(stages.iter().map(|stage| TransformStage {
+        axis: stage.axis,
+        input: Arc::clone(&stage.input),
+        output: Arc::clone(&stage.output),
+        local: LocalTransform::Identity,
+    }));
+    Ok(result.into_boxed_slice())
 }
 
 #[allow(clippy::type_complexity)]
@@ -1550,9 +1764,12 @@ fn prepare_mixed_c2c_stages<R: FftReal, const N: usize, const M: usize>(
     shape: [usize; N],
     transforms: [AxisTransform; N],
     directions: FourierDirections<N>,
-) -> Result<(Box<[MixedC2cStage<R, N, M>]>, usize, usize, usize), MixedError> {
+    backend: BackendChoice,
+) -> Result<(Box<[MixedC2cStage<R, N, M>]>, usize, usize, usize), BackendInitError<MixedError>> {
     if route.stages.len() != N {
-        return Err(MixedError::Fft(FftError::PreparationFailed));
+        return Err(BackendInitError::Local(MixedError::Fft(
+            FftError::PreparationFailed,
+        )));
     }
     let mut stages = Vec::new();
     stages
@@ -1566,13 +1783,28 @@ fn prepare_mixed_c2c_stages<R: FftReal, const N: usize, const M: usize>(
         validate_stage_pencil(pencil, axis, shape[axis])?;
         let local = match transforms[axis] {
             AxisTransform::None => MixedComplexLocal::Identity,
-            AxisTransform::Fft => MixedComplexLocal::Fft(LocalC2cPlan::new_with_sign(
-                shape[axis],
-                directions.get(axis) == Some(FourierDirection::Backward),
-            )?),
-            AxisTransform::Rfft => return Err(MixedError::InvalidGraph),
+            AxisTransform::Fft => MixedComplexLocal::Fft(match backend {
+                BackendChoice::RustFft => LocalC2cPlan::new_with_sign(
+                    shape[axis],
+                    directions.get(axis) == Some(FourierDirection::Backward),
+                )
+                .map_err(MixedError::from)
+                .map_err(BackendInitError::Local)?,
+                #[cfg(feature = "fftw")]
+                BackendChoice::Fftw(options) => LocalC2cPlan::new_fftw_with_sign(
+                    shape[axis],
+                    directions.get(axis) == Some(FourierDirection::Backward),
+                    options,
+                )
+                .map_err(|error| match error {
+                    BackendInitError::Local(e) => BackendInitError::Local(MixedError::LocalC2c(e)),
+                    BackendInitError::Native(e) => BackendInitError::Native(e),
+                    BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
+                })?,
+            }),
+            AxisTransform::Rfft => return Err(BackendInitError::Local(MixedError::InvalidGraph)),
             AxisTransform::R2r(kind) => {
-                MixedComplexLocal::R2r(mixed_r2r_local::<Complex<R>>(kind, shape[axis])?)
+                MixedComplexLocal::R2r(mixed_r2r_local::<Complex<R>>(kind, shape[axis], backend)?)
             }
         };
         embedding_len = embedding_len.max(local.embedding_len());
@@ -2907,7 +3139,7 @@ where
         &self,
         directions: FourierDirections<N>,
     ) -> Result<Self, MixedError> {
-        let mut plan = Self::construct(
+        let mut plan = Self::construct_with_backend(
             Arc::clone(self.input_pencil().topology()),
             *self.input_pencil().global_shape(),
             self.core.extra_shape.clone(),
@@ -2920,7 +3152,17 @@ where
             self.core.transforms,
             self.core.layout,
             directions,
-        )?;
+            self.core.backend,
+        )
+        .map_err(|error| match error {
+            BackendInitError::Local(error) => error,
+            #[cfg(feature = "fftw")]
+            BackendInitError::Native(_) | BackendInitError::PeerPreflight => {
+                MixedError::Fft(FftError::PreparationFailed)
+            }
+            #[cfg(not(feature = "fftw"))]
+            BackendInitError::PeerPreflight => MixedError::Fft(FftError::PreparationFailed),
+        })?;
         Arc::get_mut(&mut plan.core)
             .expect("fresh core")
             .strict_array_identity = true;
@@ -2970,6 +3212,51 @@ where
     /// Returns the configured Fourier signs.
     pub fn fft_directions(&self) -> FourierDirections<N> {
         self.core.directions
+    }
+
+    /// Returns the selected local backend.
+    pub fn backend_kind(&self) -> crate::BackendKind {
+        self.core.backend.kind()
+    }
+
+    pub(super) fn collection_descriptor(&self) -> &[u64] {
+        &self.core.descriptor
+    }
+
+    #[cfg(feature = "fftw")]
+    /// Returns native planning options, or `None` for RustFFT.
+    pub fn options(&self) -> Option<PlanOptions> {
+        match self.core.backend {
+            BackendChoice::Fftw(options) => Some(options),
+            BackendChoice::RustFft => None,
+        }
+    }
+
+    pub(super) fn collection_preflight_forward(
+        &self,
+        source: &PencilArray<R, N, M>,
+        destination: &PencilArray<Complex<R>, N, M>,
+        workspace: &MixedR2cWorkspace<R, N, M>,
+    ) -> Result<(), MixedError> {
+        validate_mixed_r2c_forward(&self.core, source, destination, workspace)
+    }
+
+    pub(super) fn collection_preflight_inverse(
+        &self,
+        source: &PencilArray<Complex<R>, N, M>,
+        destination: &PencilArray<R, N, M>,
+        workspace: &MixedR2cWorkspace<R, N, M>,
+    ) -> Result<(), MixedError> {
+        validate_mixed_r2c_reverse(&self.core, source, destination, workspace)
+    }
+
+    pub(super) fn collection_preflight_in_place(
+        &self,
+        direction: super::Direction,
+        array: &MixedR2cInPlaceArray<R, N, M>,
+        workspace: &MixedR2cInPlaceWorkspace<R, N, M>,
+    ) -> Result<(), MixedError> {
+        validate_mixed_r2c_ip(&self.core, direction, array, workspace)
     }
 
     /// Allocates a zero-initialized real input array.
@@ -3275,6 +3562,94 @@ where
         layout: DistributedLayout,
         directions: FourierDirections<N>,
     ) -> Result<Self, MixedError> {
+        Self::construct_with_backend(
+            topology,
+            global_shape,
+            extra_shape,
+            input,
+            transforms,
+            layout,
+            directions,
+            BackendChoice::RustFft,
+        )
+        .map_err(|error| match error {
+            BackendInitError::Local(error) => error,
+            _ => MixedError::Fft(FftError::PreparationFailed),
+        })
+    }
+
+    #[cfg(feature = "fftw")]
+    #[allow(private_bounds)]
+    /// Builds a mixed plan from a shape using FFTW.
+    pub fn from_shape_with_fftw(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        transforms: [AxisTransform; N],
+        options: PlanOptions,
+    ) -> Result<Self, BackendInitError<MixedError>>
+    where
+        R: crate::backend::FftwReal,
+    {
+        let input = Pencil::new(
+            Arc::clone(&topology),
+            global_shape,
+            std::array::from_fn(|axis| axis),
+        )
+        .map_err(FftError::Pencil);
+        Self::construct_with_backend(
+            topology,
+            global_shape,
+            extra_shape,
+            input,
+            transforms,
+            DistributedLayout::default(),
+            FourierDirections::default(),
+            BackendChoice::Fftw(options),
+        )
+    }
+
+    #[cfg(feature = "fftw")]
+    #[allow(private_bounds)]
+    /// Rebuilds this mixed plan using FFTW.
+    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<MixedError>>
+    where
+        R: crate::backend::FftwReal,
+    {
+        let topology = Arc::clone(self.input_pencil().topology());
+        let shape = *self.input_pencil().global_shape();
+        let input = Pencil::new(
+            Arc::clone(&topology),
+            shape,
+            std::array::from_fn(|axis| axis),
+        )
+        .map_err(FftError::Pencil);
+        let mut plan = Self::construct_with_backend(
+            topology,
+            shape,
+            self.core.extra_shape.clone(),
+            input,
+            self.core.transforms,
+            self.core.layout,
+            self.core.directions,
+            BackendChoice::Fftw(options),
+        )?;
+        Arc::get_mut(&mut plan.core)
+            .expect("fresh core")
+            .strict_array_identity = true;
+        Ok(plan)
+    }
+
+    fn construct_with_backend(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        input: Result<Arc<Pencil<N, M>>, FftError>,
+        transforms: [AxisTransform; N],
+        layout: DistributedLayout,
+        directions: FourierDirections<N>,
+        backend: BackendChoice,
+    ) -> Result<Self, BackendInitError<MixedError>> {
         let communicator = topology.communicator();
         let local_boundary = validate_r2c_graph(global_shape, transforms).ok();
         let mut reduced_shape = global_shape;
@@ -3283,7 +3658,7 @@ where
             reduced_shape[axis] = global_shape[axis] / 2 + 1;
         }
         let expected_len =
-            mixed_descriptor_len::<N, M>(&extra_shape).and_then(|length| length.checked_add(N));
+            mixed_descriptor_len::<N, M>(&extra_shape).and_then(|length| length.checked_add(N + 6));
         let descriptor = expected_len.and_then(|_| {
             build_mixed_descriptor::<R, N, M>(
                 &topology,
@@ -3297,17 +3672,26 @@ where
                 layout,
             )
             .ok()
-            .map(|mut descriptor| {
+            .and_then(|mut descriptor| {
+                descriptor.try_reserve_exact(N + 6).ok()?;
+                descriptor.extend(backend.descriptor_words::<R>());
                 descriptor.extend(directions.0.iter().map(|direction| match direction {
                     FourierDirection::Forward => 0,
                     FourierDirection::Backward => 1,
                 }));
-                descriptor
+                Some(descriptor)
             })
         });
-        let header = mixed_header::<N, M>(OPERATION_MIXED_R2C_PLAN, N, M, expected_len);
+        let operation = match backend {
+            BackendChoice::RustFft => super::OPERATION_MIXED_R2C_PLAN,
+            #[cfg(feature = "fftw")]
+            BackendChoice::Fftw(_) => OPERATION_MIXED_R2C_PLAN_NATIVE,
+        };
+        let header = mixed_header::<N, M>(operation, N, M, expected_len);
         if !agree_header(communicator, header) {
-            return Err(MixedError::Fft(FftError::CollectiveDescriptorMismatch));
+            return Err(BackendInitError::Local(MixedError::Fft(
+                FftError::CollectiveDescriptorMismatch,
+            )));
         }
         let descriptor = collective_descriptor(communicator, descriptor, expected_len)?;
         agree_result(
@@ -3348,24 +3732,29 @@ where
                 layout.permute_dims,
             ),
         )?;
+        let prepared = prepare_mixed_r2c_stages(
+            &original_route,
+            &reduced_route,
+            global_shape,
+            reduced_shape,
+            reduction_axis,
+            transforms,
+            directions,
+            backend,
+        );
+        if !collective_valid(communicator, prepared.is_ok()) {
+            return Err(match prepared {
+                Err(error) => error,
+                Ok(_) => BackendInitError::PeerPreflight,
+            });
+        }
         let (stages, embedding_len, fft_scratch_len, real_line_len, complex_line_len) =
-            agree_result(
-                communicator,
-                prepare_mixed_r2c_stages(
-                    &original_route,
-                    &reduced_route,
-                    global_shape,
-                    reduced_shape,
-                    reduction_axis,
-                    transforms,
-                    directions,
-                ),
-            )?;
+            prepared.expect("collective backend preflight accepted");
         let raw_absolute_threshold = agree_result(
             communicator,
             mixed_raw_threshold::<R, N, M>(&stages, &extra_shape, boundary),
         )?;
-        let layout_stages = mixed_r2c_layout_stages(&stages);
+        let layout_stages = agree_result(communicator, mixed_r2c_layout_stages(&stages))?;
         let stage_prep = StagePreparation {
             stages: layout_stages,
             fft_scratch_len: 0,
@@ -3451,7 +3840,8 @@ where
                 real_transpose_receive_len,
                 raw_absolute_threshold,
                 directions,
-                strict_array_identity: false,
+                backend,
+                strict_array_identity: backend.kind() == crate::BackendKind::Fftw,
             }),
         })
     }
@@ -3692,9 +4082,13 @@ fn prepare_mixed_r2c_stages<R: FftReal, const N: usize, const M: usize>(
     boundary: usize,
     transforms: [AxisTransform; N],
     directions: FourierDirections<N>,
-) -> Result<(Box<[MixedR2cStage<R, N, M>]>, usize, usize, usize, usize), MixedError> {
+    backend: BackendChoice,
+) -> Result<(Box<[MixedR2cStage<R, N, M>]>, usize, usize, usize, usize), BackendInitError<MixedError>>
+{
     if original_route.stages.len() != N || reduced_route.stages.len() != N {
-        return Err(MixedError::Fft(FftError::PreparationFailed));
+        return Err(BackendInitError::Local(MixedError::Fft(
+            FftError::PreparationFailed,
+        )));
     }
     let mut stages = Vec::new();
     stages
@@ -3711,9 +4105,9 @@ fn prepare_mixed_r2c_stages<R: FftReal, const N: usize, const M: usize>(
             let local = match transforms[axis] {
                 AxisTransform::None => MixedR2cStageLocal::Real(MixedRealLocal::Identity),
                 AxisTransform::R2r(kind) => MixedR2cStageLocal::Real(MixedRealLocal::R2r(
-                    mixed_r2r_local::<R>(kind, original_shape[axis])?,
+                    mixed_r2r_local::<R>(kind, original_shape[axis], backend)?,
                 )),
-                _ => return Err(MixedError::InvalidGraph),
+                _ => return Err(BackendInitError::Local(MixedError::InvalidGraph)),
             };
             (
                 Arc::clone(&original_route.stages[index]),
@@ -3726,29 +4120,63 @@ fn prepare_mixed_r2c_stages<R: FftReal, const N: usize, const M: usize>(
             (
                 Arc::clone(&original_route.stages[index]),
                 Arc::clone(&reduced_route.stages[index]),
-                MixedR2cStageLocal::Real(MixedRealLocal::Rfft(LocalR2cPlan::new(
-                    original_shape[axis],
-                )?)),
+                MixedR2cStageLocal::Real(MixedRealLocal::Rfft(match backend {
+                    BackendChoice::RustFft => LocalR2cPlan::new(original_shape[axis])
+                        .map_err(MixedError::from)
+                        .map_err(BackendInitError::Local)?,
+                    #[cfg(feature = "fftw")]
+                    BackendChoice::Fftw(options) => {
+                        LocalR2cPlan::new_fftw(original_shape[axis], options).map_err(|error| {
+                            match error {
+                                BackendInitError::Local(e) => {
+                                    BackendInitError::Local(MixedError::LocalR2c(e))
+                                }
+                                BackendInitError::Native(e) => BackendInitError::Native(e),
+                                BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
+                            }
+                        })?
+                    }
+                })),
             )
         } else {
             validate_stage_pencil(&reduced_route.stages[index], axis, reduced_shape[axis])?;
             let local = match transforms[axis] {
                 AxisTransform::None => MixedR2cStageLocal::Complex(MixedComplexLocal::Identity),
-                AxisTransform::Fft => MixedR2cStageLocal::Complex(MixedComplexLocal::Fft(
-                    LocalC2cPlan::new_with_sign(
-                        reduced_shape[axis],
-                        directions.get(axis) == Some(FourierDirection::Backward),
-                    )?,
-                )),
+                AxisTransform::Fft => {
+                    MixedR2cStageLocal::Complex(MixedComplexLocal::Fft(match backend {
+                        BackendChoice::RustFft => LocalC2cPlan::new_with_sign(
+                            reduced_shape[axis],
+                            directions.get(axis) == Some(FourierDirection::Backward),
+                        )
+                        .map_err(MixedError::from)
+                        .map_err(BackendInitError::Local)?,
+                        #[cfg(feature = "fftw")]
+                        BackendChoice::Fftw(options) => LocalC2cPlan::new_fftw_with_sign(
+                            reduced_shape[axis],
+                            directions.get(axis) == Some(FourierDirection::Backward),
+                            options,
+                        )
+                        .map_err(|error| match error {
+                            BackendInitError::Local(e) => {
+                                BackendInitError::Local(MixedError::LocalC2c(e))
+                            }
+                            BackendInitError::Native(e) => BackendInitError::Native(e),
+                            BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
+                        })?,
+                    }))
+                }
                 AxisTransform::R2r(kind) => {
                     MixedR2cStageLocal::Complex(MixedComplexLocal::R2r(mixed_r2r_local::<
                         Complex<R>,
                     >(
                         kind,
                         reduced_shape[axis],
+                        backend,
                     )?))
                 }
-                AxisTransform::Rfft => return Err(MixedError::InvalidGraph),
+                AxisTransform::Rfft => {
+                    return Err(BackendInitError::Local(MixedError::InvalidGraph));
+                }
             };
             (
                 Arc::clone(&reduced_route.stages[index]),
@@ -3786,16 +4214,20 @@ fn prepare_mixed_r2c_stages<R: FftReal, const N: usize, const M: usize>(
 
 fn mixed_r2c_layout_stages<R: FftReal, const N: usize, const M: usize>(
     stages: &[MixedR2cStage<R, N, M>],
-) -> Box<[TransformStage<R, N, M>]> {
-    stages
-        .iter()
-        .map(|stage| TransformStage {
-            axis: stage.axis,
-            input: Arc::clone(&stage.input),
-            output: Arc::clone(&stage.output),
-            local: LocalTransform::Identity,
+) -> Result<Box<[TransformStage<R, N, M>]>, MixedError> {
+    let mut result = Vec::new();
+    result.try_reserve_exact(stages.len()).map_err(|_| {
+        MixedError::Fft(FftError::AllocationFailed {
+            required: stages.len(),
         })
-        .collect()
+    })?;
+    result.extend(stages.iter().map(|stage| TransformStage {
+        axis: stage.axis,
+        input: Arc::clone(&stage.input),
+        output: Arc::clone(&stage.output),
+        local: LocalTransform::Identity,
+    }));
+    Ok(result.into_boxed_slice())
 }
 
 fn local_line_len_real<R: FftReal>(local: &MixedRealLocal<R>) -> usize {
