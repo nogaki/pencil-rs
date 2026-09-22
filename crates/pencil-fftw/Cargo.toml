@@ -1,0 +1,13 @@
+[package]
+name = "pencil-fftw"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+libloading = "=0.8.9"
+rustfft = "~6.4.1"
+realfft = "~3.5.0"
+num-complex = "0.4.6"
+thiserror.workspace = true

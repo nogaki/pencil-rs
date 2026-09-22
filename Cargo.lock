@@ -493,6 +493,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pencil-fftw"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "num-complex",
+ "realfft",
+ "rustfft",
+ "thiserror",
+]
+
+[[package]]
 name = "pencil-io"
 version = "0.1.0"
 dependencies = [
