@@ -487,6 +487,7 @@ dependencies = [
  "mpi",
  "num-complex",
  "pencil-array",
+ "pencil-fftw",
  "realfft",
  "rustfft",
  "thiserror",

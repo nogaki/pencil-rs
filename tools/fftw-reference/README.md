@@ -31,6 +31,38 @@ JULIA=julia MPIEXEC=mpiexec \
 ./tools/fftw-reference/check.sh
 ```
 
+The default/unset `PENCIL_FFT_BACKEND` (or explicit `rustfft`) builds
+`--features distributed`. Set `PENCIL_FFT_BACKEND=fftw` to build
+`--features distributed,fftw` and actually configure every plan with
+`with_fftw` (ESTIMATE). This requires installed native FFTW runtimes for
+both f32 and f64; missing libraries fail the explicit run, never fall back
+to RustFFT. Ordinary Cargo tests need neither Julia nor native FFTW.
+The consumer runtime observed here is FFTW 3.3.8, while the Julia oracle
+currently reports FFTW 3.3.11. These are observed runtime versions, not a
+general constant or a promise that consumer and oracle versions match.
+
+`PENCIL_FFT_DIRECTION_ORDER` accepts `native-first` (default) or
+`directions-first`, applying native planning before or after Fourier direction
+configuration. Unknown values (including empty strings) for either selector
+fail before any tool is launched; direct ignored Rust test invocations reject
+them too. Run both native configuration orders with the same full checker:
+
+```bash
+export JULIA=/home/kosuke/local/bin/julia
+export JULIA_DEPOT_PATH=/tmp/pencil-rs-julia-depot.Q6bSFs:$HOME/.julia
+export JULIA_NUM_THREADS=1 JULIA_NUM_PRECOMPILE_TASKS=1 CARGO_BUILD_JOBS=2
+export CARGO_TARGET_DIR=$(mktemp -d /tmp/pencil-reference-target.XXXXXX)
+PENCIL_FFT_BACKEND=rustfft ./tools/fftw-reference/check.sh
+PENCIL_FFT_BACKEND=fftw PENCIL_FFT_DIRECTION_ORDER=native-first ./tools/fftw-reference/check.sh
+PENCIL_FFT_BACKEND=fftw PENCIL_FFT_DIRECTION_ORDER=directions-first ./tools/fftw-reference/check.sh
+# Exact installed MSRV, isolated target; equivalent to cargo +1.85.0 inside the runner:
+RUSTUP_HOME=/tmp/pencil-rs-rustup-msrv.0vuEDM RUSTUP_TOOLCHAIN=1.85.0 \
+CARGO_TARGET_DIR=$(mktemp -d /tmp/pencil-reference-msrv-target.XXXXXX) \
+PENCIL_FFT_BACKEND=fftw PENCIL_FFT_DIRECTION_ORDER=native-first ./tools/fftw-reference/check.sh
+# Pure parser checks (no environment mutation, MPI launch, or runtime loading):
+cargo test -p pencil-fft --features distributed --test fftw_reference --locked
+```
+
 Set `JULIA` or `MPIEXEC` explicitly when they are not on `PATH`. The script
 checks Julia 1.12.6 before package setup, copies `Project.toml` and
 `Manifest.toml` (including the provider preference in the project) to a
@@ -59,7 +91,8 @@ paths. All fixtures contain raw
 test cannot pass silently. It also runs eight independent pristine-fixture copies for legacy C2C, R2C,
 R2R, and DHT, plus twelve independent mixed-axis corruption copies covering
 both mixed plan families and all forward/inverse/raw-backward expected sections;
-each one-rank run must fail with comparison markers and matching kind/operation
+each one-rank run must fail with status 1 or 101, the executed test's START
+and failed-test markers, and comparison markers with matching kind/operation
 context. Missing Julia, MPI, fixtures, or matrix members is a failure, never a
 skip. The runner uses Cargo's selected toolchain and target directory; it never
 selects an executable by filename or timestamp. Set `RUSTUP_TOOLCHAIN=1.85.0`
@@ -73,7 +106,11 @@ and 272 base policy/layout runs unchanged. It adds exactly 5 direction fixtures:
 positive-sign complex suffix). Each runs both precisions, transports, and
 memory policies: 40 additional configurations per MPI size (1, 4, and 6).
 Forward, independent inverse input, normalized inverse, and raw backward are
-compared numerically. Missing/duplicate fixtures, altered signs, and altered
+compared numerically. The combined total is 87 fixtures and 312 configurations
+per MPI size, unchanged for either backend or configuration order. Ten direction
+corruptions plus the twenty legacy/mixed corruptions give 30 required rejections;
+status, START, failed-test, and intended-reason guards reject runner/build/timeout
+failures as evidence. Missing/duplicate fixtures, altered signs, and altered
 expected outputs must fail.
 
 Direction format 1 starts with `PENCIL_FFTW_DIRECTION_REFERENCE 1`, the pinned

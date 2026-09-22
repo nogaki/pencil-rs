@@ -4,7 +4,8 @@ A row-major, MPI-distributed multidimensional array foundation inspired by
 PencilArrays.jl, with a separately layered FFT implementation.
 
 The workspace contains the `pencil-array` core crate, the local FFT
-`pencil-fft` crate, and the separate `pencil-io` crate. `pencil-array` is
+`pencil-fft` crate, the separate `pencil-io` crate, and the optional native CPU
+`pencil-fftw` adapter. `pencil-array` is
 intentionally independent of RustFFT, RealFFT, FFTW, and any FFT-specific API.
 The local `pencil-fft` path accepts flat slices, uses RustFFT/RealFFT, and is
 independent of MPI and `pencil-array`. Local C2C provides unnormalized
@@ -112,6 +113,29 @@ neutrality are caller obligations; callbacks must not panic or call MPI.
 norm policies. `min_by` and `max_by` reduce mapped values and return `None` for
 a globally empty input. New collective descriptors agree both layouts and exact
 neutral bits before invoking callbacks or exchanging typed data.
+
+## Collections of separate arrays
+
+All six distributed plan families provide `forward_many`, `inverse_many`, and
+`backward_many`, plus `*_many_in_place` for their existing in-place array types.
+They take standard slices of separate arrays and reuse one plan-bound workspace
+sequentially. This differs from one array with `ExtraShape` batch axes. Use
+standard Rust iterator/`Vec` allocation rather than a separate collection owner.
+
+A collection call collectively agrees its operation, family, count and complete
+plan/member metadata, then validates every member before executing the first.
+Empty collections are rejected collectively. Ordinary preflight failures leave
+all arrays and the workspace unchanged; a later execution error reports the
+member index through `CollectionError<E>` and does not roll back earlier members.
+An arbitrary panic during member execution is fail-stop via MPI abort, not a
+promise of cross-rank panic recovery or another potentially mismatched reduction.
+
+`pencil-io` also provides `write_mpi_collection` / `read_mpi_collection` and their
+HDF5 counterparts. These accept the Cartesian communicator explicitly and view
+slices, and store one `[component, extra..., spatial...]` payload using the
+existing single-dataset format. Every read destination is staged until native
+cleanup and agreement succeed. Named collection aliases are not provided; these
+APIs do not pretend several independent dataset writes are one collection.
 
 ## Distributed R2C/C2R FFT
 
@@ -278,6 +302,46 @@ recovery from MPI failure or process loss. In-place overlap is not exposed;
 in-place profiling remains supported. Overlap on Alltoallv is rejected, and
 old, profiled and overlap calls have distinct collective operation words.
 
+## Optional native CPU FFTW backend
+
+Enable `pencil-fft/fftw` to use explicit `new_fftw` constructors for local C2C,
+R2C/C2R, R2R and DHT plans. All distributed families provide `with_fftw(options)`
+and native shape constructors. Existing constructors **always select RustFFT /
+RealFFT**, even when the feature is enabled; default builds need no native FFTW.
+A rebuilt distributed plan has a fresh identity, so allocate its own workspaces
+and in-place arrays. Fourier-direction rebuilding preserves the selected backend.
+
+`PlanOptions` selects `PlanningRigor::{Estimate, Measure, Patient, Exhaustive}`
+and an optional positive `Duration` planning budget. It is FFTW's approximate
+planning limit, not a real-time deadline. Backend, precision, rigor and exact
+requested duration are agreed before native planning. `BackendInitError<E>`
+reports initialization failures without extending legacy error enums; a missing
+native library never silently falls back to RustFFT. Plan `backend_kind()` and
+option accessors expose the actual selection.
+
+The MPI-free adapter dynamically loads Linux `libfftw3.so.3` and
+`libfftw3f.so.3`, with initialized private planning buffers, separate native
+in-place/out-of-place plans, and unaligned new-array execution. R2R/DHT retain
+their current embedding algorithms with FFTW complex kernels; this is not a
+claim of native specialized DCT/DST performance. Planning/destruction are locked
+per precision, and the adapter resets its planning time limit to NO_TIMELIMIT.
+Uncoordinated foreign FFTW planner/state changes are outside its guarantee.
+
+**Licensing:** this project's wrapper source remains MIT; FFTW is GPL-2.0-or-later
+or separately commercially licensed. No FFTW source or binary is vendored.
+Dynamic loading is **not** a licensing exemption; FFTW-enabled distributions
+must address the applicable terms. See [`NOTICE.md`](NOTICE.md) and
+[`crates/pencil-fftw/README.md`](crates/pencil-fftw/README.md).
+
+Native tests are explicitly opt-in and fail if the runtime is unavailable:
+
+```bash
+cargo test -p pencil-fftw -- --ignored
+cargo test -p pencil-fft --features fftw --test fftw_local -- --ignored
+PENCIL_FFT_BACKEND=fftw tools/fftw-reference/check.sh
+PENCIL_FFT_BACKEND=fftw PENCIL_FFT_DIRECTION_ORDER=directions-first tools/fftw-reference/check.sh
+```
+
 ## Local Julia/FFTW reference validation
 
 The opt-in Milestone 9 checker generates temporary Julia 1.12.6/FFTW.jl
@@ -348,6 +412,32 @@ staged reads that update the destination only after successful cleanup. HDF5
 is not a crash-atomic journal, and neither backend promises process-loss
 recovery. The original exclusive-create v1 APIs and file representations remain
 unchanged; no Julia PencilIO wire compatibility is claimed.
+
+### Explicit raw input and I/O controls
+
+`read_mpi_raw(path, view_mut, RawReadOptions)` reads external headerless binary
+input. The view supplies type and global shape; options select a byte offset
+and native/little/big byte order. File elements follow canonical logical
+`[extra..., spatial...]` row-major order; each complex component is decoded
+separately. Prefixes and trailing records are allowed, but the complete requested
+range must fit the file and native count/offset limits. No type, shape, layout or
+Julia-wire detection is implied. Existing readers never silently fall back to
+this less self-describing format, and failed raw reads preserve the destination.
+
+Additive `*_with_options` APIs for ordinary and named I/O accept `MpiIoOptions`,
+`Hdf5ReadOptions`, or `Hdf5WriteOptions`. Builders configure `MpiIoMode`, validated
+MPI hints, and (for HDF5 writes) native chunk dimensions in canonical logical
+order. Hints are forwarded to MPI open/view and HDF5 MPIO properties; the native
+implementation may ignore unsupported hints. Chunking uses a real dataset
+creation property list, including support for empty extents; it does not expose
+dataset resizing or alter the old file representation.
+
+`Independent` selects actual independent **payload** transfers, not a one-rank
+API: all ranks still enter metadata, validation, commit and cleanup in order.
+Same-file modification across jobs or communicators requires external writer
+serialization, and reads require stable file contents. No internal file lock or
+concurrent-append guarantee is added. Existing entry points retain collective
+payloads, null/default hints and their original failure guarantees.
 
 Run the MPI-IO integration test at the required 1/4/6 rank matrix:
 

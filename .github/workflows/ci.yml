@@ -25,10 +25,13 @@ jobs:
         run: |
           set -euo pipefail
           cargo tree -p pencil-fft --no-default-features --edges normal --locked | tee /tmp/pencil-fft-local-tree.txt
-          if grep -Eq '(^|[[:space:]])(mpi|pencil-array)([[:space:]]|$)' /tmp/pencil-fft-local-tree.txt; then
+          if grep -Eq '(^|[[:space:]])(mpi|pencil-array|pencil-fftw)([[:space:]]|$)' /tmp/pencil-fft-local-tree.txt; then
             echo "local pencil-fft unexpectedly depends on MPI or pencil-array" >&2
             exit 1
           fi
+
+      - name: Check native adapter host paths without FFTW installation
+        run: cargo test -p pencil-fftw --locked
 
   rust:
     runs-on: ubuntu-latest
@@ -40,7 +43,7 @@ jobs:
       - name: Install MPI toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libopenmpi-dev openmpi-bin libhdf5-openmpi-dev pkg-config libclang-dev
+          sudo apt-get install --yes libopenmpi-dev openmpi-bin libhdf5-openmpi-dev libfftw3-double3 libfftw3-single3 pkg-config libclang-dev
 
       - name: Install Rust components
         run: rustup component add rustfmt clippy
@@ -191,12 +194,35 @@ jobs:
                 cargo test -p pencil-fft --features distributed --test "$suite" --locked -- \
                   --nocapture --test-threads=1
             done
-            for suite in named_mpi named_hdf5; do
+            run_one timeout --kill-after=5s 240s \
+              mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-fft --features distributed --test collections --locked -- \
+                --nocapture --test-threads=1
+            run_one timeout --kill-after=5s 240s \
+              mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-fft --features distributed,fftw --test fftw_distributed --locked \
+                fftw_distributed_native_matrix -- --exact --ignored --nocapture --test-threads=1
+            run_one timeout --kill-after=5s 240s \
+              mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-fft --features distributed,fftw --lib --locked \
+                distributed::fftw_tests::fftw_descriptor_and_factory_preflight_all_six -- \
+                --exact --ignored --nocapture --test-threads=1
+            for suite in named_mpi named_hdf5 new_options collections; do
               run_one timeout --kill-after=5s 240s \
                 mpiexec --oversubscribe -n "$n" \
                 cargo test -p pencil-io --features parallel-hdf5 --test "$suite" --locked -- \
                   --nocapture --test-threads=1
             done
+          done
+          for native in tests::native_f32 tests::native_f64 ffi::tests::native_partial_construction_cleanup; do
+            run_one timeout --kill-after=5s 120s \
+              cargo test -p pencil-fftw --lib --locked "$native" -- \
+                --exact --ignored --nocapture --test-threads=1
+          done
+          for native in native_f32_all_local native_f64_all_local; do
+            run_one timeout --kill-after=5s 120s \
+              cargo test -p pencil-fft --features fftw --test fftw_local --locked "$native" -- \
+                --exact --ignored --nocapture --test-threads=1
           done
           # MPI is initialized once in this separate one-rank test process.
           run_one timeout --kill-after=5s 120s \
@@ -204,10 +230,20 @@ jobs:
               distributed::r2r::tests::in_place_error_panic_backend_and_short_workspace_poison_contracts -- \
               --ignored --exact --nocapture --test-threads=1
 
+      - name: Verify collection member panic fails stop rather than hangs
+        run: |
+          set -euo pipefail
+          artifacts=$(mktemp)
+          trap 'rm -f "$artifacts"' EXIT
+          cargo test -p pencil-fft --features distributed,fftw --lib --no-run --locked --message-format=json >"$artifacts"
+          binary=$(python3 -c 'import json,sys; records=[json.loads(line) for line in open(sys.argv[1])]; paths=[r["executable"] for r in records if r.get("reason")=="compiler-artifact" and r.get("executable") and r["target"]["name"]=="pencil_fft" and r["profile"]["test"]]; assert len(paths)==1,paths; print(paths[0])' "$artifacts")
+          bash crates/pencil-fft/tests/collections_panic.sh "$binary" /tmp/pencil-collections-panic-ci
+
       - name: Check legacy error-enum compatibility and per-axis Fourier signs
         run: |
           set -euo pipefail
           cargo test -p pencil-fft --features distributed --test legacy_error_compat --locked
+          cargo test -p pencil-fft --features distributed,fftw --test legacy_local_error_compat --locked
           cargo build -p pencil-fft --features distributed --example mpi_directions --locked
           log=$(mktemp)
           trap 'rm -f "$log"' EXIT
@@ -249,6 +285,12 @@ jobs:
 
       - name: Run distributed FFT Clippy
         run: cargo clippy -p pencil-fft --features distributed --all-targets --locked -- -D warnings
+
+      - name: Check all FFT backend combinations
+        run: |
+          cargo check -p pencil-fft --features fftw --all-targets --locked
+          cargo clippy -p pencil-fft --all-features --all-targets --locked -- -D warnings
+          cargo test -p pencil-fft --all-features --doc --locked
 
       - name: Run pencil-io Clippy with optional HDF5
         run: cargo clippy -p pencil-io --all-features --all-targets --locked -- -D warnings
@@ -303,3 +345,8 @@ jobs:
 
       - name: Check distributed FFT on minimum supported Rust
         run: cargo +1.85.0 check -p pencil-fft --features distributed --all-targets --locked
+
+      - name: Check optional native FFTW targets on minimum supported Rust
+        run: |
+          cargo +1.85.0 check -p pencil-fft --features fftw --all-targets --locked
+          cargo +1.85.0 check -p pencil-fft --all-features --all-targets --locked

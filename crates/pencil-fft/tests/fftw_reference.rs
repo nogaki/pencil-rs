@@ -19,10 +19,77 @@ use pencil_fft::{
 #[cfg(feature = "fftw")]
 use pencil_fft::{PlanOptions, PlanningRigor};
 
+fn parse_selectors(backend: Option<&str>, order: Option<&str>) -> Result<(bool, bool), String> {
+    let fftw = match backend {
+        None | Some("rustfft") => false,
+        Some("fftw") => true,
+        Some(value) => return Err(format!("invalid PENCIL_FFT_BACKEND: {value:?}")),
+    };
+    let directions_first = match order {
+        None | Some("native-first") => false,
+        Some("directions-first") => true,
+        Some(value) => return Err(format!("invalid PENCIL_FFT_DIRECTION_ORDER: {value:?}")),
+    };
+    Ok((fftw, directions_first))
+}
+
+fn reference_selectors() -> (bool, bool) {
+    let read = |name| match env::var(name) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(error) => panic!("invalid {name}: {error}"),
+    };
+    let backend = read("PENCIL_FFT_BACKEND");
+    let order = read("PENCIL_FFT_DIRECTION_ORDER");
+    let selectors = parse_selectors(backend.as_deref(), order.as_deref()).unwrap();
+    assert!(
+        !selectors.0 || cfg!(feature = "fftw"),
+        "PENCIL_FFT_BACKEND=fftw requires the fftw feature"
+    );
+    selectors
+}
+
+#[test]
+fn reference_selector_parser() {
+    for (backend, fftw) in [
+        (None, false),
+        (Some("rustfft"), false),
+        (Some("fftw"), true),
+    ] {
+        for (order, first) in [
+            (None, false),
+            (Some("native-first"), false),
+            (Some("directions-first"), true),
+        ] {
+            assert_eq!(parse_selectors(backend, order), Ok((fftw, first)));
+        }
+    }
+    for invalid in [
+        "",
+        "default",
+        "FFTW",
+        "rust",
+        "native",
+        "directions-fist",
+        " fftw",
+    ] {
+        assert!(
+            parse_selectors(Some(invalid), None)
+                .unwrap_err()
+                .contains("PENCIL_FFT_BACKEND")
+        );
+        assert!(
+            parse_selectors(None, Some(invalid))
+                .unwrap_err()
+                .contains("PENCIL_FFT_DIRECTION_ORDER")
+        );
+    }
+}
+
 macro_rules! select_backend {
     ($plan:expr) => {{
         let plan = $plan;
-        let use_fftw = env::var("PENCIL_FFT_BACKEND").as_deref() == Ok("fftw");
+        let use_fftw = reference_selectors().0;
         #[cfg(not(feature = "fftw"))]
         assert!(
             !use_fftw,
@@ -52,7 +119,7 @@ macro_rules! select_backend {
 macro_rules! select_directed_backend {
     ($plan:expr, $directions:expr) => {{
         let base = $plan;
-        let plan = if env::var("PENCIL_FFT_DIRECTION_ORDER").as_deref() == Ok("directions-first") {
+        let plan = if reference_selectors().1 {
             select_backend!(base.with_fft_directions($directions).unwrap())
         } else {
             select_backend!(base)
@@ -61,7 +128,7 @@ macro_rules! select_directed_backend {
         };
         assert_eq!(
             plan.backend_kind(),
-            if env::var("PENCIL_FFT_BACKEND").as_deref() == Ok("fftw") {
+            if reference_selectors().0 {
                 BackendKind::Fftw
             } else {
                 BackendKind::RustFft
@@ -3485,6 +3552,7 @@ fn run_direction_real<R: Real, const N: usize, const M: usize>(
 #[test]
 #[ignore = "opt-in local Julia/FFTW cross-validation; run tools/fftw-reference/check.sh"]
 fn fftw_direction_reference_parser() {
+    reference_selectors();
     println!("PENCIL_FFTW_DIRECTION_REFERENCE_STARTED");
     let directory = env::var_os("PENCIL_FFTW_DIRECTION_FIXTURES")
         .map(PathBuf::from)
@@ -3600,6 +3668,7 @@ fn fftw_direction_reference_parser() {
 #[test]
 #[ignore = "opt-in local Julia/FFTW cross-validation; run tools/fftw-reference/check.sh"]
 fn fftw_reference_matrix() {
+    reference_selectors();
     let directory = env::var_os("PENCIL_FFTW_FIXTURES")
         .map(PathBuf::from)
         .expect("PENCIL_FFTW_FIXTURES is required for the opted-in reference test");
