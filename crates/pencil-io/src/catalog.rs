@@ -1,6 +1,6 @@
 //! Collective, metadata-only catalog readers.
 use crate::mpi_io::{
-    FileGuard, abort_unrecoverable, collective_state, duplicate_comm, finish_resources,
+    FileGuard, abort_unrecoverable, collective_state, duplicate_comm, finish_resources, path_bytes,
 };
 use crate::named_mpi::scan_file_bounded;
 use crate::{COMMIT_MARKER, FORMAT_VERSION, IoError, MAX_HEADER_BYTES, MAX_PROTOCOL_RANK, ffi};
@@ -136,6 +136,7 @@ impl DatasetInfo {
 }
 /// Errors returned while collectively reading a catalog.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CatalogError {
     /// The underlying I/O operation failed.
     #[error(transparent)]
@@ -151,8 +152,7 @@ fn u(b: &[u8], p: usize) -> Option<u64> {
     b.get(p..p + 8)?.try_into().ok().map(u64::from_le_bytes)
 }
 fn path<P: AsRef<Path>>(p: P) -> Result<CString, CatalogError> {
-    CString::new(p.as_ref().to_str().ok_or(IoError::InvalidPath)?)
-        .map_err(|_| IoError::InvalidPath.into())
+    CString::new(path_bytes(p.as_ref())?).map_err(|_| IoError::InvalidPath.into())
 }
 fn catalog_header(c: &CartesianCommunicator, op: u64) -> Result<(), CatalogError> {
     let fixed = [CATALOG_NAMESPACE, op, FORMAT_VERSION, 0, 0];
@@ -180,10 +180,10 @@ fn agree<C: CommunicatorCollectives>(
     }
 }
 fn agree_path(c: &CartesianCommunicator, p: &Path) -> Result<CString, CatalogError> {
-    let local = p.to_str();
-    let valid = local.is_some_and(|s| {
-        !s.is_empty() && s.len() <= MAX_HEADER_BYTES && !s.as_bytes().contains(&0)
-    });
+    let local = path_bytes(p);
+    let valid = local
+        .as_ref()
+        .is_ok_and(|s| !s.is_empty() && s.len() <= MAX_HEADER_BYTES && !s.contains(&0));
     let flag = i32::from(valid);
     let mut all_valid = 0;
     c.all_reduce_into(&flag, &mut all_valid, SystemOperation::min());
@@ -203,7 +203,7 @@ fn agree_path(c: &CartesianCommunicator, p: &Path) -> Result<CString, CatalogErr
     if lo != hi || n > MAX_HEADER_BYTES {
         return Err(IoError::CollectiveDescriptorMismatch.into());
     }
-    agree_bytes(c, s.as_bytes())?;
+    agree_bytes(c, s)?;
     path(p)
 }
 pub(crate) fn agree_bytes(c: &CartesianCommunicator, bytes: &[u8]) -> Result<(), CatalogError> {

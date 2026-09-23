@@ -130,6 +130,57 @@ fn catalog_integration() {
     assert_eq!(v[0].extra_shape(), &[3]);
     assert_eq!(v[0].provenance().len(), 32);
 
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let native = dir.join(OsString::from_vec(b"native-\xff.pio".to_vec()));
+        write_mpi(&native, a.view()).unwrap();
+        assert_eq!(read_mpi_catalog(&native, comm).unwrap(), v);
+
+        let named = dir.join(OsString::from_vec(b"named-\xff.pio".to_vec()));
+        write_mpi_named(&named, "日本", a.view()).unwrap();
+        let got = read_mpi_named_catalog(&named, comm).unwrap();
+        assert_eq!(got[0].name(), Some("日本"));
+        assert_eq!(got[0].global_shape(), &[4, 5]);
+        assert_eq!(got[0].extra_shape(), &[3]);
+        assert_eq!(got[0].scalar_type(), ScalarType::F32);
+
+        #[cfg(feature = "parallel-hdf5")]
+        for named in [false, true] {
+            let file = dir.join(OsString::from_vec(if named {
+                b"named-\xff.h5".to_vec()
+            } else {
+                b"native-\xff.h5".to_vec()
+            }));
+            if named {
+                pencil_io::write_hdf5_named(&file, "日本", a.view()).unwrap();
+            } else {
+                pencil_io::write_hdf5(&file, a.view()).unwrap();
+            }
+            let got = pencil_io::read_hdf5_catalog(&file, comm).unwrap();
+            assert_eq!(got[0].name(), named.then_some("日本"));
+            assert_eq!(got[0].global_shape(), &[4, 5]);
+            assert_eq!(got[0].extra_shape(), &[3]);
+            assert_eq!(got[0].scalar_type(), ScalarType::F32);
+        }
+
+        // Equal-length native paths must agree byte-for-byte, not lossily.
+        if world.size() > 1 {
+            let different = dir.join(OsString::from_vec(b"native-\xfe.pio".to_vec()));
+            let local = if world.rank() == 0 {
+                &native
+            } else {
+                &different
+            };
+            assert!(read_mpi_catalog(local, comm).is_err());
+            assert!(read_mpi_named_catalog(local, comm).is_err());
+            #[cfg(feature = "parallel-hdf5")]
+            assert!(pencil_io::read_hdf5_catalog(local, comm).is_err());
+        }
+    }
+
     // Exercise every stable scalar code and width with bytes written directly.
     let scalars = [
         (ScalarType::I8, 1, 1),

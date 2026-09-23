@@ -106,6 +106,7 @@ pub enum FftwError {
 }
 /// Wisdom errors are separate to preserve the closed backend error API.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum WisdomError {
     #[error("wisdom contains an interior NUL")]
     InteriorNul,

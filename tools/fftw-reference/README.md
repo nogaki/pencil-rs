@@ -41,9 +41,18 @@ The consumer runtime observed here is FFTW 3.3.8, while the Julia oracle
 currently reports FFTW 3.3.11. These are observed runtime versions, not a
 general constant or a promise that consumer and oracle versions match.
 
+`PENCIL_FFT_THREADS` defaults to `1` and accepts canonical positive decimal
+integers through `2147483647` (positive `c_int`; no signs, whitespace, or leading
+zeros). Native plans use `PlanOptions.with_threads` and assert the resulting
+plan's `requested_threads`, including after either direction configuration order.
+This is a requested native planner thread cap, not observed utilization or a
+speed guarantee. RustFFT accepts only `1`; larger values fail rather than
+pretending to control its threads. The Julia oracle remains fixed at one FFTW
+thread, independently of this selector.
+
 `PENCIL_FFT_DIRECTION_ORDER` accepts `native-first` (default) or
 `directions-first`, applying native planning before or after Fourier direction
-configuration. Unknown values (including empty strings) for either selector
+configuration. Unknown values (including empty strings) for any selector
 fail before any tool is launched; direct ignored Rust test invocations reject
 them too. Run both native configuration orders with the same full checker:
 
@@ -53,12 +62,12 @@ export JULIA_DEPOT_PATH=/tmp/pencil-rs-julia-depot.Q6bSFs:$HOME/.julia
 export JULIA_NUM_THREADS=1 JULIA_NUM_PRECOMPILE_TASKS=1 CARGO_BUILD_JOBS=2
 export CARGO_TARGET_DIR=$(mktemp -d /tmp/pencil-reference-target.XXXXXX)
 PENCIL_FFT_BACKEND=rustfft ./tools/fftw-reference/check.sh
-PENCIL_FFT_BACKEND=fftw PENCIL_FFT_DIRECTION_ORDER=native-first ./tools/fftw-reference/check.sh
-PENCIL_FFT_BACKEND=fftw PENCIL_FFT_DIRECTION_ORDER=directions-first ./tools/fftw-reference/check.sh
+PENCIL_FFT_BACKEND=fftw PENCIL_FFT_THREADS=2 PENCIL_FFT_DIRECTION_ORDER=native-first ./tools/fftw-reference/check.sh
+PENCIL_FFT_BACKEND=fftw PENCIL_FFT_THREADS=2 PENCIL_FFT_DIRECTION_ORDER=directions-first ./tools/fftw-reference/check.sh
 # Exact installed MSRV, isolated target; equivalent to cargo +1.85.0 inside the runner:
 RUSTUP_HOME=/tmp/pencil-rs-rustup-msrv.0vuEDM RUSTUP_TOOLCHAIN=1.85.0 \
 CARGO_TARGET_DIR=$(mktemp -d /tmp/pencil-reference-msrv-target.XXXXXX) \
-PENCIL_FFT_BACKEND=fftw PENCIL_FFT_DIRECTION_ORDER=native-first ./tools/fftw-reference/check.sh
+PENCIL_FFT_THREADS=2 PENCIL_FFT_BACKEND=fftw PENCIL_FFT_DIRECTION_ORDER=native-first ./tools/fftw-reference/check.sh
 # Pure parser checks (no environment mutation, MPI launch, or runtime loading):
 cargo test -p pencil-fft --features distributed --test fftw_reference --locked
 ```

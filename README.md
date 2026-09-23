@@ -114,6 +114,25 @@ norm policies. `min_by` and `max_by` reduce mapped values and return `None` for
 a globally empty input. New collective descriptors agree both layouts and exact
 neutral bits before invoking callbacks or exchanging typed data.
 
+### Three or more inputs
+
+`pointwise3` accepts three differently typed inputs; `pointwise_many` accepts an
+arbitrary nonempty slice of same-typed inputs. Both have borrowed-view and
+in-place counterparts, using checked singleton-extra broadcasting and reusable
+O(input count × extra rank) mapping/reference storage, not per-point allocations
+or full input clones. `MultiInputError` identifies invalid inputs without changing
+the original `PointwiseError` variants.
+
+`map_reduce3` and `map_reduce_many` add custom multi-input folds. The many-input
+collective accepts a Cartesian communicator explicitly so even an empty or
+rank-dependent input list can be rejected through the common header. Every input,
+output scalar, neutral value and broadcast shape is checked before callbacks.
+`sum_many_by`, `norm_many_by`, `min_many_by`, and `max_many_by` retain the checked
+integer, scaled norm and IEEE policies. Reducers must be deterministic,
+associative and neutral-compatible; their results must not depend on mutable
+invocation count/order. Callbacks must not panic or call MPI. Empty many-input
+lists are rejected; zero-element arrays remain valid.
+
 ## Collections of separate arrays
 
 All six distributed plan families provide `forward_many`, `inverse_many`, and
@@ -134,8 +153,12 @@ promise of cross-rank panic recovery or another potentially mismatched reduction
 HDF5 counterparts. These accept the Cartesian communicator explicitly and view
 slices, and store one `[component, extra..., spatial...]` payload using the
 existing single-dataset format. Every read destination is staged until native
-cleanup and agreement succeed. Named collection aliases are not provided; these
-APIs do not pretend several independent dataset writes are one collection.
+cleanup and agreement succeed. Option-bearing collection forms preserve the
+same staging guarantees. `write_mpi_named_collection`, `append_mpi_named_collection`,
+`read_mpi_named_collection` and their HDF5 counterparts store one combined named
+dataset and accept explicit options. Names, options and all members agree before
+payload staging or mutation. These APIs do not pretend several independent
+dataset writes are one collection.
 
 ## Distributed R2C/C2R FFT
 
@@ -327,6 +350,26 @@ claim of native specialized DCT/DST performance. Planning/destruction are locked
 per precision, and the adapter resets its planning time limit to NO_TIMELIMIT.
 Uncoordinated foreign FFTW planner/state changes are outside its guarantee.
 
+`PlanOptions::with_threads(n)` requests a positive per-plan CPU thread count
+(default one); `requested_threads()` reports that request, not observed thread
+utilization or a speedup. Distributed descriptors include the exact count.
+Before the first coordinated stateful FFTW call, the adapter probes and, when
+available, initializes the matching pthread runtime. Base/thread libraries remain
+pinned for process lifetime. A pre-initialization load/symbol failure leaves
+serial planning and wisdom available but rejects requests above one; it is not
+silently retried after serial use. Attempted native initialization failure blocks
+further stateful calls. Successful planning resets the native count to known one,
+not an invented prior foreign setting.
+
+`export_wisdom::<R>()`, `import_wisdom::<R>()`, and `forget_wisdom::<R>()` manage
+actual precision-specific native wisdom. Use ordinary file I/O to persist the
+returned string; these operations are process-local, not implicit MPI broadcasts.
+Forgetting wisdom does not invalidate existing plans. The pinned runtime keeps
+imported wisdom alive even with no live plans. Invalid imports have no rollback
+guarantee, and wisdom portability across FFTW versions, machines, flags and
+thread settings is determined by FFTW. Coordinate local errors before entering
+subsequent MPI operations.
+
 **Licensing:** this project's wrapper source remains MIT; FFTW is GPL-2.0-or-later
 or separately commercially licensed. No FFTW source or binary is vendored.
 Dynamic loading is **not** a licensing exemption; FFTW-enabled distributions
@@ -340,6 +383,7 @@ cargo test -p pencil-fftw -- --ignored
 cargo test -p pencil-fft --features fftw --test fftw_local -- --ignored
 PENCIL_FFT_BACKEND=fftw tools/fftw-reference/check.sh
 PENCIL_FFT_BACKEND=fftw PENCIL_FFT_DIRECTION_ORDER=directions-first tools/fftw-reference/check.sh
+PENCIL_FFT_BACKEND=fftw PENCIL_FFT_THREADS=2 tools/fftw-reference/check.sh
 ```
 
 ## Local Julia/FFTW reference validation
@@ -430,7 +474,15 @@ MPI hints, and (for HDF5 writes) native chunk dimensions in canonical logical
 order. Hints are forwarded to MPI open/view and HDF5 MPIO properties; the native
 implementation may ignore unsupported hints. Chunking uses a real dataset
 creation property list, including support for empty extents; it does not expose
-dataset resizing or alter the old file representation.
+dataset resizing or change the existing metadata schema.
+
+HDF5 writes also accept `shuffle(true)` and `deflate(level)` (0 through 9).
+Filters require explicit chunks and collective payload writes; level zero still
+requests Deflate. Filter availability and encode/decode capabilities are checked
+on all ranks before file creation/opening. Unsupported requests fail explicitly,
+without silently disabling compression. Empty local ranks still participate in
+collective writes for a nonempty global dataset. These are native HDF5 filters,
+not a new compression dependency or a guarantee that every dataset shrinks.
 
 `Independent` selects actual independent **payload** transfers, not a one-rank
 API: all ranks still enter metadata, validation, commit and cleanup in order.
@@ -438,6 +490,24 @@ Same-file modification across jobs or communicators requires external writer
 serialization, and reads require stable file contents. No internal file lock or
 concurrent-append guarantee is added. Existing entry points retain collective
 payloads, null/default hints and their original failure guarantees.
+
+### Dataset catalogs
+
+`read_mpi_catalog`, `read_mpi_named_catalog`, and `read_hdf5_catalog` inspect the
+supported formats collectively without reading their data payloads or requiring
+an allocated destination array. Pass the Cartesian communicator explicitly.
+`DatasetInfo` exposes optional names, `ScalarType`, stored spatial and extra
+shapes, and available writer provenance. Extra dimensions are reported verbatim;
+a collection component count is not inferred from an ordinary extra axis.
+
+Catalogs are strict snapshots: malformed/incomplete metadata, a bad named-MPI
+tail, or an incomplete HDF5 dataset rejects the whole inspection after cleanup.
+Existing named reads may still recover a known committed MPI-prefix dataset.
+Catalogs do not infer types from raw files or prove payload integrity. HDF5
+inspection accepts only the supported hard-link group/dataset structures and does
+not follow soft/external links. Native Unix file-path bytes remain supported;
+dataset keys themselves remain bounded UTF-8. Catalog size/name/header bounds
+are documented in the API.
 
 Run the MPI-IO integration test at the required 1/4/6 rank matrix:
 

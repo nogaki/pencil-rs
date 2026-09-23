@@ -17,7 +17,7 @@ use pencil_array::{PencilArrayView, PencilArrayViewMut};
 use crate::ffi;
 use crate::format::{IoElement, element_count, pack_view, prepare_physical_values};
 use crate::mpi_io::agree_phase;
-use crate::mpi_io::{DatatypeGuard, build_layout, duplicate_comm, finish_resources};
+use crate::mpi_io::{DatatypeGuard, build_layout, duplicate_comm, finish_resources, path_bytes};
 use crate::options::{InfoGuard, MpiIoMode, MpiIoOptions, agree_options};
 use crate::{COMMIT_MARKER, IoError, MAX_PROTOCOL_RANK, NamedIoError};
 
@@ -90,7 +90,7 @@ fn prepared<C: CommunicatorCollectives, T>(
 }
 
 fn path_c<P: AsRef<Path>>(p: P) -> Result<CString, IoError> {
-    let path = p.as_ref().to_str().ok_or(IoError::InvalidPath)?;
+    let path = path_bytes(p.as_ref())?;
     let len = path
         .len()
         .checked_add(1)
@@ -99,7 +99,7 @@ fn path_c<P: AsRef<Path>>(p: P) -> Result<CString, IoError> {
     bytes
         .try_reserve_exact(len)
         .map_err(|_| IoError::AllocationFailed { requested: len })?;
-    bytes.extend_from_slice(path.as_bytes());
+    bytes.extend_from_slice(path);
     bytes.push(0);
     CString::from_vec_with_nul(bytes).map_err(|_| IoError::InvalidPath)
 }

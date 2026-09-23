@@ -11,10 +11,10 @@ Array remains FFT/I/O-independent, default FFT remains MPI-/FFTW-runtime-free, F
 ## Deliverables
 
 - [x] Multi-input computation: heterogeneous typed three-input pointwise/custom reduction plus arbitrary-count homogeneous view-slice APIs. Output-specified and in-place/view pointwise forms, no Clone/full input copies or per-point allocation. Same spatial layout, equal extra rank, singleton-extra expansion including 1 to 0; physical memory iteration. Empty many-input collections are rejected. New errors when needed rather than extending `PointwiseError`. Reductions have explicit communicator for empty-safe entry, composite descriptors for all inputs/output/neutral, preallocate all mapping/reference/partial storage before callbacks. Keep deterministic neutral-compatible associative reducer requirements, non-panicking/MPI-free callback contract and checked/IEEE/scaled standard many reductions. Stateful observation is distinct from a result depending on reducer invocation count/order. Any chosen panic policy must not introduce mismatched recovery collectives.
-- [ ] FFTW wisdom and per-plan CPU threads: real import/export/forget APIs per sealed precision, strings plus standard file I/O examples. Pin successful base-library loads for process lifetime so imported wisdom persists after temporary handles/plans are dropped. Pin thread libraries too because initialization registers callbacks into base FFTW. Serialize initialization, wisdom mutations, planning and destruction under existing per-precision locks; no global cleanup routines. Preserve old `PlanOptions::new`, add validated requested thread count default one. Installed 3.3.8 thread libraries have init/set symbols but no planner-thread getter; restore known one via RAII, do not invent observed thread counts or foreign-state restoration. No speedup guarantee and no silent single-thread fallback. Exact thread count propagates into every local/distributed/core/collection descriptor before native factories, and survives direction/backend rebuild order. Old `FftwError`/planning enums stay closed; new wisdom error wrapper if required. Export pointers use matching FFTW deallocator and checked copying; all buffers initialized. Prove cache reuse after dropping all plans, not only while a library happens to remain loaded.
-- [ ] Named collection I/O and options: standard view slices plus explicit communicator; one combined `[component, extra..., spatial...]` native dataset. Add named create/read/append and option-bearing collection paths without changing old defaults/signatures. Exact names/options/count/member checks and all required allocations agree before writes/duplicate lookup; reads stage all members through cleanup agreement. Empty collections reject collectively, no fake repeated writes or new collection owner framework. External writer serialization remains a caller obligation.
-- [ ] HDF5 filters: extend private write options with shuffle and optional Deflate level 0..9 (zero still requests the filter). Require explicit valid chunks; verify each requested filter's availability and encode/decode capability collectively before native file open/create or mutation. Reject independent filtered writes explicitly. Apply actual chunk/shuffle/deflate DCPL in that order. Empty local selections still participate in collective writes when global extent is nonzero; globally empty datasets remain valid. No silent fallback, plugin registry, new compression dependency or resize API.
-- [ ] Dataset catalog/metadata: collective read-only inspection with explicit Cartesian communicator and no array allocation prerequisite. Support existing single-dataset v1 and named layouts; return name/type/spatial shape/extras/writer provenance from bounded metadata only. New `DatasetInfo` private fields/getters and non-exhaustive unambiguous `ScalarType` (`ComplexF32`/`ComplexF64`). Strict snapshot semantics: malformed/incomplete named tail or HDF5 dataset makes the inspection fail, discarding staged results; no misleading complete partial catalog. Existing named reads can still recover known committed MPI-prefix records. No raw type inference, Julia-wire autodetection, or inferred `collection_count` (old formats store only extra dimensions). Enumerate HDF5 links by indexed queries rather than Rust allocation/unwind through C callbacks. Close all handles before publishing metadata or errors.
+- [x] FFTW wisdom and per-plan CPU threads: real import/export/forget APIs per sealed precision, strings plus standard file I/O examples. Pin successful base-library loads for process lifetime so imported wisdom persists after temporary handles/plans are dropped. Pin thread libraries too because initialization registers callbacks into base FFTW. Serialize initialization, wisdom mutations, planning and destruction under existing per-precision locks; no global cleanup routines. Preserve old `PlanOptions::new`, add validated requested thread count default one. Installed 3.3.8 thread libraries have init/set symbols but no planner-thread getter; restore known one via RAII, do not invent observed thread counts or foreign-state restoration. No speedup guarantee and no silent single-thread fallback. Exact thread count propagates into every local/distributed/core/collection descriptor before native factories, and survives direction/backend rebuild order. Old `FftwError`/planning enums stay closed; new wisdom error wrapper if required. Export pointers use matching FFTW deallocator and checked copying; all buffers initialized. Prove cache reuse after dropping all plans, not only while a library happens to remain loaded.
+- [x] Named collection I/O and options: standard view slices plus explicit communicator; one combined `[component, extra..., spatial...]` native dataset. Add named create/read/append and option-bearing collection paths without changing old defaults/signatures. Exact names/options/count/member checks and all required allocations agree before writes/duplicate lookup; reads stage all members through cleanup agreement. Empty collections reject collectively, no fake repeated writes or new collection owner framework. External writer serialization remains a caller obligation.
+- [x] HDF5 filters: extend private write options with shuffle and optional Deflate level 0..9 (zero still requests the filter). Require explicit valid chunks; verify each requested filter's availability and encode/decode capability collectively before native file open/create or mutation. Reject independent filtered writes explicitly. Apply actual chunk/shuffle/deflate DCPL in that order. Empty local selections still participate in collective writes when global extent is nonzero; globally empty datasets remain valid. No silent fallback, plugin registry, new compression dependency or resize API.
+- [x] Dataset catalog/metadata: collective read-only inspection with explicit Cartesian communicator and no array allocation prerequisite. Support existing single-dataset v1 and named layouts; return name/type/spatial shape/extras/writer provenance from bounded metadata only. New `DatasetInfo` private fields/getters and non-exhaustive unambiguous `ScalarType` (`ComplexF32`/`ComplexF64`). Strict snapshot semantics: malformed/incomplete named tail or HDF5 dataset makes the inspection fail, discarding staged results; no misleading complete partial catalog. Existing named reads can still recover known committed MPI-prefix records. No raw type inference, Julia-wire autodetection, or inferred `collection_count` (old formats store only extra dimensions). Enumerate HDF5 links by indexed queries rather than Rust allocation/unwind through C callbacks. Close all handles before publishing metadata or errors.
 
 ## Native and license context
 
@@ -43,6 +43,69 @@ The direct-view matrix covers all four typed-three/many output/in-place forms, n
 Follow-up evidence is `target/cpu4-logs/fix-*.log` (earlier unprefixed evidence predates this fix). Stable fmt, all-feature/all-target Clippy with `-D warnings`, all-feature test compilation, 37 unit tests and 12 rustdoc tests passed. Exact `cargo +1.85.0` all-feature test compilation, unit and rustdoc tests passed using the separate MSRV target above; version is logged in `fix-msrv-version.log`. `fix-mpi-summary.log` records 56 successful MPI launches on the final test sources: both toolchains run multi_input/collectives/array_ops/array_access/alltoallv_transpose/timing_overlap at 1/4/6, and array/local_transpose/many/pencil/topology at 1/4 only. Each launch used `timeout 90 mpirun --oversubscribe -n N BINARY --nocapture`; no legacy array six-rank run was made in this follow-up. Build environment used `CARGO_HOME=/tmp/pencil-rs-cargo-home`, build jobs 2, usual PATH/OpenMPI library path, and `RUSTUP_HOME=/tmp/pencil-rs-rustup` for exact MSRV. Initial helper compile/assertion failures were corrected before the final passing runs; no tests were skipped to obtain these results.
 
 Limits: no allocator-failure injection or heap-profiler instrumentation; reusable fallibly preallocated reference scratch and no per-point allocation are verified structurally. No callback-panic recovery/process-loss guarantee, GPU work, FFT/I/O validation, or parent combined-tree verification is claimed.
+
+## Integrated review corrections
+
+The original `PointwiseError` variant set is preserved; typed-three attribution
+uses `MultiInputError`. Direct view, nonempty broadcast, rank-empty, zero-extra,
+non-Clone in-place and typed-three descriptor regressions cover the new paths.
+
+Named collection controls are agreed before staging. Catalog traversal checks
+hard-link and expected object kinds before opening known HDF5 roots and leaves,
+rejecting soft/external links. All 12 scalar code/width pairs are checked, and
+native Unix non-UTF-8 file paths retain exact-byte handling (dataset names remain
+UTF-8). Strict catalog failure does not alter older named payload-prefix reads.
+
+FFTW initialization now follows upstream ordering: before the first coordinated
+planning/wisdom routine the adapter optionally probes and initializes a matching
+pthread runtime. Base/thread symbol identity is checked before initialization.
+A cached pre-init loader/symbol failure permits base-only serial planning and
+wisdom, but explicit multithreading fails; native attempted-init failure blocks
+stateful calls. No unsafe lazy enable is attempted after serial use. Native
+fresh-process order, failure and wisdom-lifetime tests cover this, with known-one
+RAII reset and no invented getter/foreign-state restoration. Mixed-real direction
+rebuild tests use a real FFT axis with a non-default sign and requested count two
+in both configuration orders; the dropped-direction mutant fails.
+
+Independent Sol reviews cover each feature and these corrections. Parent
+integrated validation/publication is separate from the worktree evidence above.
+GPU code and draft PR29 remain untouched.
+
+## Parent combined-tree validation (2026-09-23)
+
+Normal Rust 1.98.1 and exact Rust 1.85.0 passed default/all-feature/all-target
+checks and test compilation, unit/rustdoc checks, and real native FFTW adapter
+and local-plan suites. Stable fmt, strict Clippy and warning-denying rustdoc
+passed. Legacy exhaustive error matches and default-FFT/array dependency
+boundaries remain checked. No exact-MSRV strict-Clippy claim is made: a worker
+observed the existing grid lifetime lint under that older Clippy.
+
+Parent MPI matrices passed 95 positive launches per compiler (190 total), plus
+three expected asymmetric panic/abort-86 cases per compiler. Supported suites
+run at ranks 1/4/6; legacy 1/4-only suites retain their supported matrix. Native
+wisdom/cache/thread counts 1/2/3, fresh-process initialization ordering and
+missing loader/symbol recovery run against the actual 3.3.8 libraries. The I/O
+matrices include actual filters, catalogs, non-UTF-8 native paths, malicious
+links, all scalar kinds and injected cleanup/preflight failures.
+
+The official Julia runner passed six complete runs: RustFFT and native FFTW in
+both configuration orders, on both compilers. Native reference plans explicitly
+request and assert count two via strict `PENCIL_FFT_THREADS` selection; Julia's
+independent 3.3.11 oracle remains single-threaded. Each run covers 87 fixtures /
+312 configurations at 1/4/6 ranks and rejects all 30 intentional corruptions.
+Together with the main matrices this is 226 positive MPI launches and 180
+reference corruption rejections, excluding the expected panic-abort launches.
+New selector negative controls reject invalid input before Julia/Cargo/MPI.
+No thread-utilization or speedup guarantee follows from these checks.
+
+Evidence: `/tmp/pencil-cpu4-parent-{static,msrv}.log`,
+`/tmp/pencil-cpu4-post-reference-static.log`,
+`/tmp/pencil-cpu4-parent-mpi-{stable,msrv}-summary.log`, and
+`/tmp/pencil-cpu4-reference-{stable,msrv}-{rustfft,fftw-native-first,fftw-directions-first}.log`.
+Separate source/MSRV target directories and the known CARGO_HOME/OpenMPI/Julia
+environment were used. Sol approved the combined source and then the thread-aware
+reference-tooling delta. Local evidence is not CI success; the September waiver
+and deferred GPU draft remain unchanged.
 
 ## Work ownership
 
