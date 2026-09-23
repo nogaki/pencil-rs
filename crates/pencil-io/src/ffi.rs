@@ -15,6 +15,20 @@ use mpi::ffi;
 thread_local! { pub(crate) static DUPLICATE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 #[cfg(test)]
+thread_local! { pub(crate) static AT_CALLS: std::cell::Cell<[usize; 5]> = const { std::cell::Cell::new([0; 5]) }; }
+#[cfg(test)]
+fn record_at(write: bool, collective: bool, len: usize) {
+    AT_CALLS.with(|c| {
+        let mut n = c.get();
+        n[usize::from(!write) * 2 + usize::from(!collective)] += 1;
+        if !write {
+            n[4] += len;
+        }
+        c.set(n);
+    });
+}
+
+#[cfg(test)]
 thread_local! { static PAYLOAD_CALLS: std::cell::Cell<[usize;6]> = const { std::cell::Cell::new([0;6]) }; }
 #[cfg(test)]
 fn record_payload(index: usize) {
@@ -338,12 +352,28 @@ pub(crate) fn file_write_at_all(
     offset: ffi::MPI_Offset,
     bytes: &[u8],
 ) -> Result<usize, i32> {
+    file_write_at(file, offset, bytes, true)
+}
+
+pub(crate) fn file_write_at(
+    file: ffi::MPI_File,
+    offset: ffi::MPI_Offset,
+    bytes: &[u8],
+    collective: bool,
+) -> Result<usize, i32> {
     let count = c_int::try_from(bytes.len()).map_err(|_| ffi::MPI_ERR_COUNT as i32)?;
-    // SAFETY: `bytes` remains borrowed for the duration of the collective MPI
+    #[cfg(test)]
+    record_at(true, collective, bytes.len());
+    // SAFETY: `bytes` remains borrowed for the duration of the MPI
     // call, count is its checked length, and the byte datatype is predefined.
     unsafe {
         let mut status = MaybeUninit::<ffi::MPI_Status>::zeroed().assume_init();
-        let code = ffi::MPI_File_write_at_all(
+        let write = if collective {
+            ffi::MPI_File_write_at_all
+        } else {
+            ffi::MPI_File_write_at
+        };
+        let code = write(
             file,
             offset,
             if bytes.is_empty() {
@@ -376,12 +406,28 @@ pub(crate) fn file_read_at_all(
     offset: ffi::MPI_Offset,
     bytes: &mut [u8],
 ) -> Result<usize, i32> {
+    file_read_at(file, offset, bytes, true)
+}
+
+pub(crate) fn file_read_at(
+    file: ffi::MPI_File,
+    offset: ffi::MPI_Offset,
+    bytes: &mut [u8],
+    collective: bool,
+) -> Result<usize, i32> {
     let count = c_int::try_from(bytes.len()).map_err(|_| ffi::MPI_ERR_COUNT as i32)?;
-    // SAFETY: `bytes` is writable and remains borrowed for the collective MPI
+    #[cfg(test)]
+    record_at(false, collective, bytes.len());
+    // SAFETY: `bytes` is writable and remains borrowed for the MPI
     // call, count is its checked length, and the byte datatype is predefined.
     unsafe {
         let mut status = MaybeUninit::<ffi::MPI_Status>::zeroed().assume_init();
-        let code = ffi::MPI_File_read_at_all(
+        let read = if collective {
+            ffi::MPI_File_read_at_all
+        } else {
+            ffi::MPI_File_read_at
+        };
+        let code = read(
             file,
             offset,
             if bytes.is_empty() {

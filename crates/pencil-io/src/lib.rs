@@ -39,6 +39,7 @@
 //! [`read_mpi_raw`], never inferred by the strict versioned readers.
 
 mod catalog;
+mod chunked;
 mod collections;
 mod format;
 mod mpi_io;
@@ -58,6 +59,7 @@ pub use catalog::read_hdf5_catalog;
 pub use catalog::{
     CatalogError, DatasetInfo, ScalarType, read_mpi_catalog, read_mpi_named_catalog,
 };
+pub use chunked::{read_mpi_chunked, read_mpi_chunked_catalog, write_mpi_chunked};
 pub use collections::*;
 pub use format::IoElement;
 pub use mpi_io::{read_mpi, read_mpi_with_options, write_mpi, write_mpi_with_options};
