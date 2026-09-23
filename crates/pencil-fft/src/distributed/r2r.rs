@@ -1730,7 +1730,7 @@ where
     ) -> Result<Arc<R2rCore<T, N, M>>, BackendInitError<R2rError>> {
         let communicator = topology.communicator();
         let expected_len =
-            descriptor_len::<N, M>(&extra_shape).and_then(|length| length.checked_add(6));
+            descriptor_len::<N, M>(&extra_shape).and_then(|length| length.checked_add(7));
         let descriptor = expected_len.and_then(|_| {
             build_r2r_descriptor::<T, N, M>(
                 &topology,
@@ -1741,7 +1741,7 @@ where
             )
             .ok()
             .and_then(|mut descriptor| {
-                descriptor.try_reserve_exact(6).ok()?;
+                descriptor.try_reserve_exact(7).ok()?;
                 descriptor.extend(backend.descriptor_words::<T::Real>());
                 Some(descriptor)
             })

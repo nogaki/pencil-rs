@@ -233,7 +233,10 @@ pub use backend::BackendInitError;
 pub use backend::BackendKind;
 pub use dht::LocalDhtPlan;
 #[cfg(feature = "fftw")]
-pub use pencil_fftw::{FftwError, PlanOptions, PlanningRigor, runtime_version};
+pub use pencil_fftw::{
+    FftwError, PlanOptions, PlanningRigor, WisdomError, export_wisdom, forget_wisdom,
+    import_wisdom, runtime_version,
+};
 pub use r2c::{
     LocalR2cError, LocalR2cInPlaceArray, LocalR2cInPlaceWorkspace, LocalR2cPlan, R2cState,
 };

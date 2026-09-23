@@ -1,3 +1,4 @@
+pub(crate) static NATIVE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use super::*;
 fn dft(input: &[Complex<f64>], inverse: bool) -> Vec<Complex<f64>> {
     (0..input.len())
@@ -64,7 +65,7 @@ fn host_contracts() {
         Err(FftwError::InvalidOptions(_))
     ));
 }
-fn matrix<R: Real + rustfft::num_traits::ToPrimitive>() {
+fn matrix<R: Real + rustfft::num_traits::ToPrimitive>(threads: usize) {
     eprintln!(
         "runtime {}: {}",
         std::any::type_name::<R>(),
@@ -76,7 +77,10 @@ fn matrix<R: Real + rustfft::num_traits::ToPrimitive>() {
         PlanningRigor::Patient,
         PlanningRigor::Exhaustive,
     ] {
-        let options = PlanOptions::new(rigor, Some(Duration::from_millis(2))).unwrap();
+        let options = PlanOptions::new(rigor, Some(Duration::from_millis(2)))
+            .unwrap()
+            .with_threads(threads)
+            .unwrap();
         for n in [1, 3, 4, 7, 8] {
             let source: Vec<_> = (0..n)
                 .map(|j| Complex::new(j as f64 * 0.3 - 0.4, 0.2 - j as f64 * 0.1))
@@ -109,7 +113,11 @@ fn matrix<R: Real + rustfft::num_traits::ToPrimitive>() {
                 assert_eq!(output[0], original[0]);
                 assert_eq!(output[2 * n + 1], original[2 * n + 1]);
                 p.process_with_scratch(&mut batch[1..2 * n + 1], &mut scratch);
-                assert_eq!(batch, output);
+                for (k, &value) in batch[1..2 * n + 1].iter().enumerate() {
+                    near(value, expected[k % n]);
+                }
+                assert_eq!(batch[0], original[0]);
+                assert_eq!(batch[2 * n + 1], original[2 * n + 1]);
                 batch.clone_from(&original);
                 p.process_outofplace_with_scratch(
                     &mut batch[1..2 * n + 1],
@@ -126,19 +134,23 @@ fn matrix<R: Real + rustfft::num_traits::ToPrimitive>() {
                         let input_before = batch.clone();
                         let output_before = output.clone();
                         assert!(
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match form {
-                                0 => p.process(&mut batch[1..1 + len]),
-                                1 => p.process_with_scratch(&mut batch[1..1 + len], &mut scratch,),
-                                2 => p.process_outofplace_with_scratch(
-                                    &mut batch[1..1 + len],
-                                    &mut output[1..1 + len],
-                                    &mut scratch,
-                                ),
-                                _ => p.process_immutable_with_scratch(
-                                    &batch[1..1 + len],
-                                    &mut output[1..1 + len],
-                                    &mut scratch,
-                                ),
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                match form {
+                                    0 => p.process(&mut batch[1..1 + len]),
+                                    1 => {
+                                        p.process_with_scratch(&mut batch[1..1 + len], &mut scratch)
+                                    }
+                                    2 => p.process_outofplace_with_scratch(
+                                        &mut batch[1..1 + len],
+                                        &mut output[1..1 + len],
+                                        &mut scratch,
+                                    ),
+                                    _ => p.process_immutable_with_scratch(
+                                        &batch[1..1 + len],
+                                        &mut output[1..1 + len],
+                                        &mut scratch,
+                                    ),
+                                }
                             }))
                             .is_err()
                         );
@@ -314,10 +326,36 @@ fn matrix<R: Real + rustfft::num_traits::ToPrimitive>() {
 #[test]
 #[ignore = "requires native libfftw3.so.3"]
 fn native_f64() {
-    matrix::<f64>();
+    let _guard = NATIVE_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    for threads in [1, 2, 3] {
+        matrix::<f64>(threads);
+    }
 }
 #[test]
 #[ignore = "requires native libfftw3f.so.3"]
 fn native_f32() {
-    matrix::<f32>();
+    let _guard = NATIVE_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    for threads in [1, 2, 3] {
+        matrix::<f32>(threads);
+    }
+}
+
+#[test]
+fn thread_options() {
+    assert_eq!(PlanOptions::default().requested_threads(), 1);
+    assert!(PlanOptions::default().with_threads(0).is_err());
+    assert!(
+        PlanOptions::default()
+            .with_threads(i32::MAX as usize + 1)
+            .is_err()
+    );
+    for n in [1, 2, 3] {
+        assert_eq!(
+            PlanOptions::default()
+                .with_threads(n)
+                .unwrap()
+                .requested_threads(),
+            n
+        );
+    }
 }

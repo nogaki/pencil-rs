@@ -155,6 +155,59 @@ fn fftw_descriptor_and_factory_preflight_all_six() {
             assert!(count() > 0);
         }};
     }
+    if size > 1 {
+        let native = native.with_threads(if rank == 0 { 1 } else { 2 }).unwrap();
+        macro_rules! reject_threads {
+            ($make:expr) => {{
+                reset();
+                assert!($make.is_err());
+                assert_eq!(count(), 0, "thread mismatch reached native factory");
+            }};
+        }
+        reject_threads!(C2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+            Arc::clone(&topology),
+            shape,
+            extra.clone(),
+            native
+        ));
+        reject_threads!(R2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+            Arc::clone(&topology),
+            shape,
+            extra.clone(),
+            native
+        ));
+        reject_threads!(R2rPlan::<f64, 2, 1>::from_shape_with_fftw(
+            Arc::clone(&topology),
+            shape,
+            extra.clone(),
+            [Some(R2rKind::DctII); 2],
+            native
+        ));
+        reject_threads!(DhtPlan::<f64, 2, 1>::from_shape_with_fftw(
+            Arc::clone(&topology),
+            shape,
+            extra.clone(),
+            native
+        ));
+        reject_threads!(MixedC2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+            Arc::clone(&topology),
+            shape,
+            extra.clone(),
+            [
+                AxisTransform::R2r(AxisR2rKind::Dht),
+                AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DctII))
+            ],
+            native
+        ));
+        reject_threads!(MixedR2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+            Arc::clone(&topology),
+            shape,
+            extra.clone(),
+            [AxisTransform::R2r(AxisR2rKind::Dht), AxisTransform::Rfft],
+            native
+        ));
+    }
+    let native = native.with_threads(2).unwrap();
     injected!(C2cPlan::<f64, 2, 1>::from_shape_with_fftw(
         Arc::clone(&topology),
         shape,

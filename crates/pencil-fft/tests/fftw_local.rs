@@ -12,6 +12,7 @@ fn assert_options(actual: Option<PlanOptions>, expected: PlanOptions) {
     let actual = actual.expect("native options");
     assert_eq!(actual.rigor(), expected.rigor());
     assert_eq!(actual.time_limit(), expected.time_limit());
+    assert_eq!(actual.requested_threads(), expected.requested_threads());
 }
 
 trait Value: R2rScalar {
@@ -207,7 +208,10 @@ fn edge_native<R: FftReal + ToPrimitive + FromPrimitive>() {
             .collect();
         let p = LocalC2cPlan::<R>::new_fftw(
             n,
-            PlanOptions::new(PlanningRigor::Estimate, Some(Duration::from_millis(2))).unwrap(),
+            PlanOptions::new(PlanningRigor::Estimate, Some(Duration::from_millis(2)))
+                .unwrap()
+                .with_threads(2)
+                .unwrap(),
         )
         .unwrap();
         let mut out = vec![Complex::new(R::zero(), R::zero()); source.len()];
@@ -251,7 +255,10 @@ fn edge_native<R: FftReal + ToPrimitive + FromPrimitive>() {
         }
         let d = LocalDhtPlan::<R>::new_fftw(
             n,
-            PlanOptions::new(PlanningRigor::Estimate, Some(Duration::from_millis(2))).unwrap(),
+            PlanOptions::new(PlanningRigor::Estimate, Some(Duration::from_millis(2)))
+                .unwrap()
+                .with_threads(2)
+                .unwrap(),
         )
         .unwrap();
         let real: Vec<R> = (0..n * 2)
@@ -353,7 +360,15 @@ where
         PlanningRigor::Patient,
         PlanningRigor::Exhaustive,
     ]
-    .map(|r| PlanOptions::new(r, Some(Duration::from_millis(2))).unwrap());
+    .into_iter()
+    .flat_map(|r| {
+        [1, 2, 3].map(|threads| {
+            PlanOptions::new(r, Some(Duration::from_millis(2)))
+                .unwrap()
+                .with_threads(threads)
+                .unwrap()
+        })
+    });
     for options in options {
         for &n in &[1, 3, 4, 5] {
             let src: Vec<T> = (0..n * 2)

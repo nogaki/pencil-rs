@@ -32,10 +32,20 @@ pub enum PlanningRigor {
     Patient,
     Exhaustive,
 }
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct PlanOptions {
     rigor: PlanningRigor,
     time_limit: Option<Duration>,
+    threads: i32,
+}
+impl Default for PlanOptions {
+    fn default() -> Self {
+        Self {
+            rigor: PlanningRigor::Estimate,
+            time_limit: None,
+            threads: 1,
+        }
+    }
 }
 impl PlanOptions {
     pub fn new(rigor: PlanningRigor, time_limit: Option<Duration>) -> Result<Self, FftwError> {
@@ -44,7 +54,25 @@ impl PlanOptions {
                 "time limit must be positive and finite",
             ));
         }
-        Ok(Self { rigor, time_limit })
+        Ok(Self {
+            rigor,
+            time_limit,
+            threads: 1,
+        })
+    }
+    /// Request CPU planning threads; this is not a utilization guarantee.
+    pub fn with_threads(mut self, count: usize) -> Result<Self, FftwError> {
+        self.threads =
+            i32::try_from(count)
+                .ok()
+                .filter(|&n| n > 0)
+                .ok_or(FftwError::InvalidOptions(
+                    "thread count must be positive and fit c_int",
+                ))?;
+        Ok(self)
+    }
+    pub fn requested_threads(self) -> usize {
+        self.threads as usize
     }
     pub fn rigor(self) -> PlanningRigor {
         self.rigor
@@ -75,6 +103,32 @@ pub enum FftwError {
     NullPlan,
     #[error("FFTW planning buffer allocation failed: {0}")]
     Allocation(#[from] std::collections::TryReserveError),
+}
+/// Wisdom errors are separate to preserve the closed backend error API.
+#[derive(Debug, thiserror::Error)]
+pub enum WisdomError {
+    #[error("wisdom contains an interior NUL")]
+    InteriorNul,
+    #[error("FFTW rejected wisdom")]
+    InvalidWisdom,
+    #[error("FFTW returned null wisdom")]
+    NullExport,
+    #[error("FFTW exported non-UTF-8 wisdom")]
+    InvalidUtf8,
+    #[error(transparent)]
+    Backend(#[from] FftwError),
+}
+/// Import native wisdom. Rejected input is not guaranteed to leave wisdom unchanged.
+pub fn import_wisdom<R: Real>(wisdom: &str) -> Result<(), WisdomError> {
+    ffi::import_wisdom::<R>(wisdom)
+}
+/// Export an owned copy of this precision's native wisdom.
+pub fn export_wisdom<R: Real>() -> Result<String, WisdomError> {
+    ffi::export_wisdom::<R>()
+}
+/// Forget cached wisdom, without invalidating existing plans.
+pub fn forget_wisdom<R: Real>() -> Result<(), WisdomError> {
+    ffi::forget_wisdom::<R>()
 }
 fn checked_len<R: Real>(n: usize) -> Result<i32, FftwError> {
     if n == 0 {
