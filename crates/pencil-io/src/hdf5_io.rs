@@ -30,15 +30,19 @@ pub(crate) struct Hdf5Settings<'a> {
     pub chunks: Option<&'a [usize]>,
     pub hints: &'a [(String, String)],
     pub explicit: bool,
+    pub shuffle: bool,
+    pub deflate: Option<u8>,
 }
 
-impl<'a> Default for Hdf5Settings<'a> {
+impl Default for Hdf5Settings<'_> {
     fn default() -> Self {
         Self {
             collective: true,
             chunks: None,
             hints: &[],
             explicit: false,
+            shuffle: false,
+            deflate: None,
         }
     }
 }
@@ -305,6 +309,27 @@ where
             "HDF5 chunk layout",
         ) {
             return Err(cleanup_ready(comm, duplicate, opened, resources, error));
+        }
+        if settings.shuffle {
+            if let Err(error) = phase_code(
+                comm,
+                native::plist_set_shuffle(resources.dcpl.expect("dcpl agreement")),
+                "HDF5 shuffle filter",
+            ) {
+                return Err(cleanup_ready(comm, duplicate, opened, resources, error));
+            }
+        }
+        if let Some(level) = settings.deflate {
+            if let Err(error) = phase_code(
+                comm,
+                native::plist_set_deflate(
+                    resources.dcpl.expect("dcpl agreement"),
+                    u32::from(level),
+                ),
+                "HDF5 deflate filter",
+            ) {
+                return Err(cleanup_ready(comm, duplicate, opened, resources, error));
+            }
         }
     }
     let dataset = match collective_handle_phase(
@@ -1385,7 +1410,8 @@ fn validate_options(
     if !settings.explicit {
         return Ok(());
     }
-    let mut extra = [0u64; crate::MAX_PROTOCOL_RANK + 2];
+    let mut extra = [0u64; crate::MAX_PROTOCOL_RANK + 5];
+    let filtered = settings.shuffle || settings.deflate.is_some();
     let valid = if let Some(chunks) = settings.chunks {
         let bytes = chunks
             .iter()
@@ -1396,17 +1422,25 @@ fn validate_options(
             && bytes.is_some_and(|n| n < (1u64 << 32))
     } else {
         true
-    };
-    agree_phase(comm, valid, "HDF5 chunk validation")?;
+    } && (!filtered || settings.chunks.is_some())
+        && settings.deflate.is_none_or(|level| level <= 9)
+        && !(filtered && !settings.collective && settings.chunks.is_some());
+    agree_phase(comm, valid, "HDF5 filter/chunk validation")?;
     let len = if let Some(chunks) = settings.chunks {
-        extra[0] = 1;
-        extra[1] = chunks.len() as u64;
-        for (dst, &x) in extra[2..].iter_mut().zip(chunks) {
+        extra[0] = 2;
+        extra[1] = u64::from(settings.shuffle);
+        extra[2] = settings.deflate.map_or(0, |level| u64::from(level) + 1);
+        extra[3] = chunks.len() as u64;
+        for (dst, &x) in extra[4..].iter_mut().zip(chunks) {
             *dst = x as u64;
         }
-        chunks.len() + 2
+        chunks.len() + 4
     } else {
-        2
+        extra[0] = 2;
+        extra[1] = u64::from(settings.shuffle);
+        extra[2] = settings.deflate.map_or(0, |level| u64::from(level) + 1);
+        extra[3] = 0;
+        4
     };
     crate::options::agree_controls(
         comm,
@@ -1417,7 +1451,17 @@ fn validate_options(
         },
         settings.hints,
         &extra[..len],
-    )
+    )?;
+    // Options agree before filter-dependent collectives. Both directions must
+    // be supported so a successfully written dataset remains readable.
+    for (requested, filter) in [(settings.shuffle, 2), (settings.deflate.is_some(), 1)] {
+        if requested {
+            let capable = native::filter_avail(filter)
+                && native::filter_info(filter).is_ok_and(|flags| flags & 3 == 3);
+            agree_phase(comm, capable, "HDF5 filter capability")?;
+        }
+    }
+    Ok(())
 }
 
 fn prepare_hdf5_fapl(
@@ -2536,4 +2580,426 @@ fn is_permutation(values: &[u64], n: usize) -> bool {
         seen[index] = true;
     }
     true
+}
+
+fn catalog_agree_bytes(
+    comm: &mpi::topology::CartesianCommunicator,
+    bytes: &[u8],
+) -> Result<(), crate::catalog::CatalogError> {
+    crate::catalog::agree_bytes(comm, bytes)
+}
+
+fn catalog_valid(
+    comm: &mpi::topology::CartesianCommunicator,
+    valid: bool,
+    phase: &'static str,
+) -> Result<(), crate::catalog::CatalogError> {
+    agree_phase(comm, valid, phase).map_err(crate::catalog::CatalogError::Io)
+}
+
+pub(crate) fn inspect_catalog(
+    path: &Path,
+    comm: &mpi::topology::CartesianCommunicator,
+) -> Result<Vec<crate::catalog::DatasetInfo>, crate::catalog::CatalogError> {
+    use crate::catalog::{CatalogError, ScalarType};
+    let path = path_cstring(path, comm).map_err(CatalogError::Io)?;
+    let duplicate = duplicate_comm(comm).map_err(CatalogError::Io)?;
+    let fapl = match prepare_hdf5_fapl(comm, duplicate.raw, &[]) {
+        Ok(x) => x,
+        Err(e) => return Err(CatalogError::Io(cleanup_comm_only(comm, duplicate, e))),
+    };
+    let file = match open_hdf5(comm, fapl, &path, false) {
+        Ok(x) => x,
+        Err(e) => return Err(CatalogError::Io(cleanup_comm_only(comm, duplicate, e))),
+    };
+    let mut resources = Hdf5Resources::default();
+    let result = (|| {
+        let mut out = Vec::new();
+        let mut groups = Vec::new();
+        let reserve = groups.try_reserve_exact(2);
+        if let Err(e) = agree_phase(
+            comm,
+            reserve.is_ok(),
+            "HDF5 catalog group collection allocation",
+        ) {
+            return Err(CatalogError::Io(
+                reserve
+                    .err()
+                    .map(|_| IoError::AllocationFailed { requested: 2 })
+                    .unwrap_or(e),
+            ));
+        }
+        for group_name in [cstr(GROUP_NAME), cstr(NAMED_GROUP)] {
+            let exists_result = native::link_exists(file, group_name);
+            let exists =
+                match agree_phase(comm, exists_result.is_ok(), "HDF5 catalog group link query") {
+                    Ok(()) => {
+                        exists_result.map_err(|x| hdf5_error("HDF5 catalog group link query", x))?
+                    }
+                    Err(e) => return Err(CatalogError::Io(e)),
+                };
+            catalog_agree_bytes(comm, &[u8::from(exists)])?;
+            if exists {
+                let group_result =
+                    native::link_is_hard_and_type(file, group_name, native::LinkObjectType::Group);
+                let is_group = match agree_phase(
+                    comm,
+                    group_result.is_ok(),
+                    "HDF5 catalog group link type query",
+                ) {
+                    Ok(()) => group_result
+                        .map_err(|x| hdf5_error("HDF5 catalog group link type query", x))?,
+                    Err(e) => return Err(CatalogError::Io(e)),
+                };
+                catalog_valid(comm, is_group, "HDF5 catalog group link type")?;
+            }
+            groups.push(exists);
+        }
+        catalog_valid(
+            comm,
+            groups.iter().any(|&x| x),
+            "HDF5 catalog recognized group",
+        )?;
+        for (group_name, named) in [(cstr(GROUP_NAME), false), (cstr(NAMED_GROUP), true)] {
+            if !groups[usize::from(named)] {
+                continue;
+            }
+            let group = match collective_handle_phase(
+                comm,
+                native::group_open(file, group_name),
+                "HDF5 catalog group open",
+            ) {
+                Ok(x) => x,
+                Err(e) => return Err(CatalogError::Io(e)),
+            };
+            resources.group = Some(group);
+            let count_result = native::group_link_count(group);
+            let count = match agree_phase(comm, count_result.is_ok(), "HDF5 catalog link count") {
+                Ok(()) => count_result.map_err(|x| hdf5_error("H5Gget_info", x))?,
+                Err(e) => return Err(CatalogError::Io(e)),
+            };
+            catalog_agree_bytes(comm, &count.to_le_bytes())?;
+            catalog_valid(
+                comm,
+                count > 0 && count <= 65_536 && (named || count == 1),
+                "HDF5 catalog link count validation",
+            )?;
+            for index in 0..count {
+                let buf_len = if named {
+                    MAX_NAME * 2 + 1
+                } else {
+                    MAX_NAME + 1
+                };
+                let mut buf = Vec::new();
+                let reserve = buf.try_reserve_exact(buf_len);
+                if let Err(e) =
+                    agree_phase(comm, reserve.is_ok(), "HDF5 catalog link-name allocation")
+                {
+                    return Err(CatalogError::Io(
+                        reserve
+                            .err()
+                            .map(|_| IoError::AllocationFailed { requested: buf_len })
+                            .unwrap_or(e),
+                    ));
+                }
+                buf.resize(buf_len, 0);
+                let nl = native::link_name_by_idx(group, index, &mut buf);
+                let nl = match agree_phase(comm, nl.is_ok(), "HDF5 catalog link name") {
+                    Ok(()) => nl.map_err(|x| hdf5_error("H5Lget_name_by_idx", x))?,
+                    Err(e) => return Err(CatalogError::Io(e)),
+                };
+                if let Err(e) = agree_phase(
+                    comm,
+                    nl <= if named { MAX_NAME * 2 } else { MAX_NAME } && nl < buf.len(),
+                    "HDF5 catalog link name validation",
+                ) {
+                    return Err(CatalogError::Io(e));
+                }
+                let link = &buf[..nl];
+                catalog_agree_bytes(comm, link)?;
+                catalog_valid(comm, named || link == b"data", "HDF5 catalog legacy link")?;
+                let dname_result = CString::new(link);
+                catalog_valid(comm, dname_result.is_ok(), "HDF5 catalog link name")?;
+                let dname = dname_result.expect("link name agreement");
+                let dataset_link =
+                    native::link_is_hard_and_type(group, &dname, native::LinkObjectType::Dataset);
+                let dataset_link = match agree_phase(
+                    comm,
+                    dataset_link.is_ok(),
+                    "HDF5 catalog dataset link query",
+                ) {
+                    Ok(()) => dataset_link
+                        .map_err(|x| hdf5_error("HDF5 catalog dataset link query", x))?,
+                    Err(e) => return Err(CatalogError::Io(e)),
+                };
+                catalog_agree_bytes(comm, &[u8::from(dataset_link)])?;
+                catalog_valid(comm, dataset_link, "HDF5 catalog dataset link")?;
+                let dataset = match collective_handle_phase(
+                    comm,
+                    native::dataset_open(group, &dname),
+                    "HDF5 catalog dataset open",
+                ) {
+                    Ok(x) => x,
+                    Err(e) => return Err(CatalogError::Io(e)),
+                };
+                resources.dataset = Some(dataset);
+                macro_rules! attr {
+                    ($n:expr, $l:expr, $m:expr) => {{
+                        let value = read_attr_phase(
+                            comm,
+                            duplicate.raw,
+                            dataset,
+                            $n,
+                            $l,
+                            $m,
+                            "HDF5 catalog attribute",
+                        )
+                        .map_err(CatalogError::Io)?;
+                        let bytes: Vec<u8> = value.iter().flat_map(|x| x.to_le_bytes()).collect();
+                        catalog_agree_bytes(comm, &bytes)?;
+                        value
+                    }};
+                }
+                let version = attr!(ATTR_VERSION, Some(1), 1);
+                let commit = attr!(ATTR_COMMIT, Some(1), 1);
+                let nvals = attr!(ATTR_N, Some(1), 1);
+                let typ = attr!(ATTR_TYPE, Some(1), 1);
+                let width = attr!(ATTR_WIDTH, Some(1), 1);
+                let erank = attr!(ATTR_EXTRA_RANK, Some(1), 1);
+                let scalar_result = ScalarType::decode(typ[0], width[0]);
+                catalog_valid(comm, scalar_result.is_some(), "HDF5 catalog scalar type")?;
+                let scalar = scalar_result.expect("scalar type agreement");
+                let n_result = usize::try_from(nvals[0]);
+                let er_result = usize::try_from(erank[0]);
+                catalog_valid(
+                    comm,
+                    n_result.is_ok() && er_result.is_ok(),
+                    "HDF5 catalog rank conversion",
+                )?;
+                let n = n_result.expect("rank agreement");
+                let er = er_result.expect("extra rank agreement");
+                catalog_valid(
+                    comm,
+                    version == [FORMAT_VERSION]
+                        && commit == [COMMIT_MARKER]
+                        && n > 0
+                        && n <= MAX_PROTOCOL_RANK
+                        && er <= MAX_PROTOCOL_RANK
+                        && n.checked_add(er).is_some_and(|x| x <= MAX_PROTOCOL_RANK),
+                    "HDF5 catalog metadata",
+                )?;
+                let extra = if er == 0 {
+                    let has_extra = attribute_exists_phase(
+                        comm,
+                        dataset,
+                        ATTR_EXTRA,
+                        "HDF5 catalog extra shape",
+                    )
+                    .map_err(CatalogError::Io)?;
+                    catalog_valid(comm, !has_extra, "HDF5 catalog extra shape")?;
+                    Vec::new()
+                } else {
+                    attr!(ATTR_EXTRA, Some(er), er)
+                };
+                let global = attr!(ATTR_GLOBAL, Some(n), n);
+                let grid = attr!(ATTR_GRID, None, MAX_PROTOCOL_RANK);
+                let perm = attr!(ATTR_PERM, Some(n), n);
+                let product = global
+                    .iter()
+                    .chain(extra.iter())
+                    .try_fold(1u64, |p, &x| p.checked_mul(x));
+                let bytes_product = product.and_then(|x| x.checked_mul(scalar.width() as u64));
+                let grid_product = grid.iter().try_fold(1u64, |p, &x| p.checked_mul(x));
+                let shape_ok = !global.is_empty()
+                    && !grid.is_empty()
+                    && global.len() + extra.len() <= MAX_PROTOCOL_RANK
+                    && bytes_product.is_some()
+                    && grid.iter().all(|&x| x > 0)
+                    && grid_product.is_some()
+                    && is_permutation(&perm, n);
+                catalog_valid(comm, shape_ok, "HDF5 catalog shape or provenance")?;
+                let expected_result: Result<Vec<hsize_t>, _> = extra
+                    .iter()
+                    .chain(global.iter())
+                    .map(|&x| hsize_t::try_from(x))
+                    .collect();
+                catalog_valid(
+                    comm,
+                    expected_result.is_ok(),
+                    "HDF5 catalog native shape bounds",
+                )?;
+                let expected = expected_result.expect("native shape agreement");
+                let (space, e) = local_handle_phase(
+                    comm,
+                    native::dataset_space(dataset),
+                    "HDF5 catalog dataset space",
+                );
+                resources.file_space = space;
+                if let Some(e) = e {
+                    return Err(CatalogError::Io(e));
+                }
+                let actual_result = native::space_shape(resources.file_space.unwrap());
+                catalog_valid(comm, actual_result.is_ok(), "HDF5 catalog dataset shape")?;
+                let actual = actual_result
+                    .map_err(|x| CatalogError::Io(hdf5_error("H5Sget_simple_extent_dims", x)))?;
+                let actual_bytes: Vec<u8> = actual.iter().flat_map(|x| x.to_le_bytes()).collect();
+                catalog_agree_bytes(comm, &actual_bytes)?;
+                catalog_valid(comm, actual == expected, "HDF5 catalog dataset shape")?;
+                let (dtype, e) = local_handle_phase(
+                    comm,
+                    native::dataset_type(dataset),
+                    "HDF5 catalog datatype",
+                );
+                resources.datatype = dtype;
+                if let Some(e) = e {
+                    return Err(CatalogError::Io(e));
+                }
+                let type_result = native::type_matches(
+                    resources.datatype.unwrap(),
+                    scalar.code(),
+                    scalar.width(),
+                    duplicate.raw,
+                );
+                catalog_valid(comm, type_result.is_ok(), "HDF5 catalog datatype query")?;
+                let type_ok = type_result
+                    .map_err(|x| CatalogError::Io(hdf5_error("HDF5 catalog datatype", x)))?;
+                catalog_agree_bytes(comm, &[u8::from(type_ok)])?;
+                catalog_valid(comm, type_ok, "HDF5 catalog datatype")?;
+                let name = if named {
+                    let link_ok = nl > 0
+                        && nl % 2 == 0
+                        && nl <= MAX_NAME * 2
+                        && link
+                            .iter()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b));
+                    catalog_valid(comm, link_ok, "HDF5 catalog named link")?;
+                    let mut decoded = Vec::new();
+                    let reserve = decoded.try_reserve_exact(nl / 2);
+                    if let Err(e) =
+                        agree_phase(comm, reserve.is_ok(), "HDF5 catalog name allocation")
+                    {
+                        return Err(CatalogError::Io(
+                            reserve
+                                .err()
+                                .map(|_| IoError::AllocationFailed { requested: nl / 2 })
+                                .unwrap_or(e),
+                        ));
+                    }
+                    for p in link.chunks_exact(2) {
+                        let hi = if p[0] <= b'9' {
+                            p[0] - b'0'
+                        } else {
+                            p[0] - b'a' + 10
+                        };
+                        let lo = if p[1] <= b'9' {
+                            p[1] - b'0'
+                        } else {
+                            p[1] - b'a' + 10
+                        };
+                        decoded.push((hi << 4) | lo);
+                    }
+                    let original = read_original_name(comm, dataset, "HDF5 catalog original name")
+                        .map_err(CatalogError::Io)?;
+                    catalog_agree_bytes(comm, &original)?;
+                    let original_ok = !original.is_empty()
+                        && original.len() <= MAX_NAME
+                        && !original.contains(&0)
+                        && std::str::from_utf8(&original).is_ok()
+                        && original == decoded;
+                    catalog_valid(comm, original_ok, "HDF5 catalog original name")?;
+                    Some(String::from_utf8(decoded).expect("UTF-8 name agreement"))
+                } else {
+                    None
+                };
+                let provenance_len =
+                    (grid.len() + perm.len())
+                        .checked_mul(8)
+                        .ok_or(CatalogError::Io(IoError::SizeLimit {
+                            what: "catalog provenance",
+                        }))?;
+                let mut provenance = Vec::new();
+                let reserve = provenance.try_reserve_exact(provenance_len);
+                if let Err(e) =
+                    agree_phase(comm, reserve.is_ok(), "HDF5 catalog provenance allocation")
+                {
+                    return Err(CatalogError::Io(
+                        reserve
+                            .err()
+                            .map(|_| IoError::AllocationFailed {
+                                requested: provenance_len,
+                            })
+                            .unwrap_or(e),
+                    ));
+                }
+                for &x in grid.iter().chain(perm.iter()) {
+                    provenance.extend_from_slice(&x.to_le_bytes());
+                }
+                let reserve = out.try_reserve_exact(1);
+                if let Err(e) =
+                    agree_phase(comm, reserve.is_ok(), "HDF5 catalog collection allocation")
+                {
+                    return Err(CatalogError::Io(
+                        reserve
+                            .err()
+                            .map(|_| IoError::AllocationFailed { requested: 1 })
+                            .unwrap_or(e),
+                    ));
+                }
+                out.push(crate::catalog::DatasetInfo {
+                    name,
+                    scalar_type: scalar,
+                    global_shape: global,
+                    extra_shape: extra,
+                    provenance,
+                });
+                let mut first = None;
+                close_optional(
+                    comm,
+                    &mut resources.datatype,
+                    &mut first,
+                    native::type_close,
+                    "H5Tclose(catalog)",
+                );
+                close_optional(
+                    comm,
+                    &mut resources.file_space,
+                    &mut first,
+                    native::dataspace_close,
+                    "H5Sclose(catalog)",
+                );
+                close_optional(
+                    comm,
+                    &mut resources.dataset,
+                    &mut first,
+                    native::dataset_close,
+                    "H5Dclose(catalog)",
+                );
+                if let Some(e) = first {
+                    return Err(CatalogError::Io(e));
+                }
+            }
+            let mut first = None;
+            close_optional(
+                comm,
+                &mut resources.group,
+                &mut first,
+                native::group_close,
+                "H5Gclose(catalog)",
+            );
+            if let Some(e) = first {
+                return Err(CatalogError::Io(e));
+            }
+        }
+        Ok(out)
+    })();
+    let agreement = agree_phase(comm, result.is_ok(), "HDF5 catalog validation");
+    let cleanup = finish_hdf5(comm, duplicate, file, resources);
+    match cleanup {
+        Some(e) => Err(CatalogError::Io(e)),
+        None => match (result, agreement) {
+            (Err(e), _) => Err(e),
+            (Ok(_), Err(e)) => Err(CatalogError::Io(e)),
+            (Ok(x), Ok(())) => Ok(x),
+        },
+    }
 }

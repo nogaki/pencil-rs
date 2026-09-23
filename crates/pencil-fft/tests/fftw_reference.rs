@@ -19,7 +19,11 @@ use pencil_fft::{
 #[cfg(feature = "fftw")]
 use pencil_fft::{PlanOptions, PlanningRigor};
 
-fn parse_selectors(backend: Option<&str>, order: Option<&str>) -> Result<(bool, bool), String> {
+fn parse_selectors(
+    backend: Option<&str>,
+    order: Option<&str>,
+    threads: Option<&str>,
+) -> Result<(bool, bool, usize), String> {
     let fftw = match backend {
         None | Some("rustfft") => false,
         Some("fftw") => true,
@@ -30,10 +34,20 @@ fn parse_selectors(backend: Option<&str>, order: Option<&str>) -> Result<(bool, 
         Some("directions-first") => true,
         Some(value) => return Err(format!("invalid PENCIL_FFT_DIRECTION_ORDER: {value:?}")),
     };
-    Ok((fftw, directions_first))
+    let value = threads.unwrap_or("1");
+    let count = value.parse::<std::ffi::c_int>().ok().filter(|&count| {
+        count > 0
+            && value.starts_with(|c: char| matches!(c, '1'..='9'))
+            && value.bytes().all(|c| c.is_ascii_digit())
+    });
+    let count = count.ok_or_else(|| format!("invalid PENCIL_FFT_THREADS: {value:?}"))?;
+    if !fftw && count != 1 {
+        return Err("PENCIL_FFT_THREADS > 1 requires PENCIL_FFT_BACKEND=fftw".into());
+    }
+    Ok((fftw, directions_first, count as usize))
 }
 
-fn reference_selectors() -> (bool, bool) {
+fn reference_selectors() -> (bool, bool, usize) {
     let read = |name| match env::var(name) {
         Ok(value) => Some(value),
         Err(env::VarError::NotPresent) => None,
@@ -41,7 +55,9 @@ fn reference_selectors() -> (bool, bool) {
     };
     let backend = read("PENCIL_FFT_BACKEND");
     let order = read("PENCIL_FFT_DIRECTION_ORDER");
-    let selectors = parse_selectors(backend.as_deref(), order.as_deref()).unwrap();
+    let threads = read("PENCIL_FFT_THREADS");
+    let selectors =
+        parse_selectors(backend.as_deref(), order.as_deref(), threads.as_deref()).unwrap();
     assert!(
         !selectors.0 || cfg!(feature = "fftw"),
         "PENCIL_FFT_BACKEND=fftw requires the fftw feature"
@@ -61,7 +77,20 @@ fn reference_selector_parser() {
             (Some("native-first"), false),
             (Some("directions-first"), true),
         ] {
-            assert_eq!(parse_selectors(backend, order), Ok((fftw, first)));
+            for threads in [None, Some("1")] {
+                assert_eq!(
+                    parse_selectors(backend, order, threads),
+                    Ok((fftw, first, 1))
+                );
+            }
+            for threads in ["2", "2147483647"] {
+                let result = parse_selectors(backend, order, Some(threads));
+                if fftw {
+                    assert_eq!(result, Ok((true, first, threads.parse().unwrap())));
+                } else {
+                    assert!(result.unwrap_err().contains("PENCIL_FFT_THREADS"));
+                }
+            }
         }
     }
     for invalid in [
@@ -74,15 +103,42 @@ fn reference_selector_parser() {
         " fftw",
     ] {
         assert!(
-            parse_selectors(Some(invalid), None)
+            parse_selectors(Some(invalid), None, None)
                 .unwrap_err()
                 .contains("PENCIL_FFT_BACKEND")
         );
         assert!(
-            parse_selectors(None, Some(invalid))
+            parse_selectors(None, Some(invalid), None)
                 .unwrap_err()
                 .contains("PENCIL_FFT_DIRECTION_ORDER")
         );
+    }
+}
+
+#[test]
+fn reference_thread_selector_parser() {
+    for invalid in [
+        "",
+        "0",
+        "-1",
+        "+1",
+        "01",
+        " 1",
+        "1 ",
+        "1\n",
+        "1.0",
+        "two",
+        "２",
+        "2147483648",
+        "999999999999999999999999999",
+    ] {
+        for backend in [None, Some("rustfft"), Some("fftw")] {
+            assert!(
+                parse_selectors(backend, None, Some(invalid))
+                    .unwrap_err()
+                    .contains("PENCIL_FFT_THREADS")
+            );
+        }
     }
 }
 
@@ -97,8 +153,13 @@ macro_rules! select_backend {
         );
         #[cfg(feature = "fftw")]
         let plan = if use_fftw {
-            plan.with_fftw(PlanOptions::new(PlanningRigor::Estimate, None).unwrap())
-                .unwrap()
+            plan.with_fftw(
+                PlanOptions::new(PlanningRigor::Estimate, None)
+                    .unwrap()
+                    .with_threads(reference_selectors().2)
+                    .unwrap(),
+            )
+            .unwrap()
         } else {
             plan
         };
@@ -109,6 +170,11 @@ macro_rules! select_backend {
             } else {
                 BackendKind::RustFft
             }
+        );
+        #[cfg(feature = "fftw")]
+        assert_eq!(
+            plan.options().map(|options| options.requested_threads()),
+            use_fftw.then_some(reference_selectors().2)
         );
         plan
     }};
@@ -133,6 +199,11 @@ macro_rules! select_directed_backend {
             } else {
                 BackendKind::RustFft
             }
+        );
+        #[cfg(feature = "fftw")]
+        assert_eq!(
+            plan.options().map(|options| options.requested_threads()),
+            reference_selectors().0.then_some(reference_selectors().2)
         );
         plan
     }};

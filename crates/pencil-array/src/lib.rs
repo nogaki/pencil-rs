@@ -300,8 +300,9 @@ pub use array::PencilArray;
 pub use axis::{AxisPermutation, SpatialAxis};
 pub use collectives::{
     NormOutput, OrderedScalar, SupportedScalar, TruthValue, all, all_by, any, any_by, gather,
-    global_max, global_min, global_sum, l2_norm, map_reduce2, max_by, min_by, norm_by, sum_by,
-    zip_norm_by, zip_sum_by,
+    global_max, global_min, global_sum, l2_norm, map_reduce_many, map_reduce2, map_reduce3, max_by,
+    max_many_by, min_by, min_many_by, norm_by, norm_many_by, sum_by, sum_many_by, zip_norm_by,
+    zip_sum_by,
 };
 pub use decomposition::Decomposition;
 pub use error::{
@@ -316,7 +317,10 @@ pub use many::{ManyPencilArray, OverwriteError};
 pub use pencil::{Pencil, PencilConfig};
 pub use point_to_point_transpose::PointToPointTransposePlan;
 pub use pointwise::{
-    PointwiseError, pointwise2, pointwise2_in_place, pointwise2_in_place_views, pointwise2_views,
+    MultiInputError, PointwiseError, pointwise_many, pointwise_many_in_place,
+    pointwise_many_in_place_views, pointwise_many_views, pointwise2, pointwise2_in_place,
+    pointwise2_in_place_views, pointwise2_views, pointwise3, pointwise3_in_place,
+    pointwise3_in_place_views, pointwise3_views,
 };
 pub use topology::MpiTopology;
 pub use transpose::{

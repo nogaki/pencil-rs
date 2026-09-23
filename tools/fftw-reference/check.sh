@@ -19,6 +19,17 @@ case "${PENCIL_FFT_DIRECTION_ORDER-native-first}" in
     *) printf 'invalid PENCIL_FFT_DIRECTION_ORDER: %s\n' "$PENCIL_FFT_DIRECTION_ORDER" >&2; exit 1 ;;
 esac
 
+threads=${PENCIL_FFT_THREADS-1}
+# Bound the length before arithmetic so even huge inputs cannot overflow Bash.
+if [[ ! $threads =~ ^[1-9][0-9]*$ ]] || (( ${#threads} > 10 )) || (( threads > 2147483647 )); then
+    printf 'invalid PENCIL_FFT_THREADS: %s\n' "$threads" >&2
+    exit 1
+fi
+if [[ ${PENCIL_FFT_BACKEND-rustfft} == rustfft && $threads != 1 ]]; then
+    printf 'PENCIL_FFT_THREADS > 1 requires PENCIL_FFT_BACKEND=fftw\n' >&2
+    exit 1
+fi
+
 JULIA_BIN=$(command -v "$JULIA" 2>/dev/null) || {
     printf 'missing Julia executable: %s\n' "$JULIA" >&2
     exit 1

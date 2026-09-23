@@ -17,7 +17,7 @@ use pencil_array::{PencilArrayView, PencilArrayViewMut};
 use crate::ffi;
 use crate::format::{IoElement, element_count, pack_view, prepare_physical_values};
 use crate::mpi_io::agree_phase;
-use crate::mpi_io::{DatatypeGuard, build_layout, duplicate_comm, finish_resources};
+use crate::mpi_io::{DatatypeGuard, build_layout, duplicate_comm, finish_resources, path_bytes};
 use crate::options::{InfoGuard, MpiIoMode, MpiIoOptions, agree_options};
 use crate::{COMMIT_MARKER, IoError, MAX_PROTOCOL_RANK, NamedIoError};
 
@@ -41,6 +41,13 @@ fn u64at(b: &[u8], p: usize) -> Option<u64> {
 }
 fn put(out: &mut Vec<u8>, x: u64) {
     out.extend_from_slice(&x.to_le_bytes());
+}
+
+pub(crate) fn agree_name<C: CommunicatorCollectives>(
+    comm: &C,
+    name: &str,
+) -> Result<(), NamedIoError> {
+    name_bytes(comm, name)
 }
 
 fn name_bytes<C: CommunicatorCollectives>(comm: &C, name: &str) -> Result<(), NamedIoError> {
@@ -83,7 +90,7 @@ fn prepared<C: CommunicatorCollectives, T>(
 }
 
 fn path_c<P: AsRef<Path>>(p: P) -> Result<CString, IoError> {
-    let path = p.as_ref().to_str().ok_or(IoError::InvalidPath)?;
+    let path = path_bytes(p.as_ref())?;
     let len = path
         .len()
         .checked_add(1)
@@ -92,7 +99,7 @@ fn path_c<P: AsRef<Path>>(p: P) -> Result<CString, IoError> {
     bytes
         .try_reserve_exact(len)
         .map_err(|_| IoError::AllocationFailed { requested: len })?;
-    bytes.extend_from_slice(path.as_bytes());
+    bytes.extend_from_slice(path);
     bytes.push(0);
     CString::from_vec_with_nul(bytes).map_err(|_| IoError::InvalidPath)
 }
@@ -138,12 +145,12 @@ fn open<C: CommunicatorCollectives + Communicator>(
 }
 
 #[derive(Clone)]
-struct Rec {
-    name: Vec<u8>,
-    typ: u64,
-    width: usize,
-    global: Vec<usize>,
-    extra: Vec<usize>,
+pub(crate) struct Rec {
+    pub(crate) name: Vec<u8>,
+    pub(crate) typ: u64,
+    pub(crate) width: usize,
+    pub(crate) global: Vec<usize>,
+    pub(crate) extra: Vec<usize>,
     payload_offset: usize,
 }
 fn read_segment<C: CommunicatorCollectives>(
@@ -173,6 +180,14 @@ fn read_segment<C: CommunicatorCollectives>(
 fn scan_file<C: CommunicatorCollectives>(
     comm: &C,
     file: ffi::MPI_File,
+) -> Result<(Vec<Rec>, usize, usize), NamedIoError> {
+    scan_file_bounded(comm, file, usize::MAX)
+}
+
+pub(crate) fn scan_file_bounded<C: CommunicatorCollectives>(
+    comm: &C,
+    file: ffi::MPI_File,
+    max_records: usize,
 ) -> Result<(Vec<Rec>, usize, usize), NamedIoError> {
     let native_size = ffi::file_get_size(file);
     agree_phase(comm, native_size.is_ok(), "MPI_File_get_size").map_err(NamedIoError::Io)?;
@@ -214,6 +229,12 @@ fn scan_file<C: CommunicatorCollectives>(
     let mut p = CONTAINER_BYTES;
     let mut out = Vec::new();
     while p < size {
+        if out.len() == max_records {
+            return Err(IoError::SizeLimit {
+                what: "catalog dataset count",
+            }
+            .into());
+        }
         if size - p < RECORD_HEADER_BYTES {
             break;
         }

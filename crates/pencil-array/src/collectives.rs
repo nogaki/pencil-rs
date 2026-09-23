@@ -17,7 +17,7 @@ use mpi::{
     Count,
     collective::{CommunicatorCollectives, SystemOperation},
     datatype::Equivalence,
-    topology::Communicator,
+    topology::{CartesianCommunicator, Communicator, CommunicatorRelation},
     traits::{Destination, Source},
 };
 use num_complex::{Complex32, Complex64};
@@ -38,6 +38,12 @@ const OP_ALL: u64 = OPERATION_NAMESPACE + 6;
 const OP_ANY_BY: u64 = OPERATION_NAMESPACE + 7;
 const OP_ALL_BY: u64 = OPERATION_NAMESPACE + 8;
 const OP_MAP_REDUCE2: u64 = 0x4d52_3201;
+const OP_MAP_REDUCE3: u64 = 0x4d52_3301;
+const OP_MAP_REDUCE_MANY: u64 = 0x4d52_4d01;
+const OP_SUM_MANY: u64 = OPERATION_NAMESPACE + 16;
+const OP_NORM_MANY: u64 = OPERATION_NAMESPACE + 17;
+const OP_MIN_MANY: u64 = OPERATION_NAMESPACE + 18;
+const OP_MAX_MANY: u64 = OPERATION_NAMESPACE + 19;
 const OP_SUM_BY: u64 = OPERATION_NAMESPACE + 9;
 const OP_NORM_BY: u64 = OPERATION_NAMESPACE + 10;
 const OP_GATHER: u64 = OPERATION_NAMESPACE + 11;
@@ -674,6 +680,225 @@ where
     norm_values(left.pencil().topology().communicator(), &mapped, prepared)
 }
 
+/// Maps three locally aligned inputs and folds their mapped triples in rank order.
+/// The reducer must be deterministic, associative, and neutral-compatible; its
+/// result must not depend on mutable invocation count or order (observational
+/// counters are fine). All ranks must use matching callbacks. Map and reduce
+/// callbacks must not call MPI or panic; no recovery is guaranteed if they do.
+pub fn map_reduce3<A, B, D, U, F, R, const N: usize, const M: usize>(
+    communicator: &CartesianCommunicator,
+    first: &PencilArrayView<'_, A, N, M>,
+    second: &PencilArrayView<'_, B, N, M>,
+    third: &PencilArrayView<'_, D, N, M>,
+    neutral: U,
+    mut map: F,
+    mut reduce: R,
+) -> Result<U, CollectiveError>
+where
+    U: SupportedScalar,
+    F: FnMut(&A, &B, &D) -> U,
+    R: FnMut(U, U) -> U,
+{
+    let plan = prepare_map_reduce3(
+        communicator,
+        first,
+        second,
+        third,
+        neutral,
+        type_name::<(F, R)>(),
+    )?;
+    let size = usize::try_from(communicator.size()).map_err(|_| CollectiveError::CountOverflow)?;
+    let mut partials = Vec::new();
+    let allocation = partials.try_reserve_exact(size);
+    if !collective_valid(communicator, allocation.is_ok()) {
+        return Err(allocation
+            .err()
+            .map_or(CollectiveError::CollectivePreconditionFailed, |_| {
+                CollectiveError::AllocationFailed { elements: size }
+            }));
+    }
+    partials.resize(size, neutral);
+    let mut local = neutral;
+    for_each_triple(first, second, third, &plan, |a, b, d| {
+        local = reduce(local, map(a, b, d))
+    });
+    communicator.all_gather_into(&local, &mut partials[..]);
+    Ok(partials.into_iter().fold(neutral, reduce))
+}
+
+/// Maps any non-empty collection of homogeneous views and folds it in rank order.
+/// `map` receives reusable references; it must not retain them, call MPI, or panic.
+/// The reducer must be deterministic, associative, and neutral-compatible; its
+/// result must not depend on mutable invocation count or order (observational
+/// counters are fine). All ranks must use matching callbacks. No recovery is
+/// guaranteed if a callback calls MPI or panics.
+pub fn map_reduce_many<T, U, F, R, const N: usize, const M: usize>(
+    communicator: &CartesianCommunicator,
+    inputs: &[PencilArrayView<'_, T, N, M>],
+    neutral: U,
+    mut map: F,
+    mut reduce: R,
+) -> Result<U, CollectiveError>
+where
+    T: 'static,
+    U: SupportedScalar,
+    F: FnMut(&[&T]) -> U,
+    R: FnMut(U, U) -> U,
+{
+    let plan = prepare_map_reduce_many(
+        communicator,
+        inputs,
+        neutral,
+        type_name::<(F, R)>(),
+        OP_MAP_REDUCE_MANY,
+    )?;
+    let size = usize::try_from(communicator.size()).map_err(|_| CollectiveError::CountOverflow)?;
+    let mut partials = Vec::new();
+    let partials_ok = partials.try_reserve_exact(size).is_ok();
+    let mut refs: Vec<&T> = Vec::new();
+    let refs_ok = refs.try_reserve_exact(inputs.len()).is_ok();
+    if !collective_valid(communicator, partials_ok && refs_ok) {
+        return Err(if !partials_ok {
+            CollectiveError::AllocationFailed { elements: size }
+        } else if !refs_ok {
+            CollectiveError::AllocationFailed {
+                elements: inputs.len(),
+            }
+        } else {
+            CollectiveError::CollectivePreconditionFailed
+        });
+    }
+    partials.resize(size, neutral);
+    let mut local = neutral;
+    for_each_many(inputs, &plan, &mut refs, |values| {
+        local = reduce(local, map(values))
+    });
+    communicator.all_gather_into(&local, &mut partials[..]);
+    Ok(partials.into_iter().fold(neutral, reduce))
+}
+
+/// Sums values produced by mapping each tuple of homogeneous inputs.
+/// Integer accumulation is checked; floating-point nonfinite policies match [`sum_by`].
+/// Callbacks must have identical semantics on all ranks, must not call MPI or
+/// panic. All preparation is agreed before mapping; callback panic has no
+/// collective recovery guarantee.
+pub fn sum_many_by<T, U, F, const N: usize, const M: usize>(
+    communicator: &CartesianCommunicator,
+    inputs: &[PencilArrayView<'_, T, N, M>],
+    f: F,
+) -> Result<U, CollectiveError>
+where
+    T: 'static,
+    U: SupportedScalar,
+    F: FnMut(&[&T]) -> U,
+{
+    let plan = prepare_map_reduce_many(
+        communicator,
+        inputs,
+        U::zero(),
+        type_name::<F>(),
+        OP_SUM_MANY,
+    )?;
+    let mut partials = U::prepare_collective_sum(communicator)?;
+    let values = map_many_values_prepared(communicator, inputs, &plan, f)?;
+    sum_values_prepared(communicator, &values, &mut partials)
+}
+
+/// Computes a scaled norm after mapping each tuple of homogeneous inputs.
+/// Uses the scaled and nonfinite policies of [`norm_by`]. The callback contract
+/// and preflight guarantees are those of [`sum_many_by`].
+/// The callback must not call MPI or panic; no recovery is guaranteed if it does.
+pub fn norm_many_by<T, U, F, const N: usize, const M: usize>(
+    communicator: &CartesianCommunicator,
+    inputs: &[PencilArrayView<'_, T, N, M>],
+    f: F,
+) -> Result<U::Norm, CollectiveError>
+where
+    T: 'static,
+    U: SupportedScalar,
+    F: FnMut(&[&T]) -> U,
+{
+    let plan = prepare_map_reduce_many(
+        communicator,
+        inputs,
+        U::zero(),
+        type_name::<F>(),
+        OP_NORM_MANY,
+    )?;
+    let values = map_many_values_prepared(communicator, inputs, &plan, f)?;
+    norm_values(
+        communicator,
+        &values,
+        PreparedLayout {
+            global_count: plan.global_count,
+        },
+    )
+}
+
+/// Computes the minimum after mapping each tuple of homogeneous inputs.
+/// Preserves [`min_by`]'s NaN policy and globally-empty `None` result.
+/// The callback contract and preflight guarantees are those of [`sum_many_by`].
+/// The callback must not call MPI or panic; no recovery is guaranteed if it does.
+pub fn min_many_by<T, U, F, const N: usize, const M: usize>(
+    communicator: &CartesianCommunicator,
+    inputs: &[PencilArrayView<'_, T, N, M>],
+    f: F,
+) -> Result<Option<U>, CollectiveError>
+where
+    T: 'static,
+    U: OrderedScalar,
+    F: FnMut(&[&T]) -> U,
+{
+    let plan = prepare_map_reduce_many(
+        communicator,
+        inputs,
+        U::zero(),
+        type_name::<F>(),
+        OP_MIN_MANY,
+    )?;
+    let values = map_many_values_prepared(communicator, inputs, &plan, f)?;
+    let local = U::local_extreme(&values, true);
+    let result = U::collective_extreme(communicator, local, true);
+    let flags = collective_flags(communicator, values_nonfinite_flags(values.iter().copied()));
+    Ok((plan.global_count != 0).then_some(if flags[0] != 0 {
+        U::nan_value()
+    } else {
+        result
+    }))
+}
+
+/// Computes the maximum after mapping each tuple of homogeneous inputs.
+/// Preserves [`max_by`]'s NaN policy and globally-empty `None` result.
+/// The callback contract and preflight guarantees are those of [`sum_many_by`].
+/// The callback must not call MPI or panic; no recovery is guaranteed if it does.
+pub fn max_many_by<T, U, F, const N: usize, const M: usize>(
+    communicator: &CartesianCommunicator,
+    inputs: &[PencilArrayView<'_, T, N, M>],
+    f: F,
+) -> Result<Option<U>, CollectiveError>
+where
+    T: 'static,
+    U: OrderedScalar,
+    F: FnMut(&[&T]) -> U,
+{
+    let plan = prepare_map_reduce_many(
+        communicator,
+        inputs,
+        U::zero(),
+        type_name::<F>(),
+        OP_MAX_MANY,
+    )?;
+    let values = map_many_values_prepared(communicator, inputs, &plan, f)?;
+    let local = U::local_extreme(&values, false);
+    let result = U::collective_extreme(communicator, local, false);
+    let flags = collective_flags(communicator, values_nonfinite_flags(values.iter().copied()));
+    Ok((plan.global_count != 0).then_some(if flags[0] != 0 {
+        U::nan_value()
+    } else {
+        result
+    }))
+}
+
 /// Maps two locally aligned inputs and folds their mapped pairs in rank order.
 /// Traversal follows local row-major memory order (with broadcast dimensions
 /// revisited). Shape/stride metadata costs O(extra-rank); unlike staged zip
@@ -817,6 +1042,31 @@ impl<T, const N: usize, const M: usize> PencilArrayView<'_, T, N, M> {
         norm_by(self, f)
     }
 
+    /// See [`map_reduce3`].
+    pub fn map_reduce3<B, D, U, F, R>(
+        &self,
+        second: &PencilArrayView<'_, B, N, M>,
+        third: &PencilArrayView<'_, D, N, M>,
+        neutral: U,
+        map: F,
+        reduce: R,
+    ) -> Result<U, CollectiveError>
+    where
+        U: SupportedScalar,
+        F: FnMut(&T, &B, &D) -> U,
+        R: FnMut(U, U) -> U,
+    {
+        map_reduce3(
+            self.pencil().topology().communicator(),
+            self,
+            second,
+            third,
+            neutral,
+            map,
+            reduce,
+        )
+    }
+
     /// See [`map_reduce2`].
     pub fn map_reduce2<B, U, F, R>(
         &self,
@@ -944,6 +1194,31 @@ impl<T, const N: usize, const M: usize> PencilArray<T, N, M> {
         norm_by(&self.view(), f)
     }
 
+    /// See [`map_reduce3`].
+    pub fn map_reduce3<B, D, U, F, R>(
+        &self,
+        second: &PencilArray<B, N, M>,
+        third: &PencilArray<D, N, M>,
+        neutral: U,
+        map: F,
+        reduce: R,
+    ) -> Result<U, CollectiveError>
+    where
+        U: SupportedScalar,
+        F: FnMut(&T, &B, &D) -> U,
+        R: FnMut(U, U) -> U,
+    {
+        map_reduce3(
+            self.pencil().topology().communicator(),
+            &self.view(),
+            &second.view(),
+            &third.view(),
+            neutral,
+            map,
+            reduce,
+        )
+    }
+
     /// See [`map_reduce2`].
     pub fn map_reduce2<B, U, F, R>(
         &self,
@@ -979,6 +1254,434 @@ struct MapPlan {
     spatial: usize,
     count: usize,
     global_count: usize,
+}
+
+#[derive(Debug)]
+struct MapPlan3 {
+    shape: Vec<usize>,
+    strides: [Vec<usize>; 3],
+    output_strides: Vec<usize>,
+    spatial: usize,
+    count: usize,
+}
+
+#[derive(Debug)]
+struct ManyPlan {
+    shape: Vec<usize>,
+    strides: Vec<Vec<usize>>,
+    output_strides: Vec<usize>,
+    spatial: usize,
+    extra: usize,
+    count: usize,
+    global_count: usize,
+}
+
+fn prepare_map_reduce3<A, B, D, U, const N: usize, const M: usize>(
+    c: &CartesianCommunicator,
+    a: &PencilArrayView<'_, A, N, M>,
+    b: &PencilArrayView<'_, B, N, M>,
+    d: &PencilArrayView<'_, D, N, M>,
+    neutral: U,
+    callback: &str,
+) -> Result<MapPlan3, CollectiveError>
+where
+    U: SupportedScalar,
+{
+    let header = [
+        DESCRIPTOR_SCHEMA,
+        OP_MAP_REDUCE3,
+        u64::try_from(N).unwrap_or(INVALID_WORD),
+        u64::try_from(M).unwrap_or(INVALID_WORD),
+        0,
+    ];
+    if !agree_header(c, header) {
+        return Err(CollectiveError::CollectiveDescriptorMismatch);
+    }
+    let lengths = [
+        descriptor_len::<A, U, N, M>(a, 0, callback),
+        descriptor_len::<B, U, N, M>(b, 0, callback),
+        descriptor_len::<D, U, N, M>(d, 0, callback),
+    ];
+    let expected = size_of::<U>().checked_mul(2).ok_or(()).and_then(|base| {
+        lengths.iter().try_fold(base, |n, x| {
+            n.checked_add(*x.as_ref().map_err(|_| ())?).ok_or(())
+        })
+    });
+    let header = [
+        DESCRIPTOR_SCHEMA,
+        OP_MAP_REDUCE3,
+        u64::try_from(N).unwrap_or(INVALID_WORD),
+        u64::try_from(M).unwrap_or(INVALID_WORD),
+        expected
+            .as_ref()
+            .ok()
+            .and_then(|n| u64::try_from(*n).ok())
+            .unwrap_or(INVALID_WORD),
+    ];
+    if !agree_header(c, header) {
+        return Err(CollectiveError::CollectiveDescriptorMismatch);
+    }
+    let descriptor = (|| {
+        let mut out = Vec::new();
+        out.try_reserve_exact(expected.map_err(|_| ())?)
+            .map_err(|_| ())?;
+        let words_a = build_descriptor::<_, A, U, N, M>(a, OP_MAP_REDUCE3, 0, callback)?;
+        let words_b = build_descriptor::<_, B, U, N, M>(b, OP_MAP_REDUCE3, 0, callback)?;
+        let words_d = build_descriptor::<_, D, U, N, M>(d, OP_MAP_REDUCE3, 0, callback)?;
+        for (words, len) in [
+            (words_a, lengths[0]),
+            (words_b, lengths[1]),
+            (words_d, lengths[2]),
+        ] {
+            if Some(words.len()) != len.ok() {
+                return Err(());
+            }
+            out.extend(words);
+        }
+        for byte in neutral_bytes(neutral)? {
+            append_word(&mut out, u64::from(byte));
+        }
+        Ok(out)
+    })();
+    let _ = collective_descriptor(c, descriptor.ok(), expected.ok())?;
+    let shape = broadcast_shape3(a.extra_shape(), b.extra_shape(), d.extra_shape());
+    if !collective_valid(c, shape.is_ok()) {
+        return Err(CollectiveError::CollectivePreconditionFailed);
+    }
+    let shape = shape?;
+    let valid = a.pencil().same_layout(b.pencil())
+        && a.pencil().same_layout(d.pencil())
+        && matches!(
+            c.compare(a.pencil().topology().communicator()),
+            CommunicatorRelation::Identical | CommunicatorRelation::Congruent
+        )
+        && matches!(
+            c.compare(b.pencil().topology().communicator()),
+            CommunicatorRelation::Identical | CommunicatorRelation::Congruent
+        )
+        && matches!(
+            c.compare(d.pencil().topology().communicator()),
+            CommunicatorRelation::Identical | CommunicatorRelation::Congruent
+        )
+        && shape.is_some();
+    if !collective_valid(c, valid) || !valid {
+        return Err(CollectiveError::CollectivePreconditionFailed);
+    }
+    let shape = shape.unwrap();
+    let dims = [
+        a.extra_shape().dimensions(),
+        b.extra_shape().dimensions(),
+        d.extra_shape().dimensions(),
+    ];
+    let strides = dims.map(strides_for_dims);
+    let output_strides = strides_for_dims(&shape);
+    let ok = strides.iter().all(Result::is_ok) && output_strides.is_ok();
+    if !collective_valid(c, ok) || !ok {
+        return Err(CollectiveError::PreparationFailed);
+    }
+    let extra = extra_count(&shape)?;
+    let count = a.pencil().local_len().checked_mul(extra);
+    let global_count = a.pencil().global_len().checked_mul(extra);
+    if !collective_valid(c, count.is_some() && global_count.is_some()) {
+        return Err(CollectiveError::CountOverflow);
+    }
+    let count = count.ok_or(CollectiveError::CountOverflow)?;
+    Ok(MapPlan3 {
+        shape,
+        strides: strides.map(Result::unwrap),
+        output_strides: output_strides.unwrap(),
+        spatial: a.pencil().local_len(),
+        count,
+    })
+}
+
+fn broadcast_shape3(
+    a: &ExtraShape,
+    b: &ExtraShape,
+    d: &ExtraShape,
+) -> Result<Option<Vec<usize>>, CollectiveError> {
+    let ab = broadcast_shape(a, b)?.ok_or(CollectiveError::CollectivePreconditionFailed)?;
+    broadcast_shape(
+        &ExtraShape::new(ab).map_err(|_| CollectiveError::PreparationFailed)?,
+        d,
+    )
+}
+
+fn strides_for_dims(dims: &[usize]) -> Result<Vec<usize>, CollectiveError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(dims.len())
+        .map_err(|_| CollectiveError::AllocationFailed {
+            elements: dims.len(),
+        })?;
+    let mut stride: usize = 1;
+    for &dim in dims.iter().rev() {
+        out.push(stride);
+        stride = stride
+            .checked_mul(dim)
+            .ok_or(CollectiveError::CountOverflow)?;
+    }
+    out.reverse();
+    Ok(out)
+}
+
+fn for_each_triple<A, B, D, F, const N: usize, const M: usize>(
+    a: &PencilArrayView<'_, A, N, M>,
+    b: &PencilArrayView<'_, B, N, M>,
+    d: &PencilArrayView<'_, D, N, M>,
+    p: &MapPlan3,
+    mut f: F,
+) where
+    F: FnMut(&A, &B, &D),
+{
+    let sa = a.as_slice();
+    let sb = b.as_slice();
+    let sd = d.as_slice();
+    if p.spatial == 0 {
+        return;
+    }
+    let dims = [
+        a.extra_shape().dimensions(),
+        b.extra_shape().dimensions(),
+        d.extra_shape().dimensions(),
+    ];
+    let extra = p.count / p.spatial;
+    for linear in 0..extra {
+        let mut ix = [0; 3];
+        for q in 0..3 {
+            for (axis, &dim) in dims[q].iter().enumerate() {
+                let i = (linear / p.output_strides[axis]) % p.shape[axis];
+                if dim != 1 {
+                    ix[q] += i * p.strides[q][axis];
+                }
+            }
+        }
+        for k in 0..p.spatial {
+            f(
+                &sa[ix[0] * p.spatial + k],
+                &sb[ix[1] * p.spatial + k],
+                &sd[ix[2] * p.spatial + k],
+            );
+        }
+    }
+}
+
+fn prepare_map_reduce_many<T, U, C, const N: usize, const M: usize>(
+    c: &C,
+    inputs: &[PencilArrayView<'_, T, N, M>],
+    neutral: U,
+    callback: &str,
+    operation: u64,
+) -> Result<ManyPlan, CollectiveError>
+where
+    T: 'static,
+    U: SupportedScalar,
+    C: CommunicatorCollectives,
+{
+    // The header is deliberately first: do not inspect input-dependent lengths
+    // or allocate a composite descriptor before this agreement.
+    let header = [
+        DESCRIPTOR_SCHEMA,
+        operation,
+        u64::try_from(N).unwrap_or(INVALID_WORD),
+        u64::try_from(M).unwrap_or(INVALID_WORD),
+        u64::try_from(inputs.len()).unwrap_or(INVALID_WORD),
+    ];
+    if !agree_header(c, header) {
+        return Err(CollectiveError::CollectiveDescriptorMismatch);
+    }
+    let prepared = (|| {
+        if inputs.is_empty() {
+            return Err(CollectiveError::CollectivePreconditionFailed);
+        }
+        let mut lengths = Vec::new();
+        lengths
+            .try_reserve_exact(inputs.len())
+            .map_err(|_| CollectiveError::AllocationFailed {
+                elements: inputs.len(),
+            })?;
+        let mut expected = size_of::<U>()
+            .checked_mul(2)
+            .ok_or(CollectiveError::CountOverflow)?;
+        for input in inputs {
+            let length = descriptor_len::<T, U, N, M>(input, 0, callback)
+                .map_err(|_| CollectiveError::CountOverflow)?;
+            expected = expected
+                .checked_add(length)
+                .ok_or(CollectiveError::CountOverflow)?;
+            lengths.push(length);
+        }
+        let mut descriptor = Vec::new();
+        descriptor
+            .try_reserve_exact(expected)
+            .map_err(|_| CollectiveError::AllocationFailed { elements: expected })?;
+        for (input, length) in inputs.iter().zip(lengths) {
+            let words = build_descriptor::<_, T, U, N, M>(input, operation, 0, callback)
+                .map_err(|_| CollectiveError::PreparationFailed)?;
+            if words.len() != length {
+                return Err(CollectiveError::PreparationFailed);
+            }
+            descriptor.extend(words);
+        }
+        for byte in neutral_bytes(neutral).map_err(|_| CollectiveError::AllocationFailed {
+            elements: size_of::<U>(),
+        })? {
+            append_word(&mut descriptor, u64::from(byte));
+        }
+        if descriptor.len() != expected {
+            return Err(CollectiveError::PreparationFailed);
+        }
+        let mut shape = Vec::new();
+        shape
+            .try_reserve_exact(inputs[0].extra_shape().dimensions().len())
+            .map_err(|_| CollectiveError::AllocationFailed {
+                elements: inputs[0].extra_shape().dimensions().len(),
+            })?;
+        shape.extend_from_slice(inputs[0].extra_shape().dimensions());
+        for input in &inputs[1..] {
+            shape = broadcast_shape(
+                &ExtraShape::new(shape).map_err(|_| CollectiveError::PreparationFailed)?,
+                input.extra_shape(),
+            )?
+            .ok_or(CollectiveError::CollectivePreconditionFailed)?;
+        }
+        let mut strides = Vec::new();
+        strides
+            .try_reserve_exact(inputs.len())
+            .map_err(|_| CollectiveError::AllocationFailed {
+                elements: inputs.len(),
+            })?;
+        for input in inputs {
+            strides.push(strides_for_dims(input.extra_shape().dimensions())?);
+        }
+        let output_strides = strides_for_dims(&shape)?;
+        let spatial = inputs[0].pencil().local_len();
+        let extra = extra_count(&shape)?;
+        let count = spatial
+            .checked_mul(extra)
+            .ok_or(CollectiveError::CountOverflow)?;
+        let global_count = inputs[0]
+            .pencil()
+            .global_len()
+            .checked_mul(extra)
+            .ok_or(CollectiveError::CountOverflow)?;
+        Ok((
+            descriptor,
+            expected,
+            shape,
+            strides,
+            output_strides,
+            spatial,
+            extra,
+            count,
+            global_count,
+        ))
+    })();
+    let ready = prepared.is_ok();
+    if !collective_valid(c, ready) {
+        return Err(prepared
+            .err()
+            .unwrap_or(CollectiveError::CollectivePreconditionFailed));
+    }
+    let (descriptor, expected, shape, strides, output_strides, spatial, extra, count, global_count) =
+        prepared.expect("collective many preparation succeeded");
+    let length = u64::try_from(expected).unwrap_or(INVALID_WORD);
+    let mut minimum = length;
+    let mut maximum = length;
+    c.all_reduce_into(&length, &mut minimum, SystemOperation::min());
+    c.all_reduce_into(&length, &mut maximum, SystemOperation::max());
+    if minimum != maximum || minimum == INVALID_WORD {
+        return Err(CollectiveError::CollectiveDescriptorMismatch);
+    }
+    let _ = collective_descriptor(c, Some(descriptor), Some(expected))?;
+    let layout_ok = inputs.iter().all(|input| {
+        input.pencil().same_layout(inputs[0].pencil())
+            && matches!(
+                c.compare(input.pencil().topology().communicator()),
+                CommunicatorRelation::Identical | CommunicatorRelation::Congruent
+            )
+    });
+    if !collective_valid(c, layout_ok) || !layout_ok {
+        return Err(CollectiveError::CollectivePreconditionFailed);
+    }
+    Ok(ManyPlan {
+        shape,
+        strides,
+        output_strides,
+        spatial,
+        extra,
+        count,
+        global_count,
+    })
+}
+
+fn for_each_many<'v, T, F, const N: usize, const M: usize>(
+    inputs: &'v [PencilArrayView<'v, T, N, M>],
+    p: &ManyPlan,
+    refs: &mut Vec<&'v T>,
+    mut f: F,
+) where
+    F: FnMut(&[&T]),
+{
+    if p.spatial == 0 {
+        return;
+    }
+    for linear in 0..p.extra {
+        refs.clear();
+        for (q, input) in inputs.iter().enumerate() {
+            let mut i = 0;
+            for axis in 0..p.shape.len() {
+                let x = (linear / p.output_strides[axis]) % p.shape[axis];
+                if input.extra_shape().dimensions()[axis] != 1 {
+                    i += x * p.strides[q][axis];
+                }
+            }
+            refs.push(&input.as_slice()[i * p.spatial]);
+        }
+        for k in 0..p.spatial {
+            for (q, input) in inputs.iter().enumerate() {
+                let mut i = 0;
+                for axis in 0..p.shape.len() {
+                    let x = (linear / p.output_strides[axis]) % p.shape[axis];
+                    if input.extra_shape().dimensions()[axis] != 1 {
+                        i += x * p.strides[q][axis];
+                    }
+                }
+                refs[q] = &input.as_slice()[i * p.spatial + k];
+            }
+            f(refs);
+        }
+    }
+}
+
+fn map_many_values_prepared<T, U, F, C, const N: usize, const M: usize>(
+    c: &C,
+    inputs: &[PencilArrayView<'_, T, N, M>],
+    p: &ManyPlan,
+    mut f: F,
+) -> Result<Vec<U>, CollectiveError>
+where
+    T: 'static,
+    U: SupportedScalar,
+    F: FnMut(&[&T]) -> U,
+    C: CommunicatorCollectives,
+{
+    let mut out = Vec::new();
+    let out_ok = out.try_reserve_exact(p.count).is_ok();
+    let mut refs = Vec::new();
+    let refs_ok = refs.try_reserve_exact(inputs.len()).is_ok();
+    if !collective_valid(c, out_ok && refs_ok) {
+        return Err(if !out_ok {
+            CollectiveError::AllocationFailed { elements: p.count }
+        } else if !refs_ok {
+            CollectiveError::AllocationFailed {
+                elements: inputs.len(),
+            }
+        } else {
+            CollectiveError::CollectivePreconditionFailed
+        });
+    }
+    for_each_many(inputs, p, &mut refs, |v| out.push(f(v)));
+    Ok(out)
 }
 
 fn prepare_map_reduce2<A, B, U, const N: usize, const M: usize>(

@@ -38,6 +38,7 @@
 //! is promised after a write failure. Raw input is explicitly requested through
 //! [`read_mpi_raw`], never inferred by the strict versioned readers.
 
+mod catalog;
 mod collections;
 mod format;
 mod mpi_io;
@@ -52,7 +53,12 @@ mod hdf5_io;
 #[cfg(feature = "parallel-hdf5")]
 mod hdf5_options;
 
-pub use collections::{CollectionIoError, read_mpi_collection, write_mpi_collection};
+#[cfg(feature = "parallel-hdf5")]
+pub use catalog::read_hdf5_catalog;
+pub use catalog::{
+    CatalogError, DatasetInfo, ScalarType, read_mpi_catalog, read_mpi_named_catalog,
+};
+pub use collections::*;
 pub use format::IoElement;
 pub use mpi_io::{read_mpi, read_mpi_with_options, write_mpi, write_mpi_with_options};
 pub use named_mpi::{
@@ -62,8 +68,6 @@ pub use named_mpi::{
 pub use options::{MpiIoMode, MpiIoOptions, RawByteOrder, RawReadOptions};
 pub use raw::read_mpi_raw;
 
-#[cfg(feature = "parallel-hdf5")]
-pub use collections::{read_hdf5_collection, write_hdf5_collection};
 #[cfg(feature = "parallel-hdf5")]
 pub use hdf5_io::{
     append_hdf5_named, append_hdf5_named_with_options, read_hdf5, read_hdf5_named,
@@ -736,6 +740,340 @@ mod tests {
             let after = crate::ffi::test_payload_calls();
             assert_eq!([after[4] - counts[4], after[5] - counts[5]], [0, 3]);
             assert_i32_values(&destination);
+        }
+        // Every member is staged before any native read or destination copy.
+        let comm = source.pencil().topology().communicator();
+        let collection = directory.join("staging-collection.pio");
+        let options = super::MpiIoOptions::default();
+        super::write_mpi_named_collection(
+            &collection,
+            "members",
+            comm,
+            &[source.view(), source.view()],
+            &options,
+        )
+        .unwrap();
+        let mut members: Vec<_> = (0..2)
+            .map(|_| {
+                PencilArray::from_elem(source.pencil().clone(), ExtraShape::scalar(), -900i32)
+                    .unwrap()
+            })
+            .collect();
+        for index in 0..members.len() {
+            let before: Vec<_> = members.iter().map(|a| a.as_slice().to_vec()).collect();
+            let calls = crate::ffi::test_payload_calls();
+            crate::collections::STAGING_FAILURE
+                .with(|f| f.set((world.rank() == 0).then_some(index)));
+            let result = super::read_mpi_named_collection(
+                &collection,
+                "members",
+                comm,
+                &mut members.iter_mut().map(|a| a.view_mut()).collect::<Vec<_>>(),
+                &options,
+            );
+            crate::collections::STAGING_FAILURE.with(|f| f.set(None));
+            assert!(result.is_err());
+            assert_eq!(calls, crate::ffi::test_payload_calls());
+            for (member, saved) in members.iter().zip(before) {
+                assert_eq!(member.as_slice(), saved);
+            }
+        }
+
+        // Collection controls are agreed before staging, including the legacy
+        // MPI collection entry points (and their named-name precondition).
+        let mut bad_hint = super::MpiIoOptions::default();
+        if world.rank() == 0 {
+            bad_hint = bad_hint.hint("", "bad");
+        }
+        crate::collections::STAGING_FAILURE.with(|f| f.set(Some(0)));
+        crate::collections::STAGING_CALLS.with(|c| c.set(0));
+        assert!(
+            super::write_mpi_collection_with_options(
+                directory.join("bad-hint-collection.pio"),
+                comm,
+                &[source.view(), source.view()],
+                &bad_hint,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            crate::collections::STAGING_CALLS.with(std::cell::Cell::get),
+            0
+        );
+        crate::collections::STAGING_FAILURE.with(|f| f.set(None));
+
+        let option_collection = directory.join("option-collection.pio");
+        super::write_mpi_collection_with_options(
+            &option_collection,
+            comm,
+            &[source.view(), source.view()],
+            &options,
+        )
+        .unwrap();
+        let bad_read_hint = if world.rank() == 0 {
+            super::MpiIoOptions::default().hint("", "bad")
+        } else {
+            super::MpiIoOptions::default()
+        };
+        crate::collections::STAGING_FAILURE.with(|f| f.set(Some(0)));
+        crate::collections::STAGING_CALLS.with(|c| c.set(0));
+        assert!(
+            super::read_mpi_collection_with_options(
+                &option_collection,
+                comm,
+                &mut members.iter_mut().map(|a| a.view_mut()).collect::<Vec<_>>(),
+                &bad_read_hint,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            crate::collections::STAGING_CALLS.with(std::cell::Cell::get),
+            0
+        );
+        crate::collections::STAGING_FAILURE.with(|f| f.set(None));
+
+        let bad_name = if size == 1 {
+            ""
+        } else if world.rank() == 0 {
+            "missing"
+        } else {
+            "members"
+        };
+        crate::collections::STAGING_FAILURE.with(|f| f.set(Some(0)));
+        crate::collections::STAGING_CALLS.with(|c| c.set(0));
+        assert!(
+            super::read_mpi_named_collection(
+                &collection,
+                bad_name,
+                comm,
+                &mut members.iter_mut().map(|a| a.view_mut()).collect::<Vec<_>>(),
+                &options,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            crate::collections::STAGING_CALLS.with(std::cell::Cell::get),
+            0
+        );
+        crate::collections::STAGING_FAILURE.with(|f| f.set(None));
+
+        if size > 1 {
+            crate::collections::STAGING_FAILURE.with(|f| f.set(Some(0)));
+            let mixed_mode = super::MpiIoOptions::default().mode(if world.rank() == 0 {
+                super::MpiIoMode::Independent
+            } else {
+                super::MpiIoMode::Collective
+            });
+            crate::collections::STAGING_CALLS.with(|c| c.set(0));
+            assert!(
+                super::write_mpi_collection_with_options(
+                    directory.join("mixed-mode-collection.pio"),
+                    comm,
+                    &[source.view(), source.view()],
+                    &mixed_mode,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                crate::collections::STAGING_CALLS.with(std::cell::Cell::get),
+                0
+            );
+
+            let mixed_hints = super::MpiIoOptions::default()
+                .hint("cb_buffer_size", if world.rank() == 0 { "1" } else { "2" });
+            crate::collections::STAGING_CALLS.with(|c| c.set(0));
+            assert!(
+                super::write_mpi_collection_with_options(
+                    directory.join("mixed-hints-collection.pio"),
+                    comm,
+                    &[source.view(), source.view()],
+                    &mixed_hints,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                crate::collections::STAGING_CALLS.with(std::cell::Cell::get),
+                0
+            );
+        }
+
+        crate::collections::STAGING_FAILURE.with(|f| f.set(None));
+
+        #[cfg(feature = "parallel-hdf5")]
+        {
+            let mut bad_hdf_hint = super::Hdf5WriteOptions::default();
+            if world.rank() == 0 {
+                bad_hdf_hint = bad_hdf_hint.hint("", "bad");
+            }
+            crate::collections::STAGING_FAILURE.with(|f| f.set(Some(0)));
+            crate::collections::STAGING_CALLS.with(|c| c.set(0));
+            assert!(
+                super::write_hdf5_collection_with_options(
+                    directory.join("bad-hdf-hint-collection.h5"),
+                    comm,
+                    &[source.view(), source.view()],
+                    &bad_hdf_hint,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                crate::collections::STAGING_CALLS.with(std::cell::Cell::get),
+                0
+            );
+            crate::collections::STAGING_FAILURE.with(|f| f.set(None));
+        }
+
+        super::read_mpi_named_collection(
+            &collection,
+            "members",
+            comm,
+            &mut members.iter_mut().map(|a| a.view_mut()).collect::<Vec<_>>(),
+            &options,
+        )
+        .unwrap();
+        let calls = crate::ffi::test_payload_calls();
+        assert_eq!(
+            super::read_mpi_named_catalog(&collection, comm).unwrap()[0].extra_shape(),
+            &[2]
+        );
+        super::read_mpi_catalog(&valid_path, comm).unwrap();
+        assert_eq!(calls, crate::ffi::test_payload_calls());
+        #[cfg(feature = "parallel-hdf5")]
+        {
+            for shuffle in [false, true] {
+                for capabilities in [0, 1, 2] {
+                    let path = directory.join(format!("unsupported-{shuffle}-{capabilities}.h5"));
+                    let options = super::Hdf5WriteOptions::default().chunks([1, 1]);
+                    let options = if shuffle {
+                        options.shuffle(true)
+                    } else {
+                        options.deflate(0)
+                    };
+                    let duplicates = crate::ffi::DUPLICATE_CALLS.with(std::cell::Cell::get);
+                    crate::ffi::FILTER_CAPABILITIES
+                        .with(|f| f.set((world.rank() == 0).then_some(capabilities)));
+                    let result = super::write_hdf5_with_options(&path, source.view(), &options);
+                    crate::ffi::FILTER_CAPABILITIES.with(|f| f.set(None));
+                    assert!(result.is_err());
+                    assert_eq!(
+                        duplicates,
+                        crate::ffi::DUPLICATE_CALLS.with(std::cell::Cell::get)
+                    );
+                    assert!(!path.exists());
+                }
+            }
+            let path = directory.join("catalog-filtered.h5");
+            super::write_hdf5_with_options(
+                &path,
+                source.view(),
+                &super::Hdf5WriteOptions::default().chunks([1, 1]).deflate(0),
+            )
+            .unwrap();
+            let calls = crate::ffi::test_payload_calls();
+            super::read_hdf5_catalog(&path, comm).unwrap();
+            assert_eq!(calls, crate::ffi::test_payload_calls());
+        }
+        // Catalog inspection must reject links and wrong object kinds on every
+        // rank without dispatching any payload operation, then recover on valid files.
+        #[cfg(feature = "parallel-hdf5")]
+        {
+            let legacy_target = directory.join("catalog-proof-legacy.h5");
+            let named_target = directory.join("catalog-proof-named.h5");
+            root_status(&world, || reset(&legacy_target));
+            root_status(&world, || reset(&named_target));
+            world.barrier();
+            super::write_hdf5(&legacy_target, source.view()).unwrap();
+            super::write_hdf5_named(&named_target, "data", source.view()).unwrap();
+            world.barrier();
+            for named_ns in [false, true] {
+                let ns = if named_ns {
+                    "pencil_io_named_v1"
+                } else {
+                    "pencil_io_v1"
+                };
+                let target_group = if named_ns {
+                    "/pencil_io_v1"
+                } else {
+                    "/pencil_io_named_v1"
+                };
+                let target_dataset = if named_ns {
+                    "/pencil_io_v1/data"
+                } else {
+                    "/pencil_io_named_v1/64617461"
+                };
+                let target_file = if named_ns {
+                    &legacy_target
+                } else {
+                    &named_target
+                };
+                let leaf = if named_ns { "64617461" } else { "data" };
+                for kind in [
+                    "soft-root",
+                    "external-root",
+                    "soft-leaf",
+                    "external-leaf",
+                    "wrong-object-group",
+                ] {
+                    let path = directory.join(format!("catalog-proof-{ns}-{kind}.h5"));
+                    if named_ns {
+                        super::write_hdf5(&path, source.view()).unwrap();
+                    } else {
+                        super::write_hdf5_named(&path, "data", source.view()).unwrap();
+                    }
+                    if world.rank() == 0 {
+                        let file = hdf5_metno::File::open_rw(&path).unwrap();
+                        match kind {
+                            "soft-root" => file.link_soft(target_group, ns).unwrap(),
+                            "external-root" => file
+                                .link_external(target_file.to_str().unwrap(), target_group, ns)
+                                .unwrap(),
+                            "soft-leaf" => {
+                                file.create_group(ns).unwrap();
+                                file.link_soft(target_dataset, &format!("{ns}/{leaf}"))
+                                    .unwrap();
+                            }
+                            "external-leaf" => {
+                                file.create_group(ns).unwrap();
+                                file.link_external(
+                                    target_file.to_str().unwrap(),
+                                    target_dataset,
+                                    &format!("{ns}/{leaf}"),
+                                )
+                                .unwrap();
+                            }
+                            "wrong-object-group" => {
+                                file.create_group(ns).unwrap();
+                                file.link_hard(target_group, &format!("{ns}/{leaf}"))
+                                    .unwrap();
+                            }
+                            _ => unreachable!(),
+                        }
+                        file.close().unwrap();
+                    }
+                    world.barrier();
+                    let before = crate::ffi::test_payload_calls();
+                    let result = super::read_hdf5_catalog(&path, comm);
+                    let local_ok = i32::from(result.is_err());
+                    let mut all_ok = 0;
+                    world.all_reduce_into(&local_ok, &mut all_ok, SystemOperation::min());
+                    assert_eq!(all_ok, 1, "{ns}/{kind} was accepted on some rank");
+                    assert_eq!(before, crate::ffi::test_payload_calls());
+                    world.barrier();
+                }
+            }
+            assert_eq!(
+                super::read_hdf5_catalog(&legacy_target, comm)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                super::read_hdf5_catalog(&named_target, comm).unwrap().len(),
+                1
+            );
+        }
+        if world.rank() == 0 {
+            println!("IO3_PRIVATE_CHECKS_OK");
         }
         cleanup_owned_temp_dir(&world, &directory);
     }

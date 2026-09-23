@@ -1143,7 +1143,7 @@ where
     ) -> Result<Self, BackendInitError<R2cError>> {
         let communicator = topology.communicator();
         let expected_len =
-            descriptor_len::<N, M>(&extra_shape).and_then(|length| length.checked_add(6));
+            descriptor_len::<N, M>(&extra_shape).and_then(|length| length.checked_add(7));
         let descriptor = expected_len.and_then(|_| {
             build_descriptor::<R, N, M>(
                 &topology,
@@ -1155,7 +1155,7 @@ where
             )
             .ok()
             .and_then(|mut descriptor| {
-                descriptor.try_reserve_exact(6).ok()?;
+                descriptor.try_reserve_exact(7).ok()?;
                 descriptor.extend(backend.descriptor_words::<R>());
                 Some(descriptor)
             })

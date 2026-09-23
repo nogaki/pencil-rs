@@ -11,7 +11,16 @@ use pencil_fft::{
 };
 
 fn options() -> PlanOptions {
-    PlanOptions::new(PlanningRigor::Estimate, Some(Duration::from_millis(1))).unwrap()
+    PlanOptions::new(PlanningRigor::Estimate, Some(Duration::from_millis(1)))
+        .unwrap()
+        .with_threads(2)
+        .unwrap()
+}
+
+fn assert_options(actual: PlanOptions, expected: PlanOptions) {
+    assert_eq!(actual.requested_threads(), expected.requested_threads());
+    assert_eq!(actual.rigor(), expected.rigor());
+    assert_eq!(actual.time_limit(), expected.time_limit());
 }
 
 fn assert_complex_close(actual: &[Complex<f64>], expected: &[Complex<f64>], tol: f64) {
@@ -74,6 +83,7 @@ fn fftw_distributed_native_matrix() {
             let native_options = $plan.options().unwrap();
             assert_eq!(native_options.rigor(), opts.rigor());
             assert_eq!(native_options.time_limit(), opts.time_limit());
+            assert_eq!(native_options.requested_threads(), opts.requested_threads());
             let mut inverse_expected = $plan.allocate_input().unwrap();
             let mut backward_expected = $plan.allocate_input().unwrap();
             $plan
@@ -110,11 +120,13 @@ fn fftw_distributed_native_matrix() {
                 raw.unwrap();
             } else {
                 assert!(forward.is_err() && reverse.is_err() && raw.is_err());
+                assert_eq!(timed_output.as_slice(), before.as_slice());
             }
-            assert_eq!(timed_output.as_slice(), before.as_slice());
+            assert_values_close(timed_output.as_slice(), before.as_slice());
             assert_values_close(inverse.as_slice(), inverse_expected.as_slice());
             assert_values_close(backward.as_slice(), backward_expected.as_slice());
 
+            let before = timed_output.as_slice().to_vec();
             assert!(
                 $plan
                     .forward(&$rust_input, &mut timed_output, &mut $workspace)
@@ -362,6 +374,19 @@ fn fftw_distributed_native_matrix() {
         signed.fft_directions().get(0),
         Some(FourierDirection::Backward)
     );
+    assert_eq!(signed.options().unwrap().requested_threads(), 2);
+    let native_first = signed
+        .with_fft_directions(FourierDirections::new([
+            FourierDirection::Forward,
+            FourierDirection::Backward,
+        ]))
+        .unwrap();
+    assert_eq!(native_first.backend_kind(), BackendKind::Fftw);
+    assert_options(native_first.options().unwrap(), opts);
+    assert_eq!(
+        native_first.fft_directions().get(1),
+        Some(FourierDirection::Backward)
+    );
     assert!(
         signed
             .with_fftw(PlanOptions::new(PlanningRigor::Measure, None).unwrap())
@@ -467,6 +492,85 @@ fn fftw_distributed_native_matrix() {
             )
             .is_ok()
         );
+    }
+
+    // Rank-local thread choices must be rejected before native planning, and a
+    // matching retry must still support workspace reuse.
+    if size > 1 {
+        for bad_rank in [1, 2] {
+            if bad_rank < size {
+                let rank_opts =
+                    PlanOptions::new(PlanningRigor::Estimate, Some(Duration::from_millis(1)))
+                        .unwrap()
+                        .with_threads(if world.rank() == bad_rank as i32 {
+                            1
+                        } else {
+                            2
+                        })
+                        .unwrap();
+                macro_rules! reject {
+                    ($call:expr) => {{
+                        assert!($call.is_err());
+                        world.barrier();
+                    }};
+                }
+                reject!(C2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+                    Arc::clone(&topology),
+                    [4 * size, 3],
+                    ExtraShape::scalar(),
+                    rank_opts
+                ));
+                reject!(R2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+                    Arc::clone(&topology),
+                    [4 * size, 3],
+                    ExtraShape::scalar(),
+                    rank_opts
+                ));
+                reject!(R2rPlan::<f64, 2, 1>::from_shape_with_fftw(
+                    Arc::clone(&topology),
+                    [4 * size, 3],
+                    ExtraShape::scalar(),
+                    [Some(R2rKind::DctII), Some(R2rKind::DstIII)],
+                    rank_opts
+                ));
+                reject!(DhtPlan::<f64, 2, 1>::from_shape_with_fftw(
+                    Arc::clone(&topology),
+                    [4 * size, 3],
+                    ExtraShape::scalar(),
+                    rank_opts
+                ));
+                reject!(MixedC2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+                    Arc::clone(&topology),
+                    [4 * size, 3],
+                    ExtraShape::scalar(),
+                    [
+                        AxisTransform::Fft,
+                        AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DctII))
+                    ],
+                    rank_opts
+                ));
+                reject!(MixedR2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+                    Arc::clone(&topology),
+                    [4 * size, 3],
+                    ExtraShape::scalar(),
+                    [AxisTransform::None, AxisTransform::Rfft],
+                    rank_opts
+                ));
+                let retry = C2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+                    Arc::clone(&topology),
+                    [4 * size, 3],
+                    ExtraShape::scalar(),
+                    opts,
+                )
+                .unwrap();
+                let input = retry.allocate_input().unwrap();
+                let mut output = retry.allocate_output().unwrap();
+                let mut workspace = retry.allocate_out_of_place_workspace().unwrap();
+                retry.forward(&input, &mut output, &mut workspace).unwrap();
+                retry.forward(&input, &mut output, &mut workspace).unwrap();
+                world.barrier();
+            }
+        }
     }
 
     for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
@@ -597,6 +701,8 @@ fn fftw_distributed_native_matrix() {
                 ]))
                 .unwrap();
             assert_eq!(mc_signed.backend_kind(), BackendKind::Fftw);
+            assert_eq!(mc_signed.options().unwrap().requested_threads(), 2);
+            assert_options(mc_signed.options().unwrap(), opts);
             assert_eq!(
                 mc_signed.fft_directions().get(0),
                 Some(FourierDirection::Backward)
@@ -620,17 +726,30 @@ fn fftw_distributed_native_matrix() {
                 layout,
             )
             .unwrap();
+            let directions_first = rust_mc
+                .with_fft_directions(mc_signed.fft_directions())
+                .unwrap()
+                .with_fftw(opts)
+                .unwrap();
+            assert_eq!(directions_first.backend_kind(), BackendKind::Fftw);
+            assert_options(directions_first.options().unwrap(), opts);
+            assert_eq!(
+                directions_first.fft_directions(),
+                mc_signed.fft_directions()
+            );
             let mut rma = rust_mc.allocate_input().unwrap();
             rma.as_mut_slice().copy_from_slice(&original_mixed);
             let mut rmb = rust_mc.allocate_output().unwrap();
             let mut rmw = rust_mc.allocate_workspace().unwrap();
             rust_mc.forward(&rma, &mut rmb, &mut rmw).unwrap();
             assert_complex_close(mb.as_slice(), rmb.as_slice(), 3e-8);
+            let mixed_directions =
+                FourierDirections::new([FourierDirection::Backward, FourierDirection::Forward]);
             let mr = MixedR2cPlan::<f64, 2, 1>::from_shape_with_layout(
                 Arc::clone(&topology),
                 [4 * size, 3],
                 ExtraShape::scalar(),
-                [AxisTransform::None, AxisTransform::Rfft],
+                [AxisTransform::Fft, AxisTransform::Rfft],
                 layout,
             )
             .unwrap()
@@ -638,13 +757,11 @@ fn fftw_distributed_native_matrix() {
             .unwrap();
             assert_eq!(mr.backend_kind(), BackendKind::Fftw);
             assert_eq!(mr.options().unwrap().rigor(), opts.rigor());
-            let mr_signed = mr
-                .with_fft_directions(FourierDirections::new([
-                    FourierDirection::Forward,
-                    FourierDirection::Forward,
-                ]))
-                .unwrap();
+            let mr_signed = mr.with_fft_directions(mixed_directions).unwrap();
+            assert_eq!(mr_signed.fft_directions(), mixed_directions);
             assert_eq!(mr_signed.backend_kind(), BackendKind::Fftw);
+            assert_eq!(mr_signed.options().unwrap().requested_threads(), 2);
+            assert_options(mr_signed.options().unwrap(), opts);
             let mut mra = mr.allocate_input().unwrap();
             mra.as_mut_slice()
                 .iter_mut()
@@ -658,10 +775,40 @@ fn fftw_distributed_native_matrix() {
                 Arc::clone(&topology),
                 [4 * size, 3],
                 ExtraShape::scalar(),
-                [AxisTransform::None, AxisTransform::Rfft],
+                [AxisTransform::Fft, AxisTransform::Rfft],
                 layout,
             )
             .unwrap();
+            let rust_mr_signed = rust_mr.with_fft_directions(mixed_directions).unwrap();
+            let directions_first = rust_mr_signed.with_fftw(opts).unwrap();
+            assert_eq!(directions_first.backend_kind(), BackendKind::Fftw);
+            assert_options(directions_first.options().unwrap(), opts);
+            assert_eq!(directions_first.fft_directions(), mixed_directions);
+            assert_eq!(directions_first.options().unwrap().requested_threads(), 2);
+            let mut signed_input = rust_mr_signed.allocate_input().unwrap();
+            signed_input
+                .as_mut_slice()
+                .copy_from_slice(&original_mixed_real);
+            let mut signed_expected = rust_mr_signed.allocate_output().unwrap();
+            let mut signed_workspace = rust_mr_signed.allocate_workspace().unwrap();
+            rust_mr_signed
+                .forward(&signed_input, &mut signed_expected, &mut signed_workspace)
+                .unwrap();
+            for signed_plan in [&mr_signed, &directions_first] {
+                let mut input = signed_plan.allocate_input().unwrap();
+                input.as_mut_slice().copy_from_slice(&original_mixed_real);
+                let mut output = signed_plan.allocate_output().unwrap();
+                let mut workspace = signed_plan.allocate_workspace().unwrap();
+                signed_plan
+                    .forward(&input, &mut output, &mut workspace)
+                    .unwrap();
+                assert_complex_close(output.as_slice(), signed_expected.as_slice(), 3e-8);
+                let mut recovered = signed_plan.allocate_input().unwrap();
+                signed_plan
+                    .inverse(&output, &mut recovered, &mut workspace)
+                    .unwrap();
+                assert_real_close(recovered.as_slice(), &original_mixed_real, 3e-8);
+            }
             let mut rmra = rust_mr.allocate_input().unwrap();
             rmra.as_mut_slice().copy_from_slice(&original_mixed_real);
             let mut rmrb = rust_mr.allocate_output().unwrap();
