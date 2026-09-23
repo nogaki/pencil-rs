@@ -76,6 +76,7 @@ pub(crate) fn test_payload_calls() -> [usize; 6] {
 #[cfg(all(test, feature = "parallel-hdf5"))]
 thread_local! {
     pub(crate) static FILTER_CAPABILITIES: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    pub(crate) static HDF_FILE_CALLS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
 }
 
 #[cfg(test)]
@@ -178,6 +179,30 @@ pub(crate) fn info_free(info: &mut MPI_Info) -> i32 {
 pub(crate) fn info_null() -> MPI_Info {
     // SAFETY: MPI is initialized at all callers.
     unsafe { ffi::RSMPI_INFO_NULL }
+}
+
+#[cfg(feature = "parallel-hdf5")]
+pub(crate) fn mpi_is_finalized() -> Result<bool, i32> {
+    let mut finalized = 0;
+    // SAFETY: MPI_Finalized is permitted after finalization; output is live.
+    let code = unsafe { ffi::MPI_Finalized(&mut finalized) };
+    if code == ffi::MPI_SUCCESS as i32 {
+        Ok(finalized != 0)
+    } else {
+        Err(code)
+    }
+}
+
+#[cfg(feature = "parallel-hdf5")]
+pub(crate) fn comm_is_congruent(a: ffi::MPI_Comm, b: ffi::MPI_Comm) -> Result<bool, i32> {
+    let mut relation = 0;
+    // SAFETY: callers retain both live communicators for this local query.
+    let code = unsafe { ffi::MPI_Comm_compare(a, b, &mut relation) };
+    if code == ffi::MPI_SUCCESS as i32 {
+        Ok(relation == ffi::MPI_IDENT as i32 || relation == ffi::MPI_CONGRUENT as i32)
+    } else {
+        Err(code)
+    }
 }
 
 pub(crate) fn comm_dup(comm: ffi::MPI_Comm) -> Result<ffi::MPI_Comm, i32> {
@@ -806,6 +831,11 @@ pub(crate) mod hdf5 {
     }
 
     pub(crate) fn file_open(fapl: Hid, path: &CStr, write: bool) -> Result<Hid, i32> {
+        #[cfg(test)]
+        super::HDF_FILE_CALLS.with(|c| {
+            let [open, close] = c.get();
+            c.set([open + 1, close]);
+        });
         hdf5_metno::sync::sync(|| {
             // SAFETY: HDF5 is serialized by its documented crate-global lock;
             // `fapl` and `path` remain live for this collective call. The
@@ -831,6 +861,11 @@ pub(crate) mod hdf5 {
     }
 
     pub(crate) fn file_open_update(fapl: Hid, path: &CStr) -> Result<Hid, i32> {
+        #[cfg(test)]
+        super::HDF_FILE_CALLS.with(|c| {
+            let [open, close] = c.get();
+            c.set([open + 1, close]);
+        });
         hdf5_metno::sync::sync(|| {
             // SAFETY: HDF5 is serialized; fapl and path are live for this call.
             unsafe {
@@ -853,6 +888,11 @@ pub(crate) mod hdf5 {
     }
 
     pub(crate) fn file_close(file: &mut Hid) -> i32 {
+        #[cfg(test)]
+        super::HDF_FILE_CALLS.with(|c| {
+            let [open, close] = c.get();
+            c.set([open, close + 1]);
+        });
         hdf5_metno::sync::sync(|| {
             // SAFETY: `file` is a live identifier owned by this rank and all
             // ranks close their corresponding parallel file collectively.
@@ -998,6 +1038,36 @@ pub(crate) mod hdf5 {
                     return Err(code as i32);
                 }
                 Ok(object.type_ == expected.hdf5())
+            }
+        })
+    }
+
+    /// Identity of a hard-linked object. Never follows soft or external links.
+    #[allow(clippy::unnecessary_cast)] // c_ulong is 32-bit on some targets.
+    pub(crate) fn hard_object_identity(loc: Hid, name: &CStr) -> Result<(u64, u64), i32> {
+        hdf5_metno::sync::sync(|| {
+            // SAFETY: live location/name and native ABI output storage; the link
+            // class is checked before HDF5 is allowed to resolve the object.
+            unsafe {
+                let mut link = h5::h5l::H5L_info1_t::default();
+                let code =
+                    h5::h5l::H5Lget_info1(loc, name.as_ptr(), &mut link, h5::h5p::H5P_DEFAULT);
+                if code < 0 || link.type_ != h5::h5l::H5L_TYPE_HARD {
+                    return Err(-1);
+                }
+                let mut object = h5::h5o::H5O_info1_t::default();
+                let code = h5::h5o::H5Oget_info_by_name2(
+                    loc,
+                    name.as_ptr(),
+                    &mut object,
+                    h5::h5o::H5O_INFO_BASIC,
+                    h5::h5p::H5P_DEFAULT,
+                );
+                if code < 0 {
+                    Err(code as i32)
+                } else {
+                    Ok((object.fileno as u64, object.addr))
+                }
             }
         })
     }
@@ -1520,6 +1590,11 @@ pub(crate) mod hdf5 {
         space_shape(space)
     }
 
+    #[cfg(test)]
+    thread_local! {
+        pub(crate) static FAIL_XFER_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     pub(crate) fn xfer_create(abort_comm: ffi::MPI_Comm, collective: bool) -> Result<Hid, i32> {
         hdf5_metno::sync::sync(|| {
             // SAFETY: the global dataset-transfer property-list class is live.
@@ -1528,8 +1603,15 @@ pub(crate) mod hdf5 {
                 if hdf5_invalid(id) {
                     return Err(id as i32);
                 }
+                let mode_id = id;
+                #[cfg(test)]
+                let mode_id = if FAIL_XFER_MODE.with(std::cell::Cell::get) {
+                    -1
+                } else {
+                    mode_id
+                };
                 let code = h5::h5p::H5Pset_dxpl_mpio(
-                    id,
+                    mode_id,
                     if collective {
                         h5::h5p::H5FD_mpio_xfer_t::H5FD_MPIO_COLLECTIVE
                     } else {

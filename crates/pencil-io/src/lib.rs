@@ -74,8 +74,9 @@ pub use raw::read_mpi_raw;
 
 #[cfg(feature = "parallel-hdf5")]
 pub use hdf5_io::{
-    append_hdf5_named, append_hdf5_named_with_options, read_hdf5, read_hdf5_named,
-    read_hdf5_named_with_options, write_hdf5, write_hdf5_named, write_hdf5_named_with_options,
+    Hdf5FileSession, Hdf5SessionError, append_hdf5_named, append_hdf5_named_with_options,
+    read_hdf5, read_hdf5_named, read_hdf5_named_with_options, write_hdf5, write_hdf5_named,
+    write_hdf5_named_with_options,
 };
 #[cfg(feature = "parallel-hdf5")]
 pub use hdf5_options::{
@@ -483,6 +484,12 @@ mod tests {
         #[cfg(feature = "parallel-hdf5")]
         {
             use super::{read_hdf5, write_hdf5};
+
+            crate::hdf5_io::test_session_native_contracts(
+                &directory.join("session-native.h5"),
+                &source,
+                &mut destination,
+            );
 
             let valid_path = directory.join("valid.h5");
             root_status(&world, || reset(&valid_path));
