@@ -88,6 +88,26 @@ pub struct PencilArrayView<'a, T, const N: usize, const M: usize> {
 }
 
 impl<'a, T, const N: usize, const M: usize> PencilArrayView<'a, T, N, M> {
+    /// Borrows external contiguous storage without copying or allocating.
+    ///
+    /// Storage must be in row-major physical order: `[extra..., permuted
+    /// spatial...]`, with the last axis varying fastest. Extra axes follow
+    /// `extra_shape.dimensions()`; spatial axes follow `pencil.permutation()`.
+    /// The slice must contain the full local buffer, exactly
+    /// `extra_shape.element_count() * pencil.local_len()` elements, not an
+    /// arbitrary subset. A wrong length returns `ArrayError::StorageLengthMismatch`;
+    /// an overflowing length returns the existing checked-size error.
+    ///
+    /// The pencil, extra shape, and storage are borrowed for the view's lifetime.
+    /// No ownership is transferred and no MPI operation is performed.
+    pub fn from_slice(
+        pencil: &'a Pencil<N, M>,
+        extra_shape: &'a ExtraShape,
+        storage: &'a [T],
+    ) -> Result<Self, ArrayError> {
+        Self::new(pencil, extra_shape, storage)
+    }
+
     pub(crate) fn new(
         pencil: &'a Pencil<N, M>,
         extra_shape: &'a ExtraShape,
@@ -198,6 +218,27 @@ pub struct PencilArrayViewMut<'a, T, const N: usize, const M: usize> {
 }
 
 impl<'a, T, const N: usize, const M: usize> PencilArrayViewMut<'a, T, N, M> {
+    /// Exclusively borrows external contiguous storage without copying or allocating.
+    ///
+    /// Storage must be in row-major physical order: `[extra..., permuted
+    /// spatial...]`, with the last axis varying fastest. Extra axes follow
+    /// `extra_shape.dimensions()`; spatial axes follow `pencil.permutation()`.
+    /// The slice must contain the full local buffer, exactly
+    /// `extra_shape.element_count() * pencil.local_len()` elements, not an
+    /// arbitrary subset. A wrong length returns `ArrayError::StorageLengthMismatch`;
+    /// an overflowing length returns the existing checked-size error.
+    ///
+    /// The pencil and extra shape are shared borrows; storage is exclusively
+    /// borrowed for the view's lifetime. No ownership is transferred and no MPI
+    /// operation is performed. Writes update the caller's storage directly.
+    pub fn from_slice_mut(
+        pencil: &'a Pencil<N, M>,
+        extra_shape: &'a ExtraShape,
+        storage: &'a mut [T],
+    ) -> Result<Self, ArrayError> {
+        Self::new(pencil, extra_shape, storage)
+    }
+
     pub(crate) fn new(
         pencil: &'a Pencil<N, M>,
         extra_shape: &'a ExtraShape,

@@ -1,0 +1,32 @@
+# CPU parity: borrowed storage, FFTW flags, chunked MPI storage, persistent I/O
+
+User requested candidates 1–4; Julia file-format compatibility (candidate 5) and GPU are excluded. Base main: `c3c11d0bb95034d5ce91ae8e49f8afe2e872de70`, tree `c2d5c4aa55680c04a7f32b49f74ce82ecd319509`.
+
+## Contracts
+
+Keep existing public signatures, closed enums, default formats, source/preflight atomicity and native cleanup/poison semantics. New collectives start with two five-u64 MIN/MAX Allreduces on the caller's original Cartesian communicator, before rank-local error returns or operation-specific communication. Array remains FFT/I/O-independent; default local FFT remains MPI/FFTW-runtime-free; unsafe remains in audited private FFI modules. No GPU, Julia-wire parser, system installs, global configuration, CI billing/protection/concurrency changes, or unrelated environment-file changes. September 2026 CI-success waiver remains; never claim failed/unstarted CI passed.
+
+## Scoped deliverables
+
+- [ ] Public checked external-slice immutable/mutable views, sharing the existing constructor validation and lifetimes. Start with contiguous physical-order slices; do not invent a generic storage backend or arbitrary-stride framework. Validate caller storage length, including empty dimensions; no allocation/copy or ownership transfer. Demonstrate actual pointwise/collective/transpose/I/O reuse where those APIs accept views.
+- [ ] FFTW `WISDOM_ONLY` and `CONSERVE_MEMORY` controls with default false, public builders/getters, named native constants, actual native flags for every plan/family and exact distributed descriptors. Preserve legacy rigor/errors and mandatory alignment safety. Wisdom miss is a real planning error, with no silent fallback. Keep pinned-runtime/thread-init ordering, known-one reset and source preservation. Both configuration orders and all six families retain settings.
+- [ ] Explicit rank-contiguous MPI chunked write/read APIs, using a separate bounded/versioned format, not altering legacy v1/v2 defaults or confusing HDF5 chunks. Store each rank's physical-order little-endian block contiguously. Validate type, shapes, writer topology/decomposition/permutation, rank ownership/counts, offsets, exact coverage and final file size before payload reads. Same-writer-layout restriction is explicit; metadata inspection must report this storage mode honestly. Existing collective/independent payload mode and MPI hints remain usable. Ordinary errors do not modify read destinations.
+- [ ] Real persistent MPI and HDF5 file sessions, plus real hierarchical HDF5 groups. Native file/duplicate-communicator handles remain open across methods; never emulate persistence by reopening path APIs.
+
+## Persistent I/O design decisions
+
+MPI sessions manage the existing append-only named v2 container, not the new single-dataset chunk format. `create` starts an empty container; `open_read` supports committed-prefix payload reads; `open_append` requires a complete committed tail. Writes append unique names and retain commit ordering. Catalogs remain strict snapshots. Chunked file APIs are separate and explicit; no undocumented session/chunk format mixing.
+
+Every session method first agrees on the original borrowed communicator, then checks a root-broadcast unique per-open identity, mode and closed/poisoned state before entering the file's duplicated context. Opening the same path twice must still produce distinct identities. Handle root counter exhaustion, keep the original communicator borrowed for the session lifetime, and prohibit overlapping operations on it. Rank-local independent counters are not valid collective identities.
+
+Use explicit collective `close(&mut self)` so a preflight mismatch leaves the session retryable, rather than consuming it and triggering a destructor abort. Unclosed drop is fail-stop, not an uncoordinated collective close; after MPI finalization do not call MPI routines other than the permitted finalized query before process abort. Document explicit close before MPI finalization. A session poisoned after uncertain mutation remains collectively closeable. Read-only sessions reject writes before mutation.
+
+HDF5 sessions use a distinct known Rust namespace with real group/dataset path components, not reinterpreted encoded legacy named keys. Bounded normalized relative paths reject NUL, empty components, `.` and `..`; parents must already exist and `create_group` creates only the final component. No recursive mkdir, overwrite, resize, or Julia compatibility. Check hard-link and object kind before opening every component. Catalog traversal rejects hard-link cycles/aliases using native object identity and bounds depth, count, component/path length and aggregate metadata. Apply existing filter/capability rules and options.
+
+Separate per-operation native resource cleanup from persistent file/communicator cleanup. Session reads publish after operation-resource cleanup/agreement; a later file close does not roll back prior successful operations. Existing path APIs retain their stronger close-before-destination-copy contract; do not implement them atop a session read that commits early. Shared read cores may return staged values.
+
+## Verification and ownership
+
+Astra implements isolated array, FFTW, and combined I/O worktrees; Sol independently reviews design and source; parent integrates, verifies and publishes. Separate stable/MSRV targets per source worktree, normal Rust 1.98.1 and exact 1.85.0. Use existing native Open MPI 4.1.7, parallel HDF5 1.10.7, FFTW 3.3.8 (headers 3.3.10), Julia oracle FFTW 3.3.11. No dependency installation.
+
+Test new views with external buffers, non-Clone elements, wrong lengths, zero extents and MPI 1/4/6. Test native flags without accepting no-op implementations: empty wisdom miss, seeded wisdom-only hit after dropping plans, both precisions/all transforms, flag preservation, partial native cleanup and MPI mismatch/retry. Test physical chunk layout bytes, uneven/empty ranks, all scalar kinds, hostile/truncated metadata, exact ownership validation and staged read failures. Test multiple operations with one native file open, session cross-wiring (including identical paths), read-only/mode/name mismatches, explicit-close retry, poison/cleanup failures, group cycles/aliases/soft/external links, and strict catalogs without payload reads. Existing full MPI/native/Julia matrices and legacy enum checks remain intact.
