@@ -10,9 +10,9 @@
 //! a different process grid or memory-axis permutation.
 //!
 //! `write_mpi` and `read_mpi` are collective over the view's Cartesian
-//! communicator.  The view must be borrowed from its owning
-//! [`pencil_array::PencilArray`] with `.view()` or `.view_mut()` and all array,
-//! topology, and MPI-IO objects must be dropped before MPI finalization. Do not
+//! communicator. Views may borrow an owning [`pencil_array::PencilArray`] or
+//! validated external slices. All array, topology, and MPI-IO objects must be
+//! dropped before MPI finalization; persistent sessions require explicit close. Do not
 //! overlap an I/O call with another operation on that topology communicator;
 //! the call temporarily installs `MPI_ERRORS_RETURN` only around
 //! `MPI_Comm_dup`, then restores the caller's original handler. Native MPI
@@ -370,6 +370,7 @@ mod tests {
         if std::env::var_os("PENCIL_MPI_SESSION_CLEANUP_CHILD").is_some() {
             crate::named_mpi::session::test_native_cleanup_child(&directory, &source);
         }
+        crate::chunked::tests::cleanup_and_native_contracts(&world);
         let valid_path = directory.join("valid.pio");
         root_status(&world, || reset(&valid_path));
         world.barrier();

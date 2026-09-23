@@ -8,10 +8,10 @@ Keep existing public signatures, closed enums, default formats, source/preflight
 
 ## Scoped deliverables
 
-- [ ] Public checked external-slice immutable/mutable views, sharing the existing constructor validation and lifetimes. Start with contiguous physical-order slices; do not invent a generic storage backend or arbitrary-stride framework. Validate caller storage length, including empty dimensions; no allocation/copy or ownership transfer. Demonstrate actual pointwise/collective/transpose/I/O reuse where those APIs accept views.
-- [ ] FFTW `WISDOM_ONLY` and `CONSERVE_MEMORY` controls with default false, public builders/getters, named native constants, actual native flags for every plan/family and exact distributed descriptors. Preserve legacy rigor/errors and mandatory alignment safety. Wisdom miss is a real planning error, with no silent fallback. Keep pinned-runtime/thread-init ordering, known-one reset and source preservation. Both configuration orders and all six families retain settings.
-- [ ] Explicit rank-contiguous MPI chunked write/read APIs, using a separate bounded/versioned format, not altering legacy v1/v2 defaults or confusing HDF5 chunks. Store each rank's physical-order little-endian block contiguously. Validate type, shapes, writer topology/decomposition/permutation, rank ownership/counts, offsets, exact coverage and final file size before payload reads. Same-writer-layout restriction is explicit; metadata inspection must report this storage mode honestly. Existing collective/independent payload mode and MPI hints remain usable. Ordinary errors do not modify read destinations.
-- [ ] Real persistent MPI and HDF5 file sessions, plus real hierarchical HDF5 groups. Native file/duplicate-communicator handles remain open across methods; never emulate persistence by reopening path APIs.
+- [x] Public checked external-slice immutable/mutable views, sharing the existing constructor validation and lifetimes. Start with contiguous physical-order slices; do not invent a generic storage backend or arbitrary-stride framework. Validate caller storage length, including empty dimensions; no allocation/copy or ownership transfer. Demonstrate actual pointwise/collective/transpose/I/O reuse where those APIs accept views.
+- [x] FFTW `WISDOM_ONLY` and `CONSERVE_MEMORY` controls with default false, public builders/getters, named native constants, actual native flags for every plan/family and exact distributed descriptors. Preserve legacy rigor/errors and mandatory alignment safety. Wisdom miss is a real planning error, with no silent fallback. Keep pinned-runtime/thread-init ordering, known-one reset and source preservation. Both configuration orders and all six families retain settings.
+- [x] Explicit rank-contiguous MPI chunked write/read APIs, using a separate bounded/versioned format, not altering legacy v1/v2 defaults or confusing HDF5 chunks. Store each rank's physical-order little-endian block contiguously. Validate type, shapes, writer topology/decomposition/permutation, rank ownership/counts, offsets, exact coverage and final file size before payload reads. Same-writer-layout restriction is explicit; metadata inspection must report this storage mode honestly. Existing collective/independent payload mode and MPI hints remain usable. Ordinary errors do not modify read destinations.
+- [x] Real persistent MPI and HDF5 file sessions, plus real hierarchical HDF5 groups. Native file/duplicate-communicator handles remain open across methods; never emulate persistence by reopening path APIs.
 
 ## Persistent I/O design decisions
 
@@ -24,6 +24,72 @@ Use explicit collective `close(&mut self)` so a preflight mismatch leaves the se
 HDF5 sessions use a distinct known Rust namespace with real group/dataset path components, not reinterpreted encoded legacy named keys. Bounded normalized relative paths reject NUL, empty components, `.` and `..`; parents must already exist and `create_group` creates only the final component. No recursive mkdir, overwrite, resize, or Julia compatibility. Check hard-link and object kind before opening every component. Catalog traversal rejects hard-link cycles/aliases using native object identity and bounds depth, count, component/path length and aggregate metadata. Apply existing filter/capability rules and options.
 
 Separate per-operation native resource cleanup from persistent file/communicator cleanup. Session reads publish after operation-resource cleanup/agreement; a later file close does not roll back prior successful operations. Existing path APIs retain their stronger close-before-destination-copy contract; do not implement them atop a session read that commits early. Shared read cores may return staged values.
+
+## Implemented API and review corrections
+
+External views expose `from_slice` / `from_slice_mut`. FFTW options expose
+`with_wisdom_only`, `wisdom_only`, `with_conserve_memory`, and `conserve_memory`;
+backend descriptors are eight words with schema 5. Required flags reach every
+native plan. NaN-filled independent collection outputs and five no-op mutants
+check that new collection tests cannot pass by retaining old expected values.
+
+Rank files use separate `write_mpi_chunked`, `read_mpi_chunked`, and
+`read_mpi_chunked_catalog` APIs with mandatory existing MPI options. The catalog
+returns one `DatasetInfo`; the API itself identifies rank-contiguous storage.
+Combined spatial-plus-extra rank is checked at write and parse boundaries,
+not merely each rank separately. The format does not repartition.
+
+`MpiFileSession` uses v2 named containers with explicit `write_named`,
+`read_named`, `catalog`, `flush`, and `close`; every metadata scan first restores
+a zero-displacement one-byte MPI view. Invalid paths reject before duplication
+or opening. A failed explicit flush remains retryable, while uncertain writes
+still poison. `Hdf5FileSession` exposes real groups and datasets under
+`/pencil_io_tree_v1`; transfer properties are prepared/agreed before dataset
+creation and poisoning. Its native malicious-file, reopen-persistence,
+cross-wired same-path handles and fail-stop tests cover the public surface.
+
+Integration unifies duplicate finalized/communicator comparison FFI helpers
+using fallible results and conservative error handling. Chunk private tests
+reuse the crate's existing single MPI initialization. A combined external-buffer
+I/O test exercises old MPI/HDF paths, chunk storage, persistent MPI and filtered
+HDF hierarchy reads without transferring buffer ownership. Old path APIs retain
+close-before-copy atomicity; session reads have the documented per-operation
+commit boundary. Independent Sol reviews approved each feature, corrections
+and the combined source/CI/documentation changes.
+
+## Parent verification results (2026-09-23)
+
+Stable Rust 1.98.1 and exact Rust 1.85.0 passed default/all-feature/all-target
+checks, test compilation, unit/rustdoc and native FFTW suites. Stable fmt,
+strict Clippy, warning-denying rustdoc and dependency-boundary checks passed.
+The final parent MPI matrices passed 110 positive launches per compiler at the
+supported 1/4/6 ranks, plus expected asymmetric panic-abort tests. Legacy array
+suites restricted to 1/4 retain that restriction. The first concurrent MSRV run
+hit a PMIx bootstrap failure before MPI initialization; a full sequential rerun
+passed without source changes, and the initial failure log was retained.
+
+Six complete Julia reference runs passed: RustFFT and native FFTW in both
+configuration orders on both compilers, with 87 fixtures / 312 configurations
+per run at ranks 1/4/6 and all 30 intentional corruptions rejected. Native
+reference plans request two threads; Julia's independent oracle remains at
+one. Together with the main matrices, this is 256 positive MPI launches and
+180 reference corruption rejections, excluding expected fail-stop children.
+Native flag-specific tests additionally cover wisdom miss/hit and all kinds,
+partial C2C cleanup/reset, exact option mismatch and retry. No memory-saving,
+thread-utilization or speedup guarantee is inferred.
+
+Session lifecycle/failure tests exercise actual native handles and operation
+cleanup. The HDF native-close child forces invalid-ID `H5Fclose` failure after
+real cleanup; it does not claim to emulate a storage failure closing a valid
+file. Older MSRV Clippy's existing grid lifetime warning is not claimed fixed;
+strict Clippy evidence here is normal stable.
+
+Evidence: `/tmp/pencil-cpu5-parent-{static,msrv}.log`,
+`/tmp/pencil-cpu5-final-static.log`,
+`/tmp/pencil-cpu5-parent-mpi-{stable,msrv}-summary.log`, and
+`/tmp/pencil-cpu5-reference-{stable,msrv}-{rustfft,fftw-native-first,fftw-directions-first}.log`.
+Source worktrees and compiler targets are isolated. Local validation is not a
+claim of CI success; the existing waiver and excluded Julia/GPU scope remain.
 
 ## Verification and ownership
 

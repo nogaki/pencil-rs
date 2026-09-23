@@ -77,6 +77,19 @@ every request, and must not overlap unfinished transposes on that context. MPI
 failures, arbitrary panics, and process loss do not guarantee global recovery;
 an unfinished request scope may abort.
 
+## Borrowing external CPU buffers
+
+`PencilArrayView::from_slice(&pencil, &extra_shape, &buffer)` and
+`PencilArrayViewMut::from_slice_mut(&pencil, &extra_shape, &mut buffer)` attach
+checked pencil metadata to caller-owned storage without allocation, copying or
+ownership transfer. The slice must contain exactly the full local buffer in
+physical row-major `[extra..., permuted spatial...]` order. Metadata and storage
+remain borrowed for the view's lifetime; mutable views retain Rust's exclusive
+borrow rules. Zero-length layouts are valid, and elements need not implement
+`Clone`. Existing view-based pointwise, reduction, transpose and I/O operations
+accept these views. This does not introduce arbitrary-stride views or an
+`ndarray`/GPU storage framework.
+
 ## Global array collectives
 
 `pencil-array` provides collective `global_sum`, `global_min`, `global_max`,
@@ -361,6 +374,18 @@ silently retried after serial use. Attempted native initialization failure block
 further stateful calls. Successful planning resets the native count to known one,
 not an invented prior foreign setting.
 
+`PlanOptions::with_wisdom_only(true)` requests native `FFTW_WISDOM_ONLY`:
+planning fails with `NullPlan` if compatible wisdom is unavailable, rather than
+silently planning afresh. Train/import wisdom with the required precision,
+rigor, thread count and plan forms first; C2C needs both in-place and
+out-of-place native plans. `with_conserve_memory(true)` requests native
+`FFTW_CONSERVE_MEMORY`, not a measured memory-reduction guarantee. Both flags
+default false; `wisdom_only()` and `conserve_memory()` report the settings.
+All distributed families agree both flags before native planning and preserve
+them through either direction/backend configuration order. Mandatory alignment
+safety and existing input-preservation contracts are unchanged; arbitrary unsafe
+FFTW flags are not exposed.
+
 `export_wisdom::<R>()`, `import_wisdom::<R>()`, and `forget_wisdom::<R>()` manage
 actual precision-specific native wisdom. Use ordinary file I/O to persist the
 returned string; these operations are process-local, not implicit MPI broadcasts.
@@ -508,6 +533,60 @@ inspection accepts only the supported hard-link group/dataset structures and doe
 not follow soft/external links. Native Unix file-path bytes remain supported;
 dataset keys themselves remain bounded UTF-8. Catalog size/name/header bounds
 are documented in the API.
+
+### Rank-contiguous MPI files
+
+`write_mpi_chunked(path, view, &options)` and
+`read_mpi_chunked(path, view_mut, &options)` use a distinct versioned format,
+leaving the existing MPI v1/v2 formats unchanged. Each Cartesian rank stores one
+contiguous physical-order little-endian block. This is the MPI rank-block layout
+option, not HDF5 dataset chunking. Collective/independent payload mode and MPI
+hints use the existing `MpiIoOptions`.
+
+Reads require the writer's exact process grid, ownership, decomposition and
+permutation; repartitioning is not supported in this format. Type, shapes,
+counts, offsets, payload coverage and exact file length are checked before
+payload reads, and destination writes wait for native cleanup agreement.
+`read_mpi_chunked_catalog(path, comm, &options)` returns one metadata-only
+`DatasetInfo`; its separate API identifies this storage mode. Metadata is
+bounded to 1 MiB and each rank's payload to `i32::MAX` bytes. Existing files are
+never replaced. No Julia binary/JSON compatibility is implied.
+
+### Persistent parallel file sessions
+
+`MpiFileSession::create(comm, path, &options)`, `open_read` and `open_append`
+retain a native MPI file and duplicated communicator across `write_named`,
+`read_named`, `catalog` and `flush` calls. They use the existing named v2
+container, interoperating with the old named path APIs—not the new chunked
+format. Writes append unique committed names. Read-only sessions can read the
+known committed prefix, while append and catalog operations require a complete
+valid tail. MPI hints and payload mode are fixed when opening the session.
+
+With `parallel-hdf5`, `Hdf5FileSession::create(path, comm, &options)` and matching
+open methods retain the native HDF5 file. `create_group("flow")` followed by
+`write("flow/velocity", view, &write_options)` creates real groups/datasets below
+`/pencil_io_tree_v1`, not encoded flat names. `read` accepts `Hdf5ReadOptions`;
+`catalog` inspects this hierarchy on the retained handle. Dataset filters use
+the existing checked options; file hints are fixed at open. Parents must already
+exist, and a group call creates only its final component. There is no overwrite,
+resize, recursive group creation, or reinterpretation of legacy named keys.
+Paths are normalized relative components; soft/external links, wrong object
+kinds, hard-link aliases/cycles and incomplete metadata are rejected. Traversal
+bounds include depth 32, 65,536 objects, 255-byte components, 4,096-byte paths and
+16 MiB of accumulated tree names. Use the session catalog for this namespace;
+the older path catalogs retain their original format scope.
+
+**Call `session.close()` collectively before MPI finalization.** Close takes
+`&mut self`, allowing a rejected preflight to be corrected and retried. Dropping
+an open session is fail-stop, never an implicit rank-local collective close.
+Every method agrees on the original borrowed communicator and a unique per-open
+identity before using retained native contexts—even two handles for the same
+path are distinct. Do not overlap calls on that communicator. Read-only and
+ordinary preflight errors leave the session usable; uncertain mutations poison
+it until close. Session reads publish after per-operation cleanup agreement;
+a later close failure cannot undo earlier successful operations. Old path reads
+retain their close-before-destination-copy guarantee. External serialization
+of same-file writers is still the caller's responsibility.
 
 Run the MPI-IO integration test at the required 1/4/6 rank matrix:
 

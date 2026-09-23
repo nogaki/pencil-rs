@@ -181,7 +181,6 @@ pub(crate) fn info_null() -> MPI_Info {
     unsafe { ffi::RSMPI_INFO_NULL }
 }
 
-#[cfg(feature = "parallel-hdf5")]
 pub(crate) fn mpi_is_finalized() -> Result<bool, i32> {
     let mut finalized = 0;
     // SAFETY: MPI_Finalized is permitted after finalization; output is live.
@@ -193,7 +192,6 @@ pub(crate) fn mpi_is_finalized() -> Result<bool, i32> {
     }
 }
 
-#[cfg(feature = "parallel-hdf5")]
 pub(crate) fn comm_is_congruent(a: ffi::MPI_Comm, b: ffi::MPI_Comm) -> Result<bool, i32> {
     let mut relation = 0;
     // SAFETY: callers retain both live communicators for this local query.
@@ -294,24 +292,6 @@ pub(crate) fn comm_free(comm: &mut ffi::MPI_Comm) -> i32 {
         return ffi::MPI_ERR_OTHER as i32;
     }
     code
-}
-
-/// Local comparison only: IDENT/CONGRUENT preserve ordered rank membership.
-pub(crate) fn comm_is_congruent(a: MPI_Comm, b: MPI_Comm) -> bool {
-    // SAFETY: callers supply live borrowed communicators; comparison is local.
-    unsafe {
-        let mut relation = 0;
-        ffi::MPI_Comm_compare(a, b, &mut relation) == ffi::MPI_SUCCESS as i32
-            && (relation == ffi::MPI_IDENT as i32 || relation == ffi::MPI_CONGRUENT as i32)
-    }
-}
-
-pub(crate) fn mpi_is_finalized() -> bool {
-    // SAFETY: MPI_Finalized is permitted even after MPI_Finalize.
-    unsafe {
-        let mut finalized = 0;
-        ffi::MPI_Finalized(&mut finalized) != ffi::MPI_SUCCESS as i32 || finalized != 0
-    }
 }
 
 pub(crate) fn file_create_readwrite(

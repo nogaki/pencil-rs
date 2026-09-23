@@ -499,18 +499,16 @@ pub fn read_mpi_chunked_catalog<P: AsRef<Path>>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use pencil_array::{ExtraShape, MpiTopology, Pencil, PencilArray};
     mod support {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/mod.rs"));
     }
-    #[test]
-    fn cleanup_and_native_contracts() {
-        let universe = mpi::initialize().unwrap();
-        let world = universe.world();
-        let dir = support::owned_temp_dir(&world, "chunked-native");
-        let t = MpiTopology::new(&world, [world.size() as usize]).unwrap();
+    // Reuse the crate's single MPI initialization across private I/O checks.
+    pub(crate) fn cleanup_and_native_contracts(world: &mpi::topology::SimpleCommunicator) {
+        let dir = support::owned_temp_dir(world, "chunked-native");
+        let t = MpiTopology::new(world, [world.size() as usize]).unwrap();
         let p = Pencil::new(t.clone(), [3, 5], [0]).unwrap();
         let src = PencilArray::from_elem(p.clone(), ExtraShape::scalar(), 42u64).unwrap();
         let mut dst = PencilArray::from_elem(p, ExtraShape::scalar(), 99u64).unwrap();
@@ -558,6 +556,6 @@ mod tests {
             read_mpi_chunked(&path, dst.view_mut(), &options).unwrap();
             assert_eq!(dst.as_slice(), src.as_slice());
         }
-        support::cleanup_owned_temp_dir(&world, &dir);
+        support::cleanup_owned_temp_dir(world, &dir);
     }
 }

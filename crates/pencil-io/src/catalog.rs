@@ -101,9 +101,11 @@ impl ScalarType {
 /// `global_shape().len()` values are the permutation. Named MPI catalogs do not
 /// store writer provenance and therefore return an empty slice.
 /// Collection component axes remain verbatim in `extra_shape`; no component
-/// count is inferred. Catalogs are bounded to 65,536 named datasets per
-/// container/group, 1,024-byte UTF-8 names, 1 MiB MPI metadata headers,
-/// and the existing protocol/native rank limits.
+/// count is inferred. Legacy path catalogs are bounded to 65,536 named datasets
+/// per container/group, 1,024-byte UTF-8 keys, 1 MiB MPI metadata headers,
+/// and the existing protocol/native rank limits. Hierarchical HDF5 session
+/// catalogs instead return relative paths under their documented component,
+/// depth, 4,096-byte full-path and aggregate tree bounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatasetInfo {
     pub(crate) name: Option<String>,

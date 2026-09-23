@@ -255,7 +255,8 @@ impl<'c> MpiFileSession<'c> {
             ffi::comm_is_congruent(
                 self.comm.as_raw(),
                 pencil.topology().communicator().as_raw(),
-            ),
+            )
+            .unwrap_or(false),
             "session view ordered membership",
         )?;
         crate::mpi_io::descriptor_agreement(
@@ -563,7 +564,7 @@ impl<'c> MpiFileSession<'c> {
 impl Drop for MpiFileSession<'_> {
     fn drop(&mut self) {
         if self.resources.is_some() {
-            if ffi::mpi_is_finalized() {
+            if ffi::mpi_is_finalized().unwrap_or(true) {
                 std::process::abort();
             }
             abort_unrecoverable(
