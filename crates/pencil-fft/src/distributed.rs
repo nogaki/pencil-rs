@@ -138,9 +138,9 @@ impl BackendChoice {
     }
 
     #[allow(clippy::extra_unused_type_parameters)]
-    fn descriptor_words<R: FftReal>(self) -> [u64; 7] {
+    fn descriptor_words<R: FftReal>(self) -> [u64; BACKEND_DESCRIPTOR_WORDS] {
         match self {
-            Self::RustFft => [0, 0, 0, 0, 0, 0, 0],
+            Self::RustFft => [0; BACKEND_DESCRIPTOR_WORDS],
             #[cfg(feature = "fftw")]
             Self::Fftw(options) => {
                 let (present, secs, nanos) = options.time_limit().map_or((0, 0, 0), |limit| {
@@ -154,13 +154,15 @@ impl BackendChoice {
                     secs,
                     nanos,
                     options.requested_threads() as u64,
+                    u64::from(options.wisdom_only()) | (u64::from(options.conserve_memory()) << 1),
                 ]
             }
         }
     }
 }
 
-const DESCRIPTOR_SCHEMA: u64 = 4;
+const BACKEND_DESCRIPTOR_WORDS: usize = 8;
+const DESCRIPTOR_SCHEMA: u64 = 5;
 const OPERATION_PLAN: u64 = 7;
 const OPERATION_FORWARD: u64 = 8;
 const OPERATION_INVERSE: u64 = 9;
@@ -1723,7 +1725,7 @@ where
         let communicator = topology.communicator();
         let expected_len = descriptor_len::<N, M>(&extra_shape)
             .and_then(|length| length.checked_add(N))
-            .and_then(|length| length.checked_add(7));
+            .and_then(|length| length.checked_add(BACKEND_DESCRIPTOR_WORDS));
         let descriptor = expected_len.and_then(|_| {
             let mut descriptor = build_descriptor::<R, N, M>(
                 &topology,
@@ -1734,7 +1736,9 @@ where
                 layout,
             )
             .ok()?;
-            descriptor.try_reserve_exact(N + 7).ok()?;
+            descriptor
+                .try_reserve_exact(N + BACKEND_DESCRIPTOR_WORDS)
+                .ok()?;
             descriptor.extend(directions.0.iter().map(|direction| match direction {
                 FourierDirection::Forward => 0,
                 FourierDirection::Backward => 1,

@@ -33,6 +33,36 @@ fn opts(rigor: PlanningRigor, limit: Option<Duration>) -> PlanOptions {
 }
 
 #[test]
+fn backend_descriptor_flags() {
+    assert_eq!(super::DESCRIPTOR_SCHEMA, 5);
+    assert_eq!(super::BACKEND_DESCRIPTOR_WORDS, 8);
+    assert_eq!(
+        super::BackendChoice::RustFft.descriptor_words::<f64>(),
+        [0; 8]
+    );
+    let options = opts(PlanningRigor::Measure, Some(Duration::new(2, 17)))
+        .with_threads(2)
+        .unwrap();
+    for (wisdom, conserve, packed) in [
+        (false, false, 0),
+        (true, false, 1),
+        (false, true, 2),
+        (true, true, 3),
+    ] {
+        let backend = super::BackendChoice::Fftw(
+            options
+                .with_wisdom_only(wisdom)
+                .with_conserve_memory(conserve),
+        );
+        assert_eq!(
+            backend.descriptor_words::<f64>(),
+            [1, 8, PlanningRigor::Measure as u64, 1, 2, 17, 2, packed]
+        );
+        assert_eq!(backend.descriptor_words::<f32>()[1], 4);
+    }
+}
+
+#[test]
 fn native_operation_words_do_not_collide() {
     let mut words: std::collections::BTreeMap<u64, &str> = (121..=126)
         .map(|word| (word, "collections reservation"))
@@ -206,6 +236,72 @@ fn fftw_descriptor_and_factory_preflight_all_six() {
             [AxisTransform::R2r(AxisR2rKind::Dht), AxisTransform::Rfft],
             native
         ));
+
+        // Wisdom/conserve flags are descriptor words as well; every family
+        // must reject a rank-local flag mismatch before its native factory.
+        for wisdom in [false, true] {
+            let flag_opts =
+                PlanOptions::new(PlanningRigor::Estimate, Some(Duration::from_millis(1)))
+                    .unwrap()
+                    .with_threads(2)
+                    .unwrap()
+                    .with_wisdom_only(wisdom && rank == 1)
+                    .with_conserve_memory(!wisdom && rank == 1);
+            reject_threads!(C2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+                Arc::clone(&topology),
+                shape,
+                extra.clone(),
+                flag_opts
+            ));
+            reject_threads!(R2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+                Arc::clone(&topology),
+                shape,
+                extra.clone(),
+                flag_opts
+            ));
+            reject_threads!(R2rPlan::<f64, 2, 1>::from_shape_with_fftw(
+                Arc::clone(&topology),
+                shape,
+                extra.clone(),
+                [Some(R2rKind::DctII); 2],
+                flag_opts
+            ));
+            reject_threads!(DhtPlan::<f64, 2, 1>::from_shape_with_fftw(
+                Arc::clone(&topology),
+                shape,
+                extra.clone(),
+                flag_opts
+            ));
+            reject_threads!(MixedC2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+                Arc::clone(&topology),
+                shape,
+                extra.clone(),
+                [
+                    AxisTransform::R2r(AxisR2rKind::Dht),
+                    AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DctII))
+                ],
+                flag_opts
+            ));
+            reject_threads!(MixedR2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+                Arc::clone(&topology),
+                shape,
+                extra.clone(),
+                [AxisTransform::R2r(AxisR2rKind::Dht), AxisTransform::Rfft],
+                flag_opts
+            ));
+        }
+        let retry = C2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+            Arc::clone(&topology),
+            shape,
+            extra.clone(),
+            native.with_threads(2).unwrap(),
+        )
+        .unwrap();
+        let input = retry.allocate_input().unwrap();
+        let mut output = retry.allocate_output().unwrap();
+        let mut workspace = retry.allocate_out_of_place_workspace().unwrap();
+        retry.forward(&input, &mut output, &mut workspace).unwrap();
+        world.barrier();
     }
     let native = native.with_threads(2).unwrap();
     injected!(C2cPlan::<f64, 2, 1>::from_shape_with_fftw(

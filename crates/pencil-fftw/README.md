@@ -33,6 +33,10 @@ assert_eq!(fft.len(), 16);
   private fields, `rigor()` and `time_limit()` getters. Default: Estimate, no limit,
   one CPU thread. `with_threads(usize)` validates a positive count fitting `c_int`;
   `requested_threads()` reports the request, not measured native utilization.
+  `with_wisdom_only(bool)` and `with_conserve_memory(bool)` set the matching
+  native planning flags (both default false); `wisdom_only()` and
+  `conserve_memory()` report them. Wisdom-only misses return `NullPlan`, with no
+  fallback. Conserving memory is a planner hint, not a performance guarantee.
 - `PlanningRigor::{Estimate, Measure, Patient, Exhaustive}`. A supplied limit must
   be positive; FFTW treats it as an approximate planning budget, not a deadline.
 - `FftwError::{Load(String), Symbol(String), InvalidOptions(&'static str), Overflow,
@@ -132,7 +136,7 @@ and fails if either is unavailable. Native checks use independent direct DFTs
 and cover both precisions, all rigors with bounded planning, both directions,
 odd/even/unit sizes, batches, IP/OOP, offset buffers, preservation/error paths,
 arbitrary spectra, raw normalization and shared-plan concurrency with requested
-counts 1/2/3. Native wisdom tests prove reuse using private WISDOM_ONLY planning
+counts 1/2/3. Native wisdom tests prove reuse using public wisdom-only options
 after all original plans drop, precision isolation, existing-plan validity after
 forget, invalid/NUL input, and concurrent planning/execution/wisdom.
 Fresh-process traces cover serial-first, each wisdom operation first, and
