@@ -12,6 +12,9 @@ use std::ptr;
 use mpi::ffi;
 
 #[cfg(test)]
+thread_local! { pub(crate) static DUPLICATE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(test)]
 thread_local! { static PAYLOAD_CALLS: std::cell::Cell<[usize;6]> = const { std::cell::Cell::new([0;6]) }; }
 #[cfg(test)]
 fn record_payload(index: usize) {
@@ -24,6 +27,11 @@ fn record_payload(index: usize) {
 #[cfg(test)]
 pub(crate) fn test_payload_calls() -> [usize; 6] {
     PAYLOAD_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(all(test, feature = "parallel-hdf5"))]
+thread_local! {
+    pub(crate) static FILTER_CAPABILITIES: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -129,6 +137,8 @@ pub(crate) fn info_null() -> MPI_Info {
 }
 
 pub(crate) fn comm_dup(comm: ffi::MPI_Comm) -> Result<ffi::MPI_Comm, i32> {
+    #[cfg(test)]
+    DUPLICATE_CALLS.with(|calls| calls.set(calls.get() + 1));
     // SAFETY: `comm` is the live intracommunicator borrowed from a validated
     // pencil topology and all ranks call this collective in the same phase.
     unsafe {
@@ -807,6 +817,58 @@ pub(crate) mod hdf5 {
         })
     }
 
+    /// Checks a link without resolving it until its class is known to be hard.
+    /// The sys binding's H5Lget_info1 name aliases the HDF5 1.10 H5Lget_info symbol.
+    pub(crate) fn link_is_hard_and_type(
+        loc: Hid,
+        name: &CStr,
+        expected: LinkObjectType,
+    ) -> Result<bool, i32> {
+        hdf5_metno::sync::sync(|| {
+            // SAFETY: loc/name are live; both output structs have the native
+            // HDF5 1.10 ABI and remain local for the duration of each call.
+            unsafe {
+                let mut link = h5::h5l::H5L_info1_t::default();
+                let code =
+                    // hdf5-metno-sys aliases H5Lget_info1 to H5Lget_info for HDF5 1.10.
+                    h5::h5l::H5Lget_info1(loc, name.as_ptr(), &mut link, h5::h5p::H5P_DEFAULT);
+                if code < 0 {
+                    return Err(code as i32);
+                }
+                if link.type_ != h5::h5l::H5L_TYPE_HARD {
+                    return Ok(false);
+                }
+                let mut object = h5::h5o::H5O_info1_t::default();
+                let code = h5::h5o::H5Oget_info_by_name2(
+                    loc,
+                    name.as_ptr(),
+                    &mut object,
+                    h5::h5o::H5O_INFO_BASIC,
+                    h5::h5p::H5P_DEFAULT,
+                );
+                if code < 0 {
+                    return Err(code as i32);
+                }
+                Ok(object.type_ == expected.hdf5())
+            }
+        })
+    }
+
+    #[derive(Clone, Copy)]
+    pub(crate) enum LinkObjectType {
+        Group,
+        Dataset,
+    }
+
+    impl LinkObjectType {
+        fn hdf5(self) -> h5::h5o::H5O_type_t {
+            match self {
+                Self::Group => h5::h5o::H5O_TYPE_GROUP,
+                Self::Dataset => h5::h5o::H5O_TYPE_DATASET,
+            }
+        }
+    }
+
     pub(crate) fn dataset_open(group: Hid, name: &CStr) -> Result<Hid, i32> {
         hdf5_metno::sync::sync(|| {
             // SAFETY: group/name are live for the duration of the collective
@@ -1344,6 +1406,60 @@ pub(crate) mod hdf5 {
             // SAFETY: plist points to a live property-list identifier.
             unsafe { h5::h5p::H5Pclose(*plist) }
         })
+    }
+
+    pub(crate) fn group_link_count(group: Hid) -> Result<u64, i32> {
+        hdf5_metno::sync::sync(|| unsafe {
+            // SAFETY: group is live and the initialized output has the native layout.
+            let mut info = h5::h5g::H5G_info_t::default();
+            let code = h5::h5g::H5Gget_info(group, &mut info);
+            if code < 0 { Err(code) } else { Ok(info.nlinks) }
+        })
+    }
+
+    pub(crate) fn link_name_by_idx(
+        group: Hid,
+        index: u64,
+        buffer: &mut [u8],
+    ) -> Result<usize, i32> {
+        let index = index as h5::h5::hsize_t;
+        hdf5_metno::sync::sync(|| unsafe {
+            let n = h5::h5l::H5Lget_name_by_idx(
+                group,
+                c".".as_ptr(),
+                h5::h5::H5_index_t::H5_INDEX_NAME,
+                h5::h5::H5_iter_order_t::H5_ITER_INC,
+                index,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                h5::h5p::H5P_DEFAULT,
+            );
+            if n < 0 { Err(n as i32) } else { Ok(n as usize) }
+        })
+    }
+
+    pub(crate) fn filter_avail(filter: h5::h5z::H5Z_filter_t) -> bool {
+        hdf5_metno::sync::sync(|| unsafe { h5::h5z::H5Zfilter_avail(filter) > 0 })
+    }
+
+    pub(crate) fn filter_info(filter: h5::h5z::H5Z_filter_t) -> Result<u32, i32> {
+        #[cfg(test)]
+        if let Some(flags) = super::FILTER_CAPABILITIES.with(std::cell::Cell::get) {
+            return Ok(flags);
+        }
+        hdf5_metno::sync::sync(|| unsafe {
+            let mut flags = 0u32;
+            let code = h5::h5z::H5Zget_filter_info(filter, &mut flags);
+            if code < 0 { Err(code) } else { Ok(flags) }
+        })
+    }
+
+    pub(crate) fn plist_set_shuffle(plist: Hid) -> i32 {
+        hdf5_metno::sync::sync(|| unsafe { h5::h5p::H5Pset_shuffle(plist) })
+    }
+
+    pub(crate) fn plist_set_deflate(plist: Hid, level: u32) -> i32 {
+        hdf5_metno::sync::sync(|| unsafe { h5::h5p::H5Pset_deflate(plist, level) })
     }
 
     pub(crate) fn dataset_io(
