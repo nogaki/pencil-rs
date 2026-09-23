@@ -54,6 +54,8 @@ mod hdf5_io;
 #[cfg(feature = "parallel-hdf5")]
 mod hdf5_options;
 
+pub use named_mpi::session::{MpiFileSession, MpiSessionError};
+
 #[cfg(feature = "parallel-hdf5")]
 pub use catalog::read_hdf5_catalog;
 pub use catalog::{
@@ -364,6 +366,9 @@ mod tests {
             }
         }
 
+        if std::env::var_os("PENCIL_MPI_SESSION_CLEANUP_CHILD").is_some() {
+            crate::named_mpi::session::test_native_cleanup_child(&directory, &source);
+        }
         let valid_path = directory.join("valid.pio");
         root_status(&world, || reset(&valid_path));
         world.barrier();
@@ -1074,6 +1079,11 @@ mod tests {
                 1
             );
         }
+        crate::named_mpi::session::test_retained_native_handles(
+            &directory,
+            &source,
+            &mut destination,
+        );
         if world.rank() == 0 {
             println!("IO3_PRIVATE_CHECKS_OK");
         }

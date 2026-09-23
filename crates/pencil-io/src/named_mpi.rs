@@ -6,6 +6,8 @@
 //! Header and payload are flushed before the independent trailing commit word.
 //! No mutable global index is needed to recover the committed prefix.
 
+pub(crate) mod session;
+
 use std::ffi::CString;
 use std::path::Path;
 
@@ -111,7 +113,9 @@ fn open<C: CommunicatorCollectives + Communicator>(
     info: Option<&InfoGuard>,
 ) -> Result<ffi::MPI_File, NamedIoError> {
     let r = if let Some(info) = info {
-        if mode == 0 {
+        if mode == 3 {
+            ffi::file_create_readwrite(raw, p, info.raw)
+        } else if mode == 0 {
             ffi::file_open_with_info(raw, p, true, info.raw)
         } else if mode == 1 {
             ffi::file_open_with_info(raw, p, false, info.raw)
