@@ -20,6 +20,11 @@ use crate::{
     OP_APPEND_HDF5_NAMED, OP_READ_HDF5, OP_READ_HDF5_NAMED, OP_WRITE_HDF5, OP_WRITE_HDF5_NAMED,
 };
 
+mod session;
+#[cfg(test)]
+pub(crate) use session::native_contracts as test_session_native_contracts;
+pub use session::{Hdf5FileSession, Hdf5SessionError};
+
 const MAX_NAME: usize = 1024;
 const OP_OPTIONS_WRITE_HDF5: u64 = 13;
 const OP_OPTIONS_READ_HDF5: u64 = 14;

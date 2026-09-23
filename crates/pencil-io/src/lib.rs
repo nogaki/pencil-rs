@@ -10,9 +10,9 @@
 //! a different process grid or memory-axis permutation.
 //!
 //! `write_mpi` and `read_mpi` are collective over the view's Cartesian
-//! communicator.  The view must be borrowed from its owning
-//! [`pencil_array::PencilArray`] with `.view()` or `.view_mut()` and all array,
-//! topology, and MPI-IO objects must be dropped before MPI finalization. Do not
+//! communicator. Views may borrow an owning [`pencil_array::PencilArray`] or
+//! validated external slices. All array, topology, and MPI-IO objects must be
+//! dropped before MPI finalization; persistent sessions require explicit close. Do not
 //! overlap an I/O call with another operation on that topology communicator;
 //! the call temporarily installs `MPI_ERRORS_RETURN` only around
 //! `MPI_Comm_dup`, then restores the caller's original handler. Native MPI
@@ -39,6 +39,7 @@
 //! [`read_mpi_raw`], never inferred by the strict versioned readers.
 
 mod catalog;
+mod chunked;
 mod collections;
 mod format;
 mod mpi_io;
@@ -53,11 +54,14 @@ mod hdf5_io;
 #[cfg(feature = "parallel-hdf5")]
 mod hdf5_options;
 
+pub use named_mpi::session::{MpiFileSession, MpiSessionError};
+
 #[cfg(feature = "parallel-hdf5")]
 pub use catalog::read_hdf5_catalog;
 pub use catalog::{
     CatalogError, DatasetInfo, ScalarType, read_mpi_catalog, read_mpi_named_catalog,
 };
+pub use chunked::{read_mpi_chunked, read_mpi_chunked_catalog, write_mpi_chunked};
 pub use collections::*;
 pub use format::IoElement;
 pub use mpi_io::{read_mpi, read_mpi_with_options, write_mpi, write_mpi_with_options};
@@ -70,8 +74,9 @@ pub use raw::read_mpi_raw;
 
 #[cfg(feature = "parallel-hdf5")]
 pub use hdf5_io::{
-    append_hdf5_named, append_hdf5_named_with_options, read_hdf5, read_hdf5_named,
-    read_hdf5_named_with_options, write_hdf5, write_hdf5_named, write_hdf5_named_with_options,
+    Hdf5FileSession, Hdf5SessionError, append_hdf5_named, append_hdf5_named_with_options,
+    read_hdf5, read_hdf5_named, read_hdf5_named_with_options, write_hdf5, write_hdf5_named,
+    write_hdf5_named_with_options,
 };
 #[cfg(feature = "parallel-hdf5")]
 pub use hdf5_options::{
@@ -362,6 +367,10 @@ mod tests {
             }
         }
 
+        if std::env::var_os("PENCIL_MPI_SESSION_CLEANUP_CHILD").is_some() {
+            crate::named_mpi::session::test_native_cleanup_child(&directory, &source);
+        }
+        crate::chunked::tests::cleanup_and_native_contracts(&world);
         let valid_path = directory.join("valid.pio");
         root_status(&world, || reset(&valid_path));
         world.barrier();
@@ -476,6 +485,12 @@ mod tests {
         #[cfg(feature = "parallel-hdf5")]
         {
             use super::{read_hdf5, write_hdf5};
+
+            crate::hdf5_io::test_session_native_contracts(
+                &directory.join("session-native.h5"),
+                &source,
+                &mut destination,
+            );
 
             let valid_path = directory.join("valid.h5");
             root_status(&world, || reset(&valid_path));
@@ -1072,6 +1087,11 @@ mod tests {
                 1
             );
         }
+        crate::named_mpi::session::test_retained_native_handles(
+            &directory,
+            &source,
+            &mut destination,
+        );
         if world.rank() == 0 {
             println!("IO3_PRIVATE_CHECKS_OK");
         }

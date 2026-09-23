@@ -14,10 +14,15 @@ use std::{
 thread_local! {
     pub(crate) static COMPLEX_EXECUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TRACE: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FLAG_TRACE: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 #[cfg(test)]
 fn trace(event: &'static str) {
     TRACE.with(|events| events.borrow_mut().push(event));
+}
+#[cfg(test)]
+fn trace_flags(flags: u32) {
+    FLAG_TRACE.with(|events| events.borrow_mut().push(flags));
 }
 
 type Handle = *mut c_void;
@@ -364,15 +369,27 @@ impl<R: Real> Plan<R> {
         let handle = unsafe {
             (table.limit)(options.time_limit.map_or(-1.0, |t| t.as_secs_f64()));
             match kind {
-                Kind::Complex(d, ip) => (table.pc)(
-                    native,
-                    a.as_mut_ptr(),
-                    if ip { a.as_mut_ptr() } else { b.as_mut_ptr() },
-                    if d == FftDirection::Forward { -1 } else { 1 },
-                    flags | 16,
-                ),
-                Kind::Forward => (table.pf)(native, r.as_mut_ptr(), b.as_mut_ptr(), flags),
-                Kind::Inverse => (table.pi)(native, a.as_mut_ptr(), r.as_mut_ptr(), flags),
+                Kind::Complex(d, ip) => {
+                    #[cfg(test)]
+                    trace_flags(flags | FFTW_PRESERVE_INPUT);
+                    (table.pc)(
+                        native,
+                        a.as_mut_ptr(),
+                        if ip { a.as_mut_ptr() } else { b.as_mut_ptr() },
+                        if d == FftDirection::Forward { -1 } else { 1 },
+                        flags | FFTW_PRESERVE_INPUT,
+                    )
+                }
+                Kind::Forward => {
+                    #[cfg(test)]
+                    trace_flags(flags);
+                    (table.pf)(native, r.as_mut_ptr(), b.as_mut_ptr(), flags)
+                }
+                Kind::Inverse => {
+                    #[cfg(test)]
+                    trace_flags(flags);
+                    (table.pi)(native, a.as_mut_ptr(), r.as_mut_ptr(), flags)
+                }
             }
         };
         drop(_reset);
@@ -462,6 +479,82 @@ mod tests {
             2 * std::mem::size_of::<f64>()
         );
     }
+    #[test]
+    #[ignore = "requires both native FFTW runtimes and pthread libraries"]
+    fn native_c2c_second_plan_failure_drops_first_and_resets_threads() {
+        let _serial = crate::tests::NATIVE_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fn check<R: Real>() {
+            let trained = PlanOptions::new(PlanningRigor::Measure, None)
+                .unwrap()
+                .with_threads(2)
+                .unwrap()
+                .with_conserve_memory(true);
+            let kind = Kind::Complex(FftDirection::Forward, false);
+            forget_wisdom::<R>().unwrap();
+            drop(Plan::<R>::new(31, kind, trained.with_threads(1).unwrap()).unwrap());
+            drop(Plan::<R>::new(17, kind, trained).unwrap());
+            let wisdom = export_wisdom::<R>().unwrap();
+            forget_wisdom::<R>().unwrap();
+            import_wisdom::<R>(&wisdom).unwrap();
+            let only = trained.with_wisdom_only(true);
+            TRACE.with(|events| events.borrow_mut().clear());
+            FLAG_TRACE.with(|events| events.borrow_mut().clear());
+            let result = crate::plan_c2c::<R>(17, FftDirection::Forward, only);
+            assert!(matches!(result, Err(FftwError::NullPlan)));
+            TRACE.with(|events| {
+                let events = events.borrow();
+                assert_eq!(
+                    events.iter().filter(|&&event| event == "destroy").count(),
+                    1
+                );
+                assert_eq!(events.iter().filter(|&&event| event == "reset1").count(), 2);
+            });
+            FLAG_TRACE.with(|flags| {
+                let flags = flags.borrow();
+                assert_eq!(flags.len(), 2);
+                assert!(flags.iter().all(|&value| value & FFTW_CONSERVE_MEMORY != 0));
+                assert!(flags.iter().all(|&value| value & FFTW_PRESERVE_INPUT != 0));
+                assert!(flags.iter().all(|&value| value & FFTW_WISDOM_ONLY != 0));
+            });
+            // Bypass our setter: one-thread wisdom can succeed only if the
+            // failed second plan restored the native thread count to one.
+            {
+                let table = Table::<R>::load().unwrap();
+                let _guard = lock::<R>();
+                let mut input = vec![Complex::<R>::default(); 31];
+                let mut output = input.clone();
+                // SAFETY: initialized disjoint buffers of the trained length;
+                // matching flags and live table, with the planner lock held.
+                let handle = unsafe {
+                    (table.pc)(
+                        31,
+                        input.as_mut_ptr(),
+                        output.as_mut_ptr(),
+                        -1,
+                        only.flags() | FFTW_PRESERVE_INPUT,
+                    )
+                };
+                assert!(
+                    !handle.is_null(),
+                    "failed plan did not reset native threads"
+                );
+                // SAFETY: non-null owned handle; table and planner lock still live.
+                unsafe { (table.destroy)(handle) };
+            }
+            FLAG_TRACE.with(|events| events.borrow_mut().clear());
+            drop(Plan::<R>::new(17, Kind::Forward, trained).unwrap());
+            drop(Plan::<R>::new(17, Kind::Inverse, trained).unwrap());
+            FLAG_TRACE.with(|flags| {
+                assert_eq!(*flags.borrow(), [trained.flags(), trained.flags()]);
+            });
+            crate::forget_wisdom::<R>().unwrap();
+        }
+        check::<f32>();
+        check::<f64>();
+    }
+
     #[test]
     #[ignore = "requires both native FFTW runtimes"]
     fn native_partial_construction_cleanup() {

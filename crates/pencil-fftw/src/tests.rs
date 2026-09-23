@@ -50,6 +50,15 @@ fn host_contracts() {
         assert_eq!(o.flags(), flags);
         assert_eq!(o.rigor(), rigor);
         assert_eq!(o.time_limit(), Some(Duration::from_millis(1)));
+        assert!(!o.wisdom_only());
+        assert!(!o.conserve_memory());
+        let toggled = o.with_wisdom_only(true).with_conserve_memory(true);
+        assert!(toggled.wisdom_only());
+        assert!(toggled.conserve_memory());
+        assert_eq!(
+            toggled.flags(),
+            flags | FFTW_WISDOM_ONLY | FFTW_CONSERVE_MEMORY
+        );
     }
     // All factory dimension checks precede loading or allocation.
     assert!(matches!(
@@ -323,6 +332,83 @@ fn matrix<R: Real + rustfft::num_traits::ToPrimitive>(threads: usize) {
     // Unbounded estimate after bounded planning exercises the reset/default path.
     plan_c2c::<R>(5, FftDirection::Forward, PlanOptions::default()).unwrap();
 }
+fn wisdom_only_matrix<R: Real + rustfft::num_traits::ToPrimitive>() {
+    let n = 11;
+    for threads in [1, 2] {
+        // Use matching unbounded Measure for real-transform wisdom on FFTW
+        // 3.3.8 too; do not assume Estimate training supplies every wisdom kind.
+        let trained = PlanOptions::new(PlanningRigor::Measure, None)
+            .unwrap()
+            .with_threads(threads)
+            .unwrap()
+            .with_conserve_memory(true);
+        let only = trained.with_wisdom_only(true);
+        forget_wisdom::<R>().unwrap();
+        for direction in [FftDirection::Forward, FftDirection::Inverse] {
+            assert!(matches!(
+                plan_c2c::<R>(n, direction, only),
+                Err(FftwError::NullPlan)
+            ));
+        }
+        assert!(matches!(plan_r2c::<R>(n, only), Err(FftwError::NullPlan)));
+        assert!(matches!(plan_c2r::<R>(n, only), Err(FftwError::NullPlan)));
+        for direction in [FftDirection::Forward, FftDirection::Inverse] {
+            drop(plan_c2c::<R>(n, direction, trained).unwrap());
+        }
+        drop(plan_r2c::<R>(n, trained).unwrap());
+        drop(plan_c2r::<R>(n, trained).unwrap());
+        let wisdom = export_wisdom::<R>().unwrap();
+        forget_wisdom::<R>().unwrap();
+        import_wisdom::<R>(&wisdom).unwrap();
+        let source: Vec<_> = (0..n)
+            .map(|j| Complex::new(j as f64 * 0.3 - 0.4, 0.0))
+            .collect();
+        let input: Vec<_> = source
+            .iter()
+            .map(|v| Complex::new(c::<R>(v.re), R::zero()))
+            .collect();
+        for direction in [FftDirection::Forward, FftDirection::Inverse] {
+            let plan = plan_c2c::<R>(n, direction, only).unwrap();
+            let expected = dft(&source, direction == FftDirection::Inverse);
+            let mut output = vec![Complex::default(); n];
+            plan.process_immutable_with_scratch(&input, &mut output, &mut []);
+            let mut inplace = input.clone();
+            plan.process(&mut inplace);
+            for ((a, b), expected) in output.into_iter().zip(inplace).zip(expected) {
+                near(a, expected);
+                near(b, expected);
+            }
+        }
+        let r2c = plan_r2c::<R>(n, only).unwrap();
+        let c2r = plan_c2r::<R>(n, only).unwrap();
+        let mut real: Vec<_> = input.iter().map(|v| v.re).collect();
+        let mut spectrum = r2c.make_output_vec();
+        r2c.process(&mut real, &mut spectrum).unwrap();
+        for (&actual, expected) in spectrum.iter().zip(dft(&source, false)) {
+            near(actual, expected);
+        }
+        let mut restored = c2r.make_output_vec();
+        c2r.process(&mut spectrum, &mut restored).unwrap();
+        for (actual, expected) in restored.into_iter().zip(&source) {
+            near(Complex::new(actual, R::zero()), *expected * n as f64);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires native libfftw3.so.3"]
+fn native_f64_wisdom_only_all_kinds() {
+    let _guard = NATIVE_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    wisdom_only_matrix::<f64>();
+}
+
+#[test]
+#[ignore = "requires native libfftw3f.so.3"]
+fn native_f32_wisdom_only_all_kinds() {
+    let _guard = NATIVE_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    wisdom_only_matrix::<f32>();
+}
+
 #[test]
 #[ignore = "requires native libfftw3.so.3"]
 fn native_f64() {
@@ -343,6 +429,8 @@ fn native_f32() {
 #[test]
 fn thread_options() {
     assert_eq!(PlanOptions::default().requested_threads(), 1);
+    assert!(!PlanOptions::default().wisdom_only());
+    assert!(!PlanOptions::default().conserve_memory());
     assert!(PlanOptions::default().with_threads(0).is_err());
     assert!(
         PlanOptions::default()

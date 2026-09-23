@@ -4,6 +4,7 @@ use pencil_fft::{
     BackendKind, Complex, FftReal, LocalC2cPlan, LocalDhtPlan, LocalR2cPlan, LocalR2rPlan,
     PlanOptions, PlanningRigor, R2rKind, R2rScalar,
 };
+use pencil_fft::{export_wisdom, forget_wisdom, import_wisdom};
 use rustfft::num_traits::{FromPrimitive, ToPrimitive, Zero};
 use std::f64::consts::TAU;
 use std::time::Duration;
@@ -13,6 +14,8 @@ fn assert_options(actual: Option<PlanOptions>, expected: PlanOptions) {
     assert_eq!(actual.rigor(), expected.rigor());
     assert_eq!(actual.time_limit(), expected.time_limit());
     assert_eq!(actual.requested_threads(), expected.requested_threads());
+    assert_eq!(actual.wisdom_only(), expected.wisdom_only());
+    assert_eq!(actual.conserve_memory(), expected.conserve_memory());
 }
 
 trait Value: R2rScalar {
@@ -579,6 +582,80 @@ where
 #[test]
 fn defaults_are_rust_plans() {
     rust_defaults();
+}
+
+fn local_wisdom<R>()
+where
+    R: FftReal + FromPrimitive + ToPrimitive,
+{
+    let trained = PlanOptions::new(PlanningRigor::Measure, None)
+        .unwrap()
+        .with_threads(2)
+        .unwrap()
+        .with_conserve_memory(true);
+    let only = trained.with_wisdom_only(true);
+    let n = 7;
+    forget_wisdom::<R>().unwrap();
+    assert!(matches!(
+        LocalR2rPlan::<R>::new_fftw(n, R2rKind::DctII, only),
+        Err(pencil_fft::BackendInitError::Native(
+            pencil_fft::FftwError::NullPlan
+        ))
+    ));
+    assert!(matches!(
+        LocalDhtPlan::<R>::new_fftw(n, only),
+        Err(pencil_fft::BackendInitError::Native(
+            pencil_fft::FftwError::NullPlan
+        ))
+    ));
+
+    let trained_r2r = LocalR2rPlan::<R>::new_fftw(n, R2rKind::DctII, trained).unwrap();
+    let dht = LocalDhtPlan::<R>::new_fftw(n, trained).unwrap();
+    assert_options(trained_r2r.backend_options(), trained);
+    assert_options(dht.backend_options(), trained);
+    let wisdom = export_wisdom::<R>().unwrap();
+    drop((trained_r2r, dht));
+    forget_wisdom::<R>().unwrap();
+    import_wisdom::<R>(&wisdom).unwrap();
+
+    let hit = LocalR2rPlan::<R>::new_fftw(n, R2rKind::DctII, only).unwrap();
+    let dht_hit = LocalDhtPlan::<R>::new_fftw(n, only).unwrap();
+    assert_options(hit.backend_options(), only);
+    assert_options(dht_hit.backend_options(), only);
+    let reference: Vec<_> = (0..n)
+        .map(|j| Complex::new(j as f64 * 0.3 - 0.4, 0.0))
+        .collect();
+    let source: Vec<_> = reference
+        .iter()
+        .map(|v| R::from_f64(v.re).unwrap())
+        .collect();
+    let mut output = vec![R::zero(); n];
+    let mut embedding = vec![Complex::new(R::zero(), R::zero()); hit.embedding_len()];
+    hit.forward(&source, &mut output, &mut embedding, &mut [])
+        .unwrap();
+    for (actual, expected) in output.iter().zip(r2r(R2rKind::DctII, &reference)) {
+        assert!((actual.to_f64().unwrap() - expected.re).abs() < 3e-4);
+    }
+    let mut hartley = vec![R::zero(); n];
+    let mut dht_embedding = vec![Complex::new(R::zero(), R::zero()); dht_hit.embedding_len()];
+    dht_hit
+        .forward(&source, &mut hartley, &mut dht_embedding, &mut [])
+        .unwrap();
+    for (actual, expected) in hartley.iter().zip(dft(&reference, false)) {
+        assert!((actual.to_f64().unwrap() - (expected.re - expected.im)).abs() < 3e-4);
+    }
+}
+
+#[test]
+#[ignore = "requires native libfftw3.so.3"]
+fn native_f64_wisdom_only_r2r_dht() {
+    local_wisdom::<f64>();
+}
+
+#[test]
+#[ignore = "requires native libfftw3f.so.3"]
+fn native_f32_wisdom_only_r2r_dht() {
+    local_wisdom::<f32>();
 }
 
 #[test]

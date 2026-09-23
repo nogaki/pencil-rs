@@ -7,7 +7,8 @@ use pencil_array::{ExtraShape, MpiTopology};
 use pencil_fft::{
     AxisR2rKind, AxisSelection, AxisTransform, BackendKind, C2cPlan, Complex, DhtPlan,
     DistributedLayout, FourierDirection, FourierDirections, MixedC2cPlan, MixedR2cPlan,
-    PlanOptions, PlanningRigor, R2cPlan, R2rKind, R2rPlan, TransposeMethod,
+    PlanOptions, PlanningRigor, R2cPlan, R2rKind, R2rPlan, TransposeMethod, export_wisdom,
+    forget_wisdom, import_wisdom,
 };
 
 fn options() -> PlanOptions {
@@ -15,12 +16,15 @@ fn options() -> PlanOptions {
         .unwrap()
         .with_threads(2)
         .unwrap()
+        .with_conserve_memory(true)
 }
 
 fn assert_options(actual: PlanOptions, expected: PlanOptions) {
     assert_eq!(actual.requested_threads(), expected.requested_threads());
     assert_eq!(actual.rigor(), expected.rigor());
     assert_eq!(actual.time_limit(), expected.time_limit());
+    assert_eq!(actual.wisdom_only(), expected.wisdom_only());
+    assert_eq!(actual.conserve_memory(), expected.conserve_memory());
 }
 
 fn assert_complex_close(actual: &[Complex<f64>], expected: &[Complex<f64>], tol: f64) {
@@ -54,6 +58,319 @@ fn assert_values_close<T: Copy + Into<Complex<f64>>>(actual: &[T], expected: &[T
             "{actual} != {expected}"
         );
     }
+}
+
+#[test]
+#[ignore = "MPI must be launched explicitly by the parent test runner"]
+fn fftw_distributed_wisdom_only_all_six() {
+    let universe = mpi::initialize().expect("MPI initialization failed");
+    let world = universe.world();
+    let size = usize::try_from(world.size()).unwrap();
+    assert!(matches!(size, 1 | 4 | 6));
+    let topology = MpiTopology::<1>::new(&world, [size]).unwrap();
+    let shape = [4 * size, 3];
+    let trained = PlanOptions::new(PlanningRigor::Measure, None)
+        .unwrap()
+        .with_threads(2)
+        .unwrap()
+        .with_conserve_memory(true);
+    let only = trained.with_wisdom_only(true);
+    forget_wisdom::<f64>().unwrap();
+    assert!(
+        C2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+            Arc::clone(&topology),
+            shape,
+            ExtraShape::scalar(),
+            only
+        )
+        .is_err()
+    );
+
+    // Train every native family before exporting one complete f64 wisdom set.
+    let c2c = C2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        trained,
+    )
+    .unwrap();
+    let r2c = R2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        trained,
+    )
+    .unwrap();
+    let r2r = R2rPlan::<f64, 2, 1>::from_shape_with_fftw(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        [Some(R2rKind::DctII); 2],
+        trained,
+    )
+    .unwrap();
+    let dht = DhtPlan::<f64, 2, 1>::from_shape_with_fftw(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        trained,
+    )
+    .unwrap();
+    let mixed_c2c = MixedC2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        [
+            AxisTransform::Fft,
+            AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DctII)),
+        ],
+        trained,
+    )
+    .unwrap();
+    let mixed_r2c = MixedR2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        [AxisTransform::Fft, AxisTransform::Rfft],
+        trained,
+    )
+    .unwrap();
+    for options in [
+        c2c.options(),
+        r2c.options(),
+        r2r.options(),
+        dht.options(),
+        mixed_c2c.options(),
+        mixed_r2c.options(),
+    ] {
+        assert_options(options.unwrap(), trained);
+    }
+    let wisdom = export_wisdom::<f64>().unwrap();
+    drop((c2c, r2c, r2r, dht, mixed_c2c, mixed_r2c));
+    forget_wisdom::<f64>().unwrap();
+    import_wisdom::<f64>(&wisdom).unwrap();
+
+    // Exercise both configuration orders and a rebuilt collection on wisdom only.
+    let c2c = C2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        only,
+    )
+    .unwrap();
+    let c2c_native_first = c2c
+        .with_fft_directions(FourierDirections::new([
+            FourierDirection::Backward,
+            FourierDirection::Forward,
+        ]))
+        .unwrap();
+    let c2c_rebuilt = C2cPlan::<f64, 2, 1>::from_shape_with_fft_directions(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        FourierDirections::new([FourierDirection::Backward, FourierDirection::Forward]),
+    )
+    .unwrap()
+    .with_fftw(only)
+    .unwrap();
+    let r2c = R2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        only,
+    )
+    .unwrap();
+    let r2r = R2rPlan::<f64, 2, 1>::from_shape_with_fftw(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        [Some(R2rKind::DctII); 2],
+        only,
+    )
+    .unwrap();
+    let dht = DhtPlan::<f64, 2, 1>::from_shape_with_fftw(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        only,
+    )
+    .unwrap();
+    let mixed_c2c = MixedC2cPlan::<f64, 2, 1>::from_shape_with_fft_directions(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        [
+            AxisTransform::Fft,
+            AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DctII)),
+        ],
+        FourierDirections::new([FourierDirection::Backward, FourierDirection::Forward]),
+    )
+    .unwrap()
+    .with_fftw(only)
+    .unwrap();
+    let mixed_c2c_native_first = mixed_c2c
+        .with_fft_directions(FourierDirections::new([
+            FourierDirection::Backward,
+            FourierDirection::Forward,
+        ]))
+        .unwrap();
+    let mixed_r2c = MixedR2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        [AxisTransform::Fft, AxisTransform::Rfft],
+        only,
+    )
+    .unwrap();
+    let mixed_r2c_native_first = mixed_r2c
+        .with_fft_directions(FourierDirections::new([
+            FourierDirection::Backward,
+            FourierDirection::Forward,
+        ]))
+        .unwrap();
+    let mixed_r2c_directions_first = MixedR2cPlan::<f64, 2, 1>::from_shape_with_fft_directions(
+        Arc::clone(&topology),
+        shape,
+        ExtraShape::scalar(),
+        [AxisTransform::Fft, AxisTransform::Rfft],
+        FourierDirections::new([FourierDirection::Backward, FourierDirection::Forward]),
+    )
+    .unwrap()
+    .with_fftw(only)
+    .unwrap();
+    for options in [
+        c2c.options(),
+        c2c_native_first.options(),
+        c2c_rebuilt.options(),
+        r2c.options(),
+        r2r.options(),
+        dht.options(),
+        mixed_c2c.options(),
+        mixed_c2c_native_first.options(),
+        mixed_r2c.options(),
+        mixed_r2c_native_first.options(),
+        mixed_r2c_directions_first.options(),
+    ] {
+        assert_options(options.unwrap(), only);
+    }
+    let mut input = c2c.allocate_input().unwrap();
+    input
+        .as_mut_slice()
+        .iter_mut()
+        .enumerate()
+        .for_each(|(i, x)| {
+            let global = (world.rank() as usize * 12 + i) as f64;
+            *x = Complex::new(global + 1.0, -0.25 * global + 0.5);
+        });
+    let mut output = c2c.allocate_output().unwrap();
+    let mut workspace = c2c.allocate_out_of_place_workspace().unwrap();
+    c2c.forward(&input, &mut output, &mut workspace).unwrap();
+    let mut recovered = c2c.allocate_input().unwrap();
+    c2c.inverse(&output, &mut recovered, &mut workspace)
+        .unwrap();
+    assert_values_close(recovered.as_slice(), input.as_slice());
+    let mut second_input = c2c.allocate_input().unwrap();
+    second_input
+        .as_mut_slice()
+        .copy_from_slice(input.as_slice());
+    let many_inputs = vec![input, second_input];
+    let mut many_output = vec![
+        c2c.allocate_output().unwrap(),
+        c2c.allocate_output().unwrap(),
+    ];
+    c2c.forward_many(&many_inputs, &mut many_output, &mut workspace)
+        .unwrap();
+    for member in &many_output {
+        assert_values_close(member.as_slice(), output.as_slice());
+    }
+
+    // Collections use the same plans and options; compare each singleton
+    // collection with its scalar execution before checking the inverse.
+    macro_rules! check_many {
+        ($plan:ident, $input:ident, $output:ident, $workspace:ident) => {{
+            let mut actual = $plan.allocate_output().unwrap();
+            actual.as_mut_slice().fill(f64::NAN.into());
+            $plan
+                .forward_many(
+                    std::slice::from_ref(&$input),
+                    std::slice::from_mut(&mut actual),
+                    &mut $workspace,
+                )
+                .unwrap();
+            assert_values_close(actual.as_slice(), $output.as_slice());
+        }};
+    }
+    let mut ri = r2c.allocate_input().unwrap();
+    ri.as_mut_slice().iter_mut().enumerate().for_each(|(i, x)| {
+        *x = (world.rank() as usize * 12 + i) as f64 * 0.17 + 0.3;
+    });
+    let ri_expected = ri.as_slice().to_vec();
+    let mut ro = r2c.allocate_output().unwrap();
+    let mut rw = r2c.allocate_workspace().unwrap();
+    r2c.forward(&ri, &mut ro, &mut rw).unwrap();
+    check_many!(r2c, ri, ro, rw);
+    let mut ri_recovered = r2c.allocate_input().unwrap();
+    r2c.inverse(&ro, &mut ri_recovered, &mut rw).unwrap();
+    assert_real_close(ri_recovered.as_slice(), &ri_expected, 3e-9);
+
+    let mut ai = r2r.allocate_input().unwrap();
+    ai.as_mut_slice().iter_mut().enumerate().for_each(|(i, x)| {
+        *x = (world.rank() as usize * 12 + i) as f64 * 0.11 + 0.2;
+    });
+    let ai_expected = ai.as_slice().to_vec();
+    let mut ao = r2r.allocate_output().unwrap();
+    let mut aw = r2r.allocate_workspace().unwrap();
+    r2r.forward(&ai, &mut ao, &mut aw).unwrap();
+    check_many!(r2r, ai, ao, aw);
+    let mut ai_recovered = r2r.allocate_input().unwrap();
+    r2r.inverse(&ao, &mut ai_recovered, &mut aw).unwrap();
+    assert_real_close(ai_recovered.as_slice(), &ai_expected, 3e-9);
+
+    let mut di = dht.allocate_input().unwrap();
+    di.as_mut_slice().iter_mut().enumerate().for_each(|(i, x)| {
+        *x = (world.rank() as usize * 12 + i) as f64 * 0.07 + 0.4;
+    });
+    let di_expected = di.as_slice().to_vec();
+    let mut do_ = dht.allocate_output().unwrap();
+    let mut dw = dht.allocate_workspace().unwrap();
+    dht.forward(&di, &mut do_, &mut dw).unwrap();
+    check_many!(dht, di, do_, dw);
+    let mut di_recovered = dht.allocate_input().unwrap();
+    dht.inverse(&do_, &mut di_recovered, &mut dw).unwrap();
+    assert_real_close(di_recovered.as_slice(), &di_expected, 3e-9);
+
+    let mut mi = mixed_c2c.allocate_input().unwrap();
+    mi.as_mut_slice().iter_mut().enumerate().for_each(|(i, x)| {
+        let global = (world.rank() as usize * 12 + i) as f64;
+        *x = Complex::new(global * 0.13 - 0.4, global * -0.09 + 0.2);
+    });
+    let mi_expected = mi.as_slice().to_vec();
+    let mut mo = mixed_c2c.allocate_output().unwrap();
+    let mut mw = mixed_c2c.allocate_workspace().unwrap();
+    mixed_c2c.forward(&mi, &mut mo, &mut mw).unwrap();
+    check_many!(mixed_c2c, mi, mo, mw);
+    let mut mi_recovered = mixed_c2c.allocate_input().unwrap();
+    mixed_c2c.inverse(&mo, &mut mi_recovered, &mut mw).unwrap();
+    assert_values_close(mi_recovered.as_slice(), &mi_expected);
+
+    let mut mri = mixed_r2c.allocate_input().unwrap();
+    mri.as_mut_slice()
+        .iter_mut()
+        .enumerate()
+        .for_each(|(i, x)| {
+            *x = (world.rank() as usize * 12 + i) as f64 * 0.05 + 0.1;
+        });
+    let mri_expected = mri.as_slice().to_vec();
+    let mut mro = mixed_r2c.allocate_output().unwrap();
+    let mut mrw = mixed_r2c.allocate_workspace().unwrap();
+    mixed_r2c.forward(&mri, &mut mro, &mut mrw).unwrap();
+    check_many!(mixed_r2c, mri, mro, mrw);
+    let mut mri_recovered = mixed_r2c.allocate_input().unwrap();
+    mixed_r2c
+        .inverse(&mro, &mut mri_recovered, &mut mrw)
+        .unwrap();
+    assert_real_close(mri_recovered.as_slice(), &mri_expected, 3e-9);
+    world.barrier();
 }
 
 #[test]

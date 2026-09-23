@@ -1082,8 +1082,8 @@ where
         backend: BackendChoice,
     ) -> Result<Self, BackendInitError<MixedError>> {
         let communicator = topology.communicator();
-        let expected_len =
-            mixed_descriptor_len::<N, M>(&extra_shape).and_then(|length| length.checked_add(N + 7));
+        let expected_len = mixed_descriptor_len::<N, M>(&extra_shape)
+            .and_then(|length| length.checked_add(N + super::BACKEND_DESCRIPTOR_WORDS));
         let descriptor = expected_len.and_then(|_| {
             build_mixed_descriptor::<R, N, M>(
                 &topology,
@@ -1098,7 +1098,9 @@ where
             )
             .ok()
             .and_then(|mut descriptor| {
-                descriptor.try_reserve_exact(N + 7).ok()?;
+                descriptor
+                    .try_reserve_exact(N + super::BACKEND_DESCRIPTOR_WORDS)
+                    .ok()?;
                 descriptor.extend(backend.descriptor_words::<R>());
                 descriptor.extend(directions.0.iter().map(|direction| match direction {
                     FourierDirection::Forward => 0,
@@ -3657,8 +3659,8 @@ where
         if let Some(axis) = local_boundary {
             reduced_shape[axis] = global_shape[axis] / 2 + 1;
         }
-        let expected_len =
-            mixed_descriptor_len::<N, M>(&extra_shape).and_then(|length| length.checked_add(N + 7));
+        let expected_len = mixed_descriptor_len::<N, M>(&extra_shape)
+            .and_then(|length| length.checked_add(N + super::BACKEND_DESCRIPTOR_WORDS));
         let descriptor = expected_len.and_then(|_| {
             build_mixed_descriptor::<R, N, M>(
                 &topology,
@@ -3673,7 +3675,9 @@ where
             )
             .ok()
             .and_then(|mut descriptor| {
-                descriptor.try_reserve_exact(N + 7).ok()?;
+                descriptor
+                    .try_reserve_exact(N + super::BACKEND_DESCRIPTOR_WORDS)
+                    .ok()?;
                 descriptor.extend(backend.descriptor_words::<R>());
                 descriptor.extend(directions.0.iter().map(|direction| match direction {
                     FourierDirection::Forward => 0,

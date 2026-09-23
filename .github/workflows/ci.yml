@@ -182,7 +182,7 @@ jobs:
               cargo test -p pencil-fft --features distributed --lib --locked \
                 distributed::tests::in_place_transaction_poison_survives_error_and_panic -- \
                 --exact --nocapture --test-threads=1
-            for suite in array_ops timing_overlap multi_input; do
+            for suite in array_ops timing_overlap multi_input external_views; do
               run_one timeout --kill-after=5s 240s \
                 mpiexec --oversubscribe -n "$n" \
                 cargo test -p pencil-array --test "$suite" --locked -- \
@@ -207,14 +207,28 @@ jobs:
               cargo test -p pencil-fft --features distributed,fftw --lib --locked \
                 distributed::fftw_tests::fftw_descriptor_and_factory_preflight_all_six -- \
                 --exact --ignored --nocapture --test-threads=1
-            for suite in named_mpi named_hdf5 new_options collections named_collections hdf5_filters catalog; do
+            for suite in named_mpi named_hdf5 new_options collections named_collections hdf5_filters catalog chunked hdf5_session external_views_io; do
               run_one timeout --kill-after=5s 240s \
                 mpiexec --oversubscribe -n "$n" \
                 cargo test -p pencil-io --features parallel-hdf5 --test "$suite" --locked -- \
                   --nocapture --test-threads=1
             done
+            run_one timeout --kill-after=5s 240s \
+              mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-io --features parallel-hdf5 --test mpi_session --locked \
+                mpi_file_session_lifecycle_and_collective_errors -- --exact --nocapture --test-threads=1
+            run_one timeout --kill-after=5s 240s \
+              mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-io --features parallel-hdf5 --lib --locked \
+                tests::post_cleanup_errors_preserve_destination_and_valid_commits -- --exact --nocapture --test-threads=1
           done
-          for native in tests::native_f32 tests::native_f64 ffi::tests::native_partial_construction_cleanup ffi::tests::native_wisdom_lifetime_and_threads ffi::tests::native_cached_thread_load_failure ffi::tests::native_initialization_order; do
+          run_one timeout --kill-after=5s 240s \
+            cargo test -p pencil-io --features parallel-hdf5 --lib --locked \
+              named_mpi::session::native_cleanup_failstop_children -- --exact --ignored --nocapture --test-threads=1
+          run_one timeout --kill-after=5s 120s \
+            cargo test -p pencil-io --features parallel-hdf5 --test mpi_session --locked \
+              mpi_file_session_active_drop_is_failstop -- --exact --ignored --nocapture --test-threads=1
+          for native in tests::native_f32 tests::native_f64 tests::native_f32_wisdom_only_all_kinds tests::native_f64_wisdom_only_all_kinds ffi::tests::native_c2c_second_plan_failure_drops_first_and_resets_threads ffi::tests::native_partial_construction_cleanup ffi::tests::native_wisdom_lifetime_and_threads ffi::tests::native_cached_thread_load_failure ffi::tests::native_initialization_order; do
             run_one timeout --kill-after=5s 120s \
               cargo test -p pencil-fftw --lib --locked "$native" -- \
                 --exact --ignored --nocapture --test-threads=1

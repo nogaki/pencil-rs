@@ -32,11 +32,22 @@ pub enum PlanningRigor {
     Patient,
     Exhaustive,
 }
+const FFTW_MEASURE: u32 = 0;
+const FFTW_UNALIGNED: u32 = 1 << 1;
+const FFTW_CONSERVE_MEMORY: u32 = 1 << 2;
+const FFTW_EXHAUSTIVE: u32 = 1 << 3;
+const FFTW_PRESERVE_INPUT: u32 = 1 << 4;
+const FFTW_PATIENT: u32 = 1 << 5;
+const FFTW_ESTIMATE: u32 = 1 << 6;
+const FFTW_WISDOM_ONLY: u32 = 1 << 21;
+
 #[derive(Clone, Copy, Debug)]
 pub struct PlanOptions {
     rigor: PlanningRigor,
     time_limit: Option<Duration>,
     threads: i32,
+    wisdom_only: bool,
+    conserve_memory: bool,
 }
 impl Default for PlanOptions {
     fn default() -> Self {
@@ -44,6 +55,8 @@ impl Default for PlanOptions {
             rigor: PlanningRigor::Estimate,
             time_limit: None,
             threads: 1,
+            wisdom_only: false,
+            conserve_memory: false,
         }
     }
 }
@@ -58,7 +71,27 @@ impl PlanOptions {
             rigor,
             time_limit,
             threads: 1,
+            wisdom_only: false,
+            conserve_memory: false,
         })
+    }
+    /// Restrict planning to wisdom already known by FFTW.
+    /// Missing matching wisdom returns [`FftwError::NullPlan`], without fallback.
+    pub fn with_wisdom_only(mut self, enabled: bool) -> Self {
+        self.wisdom_only = enabled;
+        self
+    }
+    pub fn wisdom_only(self) -> bool {
+        self.wisdom_only
+    }
+    /// Request FFTW's memory-conserving algorithms, possibly at the cost of speed.
+    /// This is a planner hint, not a memory or performance guarantee.
+    pub fn with_conserve_memory(mut self, enabled: bool) -> Self {
+        self.conserve_memory = enabled;
+        self
+    }
+    pub fn conserve_memory(self) -> bool {
+        self.conserve_memory
     }
     /// Request CPU planning threads; this is not a utilization guarantee.
     pub fn with_threads(mut self, count: usize) -> Result<Self, FftwError> {
@@ -81,12 +114,23 @@ impl PlanOptions {
         self.time_limit
     }
     fn flags(self) -> u32 {
-        2 | match self.rigor {
-            PlanningRigor::Estimate => 64,
-            PlanningRigor::Measure => 0,
-            PlanningRigor::Patient => 32,
-            PlanningRigor::Exhaustive => 8,
-        }
+        FFTW_UNALIGNED
+            | match self.rigor {
+                PlanningRigor::Estimate => FFTW_ESTIMATE,
+                PlanningRigor::Measure => FFTW_MEASURE,
+                PlanningRigor::Patient => FFTW_PATIENT,
+                PlanningRigor::Exhaustive => FFTW_EXHAUSTIVE,
+            }
+            | if self.wisdom_only {
+                FFTW_WISDOM_ONLY
+            } else {
+                0
+            }
+            | if self.conserve_memory {
+                FFTW_CONSERVE_MEMORY
+            } else {
+                0
+            }
     }
 }
 #[derive(Debug, thiserror::Error)]
