@@ -25,7 +25,7 @@ or absolute paths:
 
 ```bash
 PATH="$HOME/.cargo/bin:$PATH" \
-JULIA_DEPOT_PATH="/tmp/pencil-rs-julia-depot:$HOME/.julia" \
+JULIA_DEPOT_PATH="/tmp/pencil-rs-julia-depot" \
 JULIA_NUM_THREADS=1 JULIA_NUM_PRECOMPILE_TASKS=1 \
 JULIA=julia MPIEXEC=mpiexec \
 ./tools/fftw-reference/check.sh
@@ -58,7 +58,7 @@ them too. Run both native configuration orders with the same full checker:
 
 ```bash
 export JULIA=/home/kosuke/local/bin/julia
-export JULIA_DEPOT_PATH=/tmp/pencil-rs-julia-depot.Q6bSFs:$HOME/.julia
+export JULIA_DEPOT_PATH=$(mktemp -d /tmp/pencil-reference-depot.XXXXXX)
 export JULIA_NUM_THREADS=1 JULIA_NUM_PRECOMPILE_TASKS=1 CARGO_BUILD_JOBS=2
 export CARGO_TARGET_DIR=$(mktemp -d /tmp/pencil-reference-target.XXXXXX)
 PENCIL_FFT_BACKEND=rustfft ./tools/fftw-reference/check.sh
@@ -76,10 +76,39 @@ Set `JULIA` or `MPIEXEC` explicitly when they are not on `PATH`. The script
 checks Julia 1.12.6 before package setup, copies `Project.toml` and
 `Manifest.toml` (including the provider preference in the project) to a
 private temporary project, instantiates there, and compares the resulting
-manifest with the checked-in one. It never runs `Pkg` against this tracked
-directory. An unset `JULIA_DEPOT_PATH` gets a private temporary depot; an
+manifest with the checked-in one. Before instantiate, `verify_sources.jl` uses
+only Julia stdlibs and `Pkg.Operations.find_installed` to check the actual
+hash-selected roots, independently of entrypoint discovery. Existing roots must
+pass; only this preflight allows absent trees to be downloaded. This precedes
+Pkg's artifact-selection hooks, which can run even with package builds and
+automatic precompilation disabled. Strict verification runs after instantiate
+and before every FFTW import or numerical generator. Each selected root must
+contain `src/Name.jl` and match `Pkg.GitTools.tree_hash` against its manifest pin.
+All nine pinned trees are required; non-stdlib entries without tree hashes and
+manifest path/repository/custom-entryfile overrides are rejected.
+Missing sources, modified/extra files, executable-mode changes, symlinks,
+special files, and `.git` entries fail closed; mismatch diagnostics include
+package, path, expected hash, and observed hash. No cache is repaired and no pin
+is updated. Use a fresh private depot to recover mismatched inputs; a mismatch
+alone does not establish its cause. Git trees do not encode empty directories.
+Verification, instantiation, and reference-generation processes use
+`--compiled-modules=no`: source hashes do not authenticate cached `.ji` files.
+This is a source-input check, not package authentication, a sandbox against
+concurrent depot writers, or native-artifact verification. Downloaded inputs
+still rely on Pkg's download integrity checks; cached artifact bytes are not
+rehashed by this guard. Keep the depot private during verification and execution.
+Native version/path metadata describes the actual loaded runtime independently
+of source-tree pins.
+
+Run the small guard regression (Julia stdlibs plus Git and `mkfifo`, no downloads):
+
+```bash
+julia --compiled-modules=no --startup-file=no --history-file=no tools/fftw-reference/check_sources.jl
+```
+
+The runner never runs `Pkg` against this tracked directory. An unset `JULIA_DEPOT_PATH` gets a private temporary depot; an
 explicit depot is reused and never deleted by the runner. Package setup may
-populate or precompile into its first entry. Startup files are disabled and
+populate its first entry. Startup files are disabled and
 `JULIA_LOAD_PATH` contains only the temporary project and standard libraries;
 user preferences are never edited. Open MPI/OpenRTE gets `--oversubscribe` unless
 `PENCIL_FFTW_NO_OVERSUBSCRIBE=1` is set.
