@@ -429,7 +429,7 @@ PENCIL_FFT_BACKEND=fftw PENCIL_FFT_THREADS=2 tools/fftw-reference/check.sh
 
 ## Local Julia/FFTW reference validation
 
-The opt-in Milestone 9 checker generates temporary Julia 1.12.6/FFTW.jl
+The opt-in checker generates temporary Julia 1.12.6/FFTW.jl
 1.10.0 references and validates the distributed C2C, R2C/C2R, R2R, and DHT
 forward/inverse/raw backward APIs at 1, 4, and 6 MPI ranks with both
 transpose methods and both memory-layout policies. It covers exactly 82
@@ -749,19 +749,15 @@ The topology constructors are collective over an MPI intracommunicator. Run
 each integration-test binary with one MPI initialization per process, and drop
 all topologies and arrays before MPI finalizes.
 
-## Design and plans
+## Cargo packages
 
-- `docs/superpowers/specs/2026-09-11-pencil-arrays-rust-port-design.md`
-- `docs/superpowers/plans/2026-09-11-pencil-array-core-implementation.md`
-- `docs/superpowers/plans/2026-09-14-local-transpose-implementation.md`
-- `docs/superpowers/plans/2026-09-14-alltoallv-transpose-implementation.md`
-- `docs/superpowers/plans/2026-09-14-alltoallv-in-place-implementation.md`
-- [Point-to-point transpose implementation plan](docs/superpowers/plans/2026-09-15-point-to-point-transpose-implementation.md)
-- [Point-to-point in-place implementation plan](docs/superpowers/plans/2026-09-15-point-to-point-in-place-implementation.md)
-- [Local C2C implementation plan](docs/superpowers/plans/2026-09-15-local-c2c-implementation.md)
-- [Local R2C/C2R implementation plan](docs/superpowers/plans/2026-09-17-local-r2c-implementation.md)
-- [Distributed C2C implementation plan](docs/superpowers/plans/2026-09-17-distributed-c2c-implementation.md)
-- [Distributed C2C in-place implementation plan](docs/superpowers/plans/2026-09-18-distributed-c2c-in-place-implementation.md)
-- [Distributed C2C point-to-point implementation plan](docs/superpowers/plans/2026-09-18-distributed-c2c-point-to-point-implementation.md)
-- [Distributed R2C/C2R implementation plan](docs/superpowers/plans/2026-09-18-distributed-r2c-implementation.md)
-- [Julia/FFTW cross-validation plan](docs/superpowers/plans/2026-09-19-fftw-cross-validation.md)
+| Package | Purpose |
+|---|---|
+| [`pencil-array`](crates/pencil-array/README.md) | MPI-distributed arrays, layouts and transposes |
+| [`pencil-fft`](crates/pencil-fft/README.md) | MPI-free local FFTs, with optional distributed/native backends |
+| [`pencil-fftw`](crates/pencil-fftw/README.md) | Optional native FFTW adapter |
+| [`pencil-io`](crates/pencil-io/README.md) | MPI-IO and optional parallel HDF5 |
+
+See [RELEASING.md](RELEASING.md) for package verification, native prerequisites,
+and dependency-ordered publication. Packaging and dry-runs do not upload crates;
+actual publication requires explicit confirmation.
