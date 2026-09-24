@@ -6,6 +6,7 @@ resolver = "3"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
+repository = "https://github.com/nogaki/pencil-rs"
 
 [workspace.dependencies]
 mpi = "=0.8.2"

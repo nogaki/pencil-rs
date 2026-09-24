@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Collective MPI-IO and optional parallel HDF5 for pencil arrays"
+readme = "README.md"
+include = ["Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "NOTICE.md", "src/**/*.rs", "tests/**/*.rs", "examples/**/*.rs"]
 
 [features]
 default = []
@@ -13,6 +17,6 @@ parallel-hdf5 = ["dep:hdf5-metno", "dep:hdf5-metno-sys"]
 mpi.workspace = true
 num-complex = "0.4.6"
 thiserror.workspace = true
-pencil-array = { path = "../pencil-array" }
+pencil-array = { version = "0.1.0", path = "../pencil-array" }
 hdf5-metno = { version = "=0.12.0", default-features = false, features = ["mpio"], optional = true }
 hdf5-metno-sys = { version = "=0.11.0", features = ["mpio"], optional = true }
