@@ -16,6 +16,13 @@ True padded real/complex in-place R2C/C2R state is **not implemented**. The real
 
 Only 64-bit hosts are supported (compile-time gate). cuFFT symbols use typed C pointers, with CUDA float2/double2-compatible complex layouts; integer device addresses are converted only inside the FFI boundary. Host layout checks do not prove the native ABI.
 
+**Known source-safety release blocker:** the device-to-host path in `src/ffi.rs`
+currently calls `Vec<u8>::set_len` before the host bytes are initialized. This
+violates the initialized-element requirement; a failed transfer must not expose
+uninitialized bytes. The buffer initialization and failure-path regression need
+to be fixed before release. Branch consolidation and host-only validation do
+not resolve this pre-existing issue.
+
 Context creation/push installs a restoration guard before inspecting the result. The guard captures the prior context and verifies it after popping, even if CUDA reports an asynchronous error after changing state. Nested calls already in the private context do not push duplicate entries. If querying or restoring the prior context cannot be confirmed, the process **aborts**, including during unwinding; continuing with a possibly wrong ambient context is forbidden.
 
 A failed synchronization permanently poisons the device. Further native operations are rejected; affected buffers, plans, PTX modules, the private context, and both loaded libraries are deliberately retained until process exit. Cleanup failures also retain the context/libraries. There is no recovery/retry claim: repeated failures can exhaust GPU/host resources, so callers should terminate/restart after such an error. Successful synchronization retains normal cleanup. This is a conservative safety policy, not proof that failed synchronization means work remains active.
@@ -37,7 +44,7 @@ cargo test -p pencil-cuda --lib -- --ignored --nocapture
 
 Explicit runs fail if CUDA/driver/cuFFT is absent; they never silently skip. Tests compare f32/f64 C2C and real transforms against independent CPU direct-DFT oracles (no CPU FFT dependency): odd/even/n=1, batches, partial blocks, normalized/raw, arbitrary valid spectra, preservation, C2C in-place, wrong contexts, and endpoint rejection before writes. Ignored library tests check ambient context restoration and unwind, inject errors after actual successful create/push/pop calls (including genuine constructor failure), and inject synchronization failure to check that no buffer/plan/module/context release occurs and libraries remain loaded. A control case checks normal releases. These are native GPU checks, not ABI mocks.
 
-Real-hardware status: **UNVERIFIED**. PTX execution and numerical results require an actual CUDA device. Host-validation logs are local build artifacts, not checked-in hardware evidence. This implementation remains draft-only until the hardware release gate below is satisfied.
+Real-hardware status: **UNVERIFIED**. PTX execution and numerical results require an actual CUDA device. Host-validation logs are local build artifacts, not checked-in hardware evidence. This implementation remains draft-only until the source-safety blocker above is resolved and the hardware release gate below is satisfied.
 
 ## Distributed API (`--features distributed`)
 
@@ -107,4 +114,4 @@ done
 
 Always-run tests cover physical packing/indexing, checked shapes/overflow, empty ranks, endpoint finiteness/norm policy and per-batch/per-plane isolation. Host MPI tests force invalid ordinals (also on GPU nodes), exercise exact descriptor failures and retry, and emit `CUDA_DISTRIBUTED_HOST_OK` / `CUDA_ENDPOINT_HOST_OK` markers. The ignored hardware matrix covers f32/f64, both transports/layouts, partial/empty selections, extra batches, empty ranks, odd/even/1/2 lengths, independent direct-DFT/RFFT references, arbitrary inverse spectra, raw scale, source preservation, endpoint rejection, wrong workspace/context and recovery. The ignored matrix also checks forward-vs-inverse and allocate_input-vs-allocate_output operation mismatches after successful GPU plan setup (ranks 4/6): every rank must return `Error::Descriptor`, preserve both arrays and leave the workspace unpoisoned, then reuse the same resources without recovery. Every numerical zip comparison first asserts equal lengths.
 
-**Hardware release gate: UNVERIFIED. Publish GPU support only as a draft until the actual CUDA+MPI ranks 1/4/6 matrix and the existing one-rank-bad-ordinal/peers-valid constructor test pass on hardware.** Host-only success and ignored-test compilation do not satisfy this gate.
+**Release gate: BLOCKED by the source-safety issue above and UNVERIFIED hardware. Keep GPU support draft-only until the initialization issue is fixed and the actual CUDA+MPI ranks 1/4/6 matrix and the existing one-rank-bad-ordinal/peers-valid constructor test pass on hardware.** Host-only success and ignored-test compilation do not satisfy these gates.
