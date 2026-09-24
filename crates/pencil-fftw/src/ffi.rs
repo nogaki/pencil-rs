@@ -15,6 +15,9 @@ thread_local! {
     pub(crate) static COMPLEX_EXECUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TRACE: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
     static FLAG_TRACE: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    // Observes completed API calls, not FFTW's (unqueryable) internal state.
+    static LIMIT_TRACE: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PANIC_AFTER_LIMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 #[cfg(test)]
 fn trace(event: &'static str) {
@@ -340,6 +343,8 @@ impl Drop for Reset<'_> {
     fn drop(&mut self) {
         // SAFETY: the borrowed function pointer's library remains live.
         unsafe { (self.0)(-1.0) }
+        #[cfg(test)]
+        LIMIT_TRACE.with(|events| events.borrow_mut().push(-1.0));
     }
 }
 impl<R: Real> Plan<R> {
@@ -368,6 +373,18 @@ impl<R: Real> Plan<R> {
         // UNALIGNED removes SIMD alignment constraints, NOT alias constraints.
         let handle = unsafe {
             (table.limit)(options.time_limit.map_or(-1.0, |t| t.as_secs_f64()));
+            #[cfg(test)]
+            {
+                LIMIT_TRACE.with(|events| {
+                    events
+                        .borrow_mut()
+                        .push(options.time_limit.map_or(-1.0, |t| t.as_secs_f64()));
+                });
+                assert!(
+                    !PANIC_AFTER_LIMIT.with(|needle| needle.replace(false)),
+                    "planning unwind"
+                );
+            }
             match kind {
                 Kind::Complex(d, ip) => {
                     #[cfg(test)]
@@ -442,6 +459,50 @@ impl<R: Real> Drop for Plan<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires both native FFTW runtimes"]
+    fn native_timelimit_calls_on_success_error_and_unwind() {
+        let _serial = crate::tests::NATIVE_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fn check<R: Real>() {
+            let options = PlanOptions::new(
+                PlanningRigor::Measure,
+                Some(std::time::Duration::from_millis(1)),
+            )
+            .unwrap();
+            for mode in 0..3 {
+                forget_wisdom::<R>().unwrap();
+                LIMIT_TRACE.with(|events| events.borrow_mut().clear());
+                PANIC_AFTER_LIMIT.with(|needle| needle.set(mode == 2));
+                let result = std::panic::catch_unwind(|| {
+                    Plan::<R>::new_flags(
+                        17,
+                        Kind::Complex(FftDirection::Forward, false),
+                        options,
+                        options.flags() | if mode == 1 { FFTW_WISDOM_ONLY } else { 0 },
+                    )
+                });
+                // No subsequent constructor/setter may overwrite the evidence.
+                // Real API calls/arguments only; native state relies on FFTW's contract.
+                LIMIT_TRACE.with(|events| {
+                    assert_eq!(
+                        *events.borrow(),
+                        [0.001, -1.0],
+                        "single={}, mode={mode}",
+                        R::SINGLE
+                    );
+                });
+                match mode {
+                    0 => assert!(matches!(result, Ok(Ok(_)))),
+                    1 => assert!(matches!(result, Ok(Err(FftwError::NullPlan)))),
+                    _ => assert!(result.is_err()),
+                }
+            }
+        }
+        check::<f32>();
+        check::<f64>();
+    }
     #[test]
     fn reset_on_success_error_and_unwind() {
         use std::sync::atomic::{AtomicUsize, Ordering};

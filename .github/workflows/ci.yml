@@ -198,15 +198,23 @@ jobs:
               mpiexec --oversubscribe -n "$n" \
               cargo test -p pencil-fft --features distributed --test collections --locked -- \
                 --nocapture --test-threads=1
-            run_one timeout --kill-after=5s 240s \
-              mpiexec --oversubscribe -n "$n" \
-              cargo test -p pencil-fft --features distributed,fftw --test fftw_distributed --locked \
-                fftw_distributed_native_matrix -- --exact --ignored --nocapture --test-threads=1
+            for matrix in fftw_distributed_native_matrix fftw_distributed_wisdom_only_all_six; do
+              run_one timeout --kill-after=5s 240s \
+                mpiexec --oversubscribe -n "$n" \
+                cargo test -p pencil-fft --features distributed,fftw --test fftw_distributed --locked \
+                  "$matrix" -- --exact --ignored --nocapture --test-threads=1
+            done
             run_one timeout --kill-after=5s 240s \
               mpiexec --oversubscribe -n "$n" \
               cargo test -p pencil-fft --features distributed,fftw --lib --locked \
                 distributed::fftw_tests::fftw_descriptor_and_factory_preflight_all_six -- \
                 --exact --ignored --nocapture --test-threads=1
+            for contract in distributed::tests::r2c_overlap_callback_error_and_panic_map_per_rank distributed::mixed::reverse_overlap_tests::reverse_local_routes_run_callbacks_and_independent_spectrum; do
+              run_one timeout --kill-after=5s 240s \
+                mpiexec --oversubscribe -n "$n" \
+                cargo test -p pencil-fft --features distributed --lib --locked "$contract" -- \
+                  --exact --ignored --nocapture --test-threads=1
+            done
             for suite in named_mpi named_hdf5 new_options collections named_collections hdf5_filters catalog chunked hdf5_session external_views_io; do
               run_one timeout --kill-after=5s 240s \
                 mpiexec --oversubscribe -n "$n" \
@@ -228,12 +236,18 @@ jobs:
           run_one timeout --kill-after=5s 120s \
             cargo test -p pencil-io --features parallel-hdf5 --test mpi_session --locked \
               mpi_file_session_active_drop_is_failstop -- --exact --ignored --nocapture --test-threads=1
-          for native in tests::native_f32 tests::native_f64 tests::native_f32_wisdom_only_all_kinds tests::native_f64_wisdom_only_all_kinds ffi::tests::native_c2c_second_plan_failure_drops_first_and_resets_threads ffi::tests::native_partial_construction_cleanup ffi::tests::native_wisdom_lifetime_and_threads ffi::tests::native_cached_thread_load_failure ffi::tests::native_initialization_order; do
+          # Ordinary host tests: do not pass --ignored to these exact filters.
+          for contract in distributed::fftw_tests::backend_descriptor_flags distributed::fftw_tests::native_operation_words_do_not_collide; do
+            run_one timeout --kill-after=5s 120s \
+              cargo test -p pencil-fft --features distributed,fftw --lib --locked "$contract" -- \
+                --exact --nocapture --test-threads=1
+          done
+          for native in tests::native_f32 tests::native_f64 tests::native_f32_wisdom_only_all_kinds tests::native_f64_wisdom_only_all_kinds ffi::tests::native_c2c_second_plan_failure_drops_first_and_resets_threads ffi::tests::native_partial_construction_cleanup ffi::tests::native_wisdom_lifetime_and_threads ffi::tests::native_cached_thread_load_failure ffi::tests::native_initialization_order ffi::tests::native_timelimit_calls_on_success_error_and_unwind; do
             run_one timeout --kill-after=5s 120s \
               cargo test -p pencil-fftw --lib --locked "$native" -- \
                 --exact --ignored --nocapture --test-threads=1
           done
-          for native in native_f32_all_local native_f64_all_local; do
+          for native in native_f32_all_local native_f64_all_local native_f32_wisdom_only_r2r_dht native_f64_wisdom_only_r2r_dht; do
             run_one timeout --kill-after=5s 120s \
               cargo test -p pencil-fft --features fftw --test fftw_local --locked "$native" -- \
                 --exact --ignored --nocapture --test-threads=1

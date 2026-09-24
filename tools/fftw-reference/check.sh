@@ -73,18 +73,19 @@ cp -- "$PROJECT/Project.toml" "$PROJECT/Manifest.toml" "$JULIA_PROJECT/"
 
 "$JULIA_BIN" --startup-file=no --history-file=no \
     -e 'VERSION == v"1.12.6" || error("Julia 1.12.6 is required, got ", VERSION)'
-"$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" \
-    -e 'using Pkg; Pkg.instantiate()'
+"$JULIA_BIN" --compiled-modules=no --startup-file=no --history-file=no --project="$JULIA_PROJECT" \
+    -L "$PROJECT/verify_sources.jl" \
+    -e 'verify_sources(; preflight=true); Pkg.instantiate(; allow_build=false, allow_autoprecomp=false); verify_sources()'
 if ! cmp -s "$JULIA_PROJECT/Manifest.toml" "$PROJECT/Manifest.toml"; then
     printf 'Pkg.resolve changed the checked-in Julia manifest\n' >&2
     exit 1
 fi
-"$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" \
-    -e 'using FFTW; String(FFTW.fftw_provider) == "fftw" || error("FFTW provider is not fftw"); Base.pkgversion(FFTW) == v"1.10.0" || error("FFTW.jl is not 1.10.0")'
-"$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" \
-    "$GENERATOR" "$FIXTURES"
-"$JULIA_BIN" --startup-file=no --history-file=no --project="$JULIA_PROJECT" \
-    "$PROJECT/directions_reference.jl" "$DIRECTION_FIXTURES"
+"$JULIA_BIN" --compiled-modules=no --startup-file=no --history-file=no --project="$JULIA_PROJECT" \
+    -L "$PROJECT/verify_sources.jl" -e 'verify_sources(); using FFTW; String(FFTW.fftw_provider) == "fftw" || error("FFTW provider is not fftw"); Base.pkgversion(FFTW) == v"1.10.0" || error("FFTW.jl is not 1.10.0")'
+"$JULIA_BIN" --compiled-modules=no --startup-file=no --history-file=no --project="$JULIA_PROJECT" \
+    -L "$PROJECT/verify_sources.jl" -e 'verify_sources(); include(popfirst!(ARGS))' "$GENERATOR" "$FIXTURES"
+"$JULIA_BIN" --compiled-modules=no --startup-file=no --history-file=no --project="$JULIA_PROJECT" \
+    -L "$PROJECT/verify_sources.jl" -e 'verify_sources(); include(popfirst!(ARGS))' "$PROJECT/directions_reference.jl" "$DIRECTION_FIXTURES"
 direction_files=("$DIRECTION_FIXTURES"/*.txt)
 [[ ${#direction_files[@]} -eq 5 ]] || {
     printf 'expected exactly 5 direction reference files, found %s\n' "${#direction_files[@]}" >&2

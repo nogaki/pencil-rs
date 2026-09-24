@@ -222,8 +222,8 @@ selected spatial extents; identity axes do not contribute.
 ## Distributed C2C FFT
 
 A C2C plan also accepts `AxisSelection<N>`. It always follows the canonical
-full route from axis `N-1` through `0`, with one stage and transition per
-axis. A selected stage performs its local FFT; an unselected stage is an
+full route from axis `N-1` through `0`, with `N` stages and `N-1`
+transitions. A selected stage performs its local FFT; an unselected stage is an
 identity with no native plan or scaling. Thus an empty selection is a valid
 identity transform whose selected-layout transposes still run. The output
 pencil uses decomposition `[1..=M]` and the reversed permutation by default;
@@ -303,6 +303,22 @@ backing owner. `DistributedLayout::permute_dims = false` selects the strided
 per-line kernels. The mixed descriptors use distinct collective
 operation words, scalar widths, reduced shape, axis transform codes, and
 transport policy, so mixed and legacy calls cannot accidentally agree.
+
+Mixed reverse endpoint acceptance is checked after undoing the complex suffix
+and before C2R, separately for every extra batch and constrained DC/Nyquist plane.
+All endpoint components must be finite. For each nonidentity suffix stage `a`,
+let `E_a` be its FFT line length (FFT) or public `embedding_len()` (R2R/DHT),
+`s_a` its logical normalization factor, and `b_a` zero for FFT or two for
+R2R/DHT. Define `D = 1 + sum(ceil_log2(E_a) + b_a)` and
+`P = product(s_a)`. RFFT, real-prefix stages and identities are excluded.
+A plane passes if either its maximum absolute imaginary component is at most
+`128 * min_subnormal_R * D`, or its imaginary L2 norm is at most
+`128 * epsilon_R * D` times its real L2 norm. Raw `backward` multiplies only
+the absolute threshold by `P`; `inverse` does not. R2R/DHT embedding lengths
+are not generally their normalization factors. Odd lengths constrain DC only
+(including length one); even lengths also constrain Nyquist. The
+`MixedR2cPlan` reverse-method rustdoc specifies the same policy and failure
+boundaries. This is an acceptance policy, not a formal numerical-error bound.
 
 The existing `tools/fftw-reference` Julia/FFTW checker remains the independent
 numerical reference for the component FFT, R2R, DHT, and R2C kernels. Mixed
@@ -455,10 +471,13 @@ collective over the view's Cartesian communicator, and every rank must enter
 calls in the same order without overlapping another operation on that
 communicator. The HDF5 path explicitly creates a dataset-transfer property
 list with `H5Pset_dxpl_mpio(..., H5FD_MPIO_COLLECTIVE)`; verify that the HDF5
-and MPI libraries resolved by the build and runtime are the same ABI. The
-lockfile's shared `mpi-sys` dependency is not ABI evidence: the pair is
-validated only by inspecting the test executable's `ldd` output and recording
-runtime MPI and HDF5 versions from that same environment.
+and MPI builds use compatible binary interfaces. The lockfile's shared
+`mpi-sys` dependency does not establish native ABI compatibility. Inspecting
+`ldd` output and recording MPI/HDF5 runtime versions identifies the linked
+libraries and their provenance; it does not by itself prove ABI compatibility.
+Check the binding/header assumptions and exercise native parallel I/O with the
+same executable and runtime libraries. Such observations support interoperability
+in that tested environment, not a general ABI or memory-safety guarantee.
 
 ### Named datasets and append
 
@@ -633,8 +652,9 @@ For the declared MSRV, run
 `cargo +1.85.0 check -p pencil-io --all-features --all-targets --locked` before the native
 matrix.
 
-After building the HDF5 test binary, inspect its resolved native ABI before
-running the matrix (the exact binary name is printed by Cargo):
+After building the HDF5 test binary, record its resolved native libraries before
+running the matrix (the exact binary name is printed by Cargo). These commands
+collect provenance, not a standalone ABI proof:
 
 ```bash
 ldd target/debug/deps/hdf5_io-* | grep -E 'lib(hdf5|mpi|open-rte|open-pal)'

@@ -143,5 +143,11 @@ Fresh-process traces cover serial-first, each wisdom operation first, and
 threaded-first ordering in both precisions. Missing-library/symbol children
 prove permanent base-only planning and wisdom without native initialization or
 setters. Fatal-state injection occurs only after real successful initialization;
-it does not simulate a genuine native out-of-memory failure. Reset checks use a
-raw WISDOM_ONLY probe without setting the count before observation.
+it does not simulate a genuine native out-of-memory failure. Thread reset checks
+use a raw WISDOM_ONLY probe without setting the count before observation.
+`ffi::tests::native_timelimit_calls_on_success_error_and_unwind` records arguments
+only after actual native time-limit calls, for f32/f64 success, WISDOM_ONLY null
+plans, and injected unwind after the budget setter. It asserts `[0.001, -1.0]`
+before any subsequent constructor/setter. This observes real API calls, not
+internal FFTW state (no getter exists); that state relies on FFTW's API contract.
+The separate callback test checks generic RAII only.
