@@ -410,6 +410,44 @@ pub struct MixedC2cPlan<R: FftReal, const N: usize, const M: usize> {
 }
 
 /// A heterogeneous real-to-complex distributed transform.
+///
+/// # Reverse endpoint contract
+///
+/// All inverse/backward variants (including in-place, timing, and overlap) check
+/// the spectrum after undoing the complex suffix, immediately before C2R.
+/// Only nonidentity stages after the real stage in forward execution order
+/// contribute; the RFFT itself and the real prefix are excluded. For each suffix axis a:
+///
+/// - `Fft`: native_len_a = axis length, factor_a = axis length, allowance_a = 0.
+/// - `R2r` (including DHT): native_len_a = E_a, factor_a = the logical
+///   normalization factor, allowance_a = 2. E_a is
+///   [`LocalR2rPlan::embedding_len`] or [`crate::LocalDhtPlan::embedding_len`];
+///   factor_a is [`LocalR2rPlan::normalization_factor`] or
+///   [`crate::LocalDhtPlan::normalization_factor`] for that axis length/kind.
+///   The logical R2R factor is not generally its FFT embedding length.
+///
+/// In plaintext formulas:
+/// `depth = 1 + sum_a(ceil_log2(native_len_a) + allowance_a)`,
+/// `relative = 128 * epsilon * depth`, and
+/// `inverse_absolute = 128 * min_subnormal * depth`.
+/// Raw backward uses `absolute = inverse_absolute * product_a(factor_a)`;
+/// normalized inverse uses `absolute = inverse_absolute`. Epsilon and the
+/// smallest positive subnormal are those of R (`f32` or `f64`); ceil_log2(1) = 0.
+/// Empty suffix sums/products are 0/1.
+///
+/// Each extra-shape batch and each constrained plane is checked separately,
+/// collectively over all ranks: DC, plus Nyquist only for even real lengths.
+/// Odd lengths (including one) have only DC; their last stored frequency is
+/// not an additional constrained plane. Every constrained value must be finite.
+/// A plane passes if `max(abs(im)) <= absolute` OR
+/// `norm2(im) <= relative * norm2(complex_plane)`. The norms use scaled sums
+/// of squares to avoid overflow/underflow; a zero plane passes.
+///
+/// Accepted endpoint imaginary parts are projected to zero in working storage,
+/// never in the out-of-place source. Out-of-place reverse preserves its source
+/// even on failure. In-place preflight failures preserve the array/state;
+/// after execution starts, failure (including an invalid endpoint) leaves the
+/// array poisoned, not restored. Successful reverse leaves `RealInput` state.
 #[derive(Debug)]
 pub struct MixedR2cPlan<R: FftReal, const N: usize, const M: usize> {
     core: Arc<MixedR2cCore<R, N, M>>,
@@ -3428,6 +3466,8 @@ where
     }
 
     /// Computes the per-axis normalized mixed inverse transform.
+    ///
+    /// See the [reverse endpoint contract](MixedR2cPlan#reverse-endpoint-contract).
     pub fn inverse(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
@@ -3438,6 +3478,8 @@ where
     }
 
     /// Computes the raw paired mixed backward transform.
+    ///
+    /// See the [reverse endpoint contract](MixedR2cPlan#reverse-endpoint-contract).
     pub fn backward(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
@@ -3457,6 +3499,8 @@ where
         self.execute_forward_overlap(source, destination, workspace)
     }
     /// Computes inverse with the next local kernel after receive/unpack completion and before P2P send waits.
+    ///
+    /// See the [reverse endpoint contract](MixedR2cPlan#reverse-endpoint-contract).
     pub fn inverse_with_overlap(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
@@ -3466,6 +3510,8 @@ where
         self.execute_reverse_overlap(source, destination, workspace, true)
     }
     /// Computes backward with the next local kernel after receive/unpack completion and before P2P send waits.
+    ///
+    /// See the [reverse endpoint contract](MixedR2cPlan#reverse-endpoint-contract).
     pub fn backward_with_overlap(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
@@ -3485,6 +3531,8 @@ where
     }
 
     /// Computes the mixed inverse transform and records per-stage timing.
+    ///
+    /// See the [reverse endpoint contract](MixedR2cPlan#reverse-endpoint-contract).
     pub fn inverse_with_timing(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
@@ -3496,6 +3544,8 @@ where
         Ok(timing)
     }
     /// Computes the mixed backward transform and records per-stage timing.
+    ///
+    /// See the [reverse endpoint contract](MixedR2cPlan#reverse-endpoint-contract).
     pub fn backward_with_timing(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
@@ -3517,6 +3567,8 @@ where
         Ok(timing)
     }
     /// Computes the in-place mixed inverse transform and records timing.
+    ///
+    /// See the [reverse endpoint contract](MixedR2cPlan#reverse-endpoint-contract).
     pub fn inverse_in_place_with_timing(
         &self,
         array: &mut MixedR2cInPlaceArray<R, N, M>,
@@ -3527,6 +3579,8 @@ where
         Ok(timing)
     }
     /// Computes the in-place mixed backward transform and records timing.
+    ///
+    /// See the [reverse endpoint contract](MixedR2cPlan#reverse-endpoint-contract).
     pub fn backward_in_place_with_timing(
         &self,
         array: &mut MixedR2cInPlaceArray<R, N, M>,
@@ -3538,6 +3592,8 @@ where
     }
 
     /// Computes the per-axis normalized mixed inverse in place.
+    ///
+    /// See the [reverse endpoint contract](MixedR2cPlan#reverse-endpoint-contract).
     pub fn inverse_in_place(
         &self,
         array: &mut MixedR2cInPlaceArray<R, N, M>,
@@ -3547,6 +3603,8 @@ where
     }
 
     /// Computes the raw paired mixed backward transform in place.
+    ///
+    /// See the [reverse endpoint contract](MixedR2cPlan#reverse-endpoint-contract).
     pub fn backward_in_place(
         &self,
         array: &mut MixedR2cInPlaceArray<R, N, M>,
@@ -7350,6 +7408,169 @@ mod reverse_overlap_tests {
         super::super::consume_c2c_callback_injection().map_err(MixedError::Fft)
     }
 
+    // Direct boundary data avoids FFT roundoff and an expected-value self-oracle.
+    fn endpoint_contract<R: FftReal>(topology: &Arc<MpiTopology<2>>)
+    where
+        Complex<R>: Equivalence,
+    {
+        for real_len in [1, 7, 8] {
+            let plan = MixedR2cPlan::<R, 4, 2>::from_shape_with_layout(
+                Arc::clone(topology),
+                [6, 12, 8, real_len],
+                ExtraShape::scalar(),
+                [
+                    AxisTransform::Fft,
+                    AxisTransform::R2r(AxisR2rKind::Fftw(crate::R2rKind::DctIV)),
+                    AxisTransform::R2r(AxisR2rKind::Dht),
+                    AxisTransform::Rfft,
+                ],
+                DistributedLayout::default(),
+            )
+            .unwrap();
+            // DCT-IV: E=8*12=96, factor=2*12=24; DHT: E=factor=8;
+            // FFT: E=factor=6. Ceil logs are 7, 3, 3, respectively.
+            let depth = 1.0 + (7.0 + 2.0) + (3.0 + 2.0) + 3.0;
+            let factor = 24.0 * 8.0 * 6.0;
+            assert_eq!(mixed_endpoint_policy(&plan.core).unwrap(), (depth, factor));
+            let epsilon = <R as crate::private::Sealed>::pencil_fft_epsilon_f64();
+            let min_subnormal = <R as crate::private::Sealed>::pencil_fft_min_subnormal_f64();
+            let pencil = &plan.core.stages[plan.core.real_stage_index].output;
+            for normalize in [true, false] {
+                let absolute = 128.0 * min_subnormal * depth * if normalize { 1.0 } else { factor };
+                if !normalize {
+                    assert_eq!(plan.core.raw_absolute_threshold, absolute);
+                }
+                for (re, im, accepted) in [
+                    (1.0, 0.99 * 128.0 * epsilon * depth, true),
+                    (1.0, 1.01 * 128.0 * epsilon * depth, false),
+                    (0.0, absolute, true),
+                    (0.0, 2.0 * absolute, false),
+                    (f64::INFINITY, 0.0, false),
+                    (0.0, f64::NAN, false),
+                ] {
+                    let data = vec![
+                        Complex::new(R::from_f64(re).unwrap(), R::from_f64(im).unwrap());
+                        pencil.local_len()
+                    ];
+                    let result =
+                        validate_mixed_boundary_data(&plan.core, Ok((pencil, &data)), normalize);
+                    assert_eq!(
+                        result.is_ok(),
+                        accepted,
+                        "real_len={real_len} normalize={normalize} re={re} im={im}: {result:?}"
+                    );
+                    if !accepted {
+                        assert!(matches!(result, Err(MixedError::InvalidSpectrum)));
+                    }
+                }
+            }
+        }
+    }
+
+    fn batched_endpoint_contract<R: FftReal>(topology: &Arc<MpiTopology<2>>)
+    where
+        Complex<R>: Equivalence,
+    {
+        for real_len in [7, 8] {
+            // Execution runs right-to-left: real DCT-IV precedes RFFT;
+            // only the complex DHT contributes depth/factor. Identities on both sides.
+            let plan = MixedR2cPlan::<R, 5, 2>::from_shape_with_layout(
+                Arc::clone(topology),
+                [6, 12, real_len, 8, 6],
+                ExtraShape::new(vec![2]).unwrap(),
+                [
+                    AxisTransform::None,
+                    AxisTransform::R2r(AxisR2rKind::Dht),
+                    AxisTransform::Rfft,
+                    AxisTransform::R2r(AxisR2rKind::Fftw(crate::R2rKind::DctIV)),
+                    AxisTransform::None,
+                ],
+                DistributedLayout::default(),
+            )
+            .unwrap();
+            assert_eq!(mixed_endpoint_policy(&plan.core).unwrap(), (7.0, 12.0));
+            let pencil = &plan.core.stages[plan.core.real_stage_index].output;
+            let stride = memory_stride(pencil, 2).unwrap();
+            let local_len = pencil.local_len();
+            let reduced = real_len / 2 + 1;
+            for normalize in [true, false] {
+                for batch in 0..2 {
+                    for bin in [0, reduced - 1] {
+                        // Huge clean other planes/batches must not mask this plane's error.
+                        let mut data = vec![
+                            Complex::new(R::from_f64(1e20).unwrap(), R::zero());
+                            2 * local_len
+                        ];
+                        for index in 0..local_len {
+                            if (index / stride) % reduced == bin {
+                                data[batch * local_len + index] =
+                                    Complex::new(R::zero(), R::from_f64(1.0).unwrap());
+                            }
+                        }
+                        let result = validate_mixed_boundary_data(
+                            &plan.core,
+                            Ok((pencil, &data)),
+                            normalize,
+                        );
+                        if real_len == 7 && bin == reduced - 1 {
+                            result.unwrap(); // Odd final bin is not an endpoint.
+                        } else {
+                            assert!(matches!(result, Err(MixedError::InvalidSpectrum)));
+                        }
+                    }
+                }
+            }
+            for raw in [false, true] {
+                let mut source = plan.allocate_output().unwrap();
+                source
+                    .as_mut_slice()
+                    .fill(Complex::new(R::zero(), R::from_f64(1.0).unwrap()));
+                let source_before = source.as_slice().to_vec();
+                let mut destination = plan.allocate_input().unwrap();
+                destination.as_mut_slice().fill(R::from_f64(7.0).unwrap());
+                let before = destination.as_slice().to_vec();
+                let mut workspace = plan.allocate_workspace().unwrap();
+                let result = if raw {
+                    plan.backward(&source, &mut destination, &mut workspace)
+                } else {
+                    plan.inverse(&source, &mut destination, &mut workspace)
+                };
+                assert!(matches!(result, Err(MixedError::InvalidSpectrum)));
+                assert_eq!(source.as_slice(), source_before);
+                assert_eq!(destination.as_slice(), before);
+
+                let mut array = plan.allocate_in_place().unwrap();
+                let mut workspace = plan.allocate_in_place_workspace().unwrap();
+                plan.forward_in_place(&mut array, &mut workspace).unwrap();
+                array
+                    .complex_view_mut()
+                    .unwrap()
+                    .as_mut_slice()
+                    .copy_from_slice(source.as_slice());
+                let result = if raw {
+                    plan.backward_in_place(&mut array, &mut workspace)
+                } else {
+                    plan.inverse_in_place(&mut array, &mut workspace)
+                };
+                assert!(matches!(result, Err(MixedError::InvalidSpectrum)));
+                assert_eq!(array.state(), crate::R2cState::Poisoned);
+            }
+            // Ordinary public IP preflight must preserve the real state and data.
+            let mut array = plan.allocate_in_place().unwrap();
+            array
+                .real_view_mut()
+                .unwrap()
+                .as_mut_slice()
+                .fill(R::from_f64(0.25).unwrap());
+            let before = array.real_view().unwrap().as_slice().to_vec();
+            let state = array.state();
+            let mut workspace = plan.allocate_in_place_workspace().unwrap();
+            assert!(plan.inverse_in_place(&mut array, &mut workspace).is_err());
+            assert_eq!(array.state(), state);
+            assert_eq!(array.real_view().unwrap().as_slice(), before);
+        }
+    }
+
     #[test]
     #[ignore = "MPI must be initialized in a separate test process"]
     fn reverse_local_routes_run_callbacks_and_independent_spectrum() {
@@ -7358,6 +7579,10 @@ mod reverse_overlap_tests {
         let size = world.size() as usize;
         assert!(matches!(size, 1 | 4 | 6));
         let topology = pencil_array::MpiTopology::<2>::new(&world, [size, 1]).unwrap();
+        endpoint_contract::<f32>(&topology);
+        endpoint_contract::<f64>(&topology);
+        batched_endpoint_contract::<f32>(&topology);
+        batched_endpoint_contract::<f64>(&topology);
         for permute_dims in [false, true] {
             for boundary in 0..4 {
                 let mut transforms = [AxisTransform::R2r(AxisR2rKind::Dht); 4];
