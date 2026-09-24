@@ -148,7 +148,9 @@ pub enum IoError {
     #[error("I/O file has no completed commit marker")]
     IncompleteFile,
 
-    /// The file could not be opened or a required native backend was absent.
+    /// A native backend operation failed, including opening a file, creating
+    /// native resources, or transferring data. This can occur after a write
+    /// has started; this variant does not imply that the file is unchanged.
     #[error("native backend operation {operation} failed with code {code}")]
     Native {
         /// The native operation.

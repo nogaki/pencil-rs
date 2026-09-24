@@ -6,6 +6,11 @@
 //! implementations. A callback is local code: it must not call MPI or panic.
 //! `sum_by` and `norm_by` stage callback results, so the callback is invoked
 //! exactly once per local element before the reduction starts.
+//!
+//! Standard integer sums check every addition in the local storage-order fold
+//! and the rank-order fold of partials. An intermediate overflow is an error
+//! even if the final mathematical sum would fit; for example, one rank's
+//! `[127i8, 1, -1]` fails at the second value rather than returning 127.
 
 use std::{
     any::type_name,
@@ -483,6 +488,8 @@ impl TruthValue for bool {
 
 /// Computes the replicated global sum of a view.
 ///
+/// Integer additions are checked at every local and rank-partial fold step;
+/// intermediate overflow returns an error even if the mathematical total fits.
 /// Floating-point NaN wins globally. Opposite infinity signs produce NaN;
 /// otherwise a single infinity sign is preserved. Complex components apply
 /// those rules independently.

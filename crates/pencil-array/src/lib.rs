@@ -72,6 +72,21 @@
 //! collective descriptor and count preflight. Gather returns logical global
 //! row-major order on the root; non-root ranks receive `None`.
 //!
+//! # MPI-owning types are not transferable between threads
+//!
+//! Sharing ownership through `Arc` does not make a topology `Send` or `Sync`.
+//! These compile-time checks do not initialize MPI.
+//!
+//! ```compile_fail
+//! fn require_send<T: Send>() {}
+//! require_send::<pencil_array::MpiTopology<1>>();
+//! ```
+//!
+//! ```compile_fail
+//! fn require_sync<T: Sync>() {}
+//! require_sync::<pencil_array::MpiTopology<1>>();
+//! ```
+//!
 //! # One-rank example
 //!
 //! Run this example as one ordinary process. The array is declared after the

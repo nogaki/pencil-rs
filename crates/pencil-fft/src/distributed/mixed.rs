@@ -440,7 +440,7 @@ pub struct MixedC2cPlan<R: FftReal, const N: usize, const M: usize> {
 /// Odd lengths (including one) have only DC; their last stored frequency is
 /// not an additional constrained plane. Every constrained value must be finite.
 /// A plane passes if `max(abs(im)) <= absolute` OR
-/// `norm2(im) <= relative * norm2(complex_plane)`. The norms use scaled sums
+/// `norm2(im) <= relative * norm2(real_plane)`. The norms use scaled sums
 /// of squares to avoid overflow/underflow; a zero plane passes.
 ///
 /// Accepted endpoint imaginary parts are projected to zero in working storage,
