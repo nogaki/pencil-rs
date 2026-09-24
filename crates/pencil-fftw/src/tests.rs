@@ -329,7 +329,8 @@ fn matrix<R: Real + rustfft::num_traits::ToPrimitive>(threads: usize) {
             }
         }
     }
-    // Unbounded estimate after bounded planning exercises the reset/default path.
+    // Checks default planning after bounded planning, not the previous reset:
+    // this constructor itself sets the unlimited budget.
     plan_c2c::<R>(5, FftDirection::Forward, PlanOptions::default()).unwrap();
 }
 fn wisdom_only_matrix<R: Real + rustfft::num_traits::ToPrimitive>() {
