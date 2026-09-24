@@ -29,9 +29,10 @@ use crate::{
 };
 
 use super::{
-    C2cStageTransition, C2cState, Direction, DistributedLayout, FftError, INVALID_WORD,
-    LocalTransform, OPERATION_MIXED_C2C_BACKWARD, OPERATION_MIXED_C2C_BACKWARD_IN_PLACE,
-    OPERATION_MIXED_C2C_FORWARD, OPERATION_MIXED_C2C_FORWARD_IN_PLACE, OPERATION_MIXED_C2C_INVERSE,
+    C2cStageTransition, C2cState, Direction, DistributedLayout, FftError, FourierDirection,
+    FourierDirections, INVALID_WORD, LocalTransform, OPERATION_MIXED_C2C_BACKWARD,
+    OPERATION_MIXED_C2C_BACKWARD_IN_PLACE, OPERATION_MIXED_C2C_FORWARD,
+    OPERATION_MIXED_C2C_FORWARD_IN_PLACE, OPERATION_MIXED_C2C_INVERSE,
     OPERATION_MIXED_C2C_INVERSE_IN_PLACE, OPERATION_MIXED_C2C_PLAN, OPERATION_MIXED_R2C_BACKWARD,
     OPERATION_MIXED_R2C_BACKWARD_IN_PLACE, OPERATION_MIXED_R2C_FORWARD,
     OPERATION_MIXED_R2C_FORWARD_IN_PLACE, OPERATION_MIXED_R2C_INVERSE,
@@ -207,6 +208,10 @@ struct MixedC2cCore<R: FftReal, const N: usize, const M: usize> {
     strided_line_len: usize,
     transpose_send_len: usize,
     transpose_receive_len: usize,
+    directions: FourierDirections<N>,
+    // Reconfigured plans reject arrays belonging to the prior core; legacy
+    // constructors retain their existing layout-compatible array contract.
+    strict_array_identity: bool,
 }
 
 #[derive(Debug)]
@@ -245,6 +250,10 @@ struct MixedR2cCore<R: FftReal, const N: usize, const M: usize> {
     real_transpose_send_len: usize,
     real_transpose_receive_len: usize,
     raw_absolute_threshold: f64,
+    directions: FourierDirections<N>,
+    // Reconfigured plans reject arrays belonging to the prior core; legacy
+    // constructors retain their existing layout-compatible array contract.
+    strict_array_identity: bool,
 }
 
 /// Reusable out-of-place workspace for [`MixedC2cPlan`].
@@ -409,6 +418,7 @@ where
             Ok(input),
             transforms,
             layout,
+            FourierDirections::default(),
         )
     }
 
@@ -450,7 +460,62 @@ where
             Ok(Arc::clone(input.pencil())),
             transforms,
             layout,
+            FourierDirections::default(),
         )
+    }
+
+    /// Builds a mixed complex plan with explicit Fourier signs.
+    pub fn from_shape_with_fft_directions(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        transforms: [AxisTransform; N],
+        directions: FourierDirections<N>,
+    ) -> Result<Self, MixedError> {
+        let input = Pencil::new(
+            Arc::clone(&topology),
+            global_shape,
+            std::array::from_fn(|axis| axis),
+        )
+        .map_err(FftError::Pencil);
+        Self::construct(
+            topology,
+            global_shape,
+            extra_shape,
+            input,
+            transforms,
+            DistributedLayout::default(),
+            directions,
+        )
+    }
+
+    /// Rebuilds this plan with fresh array/workspace identities and Fourier signs.
+    ///
+    /// Forward is unscaled with these signs; inverse uses opposite signs and
+    /// normalization, and backward uses opposite signs without normalization.
+    /// Non-FFT axes must use `Forward`; other signs are rejected collectively.
+    pub fn with_fft_directions(
+        &self,
+        directions: FourierDirections<N>,
+    ) -> Result<Self, MixedError> {
+        let mut plan = Self::construct(
+            Arc::clone(self.input_pencil().topology()),
+            *self.input_pencil().global_shape(),
+            self.core.extra_shape.clone(),
+            Pencil::new(
+                Arc::clone(self.input_pencil().topology()),
+                *self.input_pencil().global_shape(),
+                std::array::from_fn(|axis| axis),
+            )
+            .map_err(FftError::Pencil),
+            self.core.transforms,
+            self.core.layout,
+            directions,
+        )?;
+        Arc::get_mut(&mut plan.core)
+            .expect("fresh core")
+            .strict_array_identity = true;
+        Ok(plan)
     }
 
     /// Builds an Alltoallv mixed complex plan from a shape.
@@ -510,6 +575,7 @@ where
             input,
             transforms,
             layout,
+            FourierDirections::default(),
         )
     }
 
@@ -541,6 +607,11 @@ where
     /// Returns the transport and memory-layout policy used by this plan.
     pub fn layout(&self) -> DistributedLayout {
         self.core.layout
+    }
+
+    /// Returns the configured Fourier signs.
+    pub fn fft_directions(&self) -> FourierDirections<N> {
+        self.core.directions
     }
 
     /// Allocates a zero-initialized complex input array.
@@ -692,9 +763,11 @@ where
         input: Result<Arc<Pencil<N, M>>, FftError>,
         transforms: [AxisTransform; N],
         layout: DistributedLayout,
+        directions: FourierDirections<N>,
     ) -> Result<Self, MixedError> {
         let communicator = topology.communicator();
-        let expected_len = mixed_descriptor_len::<N, M>(&extra_shape);
+        let expected_len =
+            mixed_descriptor_len::<N, M>(&extra_shape).and_then(|length| length.checked_add(N));
         let descriptor = expected_len.and_then(|_| {
             build_mixed_descriptor::<R, N, M>(
                 &topology,
@@ -708,6 +781,13 @@ where
                 layout,
             )
             .ok()
+            .map(|mut descriptor| {
+                descriptor.extend(directions.0.iter().map(|direction| match direction {
+                    FourierDirection::Forward => 0,
+                    FourierDirection::Backward => 1,
+                }));
+                descriptor
+            })
         });
         let header = mixed_header::<N, M>(OPERATION_MIXED_C2C_PLAN, N, M, expected_len);
         if !agree_header(communicator, header) {
@@ -715,6 +795,10 @@ where
         }
         let descriptor = collective_descriptor(communicator, descriptor, expected_len)?;
         agree_result(communicator, validate_c2c_graph(transforms))?;
+        agree_result(
+            communicator,
+            validate_r2c_directions(transforms, directions),
+        )?;
         let input = agree_result(communicator, validate_input(input, &topology, global_shape))?;
         let route = agree_result(
             communicator,
@@ -722,7 +806,7 @@ where
         )?;
         let (stages, embedding_len, fft_scratch_len, strided_line_len) = agree_result(
             communicator,
-            prepare_mixed_c2c_stages(&route, global_shape, transforms),
+            prepare_mixed_c2c_stages(&route, global_shape, transforms, directions),
         )?;
         let registered_pencils = agree_result(communicator, mixed_c2c_stage_pencils(&stages))?;
         let layout_stages = mixed_layout_stages(&stages);
@@ -756,6 +840,8 @@ where
                 strided_line_len,
                 transpose_send_len,
                 transpose_receive_len,
+                directions,
+                strict_array_identity: false,
             }),
         })
     }
@@ -1101,6 +1187,19 @@ fn validate_r2c_graph<const N: usize>(
     Ok(boundary)
 }
 
+fn validate_r2c_directions<const N: usize>(
+    transforms: [AxisTransform; N],
+    directions: FourierDirections<N>,
+) -> Result<(), MixedError> {
+    if transforms.into_iter().enumerate().any(|(axis, transform)| {
+        matches!(directions.get(axis), Some(FourierDirection::Backward))
+            && !matches!(transform, AxisTransform::Fft)
+    }) {
+        return Err(MixedError::Fft(FftError::PreparationFailed));
+    }
+    Ok(())
+}
+
 fn map_overwrite<E: Into<MixedError>>(error: OverwriteError<E>) -> MixedError {
     match error {
         OverwriteError::Array(error) => MixedError::Fft(FftError::Array(error)),
@@ -1223,6 +1322,7 @@ fn prepare_mixed_c2c_stages<R: FftReal, const N: usize, const M: usize>(
     route: &RouteCandidate<N, M>,
     shape: [usize; N],
     transforms: [AxisTransform; N],
+    directions: FourierDirections<N>,
 ) -> Result<(Box<[MixedC2cStage<R, N, M>]>, usize, usize, usize), MixedError> {
     if route.stages.len() != N {
         return Err(MixedError::Fft(FftError::PreparationFailed));
@@ -1239,7 +1339,10 @@ fn prepare_mixed_c2c_stages<R: FftReal, const N: usize, const M: usize>(
         validate_stage_pencil(pencil, axis, shape[axis])?;
         let local = match transforms[axis] {
             AxisTransform::None => MixedComplexLocal::Identity,
-            AxisTransform::Fft => MixedComplexLocal::Fft(LocalC2cPlan::new(shape[axis])?),
+            AxisTransform::Fft => MixedComplexLocal::Fft(LocalC2cPlan::new_with_sign(
+                shape[axis],
+                directions.get(axis) == Some(FourierDirection::Backward),
+            )?),
             AxisTransform::Rfft => return Err(MixedError::InvalidGraph),
             AxisTransform::R2r(kind) => {
                 MixedComplexLocal::R2r(mixed_r2r_local::<Complex<R>>(kind, shape[axis])?)
@@ -2042,12 +2145,15 @@ fn validate_mixed_c2c_oop<R: FftReal, const N: usize, const M: usize>(
         Direction::Forward => (input, output),
         Direction::Inverse | Direction::Backward => (output, input),
     };
-    if !source.pencil().same_layout(expected_source.as_ref()) {
+    if (core.strict_array_identity && !Arc::ptr_eq(source.pencil(), expected_source))
+        || !source.pencil().same_layout(expected_source.as_ref())
+    {
         return Err(MixedError::Fft(FftError::InputLayoutMismatch));
     }
-    if !destination
-        .pencil()
-        .same_layout(expected_destination.as_ref())
+    if (core.strict_array_identity && !Arc::ptr_eq(destination.pencil(), expected_destination))
+        || !destination
+            .pencil()
+            .same_layout(expected_destination.as_ref())
     {
         return Err(MixedError::Fft(FftError::OutputLayoutMismatch));
     }
@@ -2213,6 +2319,7 @@ where
             Ok(input),
             transforms,
             layout,
+            FourierDirections::default(),
         )
     }
 
@@ -2254,6 +2361,32 @@ where
             Ok(Arc::clone(input.pencil())),
             transforms,
             layout,
+            FourierDirections::default(),
+        )
+    }
+
+    /// Builds a mixed real-to-complex plan with explicit Fourier signs.
+    pub fn from_shape_with_fft_directions(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        transforms: [AxisTransform; N],
+        directions: FourierDirections<N>,
+    ) -> Result<Self, MixedError> {
+        let input = Pencil::new(
+            Arc::clone(&topology),
+            global_shape,
+            std::array::from_fn(|axis| axis),
+        )
+        .map_err(FftError::Pencil);
+        Self::construct(
+            topology,
+            global_shape,
+            extra_shape,
+            input,
+            transforms,
+            DistributedLayout::default(),
+            directions,
         )
     }
 
@@ -2314,7 +2447,37 @@ where
             input,
             transforms,
             layout,
+            FourierDirections::default(),
         )
+    }
+
+    /// Rebuilds this plan with fresh array/workspace identities and Fourier signs.
+    ///
+    /// Forward is unscaled with these signs; inverse uses opposite signs and
+    /// normalization, and backward uses opposite signs without normalization.
+    /// Non-FFT axes must use `Forward`; other signs are rejected collectively.
+    pub fn with_fft_directions(
+        &self,
+        directions: FourierDirections<N>,
+    ) -> Result<Self, MixedError> {
+        let mut plan = Self::construct(
+            Arc::clone(self.input_pencil().topology()),
+            *self.input_pencil().global_shape(),
+            self.core.extra_shape.clone(),
+            Pencil::new(
+                Arc::clone(self.input_pencil().topology()),
+                *self.input_pencil().global_shape(),
+                std::array::from_fn(|axis| axis),
+            )
+            .map_err(FftError::Pencil),
+            self.core.transforms,
+            self.core.layout,
+            directions,
+        )?;
+        Arc::get_mut(&mut plan.core)
+            .expect("fresh core")
+            .strict_array_identity = true;
+        Ok(plan)
     }
 
     /// Returns the concrete transform assigned to each logical axis.
@@ -2355,6 +2518,11 @@ where
     /// Returns the transport and memory-layout policy used by this plan.
     pub fn layout(&self) -> DistributedLayout {
         self.core.layout
+    }
+
+    /// Returns the configured Fourier signs.
+    pub fn fft_directions(&self) -> FourierDirections<N> {
+        self.core.directions
     }
 
     /// Allocates a zero-initialized real input array.
@@ -2565,6 +2733,7 @@ where
         input: Result<Arc<Pencil<N, M>>, FftError>,
         transforms: [AxisTransform; N],
         layout: DistributedLayout,
+        directions: FourierDirections<N>,
     ) -> Result<Self, MixedError> {
         let communicator = topology.communicator();
         let local_boundary = validate_r2c_graph(global_shape, transforms).ok();
@@ -2573,7 +2742,8 @@ where
         if let Some(axis) = local_boundary {
             reduced_shape[axis] = global_shape[axis] / 2 + 1;
         }
-        let expected_len = mixed_descriptor_len::<N, M>(&extra_shape);
+        let expected_len =
+            mixed_descriptor_len::<N, M>(&extra_shape).and_then(|length| length.checked_add(N));
         let descriptor = expected_len.and_then(|_| {
             build_mixed_descriptor::<R, N, M>(
                 &topology,
@@ -2587,12 +2757,23 @@ where
                 layout,
             )
             .ok()
+            .map(|mut descriptor| {
+                descriptor.extend(directions.0.iter().map(|direction| match direction {
+                    FourierDirection::Forward => 0,
+                    FourierDirection::Backward => 1,
+                }));
+                descriptor
+            })
         });
         let header = mixed_header::<N, M>(OPERATION_MIXED_R2C_PLAN, N, M, expected_len);
         if !agree_header(communicator, header) {
             return Err(MixedError::Fft(FftError::CollectiveDescriptorMismatch));
         }
         let descriptor = collective_descriptor(communicator, descriptor, expected_len)?;
+        agree_result(
+            communicator,
+            validate_r2c_directions(transforms, directions),
+        )?;
         let reduction_axis =
             agree_result(communicator, validate_r2c_graph(global_shape, transforms))?;
         let boundary = N
@@ -2637,6 +2818,7 @@ where
                     reduced_shape,
                     reduction_axis,
                     transforms,
+                    directions,
                 ),
             )?;
         let raw_absolute_threshold = agree_result(
@@ -2728,6 +2910,8 @@ where
                 real_transpose_send_len,
                 real_transpose_receive_len,
                 raw_absolute_threshold,
+                directions,
+                strict_array_identity: false,
             }),
         })
     }
@@ -2832,6 +3016,7 @@ fn prepare_mixed_r2c_stages<R: FftReal, const N: usize, const M: usize>(
     reduced_shape: [usize; N],
     boundary: usize,
     transforms: [AxisTransform; N],
+    directions: FourierDirections<N>,
 ) -> Result<(Box<[MixedR2cStage<R, N, M>]>, usize, usize, usize, usize), MixedError> {
     if original_route.stages.len() != N || reduced_route.stages.len() != N {
         return Err(MixedError::Fft(FftError::PreparationFailed));
@@ -2875,7 +3060,10 @@ fn prepare_mixed_r2c_stages<R: FftReal, const N: usize, const M: usize>(
             let local = match transforms[axis] {
                 AxisTransform::None => MixedR2cStageLocal::Complex(MixedComplexLocal::Identity),
                 AxisTransform::Fft => MixedR2cStageLocal::Complex(MixedComplexLocal::Fft(
-                    LocalC2cPlan::new(reduced_shape[axis])?,
+                    LocalC2cPlan::new_with_sign(
+                        reduced_shape[axis],
+                        directions.get(axis) == Some(FourierDirection::Backward),
+                    )?,
                 )),
                 AxisTransform::R2r(kind) => {
                     MixedR2cStageLocal::Complex(MixedComplexLocal::R2r(mixed_r2r_local::<
@@ -3866,12 +4054,19 @@ fn validate_mixed_r2c_forward<R: FftReal, const N: usize, const M: usize>(
     destination: &PencilArray<Complex<R>, N, M>,
     workspace: &MixedR2cWorkspace<R, N, M>,
 ) -> Result<(), MixedError> {
-    if !source.pencil().same_layout(core.stages[0].input.as_ref()) {
+    if (core.strict_array_identity && !Arc::ptr_eq(source.pencil(), &core.stages[0].input))
+        || !source.pencil().same_layout(core.stages[0].input.as_ref())
+    {
         return Err(MixedError::Fft(FftError::InputLayoutMismatch));
     }
-    if !destination
-        .pencil()
-        .same_layout(core.stages[core.stages.len() - 1].output.as_ref())
+    if (core.strict_array_identity
+        && !Arc::ptr_eq(
+            destination.pencil(),
+            &core.stages[core.stages.len() - 1].output,
+        ))
+        || !destination
+            .pencil()
+            .same_layout(core.stages[core.stages.len() - 1].output.as_ref())
     {
         return Err(MixedError::Fft(FftError::OutputLayoutMismatch));
     }
@@ -3887,15 +4082,18 @@ fn validate_mixed_r2c_reverse<R: FftReal, const N: usize, const M: usize>(
     destination: &PencilArray<R, N, M>,
     workspace: &MixedR2cWorkspace<R, N, M>,
 ) -> Result<(), MixedError> {
-    if !source
-        .pencil()
-        .same_layout(core.stages[core.stages.len() - 1].output.as_ref())
+    if (core.strict_array_identity
+        && !Arc::ptr_eq(source.pencil(), &core.stages[core.stages.len() - 1].output))
+        || !source
+            .pencil()
+            .same_layout(core.stages[core.stages.len() - 1].output.as_ref())
     {
         return Err(MixedError::Fft(FftError::InputLayoutMismatch));
     }
-    if !destination
-        .pencil()
-        .same_layout(core.stages[0].input.as_ref())
+    if (core.strict_array_identity && !Arc::ptr_eq(destination.pencil(), &core.stages[0].input))
+        || !destination
+            .pencil()
+            .same_layout(core.stages[0].input.as_ref())
     {
         return Err(MixedError::Fft(FftError::OutputLayoutMismatch));
     }

@@ -221,9 +221,10 @@ pub use distributed::mixed::{
 #[cfg(feature = "distributed")]
 pub use distributed::{
     AxisSelection, AxisSelectionError, C2cInPlaceArray, C2cInPlaceWorkspace,
-    C2cOutOfPlaceWorkspace, C2cPlan, C2cState, DhtPlan, DistributedLayout, FftError, R2cError,
-    R2cInPlaceArray, R2cInPlaceWorkspace, R2cPlan, R2cWorkspace, R2rError, R2rInPlaceArray,
-    R2rInPlaceWorkspace, R2rPlan, R2rState, R2rWorkspace, TransposeMethod,
+    C2cOutOfPlaceWorkspace, C2cPlan, C2cState, DhtPlan, DistributedLayout, FftError,
+    FourierDirection, FourierDirections, R2cError, R2cInPlaceArray, R2cInPlaceWorkspace, R2cPlan,
+    R2cWorkspace, R2rError, R2rInPlaceArray, R2rInPlaceWorkspace, R2rPlan, R2rState, R2rWorkspace,
+    StageGeometry, TransposeMethod,
 };
 
 /// Errors returned by local C2C plan construction and execution.
@@ -261,6 +262,8 @@ pub struct LocalC2cPlan<R: FftReal> {
     scratch_len: usize,
     forward: Arc<dyn Fft<R>>,
     inverse: Arc<dyn Fft<R>>,
+    /// Whether the public forward operation uses the positive exponent.
+    positive_forward: bool,
 }
 
 impl<R: FftReal> fmt::Debug for LocalC2cPlan<R> {
@@ -281,6 +284,13 @@ impl<R: FftReal> LocalC2cPlan<R> {
     /// `Complex<R>` slice. Backend resource failures or backend panics are not
     /// converted into [`LocalC2cError`].
     pub fn new(line_len: usize) -> Result<Self, LocalC2cError> {
+        Self::new_with_sign(line_len, false)
+    }
+
+    pub(crate) fn new_with_sign(
+        line_len: usize,
+        positive_forward: bool,
+    ) -> Result<Self, LocalC2cError> {
         validate_line_len::<R>(line_len)?;
 
         let mut planner = FftPlanner::<R>::new();
@@ -297,6 +307,7 @@ impl<R: FftReal> LocalC2cPlan<R> {
             scratch_len,
             forward,
             inverse,
+            positive_forward,
         })
     }
 
@@ -329,8 +340,12 @@ impl<R: FftReal> LocalC2cPlan<R> {
             return Ok(());
         }
 
-        self.forward
-            .process_immutable_with_scratch(src, dst, scratch);
+        let fft = if self.positive_forward {
+            &self.inverse
+        } else {
+            &self.forward
+        };
+        fft.process_immutable_with_scratch(src, dst, scratch);
         Ok(())
     }
 
@@ -351,8 +366,12 @@ impl<R: FftReal> LocalC2cPlan<R> {
             return Ok(());
         }
 
-        self.inverse
-            .process_immutable_with_scratch(src, dst, scratch);
+        let fft = if self.positive_forward {
+            &self.forward
+        } else {
+            &self.inverse
+        };
+        fft.process_immutable_with_scratch(src, dst, scratch);
         Ok(())
     }
 
@@ -389,7 +408,12 @@ impl<R: FftReal> LocalC2cPlan<R> {
             return Ok(());
         }
 
-        self.forward.process_with_scratch(data, scratch);
+        let fft = if self.positive_forward {
+            &self.inverse
+        } else {
+            &self.forward
+        };
+        fft.process_with_scratch(data, scratch);
         Ok(())
     }
 
@@ -408,7 +432,12 @@ impl<R: FftReal> LocalC2cPlan<R> {
             return Ok(());
         }
 
-        self.inverse.process_with_scratch(data, scratch);
+        let fft = if self.positive_forward {
+            &self.forward
+        } else {
+            &self.inverse
+        };
+        fft.process_with_scratch(data, scratch);
         Ok(())
     }
 

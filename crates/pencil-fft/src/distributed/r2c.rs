@@ -21,15 +21,15 @@ use pencil_array::{
 };
 
 use super::{
-    AxisSelection, DESCRIPTOR_SCHEMA, Direction, DistributedLayout, FftError, INVALID_WORD,
-    LocalTransform, OPERATION_R2C_BACKWARD, OPERATION_R2C_BACKWARD_IN_PLACE, OPERATION_R2C_FORWARD,
-    OPERATION_R2C_FORWARD_IN_PLACE, OPERATION_R2C_INVERSE, OPERATION_R2C_INVERSE_IN_PLACE,
-    OPERATION_R2C_PLAN, R2cError, StagePreparation, TransformPlanCore, TransformStage,
-    TransposeMethod, VALUE_KIND_R2C, agree_execution_descriptor_ref, agree_header, agree_result,
-    build_descriptor, build_route, build_transitions, collective_valid, descriptor_len,
-    initialized_vec, map_array_allocation, prepare_complex_stage, registered_stage_pencils,
-    strided_complex_line_len, validate_out_of_place, validate_workspace_lengths_values,
-    zero_complex,
+    AxisSelection, DESCRIPTOR_SCHEMA, Direction, DistributedLayout, FftError, FourierDirections,
+    INVALID_WORD, LocalTransform, OPERATION_R2C_BACKWARD, OPERATION_R2C_BACKWARD_IN_PLACE,
+    OPERATION_R2C_FORWARD, OPERATION_R2C_FORWARD_IN_PLACE, OPERATION_R2C_INVERSE,
+    OPERATION_R2C_INVERSE_IN_PLACE, OPERATION_R2C_PLAN, R2cError, StagePreparation,
+    TransformPlanCore, TransformStage, TransposeMethod, VALUE_KIND_R2C,
+    agree_execution_descriptor_ref, agree_header, agree_result, build_descriptor, build_route,
+    build_transitions, collective_valid, descriptor_len, initialized_vec, map_array_allocation,
+    prepare_complex_stage, registered_stage_pencils, strided_complex_line_len,
+    validate_out_of_place, validate_workspace_lengths_values, zero_complex,
 };
 #[cfg(test)]
 use crate::LocalR2cError;
@@ -591,6 +591,19 @@ where
         self.core.layout
     }
 
+    /// Returns the immutable checked geometry used by every route stage.
+    pub fn stage_geometry(&self) -> Box<[super::StageGeometry<N, M>]> {
+        self.core
+            .stages
+            .iter()
+            .map(|stage| super::StageGeometry {
+                axis: stage.axis,
+                source: Arc::clone(&stage.input),
+                output: Arc::clone(&stage.output),
+            })
+            .collect()
+    }
+
     /// Allocates a zero-initialized local real input array.
     pub fn allocate_input(&self) -> Result<PencilArray<R, N, M>, R2cError> {
         Ok(PencilArray::from_fn(
@@ -1012,6 +1025,8 @@ where
             transpose_receive_len,
             real_transpose_send_len,
             real_transpose_receive_len,
+            directions: FourierDirections::default(),
+            strict_array_identity: false,
         };
         Ok(Self {
             core: Arc::new(core),
@@ -1041,9 +1056,13 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
     for index in 0..N {
         let axis = N - 1 - index;
         let stage = match index.cmp(&boundary) {
-            Ordering::Less => {
-                prepare_complex_stage(&original_route.stages[index], original_shape, axis, false)?
-            }
+            Ordering::Less => prepare_complex_stage(
+                &original_route.stages[index],
+                original_shape,
+                axis,
+                false,
+                FourierDirections::default(),
+            )?,
             Ordering::Equal => {
                 let pencil = &original_route.stages[index];
                 if pencil
@@ -1067,6 +1086,7 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
                 reduced_shape,
                 axis,
                 selection.contains(axis),
+                FourierDirections::default(),
             )?,
         };
         fft_scratch_len = fft_scratch_len.max(stage.local.scratch_len());

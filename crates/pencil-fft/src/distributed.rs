@@ -272,6 +272,53 @@ pub struct DistributedLayout {
     pub permute_dims: bool,
 }
 
+/// The sign convention configured for a Fourier axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FourierDirection {
+    /// The negative-exponent (forward) sign.
+    Forward,
+    /// The positive-exponent (backward) sign.
+    Backward,
+}
+
+/// Per-axis Fourier sign configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FourierDirections<const N: usize>([FourierDirection; N]);
+
+impl<const N: usize> FourierDirections<N> {
+    /// Configures every axis with the forward sign.
+    pub fn forward() -> Self {
+        Self([FourierDirection::Forward; N])
+    }
+
+    /// Creates an explicit per-axis configuration.
+    pub const fn new(directions: [FourierDirection; N]) -> Self {
+        Self(directions)
+    }
+
+    /// Returns the configured sign for an axis.
+    pub fn get(&self, axis: usize) -> Option<FourierDirection> {
+        self.0.get(axis).copied()
+    }
+}
+
+impl<const N: usize> Default for FourierDirections<N> {
+    fn default() -> Self {
+        Self::forward()
+    }
+}
+
+/// Immutable geometry of one planned distributed FFT stage.
+#[derive(Clone, Debug)]
+pub struct StageGeometry<const N: usize, const M: usize> {
+    /// Logical transform axis.
+    pub axis: usize,
+    /// Immutable source pencil.
+    pub source: Arc<Pencil<N, M>>,
+    /// Immutable output pencil.
+    pub output: Arc<Pencil<N, M>>,
+}
+
 impl Default for DistributedLayout {
     fn default() -> Self {
         Self {
@@ -628,6 +675,10 @@ struct TransformPlanCore<R: FftReal, const N: usize, const M: usize> {
     transpose_receive_len: usize,
     real_transpose_send_len: usize,
     real_transpose_receive_len: usize,
+    directions: FourierDirections<N>,
+    // Reconfigured plans reject arrays belonging to the prior core; legacy
+    // constructors retain their existing layout-compatible array contract.
+    strict_array_identity: bool,
 }
 
 #[derive(Debug)]
@@ -728,6 +779,7 @@ where
             Ok(input),
             selection,
             layout,
+            FourierDirections::default(),
         )
     }
 
@@ -804,6 +856,7 @@ where
             Ok(Arc::clone(input.pencil())),
             selection,
             layout,
+            FourierDirections::default(),
         )
     }
 
@@ -910,6 +963,7 @@ where
             input,
             selection,
             layout,
+            FourierDirections::default(),
         )
     }
 
@@ -955,6 +1009,19 @@ where
     /// Returns the transport and memory-layout policy used by this plan.
     pub fn layout(&self) -> DistributedLayout {
         self.core.layout
+    }
+
+    /// Returns the immutable checked geometry used by every route stage.
+    pub fn stage_geometry(&self) -> Box<[StageGeometry<N, M>]> {
+        self.core
+            .stages
+            .iter()
+            .map(|stage| StageGeometry {
+                axis: stage.axis,
+                source: Arc::clone(&stage.input),
+                output: Arc::clone(&stage.output),
+            })
+            .collect()
     }
 
     /// Allocates a zero-initialized local input array for this plan.
@@ -1149,6 +1216,65 @@ where
         self.execute_in_place(Direction::Backward, array, workspace)
     }
 
+    /// Builds a plan with explicit per-axis Fourier signs.
+    ///
+    /// Forward uses the configured signs; inverse and backward use their opposites.
+    pub fn from_shape_with_fft_directions(
+        topology: Arc<MpiTopology<M>>,
+        global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        directions: FourierDirections<N>,
+    ) -> Result<Self, FftError> {
+        let input = Pencil::new(
+            Arc::clone(&topology),
+            global_shape,
+            std::array::from_fn(|axis| axis),
+        )
+        .map_err(FftError::Pencil);
+        Self::construct(
+            topology,
+            global_shape,
+            extra_shape,
+            input,
+            AxisSelection::all(),
+            DistributedLayout::default(),
+            directions,
+        )
+    }
+
+    /// Rebuilds this plan with new Fourier signs and fresh array/workspace identities.
+    /// Forward is unscaled with these signs; inverse uses opposite signs with
+    /// normalization, and backward uses opposite signs without normalization.
+    /// Non-selected axes must use `Forward` (checked collectively).
+    pub fn with_fft_directions(&self, directions: FourierDirections<N>) -> Result<Self, FftError> {
+        let topology = Arc::clone(self.input_pencil().topology());
+        let shape = *self.input_pencil().global_shape();
+        let input = Pencil::new(
+            Arc::clone(&topology),
+            shape,
+            std::array::from_fn(|axis| axis),
+        )
+        .map_err(FftError::Pencil);
+        let mut plan = Self::construct(
+            topology,
+            shape,
+            self.core.extra_shape.clone(),
+            input,
+            self.core.selection,
+            self.core.layout,
+            directions,
+        )?;
+        Arc::get_mut(&mut plan.core)
+            .expect("fresh core")
+            .strict_array_identity = true;
+        Ok(plan)
+    }
+
+    /// Returns the signs used by the forward operation.
+    pub fn fft_directions(&self) -> FourierDirections<N> {
+        self.core.directions
+    }
+
     fn construct(
         topology: Arc<MpiTopology<M>>,
         global_shape: [usize; N],
@@ -1156,11 +1282,13 @@ where
         input: Result<Arc<Pencil<N, M>>, FftError>,
         selection: AxisSelection<N>,
         layout: DistributedLayout,
+        directions: FourierDirections<N>,
     ) -> Result<Self, FftError> {
         let communicator = topology.communicator();
-        let expected_len = descriptor_len::<N, M>(&extra_shape);
+        let expected_len =
+            descriptor_len::<N, M>(&extra_shape).and_then(|length| length.checked_add(N));
         let descriptor = expected_len.and_then(|_| {
-            build_descriptor::<R, N, M>(
+            let mut descriptor = build_descriptor::<R, N, M>(
                 &topology,
                 global_shape,
                 &extra_shape,
@@ -1168,7 +1296,12 @@ where
                 VALUE_KIND_C2C,
                 layout,
             )
-            .ok()
+            .ok()?;
+            descriptor.extend(directions.0.iter().map(|direction| match direction {
+                FourierDirection::Forward => 0,
+                FourierDirection::Backward => 1,
+            }));
+            Some(descriptor)
         });
         let descriptor_len_word = expected_len
             .and_then(|length| u64::try_from(length).ok())
@@ -1191,9 +1324,20 @@ where
             communicator,
             build_route(input, &topology, global_shape, layout.permute_dims),
         )?;
+        agree_result(
+            communicator,
+            if (0..N).any(|axis| {
+                !selection.contains(axis)
+                    && directions.get(axis) == Some(FourierDirection::Backward)
+            }) {
+                Err(FftError::PreparationFailed)
+            } else {
+                Ok(())
+            },
+        )?;
         let stages = agree_result(
             communicator,
-            prepare_stages::<R, N, M>(&route, global_shape, selection),
+            prepare_stages::<R, N, M>(&route, global_shape, selection, directions),
         )?;
 
         let (
@@ -1226,6 +1370,8 @@ where
             transpose_receive_len,
             real_transpose_send_len,
             real_transpose_receive_len,
+            directions,
+            strict_array_identity: false,
         };
         Ok(Self {
             core: Arc::new(core),
@@ -1550,6 +1696,7 @@ fn prepare_complex_stage<R: FftReal, const N: usize, const M: usize>(
     global_shape: [usize; N],
     axis_index: usize,
     selected: bool,
+    directions: FourierDirections<N>,
 ) -> Result<TransformStage<R, N, M>, FftError> {
     if pencil
         .decomposition()
@@ -1560,7 +1707,10 @@ fn prepare_complex_stage<R: FftReal, const N: usize, const M: usize>(
         return Err(FftError::PreparationFailed);
     }
     let local = if selected {
-        LocalTransform::Complex(LocalC2cPlan::new(global_shape[axis_index])?)
+        LocalTransform::Complex(LocalC2cPlan::new_with_sign(
+            global_shape[axis_index],
+            directions.get(axis_index) == Some(FourierDirection::Backward),
+        )?)
     } else {
         LocalTransform::Identity
     };
@@ -1576,6 +1726,7 @@ fn prepare_stages<R: FftReal, const N: usize, const M: usize>(
     route: &RouteCandidate<N, M>,
     global_shape: [usize; N],
     selection: AxisSelection<N>,
+    directions: FourierDirections<N>,
 ) -> Result<StagePreparation<R, N, M>, FftError> {
     let required = route.stages.len();
     let mut stages = Vec::new();
@@ -1585,7 +1736,13 @@ fn prepare_stages<R: FftReal, const N: usize, const M: usize>(
     let mut fft_scratch_len = 0usize;
     for (index, pencil) in route.stages.iter().enumerate() {
         let axis = N - 1 - index;
-        let stage = prepare_complex_stage(pencil, global_shape, axis, selection.contains(axis))?;
+        let stage = prepare_complex_stage(
+            pencil,
+            global_shape,
+            axis,
+            selection.contains(axis),
+            directions,
+        )?;
         fft_scratch_len = fft_scratch_len.max(stage.local.scratch_len());
         stages.push(stage);
     }
@@ -2592,12 +2749,15 @@ fn validate_out_of_place<R: FftReal, T, U, V, const N: usize, const M: usize>(
         Direction::Forward => (input, output),
         Direction::Inverse | Direction::Backward => (output, input),
     };
-    if !source.pencil().same_layout(expected_source.as_ref()) {
+    if (core.strict_array_identity && !Arc::ptr_eq(source.pencil(), expected_source))
+        || !source.pencil().same_layout(expected_source.as_ref())
+    {
         return Err(FftError::InputLayoutMismatch);
     }
-    if !destination
-        .pencil()
-        .same_layout(expected_destination.as_ref())
+    if (core.strict_array_identity && !Arc::ptr_eq(destination.pencil(), expected_destination))
+        || !destination
+            .pencil()
+            .same_layout(expected_destination.as_ref())
     {
         return Err(FftError::OutputLayoutMismatch);
     }
