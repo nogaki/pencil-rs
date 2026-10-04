@@ -1,4 +1,5 @@
-//! The only raw native boundary in `pencil-io`.
+//! Raw native boundary for the collective MPI and parallel HDF5 backends.
+//! Serial HDF5 uses separate, lock-protected calls with RAII-owned handles.
 //!
 //! Every function below validates the Rust slice/handle preconditions at its
 //! caller and keeps the corresponding FFI safety argument next to the unsafe

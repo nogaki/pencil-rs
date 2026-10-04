@@ -33,6 +33,45 @@ jobs:
       - name: Check native adapter host paths without FFTW installation
         run: cargo test -p pencil-fftw --locked
 
+  serial-hdf5:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HDF5_DIR: /usr/lib/x86_64-linux-gnu/hdf5/serial
+      MPICC: /nonexistent/mpicc
+      LIBCLANG_PATH: /nonexistent/libclang
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install serial HDF5 and Clippy
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libhdf5-dev pkg-config
+          pkg-config --modversion hdf5-serial
+          rustup component add clippy
+
+      - name: Check serial HDF5 dependency boundary
+        run: |
+          set -euo pipefail
+          cargo tree -p pencil-io --no-default-features --features hdf5 \
+            --edges normal,build --prefix none --locked | tee /tmp/pencil-io-serial-tree.txt
+          if grep -Eq '^(mpi|mpi-sys|pencil-array|build-probe-mpi) ' /tmp/pencil-io-serial-tree.txt; then
+            echo "serial pencil-io unexpectedly depends on MPI or pencil-array" >&2
+            exit 1
+          fi
+
+      - name: Run serial HDF5 tests and documentation examples
+        run: cargo test -p pencil-io --no-default-features --features hdf5 --locked
+
+      - name: Check serial HDF5 with Clippy
+        run: cargo clippy -p pencil-io --no-default-features --features hdf5 --all-targets --locked -- -D warnings
+
+      - name: Build serial HDF5 documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p pencil-io --no-default-features --features hdf5 --no-deps --locked
+
   rsmpi-rt:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -142,7 +181,7 @@ jobs:
 
       - name: Build pencil-io integration tests
         run: |
-          cargo test -p pencil-io --no-default-features --test mpi_io --no-run --locked
+          cargo test -p pencil-io --no-default-features --features mpi --test mpi_io --no-run --locked
           cargo test -p pencil-io --features parallel-hdf5 --test hdf5_io --no-run --locked
 
       - name: Check distributed FFT targets
@@ -327,7 +366,7 @@ jobs:
         run: |
           for n in 1 4 6; do
             timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
-              cargo test -p pencil-io --no-default-features --test mpi_io --locked \
+              cargo test -p pencil-io --no-default-features --features mpi --test mpi_io --locked \
                 -- --nocapture --test-threads=1
           done
 

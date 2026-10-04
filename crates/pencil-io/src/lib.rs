@@ -1,16 +1,59 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-//! Collective native MPI-IO for [`pencil_array`] views.
+//! Native MPI-IO and HDF5 storage.
 //!
-//! The original [`write_mpi`] / [`read_mpi`] APIs store one versioned
+//! # Features
+//!
+//! - `mpi` (default): collective I/O for `pencil_array` views; requires native MPI.
+//! - `hdf5`: serial HDF5 over flat slices. Use `default-features = false` with
+//!   `features = ["hdf5"]` to exclude MPI and `pencil-array`. An installed HDF5
+//!   library and headers are still required; use a serial HDF5 build to avoid
+//!   native MPI dependencies too.
+//! - `parallel-hdf5`: enables `mpi`, `hdf5`, and collective HDF5; requires a
+//!   parallel HDF5 installation built against the same MPI implementation.
+//!
+//! # Serial HDF5 (`hdf5`)
+//!
+//! `write_hdf5_serial(path, global_shape, extra_shape, values)` and
+//! `read_hdf5_serial(path, global_shape, extra_shape, destination)` accept shape
+//! slices and a full flat `IoElement` buffer in row-major `[extra..., spatial...]`
+//! order. They use the same single-dataset format at `/pencil_io_v1/data` as
+//! parallel HDF5, supporting `i8`/`u8`, `i16`/`u16`, `i32`/`u32`, `i64`/`u64`,
+//! `f32`/`f64`, and `num_complex::Complex<f32>`/`Complex<f64>`.
+//! Writes exclusively create a new file (no overwrite); a returned read error
+//! leaves the destination unchanged. Serial APIs do not provide named datasets,
+//! collections, catalogs, sessions, or raw input.
+//!
+//! ```no_run
+//! # #[cfg(feature = "hdf5")]
+//! # fn main() -> Result<(), pencil_io::IoError> {
+//! use pencil_io::{read_hdf5_serial, write_hdf5_serial};
+//!
+//! let global_shape = [2, 3];
+//! let extra_shape = [2];
+//! let values: Vec<f64> = (0..12).map(f64::from).collect();
+//! // Choose a path that does not already exist.
+//! write_hdf5_serial("field.h5", &global_shape, &extra_shape, &values)?;
+//! let mut destination = vec![0.0; values.len()];
+//! read_hdf5_serial("field.h5", &global_shape, &extra_shape, &mut destination)?;
+//! assert_eq!(destination, values);
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "hdf5"))]
+//! # fn main() {}
+//! ```
+//!
+//! # Collective I/O (`mpi`)
+//!
+//! The original `write_mpi` / `read_mpi` APIs store one versioned
 //! little-endian row-major payload per file. Local buffers are packed in logical
 //! `[extra..., spatial...]` order;
 //! the packing is local and never gathers data at rank zero.  Readers may use
 //! a different process grid or memory-axis permutation.
 //!
 //! `write_mpi` and `read_mpi` are collective over the view's Cartesian
-//! communicator. Views may borrow an owning [`pencil_array::PencilArray`] or
+//! communicator. Views may borrow an owning `pencil_array::PencilArray` or
 //! validated external slices. All array, topology, and MPI-IO objects must be
 //! dropped before MPI finalization; persistent sessions require explicit close. Do not
 //! overlap an I/O call with another operation on that topology communicator;
@@ -29,11 +72,11 @@
 //! staging, validation, explicit native cleanup, and collective success
 //! agreement. A returned error leaves that destination unchanged.
 //!
-//! [`write_mpi_named`], [`append_mpi_named`], and [`read_mpi_named`] add a separate
+//! `write_mpi_named`, `append_mpi_named`, and `read_mpi_named` add a separate
 //! append-only named-dataset container. Append creates a new name without
 //! overwriting earlier committed records. The optional HDF5 named APIs likewise
 //! use per-dataset metadata and commit markers. Names are UTF-8 keys rather than
-//! filesystem paths; duplicate names fail before mutation. [`NamedIoError`]
+//! filesystem paths; duplicate names fail before mutation. `NamedIoError`
 //! preserves underlying native/commit errors. Neither format promises recovery
 //! from process loss or crash-atomic HDF5 journaling.
 //!
@@ -42,18 +85,28 @@
 //! external serialization across jobs and communicators; no whole-file rollback
 //! is promised after a write failure. Even a write error can leave a valid
 //! commit; [`IoError::CommitUncertain`] is not a safe-retry guarantee. Raw input
-//! is explicitly requested through [`read_mpi_raw`], never inferred by the strict
+//! is explicitly requested through `read_mpi_raw`, never inferred by the strict
 //! versioned readers.
 
+#[cfg(feature = "mpi")]
 mod catalog;
+#[cfg(feature = "mpi")]
 mod chunked;
+#[cfg(feature = "mpi")]
 mod collections;
 mod format;
+#[cfg(feature = "mpi")]
 mod mpi_io;
+#[cfg(feature = "mpi")]
 mod named_mpi;
+#[cfg(feature = "mpi")]
 mod options;
+#[cfg(feature = "mpi")]
 mod raw;
+#[cfg(feature = "hdf5")]
+mod serial_hdf5;
 
+#[cfg(feature = "mpi")]
 mod ffi;
 
 #[cfg(feature = "parallel-hdf5")]
@@ -61,23 +114,33 @@ mod hdf5_io;
 #[cfg(feature = "parallel-hdf5")]
 mod hdf5_options;
 
+#[cfg(feature = "mpi")]
 pub use named_mpi::session::{MpiFileSession, MpiSessionError};
 
 #[cfg(feature = "parallel-hdf5")]
 pub use catalog::read_hdf5_catalog;
+#[cfg(feature = "mpi")]
 pub use catalog::{
     CatalogError, DatasetInfo, ScalarType, read_mpi_catalog, read_mpi_named_catalog,
 };
+#[cfg(feature = "mpi")]
 pub use chunked::{read_mpi_chunked, read_mpi_chunked_catalog, write_mpi_chunked};
+#[cfg(feature = "mpi")]
 pub use collections::*;
 pub use format::IoElement;
+#[cfg(feature = "mpi")]
 pub use mpi_io::{read_mpi, read_mpi_with_options, write_mpi, write_mpi_with_options};
+#[cfg(feature = "mpi")]
 pub use named_mpi::{
     append_mpi_named, append_mpi_named_with_options, read_mpi_named, read_mpi_named_with_options,
     write_mpi_named, write_mpi_named_with_options,
 };
+#[cfg(feature = "mpi")]
 pub use options::{MpiIoMode, MpiIoOptions, RawByteOrder, RawReadOptions};
+#[cfg(feature = "mpi")]
 pub use raw::read_mpi_raw;
+#[cfg(feature = "hdf5")]
+pub use serial_hdf5::{read_hdf5_serial, write_hdf5_serial};
 
 #[cfg(feature = "parallel-hdf5")]
 pub use hdf5_io::{
@@ -92,11 +155,12 @@ pub use hdf5_options::{
 
 use thiserror::Error;
 
-/// Errors returned by collective native I/O.
+/// Errors returned by native I/O.
 ///
-/// Variants can differ across ranks: a flush failure on rank zero may report
-/// [`IoError::WriteIncomplete`] there and [`IoError::CollectivePrecondition`] on
-/// peers. All ranks must still follow the same subsequent collective call order,
+/// For collective I/O, variants can differ across ranks: a flush failure on rank
+/// zero may report [`IoError::WriteIncomplete`] there and
+/// [`IoError::CollectivePrecondition`] on peers. All ranks must still follow the
+/// same subsequent collective call order,
 /// not branch independently on their local error variant.
 #[derive(Debug, Clone, Error)]
 pub enum IoError {
@@ -190,6 +254,7 @@ pub enum IoError {
 }
 
 /// Errors specific to named datasets.
+#[cfg(feature = "mpi")]
 #[derive(Debug, Clone, Error)]
 pub enum NamedIoError {
     /// The name is empty, too long, or contains a NUL byte.
@@ -210,28 +275,38 @@ pub enum NamedIoError {
 }
 
 /// The on-file format version used by both backends.
+#[cfg(any(feature = "mpi", feature = "hdf5"))]
 const FORMAT_VERSION: u64 = 1;
 
 /// The I/O protocol namespace; array and FFT operation namespaces are unrelated.
+#[cfg(feature = "mpi")]
 const IO_NAMESPACE: u64 = 0x494f_0000;
 
 /// Commit marker written only after payload and flush success.
+#[cfg(any(feature = "mpi", feature = "hdf5"))]
 const COMMIT_MARKER: u64 = 0x434f_4d4d_4954_5445;
 
 /// Initial marker value.  It is deliberately not accepted by readers.
+#[cfg(any(feature = "mpi", feature = "hdf5"))]
 const INCOMPLETE_MARKER: u64 = 0x494e_434f_4d50_4c45;
 
 /// Maximum descriptor/header size accepted before any file-controlled allocation.
+#[cfg(feature = "mpi")]
 const MAX_HEADER_BYTES: usize = 1024 * 1024;
 
 /// Maximum collective descriptor size.  Paths and ranks are bounded before allgather.
+#[cfg(feature = "mpi")]
 const MAX_DESCRIPTOR_BYTES: usize = 64 * 1024;
 
 /// MPI count and HDF5 dimensions use this conservative protocol limit.
+#[cfg(any(feature = "mpi", feature = "hdf5"))]
 const MAX_PROTOCOL_RANK: usize = 1024;
 
+#[cfg(feature = "mpi")]
 const OP_WRITE_MPI: u64 = 1;
+#[cfg(feature = "mpi")]
 const OP_READ_MPI: u64 = 2;
+#[cfg(feature = "mpi")]
 const OP_READ_RAW_MPI: u64 = 8;
 #[cfg(feature = "parallel-hdf5")]
 const OP_WRITE_HDF5: u64 = 3;
@@ -244,7 +319,7 @@ const OP_APPEND_HDF5_NAMED: u64 = 6;
 #[cfg(feature = "parallel-hdf5")]
 const OP_READ_HDF5_NAMED: u64 = 7;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "mpi"))]
 mod tests {
     use std::path::Path;
 

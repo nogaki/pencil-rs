@@ -163,8 +163,9 @@ member index through `CollectionError<E>` and does not roll back earlier members
 An arbitrary panic during member execution is fail-stop via MPI abort, not a
 promise of cross-rank panic recovery or another potentially mismatched reduction.
 
-`pencil-io` also provides `write_mpi_collection` / `read_mpi_collection` and their
-HDF5 counterparts. These accept the Cartesian communicator explicitly and view
+With its default `mpi` feature, `pencil-io` also provides `write_mpi_collection` /
+`read_mpi_collection`; their HDF5 counterparts require `parallel-hdf5`.
+These accept the Cartesian communicator explicitly and view
 slices, and store one `[component, extra..., spatial...]` payload using the
 existing single-dataset format. Every read destination is staged until native
 cleanup and agreement succeed. Option-bearing collection forms preserve the
@@ -510,9 +511,47 @@ See [`tools/fftw-reference/README.md`](tools/fftw-reference/README.md) and run
 `tools/fftw-reference/check.sh` only when Julia, FFTW.jl, and MPI are locally
 available.
 
+## Serial HDF5 without MPI
+
+`pencil-io` can read and write flat slices without MPI or `pencil-array`:
+
+```toml
+[dependencies]
+pencil-io = { version = "0.1.0", default-features = false, features = ["hdf5"] }
+```
+
+An installed serial HDF5 library and headers are still required (Debian/Ubuntu:
+`sudo apt-get install libhdf5-dev pkg-config`); discovery uses `pkg-config` or
+`HDF5_DIR`. The default `mpi` feature preserves the existing collective API.
+`parallel-hdf5` enables both `mpi` and `hdf5` plus native MPIO support and still
+requires parallel HDF5. Features are additive, so enabling either MPI feature
+elsewhere in the dependency graph restores the MPI dependency.
+
+`write_hdf5_serial(path, global_shape, extra_shape, values)` and
+`read_hdf5_serial(path, global_shape, extra_shape, destination)` take shape slices
+and a complete `IoElement` buffer in canonical row-major `[extra..., spatial...]`
+order. Both return `Result<(), IoError>`. They use the same single-dataset
+`/pencil_io_v1/data` format as parallel HDF5, supporting all 12 scalar types
+(`i8` through `u64`, `f32`/`f64`, and complex `f32`/`f64`). Writes exclusively
+create new files without overwriting; a returned read error leaves the
+destination unchanged. Failed writes may leave a file behind; no rollback or
+crash recovery is promised. Named datasets, collections, catalogs, sessions,
+and raw input are not part of this serial API. See the
+[working slice example](crates/pencil-io/README.md#serial-hdf5-without-mpi).
+
+The focused serial CI checks select only `pencil-io`, not the MPI workspace:
+
+```bash
+cargo test -p pencil-io --no-default-features --features hdf5 --locked
+cargo clippy -p pencil-io --no-default-features --features hdf5 --all-targets --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc -p pencil-io --no-default-features --features hdf5 --no-deps --locked
+cargo tree -p pencil-io --no-default-features --features hdf5 --edges normal,build --prefix none --locked
+# The normal/build tree must contain no mpi, mpi-sys, pencil-array, or build-probe-mpi.
+```
+
 ## Native collective I/O
 
-`pencil-io` is a separate crate that adds collective,
+With its default `mpi` feature, `pencil-io` adds collective,
 decomposition-independent persistence for `PencilArray` views without changing
 `pencil-array` or `pencil-fft`. Its native MPI-IO backend writes one versioned
 header and canonical little-endian row-major payload per file, and uses MPI
@@ -555,7 +594,7 @@ refused until that invalid tail is handled outside this API. There is no
 artificial global 1 GiB limit; native per-rank count, dimension and file-offset
 limits still apply.
 
-The optional HDF5 counterparts are `write_hdf5_named`, `append_hdf5_named`, and
+The `parallel-hdf5` counterparts are `write_hdf5_named`, `append_hdf5_named`, and
 `read_hdf5_named`. They use `/pencil_io_named_v1` with injectively encoded UTF-8
 keys, original-name attributes, and per-dataset metadata/commit markers. Append
 opens the file read/write without truncation. Names are keys, not filesystem
@@ -702,7 +741,7 @@ The feature-enabled build checks used by CI are:
 pkg-config --exists hdf5-openmpi
 pkg-config --exists hdf5
 cargo check -p pencil-io --all-features --all-targets --locked
-cargo test -p pencil-io --no-default-features --test mpi_io --no-run --locked
+cargo test -p pencil-io --no-default-features --features mpi --test mpi_io --no-run --locked
 cargo test -p pencil-io --features parallel-hdf5 --test hdf5_io --no-run --locked
 cargo clippy -p pencil-io --all-features --all-targets --locked -- -D warnings
 cargo doc -p pencil-io --all-features --no-deps --locked
@@ -732,8 +771,9 @@ pkg-config --modversion hdf5-openmpi
 The default build uses upstream rsmpi and native MPI bindings:
 
 - Rust stable, with a minimum supported Rust version of 1.85
-- A C MPI implementation such as Open MPI or MPICH (for `pencil-array` and
-  distributed tests; local `pencil-fft` tests do not require MPI)
+- A C MPI implementation such as Open MPI or MPICH (for `pencil-array`, default
+  `pencil-io`, and distributed tests; local `pencil-fft` and serial-only
+  `pencil-io` tests do not require MPI)
 - `mpicc` and `mpiexec` available on `PATH`
 - libclang and its C development headers, required by bindgen while building
   the MPI bindings
@@ -786,10 +826,11 @@ mpi = { version = "=0.8.2", default-features = false, features = ["mpi-rt-sys-ba
 mpi = { git = "https://github.com/tensor4all/rsmpi-rt", rev = "736d45cdfd816e4013f9b46801d7ee5eb17ad2e8" }
 ```
 
-**Not supported yet:** `pencil-io`, including MPI-IO and parallel HDF5. It uses
-native FFI constants and handles which differ from rsmpi-rt's MPIABI interface;
-HDF5 also needs an ABI-compatible MPI stack. Do not use `--workspace` with this
-runtime configuration. Default local `pencil-fft` remains MPI-free.
+**Not supported yet:** `pencil-io`'s MPI backends, including MPI-IO and parallel
+HDF5. They use native FFI constants and handles which differ from rsmpi-rt's
+MPIABI interface; parallel HDF5 also needs an ABI-compatible MPI stack. Do not
+use `--workspace` with this runtime configuration. Default local `pencil-fft`
+and serial-only `pencil-io` remain MPI-free and need no runtime MPI patch.
 
 ## Verification
 
@@ -884,7 +925,7 @@ all topologies and arrays before MPI finalizes.
 | [`pencil-array`](crates/pencil-array/README.md) | MPI-distributed arrays, layouts and transposes |
 | [`pencil-fft`](crates/pencil-fft/README.md) | MPI-free local FFTs, with optional distributed/native backends |
 | [`pencil-fftw`](crates/pencil-fftw/README.md) | Optional native FFTW adapter |
-| [`pencil-io`](crates/pencil-io/README.md) | MPI-IO and optional parallel HDF5 |
+| [`pencil-io`](crates/pencil-io/README.md) | MPI-IO by default; optional serial HDF5 without MPI or parallel HDF5 |
 
 See [RELEASING.md](RELEASING.md) for package verification, native prerequisites,
 and dependency-ordered publication. Packaging and dry-runs do not upload crates;

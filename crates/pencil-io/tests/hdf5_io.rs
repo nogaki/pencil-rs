@@ -6,7 +6,7 @@ use hdf5_metno::{File, H5Type};
 use mpi::traits::*;
 use num_complex::Complex;
 use pencil_array::{AxisPermutation, ExtraShape, MpiTopology, Pencil, PencilArray};
-use pencil_io::{IoError, read_hdf5, write_hdf5};
+use pencil_io::{IoError, read_hdf5, read_hdf5_serial, write_hdf5, write_hdf5_serial};
 
 mod support;
 use support::{
@@ -172,7 +172,14 @@ fn parallel_hdf5_preserves_logical_order_and_rejects_bad_files() {
         if values != expected {
             return Err("HDF5 logical payload".to_owned());
         }
-        h5(file.close())
+        h5(file.close())?;
+        let mut serial = vec![-1i32; expected.len()];
+        read_hdf5_serial(&path, &[4, 5], &[2], &mut serial).map_err(|e| e.to_string())?;
+        if serial != expected {
+            return Err("parallel-to-serial batched payload".to_owned());
+        }
+        write_hdf5_serial(directory.join("array-serial.h5"), &[4, 5], &[2], &expected)
+            .map_err(|e| e.to_string())
     });
     world.barrier();
 
@@ -198,6 +205,9 @@ fn parallel_hdf5_preserves_logical_order_and_rejects_bad_files() {
     let reader_pencil = Pencil::<2, 2>::new(reader_topology, [4, 5], [1, 0]).unwrap();
     let mut destination = PencilArray::from_elem(reader_pencil, extra, -777i32).unwrap();
     read_hdf5(&path, destination.view_mut()).unwrap();
+    assert_i32_values(&destination);
+    destination.as_mut_slice().fill(-111);
+    read_hdf5(directory.join("array-serial.h5"), destination.view_mut()).unwrap();
     assert_i32_values(&destination);
 
     let missing_path = directory.join("missing.h5");
@@ -462,6 +472,13 @@ fn parallel_hdf5_preserves_logical_order_and_rejects_bad_files() {
     read_hdf5(&zero_path, zero_destination.view_mut()).unwrap();
     assert!(zero_destination.as_slice().is_empty());
     world.barrier();
+    let zero_serial = directory.join("zero-serial.h5");
+    root_status(&world, || {
+        read_hdf5_serial::<_, i32>(&zero_path, &[4, 5], &[0], &mut [])
+            .map_err(|e| e.to_string())?;
+        write_hdf5_serial::<_, i32>(&zero_serial, &[4, 5], &[0], &[]).map_err(|e| e.to_string())
+    });
+    read_hdf5(&zero_serial, zero_destination.view_mut()).unwrap();
 
     macro_rules! scalar_case {
         ($name:literal, $ty:ty, $make:expr) => {
@@ -470,8 +487,24 @@ fn parallel_hdf5_preserves_logical_order_and_rejects_bad_files() {
                 &directory,
                 $name,
                 $make,
-                |path, view| write_hdf5(path, view).unwrap(),
-                |path, view| read_hdf5(path, view).unwrap(),
+                |path, view| {
+                    write_hdf5(path, view).unwrap();
+                    world.barrier();
+                    root_status(&world, || {
+                        let expected: Vec<$ty> = (0usize..4)
+                            .flat_map(|x| (0usize..5).map(move |y| ($make)(x, y)))
+                            .collect();
+                        let mut serial = vec![($make)(9usize, 9usize); 20];
+                        read_hdf5_serial(path, &[4, 5], &[], &mut serial)
+                            .map_err(|e| e.to_string())?;
+                        if serial != expected {
+                            return Err(format!("parallel-to-serial {}", $name));
+                        }
+                        write_hdf5_serial(path.with_extension("serial.h5"), &[4, 5], &[], &expected)
+                            .map_err(|e| e.to_string())
+                    });
+                },
+                |path, view| read_hdf5(path.with_extension("serial.h5"), view).unwrap(),
             );
         };
     }
@@ -479,6 +512,7 @@ fn parallel_hdf5_preserves_logical_order_and_rejects_bad_files() {
     scalar_case!("u8.h5", u8, |x, y| (x * 10 + y) as u8);
     scalar_case!("i16.h5", i16, |x, y| (x * 100 + y) as i16);
     scalar_case!("u16.h5", u16, |x, y| (x * 100 + y) as u16);
+    scalar_case!("i32.h5", i32, |x, y| (x * 100 + y) as i32);
     scalar_case!("u32.h5", u32, |x, y| (x * 100 + y) as u32);
     scalar_case!("i64.h5", i64, |x, y| (x * 100 + y) as i64);
     scalar_case!("u64.h5", u64, |x, y| (x * 100 + y) as u64);

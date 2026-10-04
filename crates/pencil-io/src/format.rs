@@ -1,15 +1,17 @@
 use std::convert::TryInto;
 
 use num_complex::Complex;
+#[cfg(feature = "mpi")]
 use pencil_array::{Pencil, PencilArrayView, PencilArrayViewMut};
 
+#[cfg(any(feature = "mpi", feature = "hdf5"))]
 use crate::IoError;
 
 mod sealed {
     pub trait Sealed {}
 }
 
-/// A sealed scalar representation supported by both native backends.
+/// A sealed scalar representation supported by the native I/O backends.
 ///
 /// Values are identified by a stable code and encoded in canonical
 /// little-endian bytes.  The set intentionally excludes platform-sized and
@@ -122,6 +124,7 @@ impl IoElement for Complex<f64> {
     }
 }
 
+#[cfg(feature = "mpi")]
 fn canonical_dims<const N: usize, const M: usize>(
     extra: &[usize],
     pencil: &Pencil<N, M>,
@@ -144,6 +147,7 @@ fn canonical_dims<const N: usize, const M: usize>(
     Ok(dims)
 }
 
+#[cfg(any(feature = "mpi", feature = "hdf5"))]
 pub(crate) fn element_count(dims: &[usize]) -> Result<usize, IoError> {
     dims.iter().try_fold(1usize, |product, &extent| {
         product.checked_mul(extent).ok_or(IoError::SizeLimit {
@@ -152,6 +156,7 @@ pub(crate) fn element_count(dims: &[usize]) -> Result<usize, IoError> {
     })
 }
 
+#[cfg(feature = "mpi")]
 pub(crate) fn pack_view<T: IoElement, const N: usize, const M: usize>(
     view: &PencilArrayView<'_, T, N, M>,
 ) -> Result<Vec<u8>, IoError> {
@@ -197,6 +202,7 @@ pub(crate) fn pack_view<T: IoElement, const N: usize, const M: usize>(
 /// order.  All allocation and index validation happens before callers close
 /// their native resources; the returned vector can therefore be committed with
 /// one infallible slice copy.
+#[cfg(feature = "mpi")]
 pub(crate) fn prepare_physical_values<T: IoElement, const N: usize, const M: usize>(
     view: &PencilArrayViewMut<'_, T, N, M>,
     packed: &[u8],
@@ -272,6 +278,7 @@ pub(crate) fn prepare_physical_values<T: IoElement, const N: usize, const M: usi
     Ok(values)
 }
 
+#[cfg(feature = "mpi")]
 fn set_indices(flat: usize, dims: &[usize], indices: &mut [usize]) {
     let mut remaining = flat;
     for axis in (0..dims.len()).rev() {

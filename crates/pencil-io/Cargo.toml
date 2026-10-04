@@ -5,18 +5,90 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Collective MPI-IO and optional parallel HDF5 for pencil arrays"
+description = "MPI-IO for pencil arrays and optional serial or parallel HDF5"
 readme = "README.md"
 include = ["Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "NOTICE.md", "src/**/*.rs", "tests/**/*.rs", "examples/**/*.rs"]
 
 [features]
-default = []
-parallel-hdf5 = ["dep:hdf5-metno", "dep:hdf5-metno-sys"]
+default = ["mpi"]
+mpi = ["dep:mpi", "dep:pencil-array"]
+hdf5 = ["dep:hdf5-metno", "dep:hdf5-metno-sys"]
+parallel-hdf5 = ["mpi", "hdf5", "hdf5-metno/mpio", "hdf5-metno-sys/mpio"]
 
 [dependencies]
-mpi.workspace = true
+mpi = { workspace = true, optional = true }
 num-complex = "0.4.6"
 thiserror.workspace = true
-pencil-array = { version = "0.1.0", path = "../pencil-array" }
-hdf5-metno = { version = "=0.12.0", default-features = false, features = ["mpio"], optional = true }
-hdf5-metno-sys = { version = "=0.11.0", features = ["mpio"], optional = true }
+pencil-array = { version = "0.1.0", path = "../pencil-array", optional = true }
+hdf5-metno = { version = "=0.12.0", default-features = false, optional = true }
+hdf5-metno-sys = { version = "=0.11.0", optional = true }
+
+[[test]]
+name = "catalog"
+path = "tests/catalog.rs"
+required-features = ["mpi"]
+
+[[test]]
+name = "chunked"
+path = "tests/chunked.rs"
+required-features = ["mpi"]
+
+[[test]]
+name = "collections"
+path = "tests/collections.rs"
+required-features = ["mpi"]
+
+[[test]]
+name = "external_views_io"
+path = "tests/external_views_io.rs"
+required-features = ["mpi"]
+
+[[test]]
+name = "hdf5_filters"
+path = "tests/hdf5_filters.rs"
+required-features = ["parallel-hdf5"]
+
+[[test]]
+name = "hdf5_io"
+path = "tests/hdf5_io.rs"
+required-features = ["parallel-hdf5"]
+
+[[test]]
+name = "hdf5_session"
+path = "tests/hdf5_session.rs"
+required-features = ["parallel-hdf5"]
+
+[[test]]
+name = "mpi_io"
+path = "tests/mpi_io.rs"
+required-features = ["mpi"]
+
+[[test]]
+name = "mpi_session"
+path = "tests/mpi_session.rs"
+required-features = ["mpi"]
+
+[[test]]
+name = "named_collections"
+path = "tests/named_collections.rs"
+required-features = ["mpi"]
+
+[[test]]
+name = "named_hdf5"
+path = "tests/named_hdf5.rs"
+required-features = ["parallel-hdf5"]
+
+[[test]]
+name = "named_mpi"
+path = "tests/named_mpi.rs"
+required-features = ["mpi"]
+
+[[test]]
+name = "new_options"
+path = "tests/new_options.rs"
+required-features = ["mpi"]
+
+[[test]]
+name = "serial_hdf5"
+path = "tests/serial_hdf5.rs"
+required-features = ["hdf5"]
