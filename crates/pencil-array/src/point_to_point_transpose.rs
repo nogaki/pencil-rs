@@ -32,8 +32,8 @@ use crate::{
     transpose::{
         CommunicationMode, OverlapError, POINT_TO_POINT_RESERVED_TAG, PreparedExchange,
         TransposeError, TransposePlanCore, TransposeTiming, TransposeWorkspace,
-        TransposeWorkspaceRequirements, collective_valid, finish_in_place, pack_source,
-        prepare_in_place, unpack_destination,
+        TransposeWorkspaceRequirements, agree_preflight, collective_valid, finish_in_place,
+        pack_source, prepare_in_place, unpack_destination,
     },
 };
 
@@ -144,15 +144,12 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
             CommunicationMode::PointToPoint.views_operation(),
         )?;
 
-        let local_preflight = self
-            .core
-            .prepare_execution(&source, &destination, workspace);
-        if !collective_valid(communicator, local_preflight.is_ok()) {
-            return Err(local_preflight
-                .err()
-                .unwrap_or(TransposeError::CollectivePreconditionFailed));
-        }
-        let prepared = local_preflight.expect("collective point-to-point preflight succeeded");
+        let prepared = agree_preflight(
+            communicator,
+            self.core
+                .prepare_execution(&source, &destination, workspace),
+            TransposeError::CollectivePreconditionFailed,
+        )?;
         let extra_count = source.extra_shape().element_count();
 
         execute_point_to_point_exchange(
@@ -193,15 +190,12 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
             destination.extra_shape(),
             CommunicationMode::PointToPoint.timed_views_operation(),
         )?;
-        let local_preflight = self
-            .core
-            .prepare_execution(&source, &destination, workspace);
-        if !collective_valid(communicator, local_preflight.is_ok()) {
-            return Err(local_preflight
-                .err()
-                .unwrap_or(TransposeError::CollectivePreconditionFailed));
-        }
-        let prepared = local_preflight.expect("collective point-to-point preflight succeeded");
+        let prepared = agree_preflight(
+            communicator,
+            self.core
+                .prepare_execution(&source, &destination, workspace),
+            TransposeError::CollectivePreconditionFailed,
+        )?;
         let extra_count = source.extra_shape().element_count();
         let mut timing = TransposeTiming::default();
         execute_point_to_point_exchange_timed(
@@ -251,16 +245,13 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
             CommunicationMode::PointToPoint.callback_operation(),
         )
         .map_err(OverlapError::Transpose)?;
-        let local = self
-            .core
-            .prepare_execution(&source, &destination, workspace);
-        if !collective_valid(communicator, local.is_ok()) {
-            return Err(local.err().map_or(
-                OverlapError::CollectivePreconditionFailed,
-                OverlapError::Transpose,
-            ));
-        }
-        let prepared = local.expect("collective point-to-point preflight succeeded");
+        let prepared = agree_preflight(
+            communicator,
+            self.core
+                .prepare_execution(&source, &destination, workspace)
+                .map_err(OverlapError::Transpose),
+            OverlapError::CollectivePreconditionFailed,
+        )?;
         let extra_count = source.extra_shape().element_count();
         execute_point_to_point_exchange_callback(
             &self.core,
@@ -319,14 +310,11 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
             CommunicationMode::PointToPoint.callback_in_place_operation(),
         )
         .map_err(OverlapError::Transpose)?;
-        let local = prepare_in_place(&self.core, array, workspace);
-        if !collective_valid(communicator, local.is_ok()) {
-            return Err(local.err().map_or(
-                OverlapError::CollectivePreconditionFailed,
-                OverlapError::Transpose,
-            ));
-        }
-        let prepared = local.expect("collective in-place preflight succeeded");
+        let prepared = agree_preflight(
+            communicator,
+            prepare_in_place(&self.core, array, workspace).map_err(OverlapError::Transpose),
+            OverlapError::CollectivePreconditionFailed,
+        )?;
         let extra_count = array.extra_shape().element_count();
         // The transport reserves and agrees before invoking pack. Delay poisoning
         // until then so reservation failure is still an atomic preflight failure.
@@ -408,13 +396,11 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
             CommunicationMode::PointToPoint.in_place_operation(),
         )?;
 
-        let local_preflight = prepare_in_place(&self.core, array, workspace);
-        if !collective_valid(communicator, local_preflight.is_ok()) {
-            return Err(local_preflight
-                .err()
-                .unwrap_or(TransposeError::CollectivePreconditionFailed));
-        }
-        let prepared = local_preflight.expect("collective in-place preflight succeeded");
+        let prepared = agree_preflight(
+            communicator,
+            prepare_in_place(&self.core, array, workspace),
+            TransposeError::CollectivePreconditionFailed,
+        )?;
         let extra_count = array.extra_shape().element_count();
         {
             let source = array
@@ -458,13 +444,11 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
             array.extra_shape(),
             CommunicationMode::PointToPoint.timed_in_place_operation(),
         )?;
-        let local = prepare_in_place(&self.core, array, workspace);
-        if !collective_valid(communicator, local.is_ok()) {
-            return Err(local
-                .err()
-                .unwrap_or(TransposeError::CollectivePreconditionFailed));
-        }
-        let prepared = local.expect("collective in-place preflight succeeded");
+        let prepared = agree_preflight(
+            communicator,
+            prepare_in_place(&self.core, array, workspace),
+            TransposeError::CollectivePreconditionFailed,
+        )?;
         let extra_count = array.extra_shape().element_count();
         let mut timing = TransposeTiming::default();
         {

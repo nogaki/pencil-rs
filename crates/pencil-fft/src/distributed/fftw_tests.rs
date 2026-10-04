@@ -70,13 +70,13 @@ fn native_operation_words_do_not_collide() {
     for source in [
         include_str!("../distributed.rs"),
         include_str!("r2c.rs"),
+        include_str!("c2r.rs"),
         include_str!("r2r.rs"),
         include_str!("mixed.rs"),
     ] {
-        for line in source
-            .lines()
-            .filter(|line| line.starts_with("const OPERATION_"))
-        {
+        for line in source.lines().filter(|line| {
+            line.starts_with("const OPERATION_") || line.starts_with("pub(super) const OPERATION_")
+        }) {
             let (name, value) = line.split_once(" = ").expect("literal operation word");
             let word: u64 = value.trim_end_matches(';').parse().unwrap();
             assert!(
@@ -85,7 +85,7 @@ fn native_operation_words_do_not_collide() {
             );
         }
     }
-    for word in 127..=132 {
+    for word in (127..=132).chain([134]) {
         let name = words.get(&word).expect("native family reservation");
         assert!(name.contains("NATIVE"));
     }

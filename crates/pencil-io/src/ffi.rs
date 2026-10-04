@@ -446,6 +446,24 @@ pub(crate) fn file_set_view_with_info(
     }
 }
 
+fn byte_transfer_result(code: c_int, status: &ffi::MPI_Status) -> Result<usize, i32> {
+    if code != ffi::MPI_SUCCESS as c_int {
+        return Err(code);
+    }
+    let mut actual = 0;
+    // SAFETY: callers supply the status of a completed byte transfer while MPI
+    // is initialized; the predefined datatype and writable count are valid.
+    let count_code = unsafe { ffi::MPI_Get_count(status, ffi::RSMPI_UINT8_T, &mut actual) };
+    if count_code != ffi::MPI_SUCCESS as c_int || actual < 0 {
+        return Err(if count_code == ffi::MPI_SUCCESS as c_int {
+            ffi::MPI_ERR_OTHER as i32
+        } else {
+            count_code
+        });
+    }
+    Ok(actual as usize)
+}
+
 pub(crate) fn file_write_at_all(
     file: ffi::MPI_File,
     offset: ffi::MPI_Offset,
@@ -484,19 +502,7 @@ pub(crate) fn file_write_at(
             ffi::RSMPI_UINT8_T,
             &mut status,
         );
-        if code != ffi::MPI_SUCCESS as c_int {
-            return Err(code);
-        }
-        let mut actual = 0;
-        let count_code = ffi::MPI_Get_count(&status, ffi::RSMPI_UINT8_T, &mut actual);
-        if count_code != ffi::MPI_SUCCESS as c_int || actual < 0 {
-            return Err(if count_code == ffi::MPI_SUCCESS as c_int {
-                ffi::MPI_ERR_OTHER as i32
-            } else {
-                count_code
-            });
-        }
-        Ok(actual as usize)
+        byte_transfer_result(code, &status)
     }
 }
 
@@ -538,19 +544,7 @@ pub(crate) fn file_read_at(
             ffi::RSMPI_UINT8_T,
             &mut status,
         );
-        if code != ffi::MPI_SUCCESS as c_int {
-            return Err(code);
-        }
-        let mut actual = 0;
-        let count_code = ffi::MPI_Get_count(&status, ffi::RSMPI_UINT8_T, &mut actual);
-        if count_code != ffi::MPI_SUCCESS as c_int || actual < 0 {
-            return Err(if count_code == ffi::MPI_SUCCESS as c_int {
-                ffi::MPI_ERR_OTHER as i32
-            } else {
-                count_code
-            });
-        }
-        Ok(actual as usize)
+        byte_transfer_result(code, &status)
     }
 }
 
@@ -573,19 +567,7 @@ pub(crate) fn file_write_all(file: ffi::MPI_File, bytes: &[u8]) -> Result<usize,
             ffi::RSMPI_UINT8_T,
             &mut status,
         );
-        if code != ffi::MPI_SUCCESS as c_int {
-            return Err(code);
-        }
-        let mut actual = 0;
-        let count_code = ffi::MPI_Get_count(&status, ffi::RSMPI_UINT8_T, &mut actual);
-        if count_code != ffi::MPI_SUCCESS as c_int || actual < 0 {
-            return Err(if count_code == ffi::MPI_SUCCESS as c_int {
-                ffi::MPI_ERR_OTHER as i32
-            } else {
-                count_code
-            });
-        }
-        Ok(actual as usize)
+        byte_transfer_result(code, &status)
     }
 }
 
@@ -603,19 +585,7 @@ pub(crate) fn file_write_independent(file: ffi::MPI_File, bytes: &[u8]) -> Resul
             ffi::RSMPI_UINT8_T,
             &mut status,
         );
-        if code != ffi::MPI_SUCCESS as c_int {
-            return Err(code);
-        }
-        let mut actual = 0;
-        let code = ffi::MPI_Get_count(&status, ffi::RSMPI_UINT8_T, &mut actual);
-        if code != ffi::MPI_SUCCESS as c_int || actual < 0 {
-            return Err(if code == ffi::MPI_SUCCESS as c_int {
-                ffi::MPI_ERR_OTHER as i32
-            } else {
-                code
-            });
-        }
-        Ok(actual as usize)
+        byte_transfer_result(code, &status)
     }
 }
 
@@ -636,19 +606,7 @@ pub(crate) fn file_read_independent(file: ffi::MPI_File, bytes: &mut [u8]) -> Re
             ffi::RSMPI_UINT8_T,
             &mut status,
         );
-        if code != ffi::MPI_SUCCESS as c_int {
-            return Err(code);
-        }
-        let mut actual = 0;
-        let code = ffi::MPI_Get_count(&status, ffi::RSMPI_UINT8_T, &mut actual);
-        if code != ffi::MPI_SUCCESS as c_int || actual < 0 {
-            return Err(if code == ffi::MPI_SUCCESS as c_int {
-                ffi::MPI_ERR_OTHER as i32
-            } else {
-                code
-            });
-        }
-        Ok(actual as usize)
+        byte_transfer_result(code, &status)
     }
 }
 
@@ -671,19 +629,7 @@ pub(crate) fn file_read_all(file: ffi::MPI_File, bytes: &mut [u8]) -> Result<usi
             ffi::RSMPI_UINT8_T,
             &mut status,
         );
-        if code != ffi::MPI_SUCCESS as c_int {
-            return Err(code);
-        }
-        let mut actual = 0;
-        let count_code = ffi::MPI_Get_count(&status, ffi::RSMPI_UINT8_T, &mut actual);
-        if count_code != ffi::MPI_SUCCESS as c_int || actual < 0 {
-            return Err(if count_code == ffi::MPI_SUCCESS as c_int {
-                ffi::MPI_ERR_OTHER as i32
-            } else {
-                count_code
-            });
-        }
-        Ok(actual as usize)
+        byte_transfer_result(code, &status)
     }
 }
 

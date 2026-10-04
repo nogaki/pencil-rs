@@ -73,6 +73,22 @@ fn host_contracts() {
         plan_r2c::<f64>(0, PlanOptions::default()),
         Err(FftwError::InvalidOptions(_))
     ));
+    for n in [0, 1] {
+        assert!(matches!(
+            plan_r2r::<f64>(n, R2rKind::DctI, PlanOptions::default()),
+            Err(FftwError::InvalidOptions(_))
+        ));
+    }
+    for kind in r2r_kinds() {
+        assert!(matches!(
+            plan_r2r::<f32>(0, kind, PlanOptions::default()),
+            Err(FftwError::InvalidOptions(_))
+        ));
+        assert!(matches!(
+            plan_r2r::<f64>(i32::MAX as usize + 1, kind, PlanOptions::default()),
+            Err(FftwError::Overflow)
+        ));
+    }
 }
 fn matrix<R: Real + rustfft::num_traits::ToPrimitive>(threads: usize) {
     eprintln!(
@@ -425,6 +441,139 @@ fn native_f32() {
     for threads in [1, 2, 3] {
         matrix::<f32>(threads);
     }
+}
+
+fn r2r_kinds() -> [R2rKind; 9] {
+    [
+        R2rKind::DctI,
+        R2rKind::DctII,
+        R2rKind::DctIII,
+        R2rKind::DctIV,
+        R2rKind::DstI,
+        R2rKind::DstII,
+        R2rKind::DstIII,
+        R2rKind::DstIV,
+        R2rKind::Dht,
+    ]
+}
+
+fn native_r2r<R: Real + rustfft::num_traits::ToPrimitive>() {
+    for threads in [1, 2] {
+        let options = PlanOptions::new(PlanningRigor::Measure, None)
+            .unwrap()
+            .with_threads(threads)
+            .unwrap()
+            .with_conserve_memory(true);
+        for kind in r2r_kinds() {
+            for n in [1, 2, 3, 7, 8] {
+                if kind == R2rKind::DctI && n == 1 {
+                    continue;
+                }
+                let paired = match kind {
+                    R2rKind::DctII => R2rKind::DctIII,
+                    R2rKind::DctIII => R2rKind::DctII,
+                    R2rKind::DstII => R2rKind::DstIII,
+                    R2rKind::DstIII => R2rKind::DstII,
+                    _ => kind,
+                };
+                forget_wisdom::<R>().unwrap();
+                assert!(matches!(
+                    plan_r2r::<R>(n, kind, options.with_wisdom_only(true)),
+                    Err(FftwError::NullPlan)
+                ));
+                drop(plan_r2r::<R>(n, kind, options).unwrap());
+                let wisdom = export_wisdom::<R>().unwrap();
+                forget_wisdom::<R>().unwrap();
+                import_wisdom::<R>(&wisdom).unwrap();
+                let plan = plan_r2r::<R>(n, kind, options.with_wisdom_only(true)).unwrap();
+                let inverse = plan_r2r::<R>(n, paired, options).unwrap();
+                forget_wisdom::<R>().unwrap();
+                assert_eq!(plan.len(), n);
+                assert!(!plan.is_empty());
+                assert_eq!(plan.kind(), kind);
+                let source: Vec<_> = (0..n + 2).map(|i| c::<R>(0.17 * i as f64 - 0.4)).collect();
+                let saved = source.clone();
+                let mut output = vec![c::<R>(91.0); n + 2];
+                let complex_count = ffi::COMPLEX_EXECUTIONS.with(|c| c.get());
+                let r2r_count = ffi::R2R_EXECUTIONS.with(|c| c.get());
+                plan.process(&source[1..n + 1], &mut output[1..n + 1])
+                    .unwrap();
+                let mut inplace = source.clone();
+                plan.process_in_place(&mut inplace[1..n + 1]).unwrap();
+                assert_eq!(source, saved);
+                assert_eq!(output[0], c(91.0));
+                assert_eq!(output[n + 1], c(91.0));
+                assert_eq!(inplace[0], source[0]);
+                assert_eq!(inplace[n + 1], source[n + 1]);
+                for (&a, &b) in output[1..n + 1].iter().zip(&inplace[1..n + 1]) {
+                    near(
+                        Complex::new(a, R::zero()),
+                        Complex::new(b.to_f64().unwrap(), 0.0),
+                    );
+                }
+                assert_eq!(ffi::R2R_EXECUTIONS.with(|c| c.get()), r2r_count + 2);
+                assert_eq!(ffi::COMPLEX_EXECUTIONS.with(|c| c.get()), complex_count);
+                let factor = match kind {
+                    R2rKind::DctI => 2 * (n - 1),
+                    R2rKind::DstI => 2 * (n + 1),
+                    R2rKind::Dht => n,
+                    _ => 2 * n,
+                };
+                let handles: Vec<_> = (0..3)
+                    .map(|_| {
+                        let plan = Arc::clone(&plan);
+                        let inverse = Arc::clone(&inverse);
+                        let source = source[1..n + 1].to_vec();
+                        std::thread::spawn(move || {
+                            let mut output = vec![R::zero(); n];
+                            plan.process(&source, &mut output).unwrap();
+                            inverse.process_in_place(&mut output).unwrap();
+                            for (&actual, &expected) in output.iter().zip(&source) {
+                                near(
+                                    Complex::new(actual, R::zero()),
+                                    Complex::new(expected.to_f64().unwrap() * factor as f64, 0.0),
+                                );
+                            }
+                        })
+                    })
+                    .collect();
+                // Exact-sized API rejects short AND oversized slices before native execution.
+                let output_before = output.clone();
+                let inplace_before = inplace.clone();
+                let r2r_count = ffi::R2R_EXECUTIONS.with(|c| c.get());
+                for len in [0, n - 1, n + 1] {
+                    assert!(matches!(
+                        plan.process(&source[..len], &mut output[1..n + 1]),
+                        Err(FftError::InputBuffer(_, _))
+                    ));
+                    assert!(matches!(
+                        plan.process(&source[1..n + 1], &mut output[..len]),
+                        Err(FftError::OutputBuffer(_, _))
+                    ));
+                    assert!(matches!(
+                        plan.process_in_place(&mut inplace[..len]),
+                        Err(FftError::InputBuffer(_, _))
+                    ));
+                    assert_eq!(source, saved);
+                    assert_eq!(output, output_before);
+                    assert_eq!(inplace, inplace_before);
+                    assert_eq!(ffi::R2R_EXECUTIONS.with(|c| c.get()), r2r_count);
+                }
+                drop((plan, inverse));
+                for h in handles {
+                    h.join().unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires both native FFTW runtimes and pthread libraries"]
+fn native_r2r_alias_modes_wisdom_and_concurrency() {
+    let _guard = NATIVE_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    native_r2r::<f32>();
+    native_r2r::<f64>();
 }
 
 #[test]

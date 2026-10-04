@@ -28,6 +28,15 @@ assert_eq!(fft.len(), 16);
 - `plan_c2c<R: Real>(usize, FftDirection, PlanOptions) -> Result<Arc<dyn rustfft::Fft<R>>, FftwError>`.
 - `plan_r2c<R: Real>(usize, PlanOptions) -> Result<Arc<dyn realfft::RealToComplex<R>>, FftwError>`.
 - `plan_c2r<R: Real>(usize, PlanOptions) -> Result<Arc<dyn realfft::ComplexToReal<R>>, FftwError>`.
+- `plan_r2r<R: Real>(usize, R2rKind, PlanOptions) -> Result<Arc<R2rPlan<R>>, FftwError>`.
+  `R2rKind::{DctI, DctII, DctIII, DctIV, DstI, DstII, DstIII, DstIV, Dht}` selects
+  native `fftw[f]_plan_r2r_1d`/`execute_r2r` kernels. `R2rPlan::process(&[R], &mut [R])`
+  preserves input; `process_in_place(&mut [R])` uses a distinct native in-place
+  plan. Both require exactly `len()` values and return existing `realfft::FftError`
+  dimension errors before writes. `kind()` reports the selected kind. No scratch
+  or execution-time allocation is required. Length zero is invalid; DCT-I also
+  rejects length one before native loading. Lengths must fit `c_int` and Rust's
+  addressable allocation range. Complex consumers transform components separately.
 - `runtime_version<R: Real>() -> Result<String, FftwError>` queries the loaded runtime, not headers.
 - `PlanOptions::new(PlanningRigor, Option<Duration>) -> Result<PlanOptions, FftwError>`;
   private fields, `rigor()` and `time_limit()` getters. Default: Estimate, no limit,
@@ -50,17 +59,32 @@ per call (consumers loop for batching). Invalid C2C dimensions panic before nati
 execution, preserving input, output and scratch; real dimensions return the
 existing `FftError` variants before writes.
 C2R reports `InputValues` **after** execution for imaginary DC/even Nyquist.
-Real inputs are mutable and may be destroyed. Consumers needing preservation
-must copy them. C2C immutable input is explicitly preserved. Scratch lengths
+R2C/C2R inputs are mutable and may be destroyed. Consumers needing preservation
+must copy them. C2C and R2R immutable input is explicitly preserved. Scratch lengths
 are zero; any supplied scratch (including its tail) is untouched. Convenience
 vectors and private planning buffers are fully initialized. Planning buffers use
 fallible allocation; convenience trait Vec methods follow ordinary Rust allocation
 behavior because their signatures cannot return allocation errors.
 
-C2C owns distinct native IP/OOP plans. All plans use UNALIGNED, so ordinary Rust
-slices and offset subslices are valid. No native DCT/DST/DHT API is provided:
-consumer R2R/DHT integration must use complex embedding kernels, not claim direct
-native real-to-real transforms.
+C2C and R2R own distinct native IP/OOP plans. All plans use UNALIGNED, so ordinary
+Rust slices and offset subslices are valid. DCT-II/III and DST-II/III are paired
+inverses; DCT-I/IV, DST-I/IV and DHT are self-paired. Raw compositions scale by
+`2*(n-1)` for DCT-I, `2*(n+1)` for DST-I, `n` for DHT and `2*n` otherwise.
+
+`pencil-fft`'s FFTW DCT/DST/DHT locals call these native kernels (one per real
+component), not complex FFT embeddings. They reuse initialized caller complex
+workspace as two contiguous real component lines. For length `n`, both native
+DCT/DST and DHT report `embedding_len() = n` initialized complex elements and
+`scratch_len() = 0`. RustFFT defaults and workspace requirements are unchanged.
+
+Compatibility: native DCT/DST `embedding_len()` and too-small-buffer errors'
+`required` values now use `n`, not the historical RustFFT extension lengths.
+Old larger local buffers remain valid, with unused tails untouched. Compact
+native buffers must not be used with RustFFT unless they meet that plan's
+getters. Distributed shared embedding lines take the maximum stage requirement,
+which may not shrink when another stage dominates; no RSS reduction or speedup
+is promised. The independent [mixed endpoint tolerance model](../../README.md#distributed-mixed-axis-plans)
+is unchanged and does not use the workspace-capacity getter.
 
 ## Wisdom and CPU threads
 
@@ -136,7 +160,13 @@ and fails if either is unavailable. Native checks use independent direct DFTs
 and cover both precisions, all rigors with bounded planning, both directions,
 odd/even/unit sizes, batches, IP/OOP, offset buffers, preservation/error paths,
 arbitrary spectra, raw normalization and shared-plan concurrency with requested
-counts 1/2/3. Native wisdom tests prove reuse using public wisdom-only options
+counts 1/2/3. Native R2R checks cover all nine kinds, both alias modes, unit/minimal,
+odd/even lengths, validation-before-execution, offset tails, paired composition,
+shared-plan concurrency, flags and wisdom reuse. The `pencil-fft` ignored tests
+`native_r2r_oracles_and_workspace_contracts` and
+`native_dht_oracles_and_workspace_contracts` check independent definitions for
+real/complex f32/f64, raw/normalized IP/OOP paths and source/workspace preservation.
+Native wisdom tests prove reuse using public wisdom-only options
 after all original plans drop, precision isolation, existing-plan validity after
 forget, invalid/NUL input, and concurrent planning/execution/wisdom.
 Fresh-process traces cover serial-first, each wisdom operation first, and
@@ -146,8 +176,8 @@ setters. Fatal-state injection occurs only after real successful initialization;
 it does not simulate a genuine native out-of-memory failure. Thread reset checks
 use a raw WISDOM_ONLY probe without setting the count before observation.
 `ffi::tests::native_timelimit_calls_on_success_error_and_unwind` records arguments
-only after actual native time-limit calls, for f32/f64 success, WISDOM_ONLY null
-plans, and injected unwind after the budget setter. It asserts `[0.001, -1.0]`
+only after actual native time-limit calls, for C2C/DCT/DHT f32/f64 success,
+WISDOM_ONLY null plans, and injected unwind after the budget setter. It asserts `[0.001, -1.0]`
 before any subsequent constructor/setter. This observes real API calls, not
 internal FFTW state (no getter exists); that state relies on FFTW's API contract.
 The separate callback test checks generic RAII only.

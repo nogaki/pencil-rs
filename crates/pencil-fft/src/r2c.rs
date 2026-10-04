@@ -316,14 +316,10 @@ impl<R: FftReal> LocalR2cPlan<R> {
 
     /// Builds a plan using the runtime-loaded FFTW backend.
     #[cfg(feature = "fftw")]
-    #[allow(private_bounds)]
     pub fn new_fftw(
         real_len: usize,
         options: super::PlanOptions,
-    ) -> Result<Self, super::BackendInitError<LocalR2cError>>
-    where
-        R: super::backend::FftwReal,
-    {
+    ) -> Result<Self, super::BackendInitError<LocalR2cError>> {
         let complex_len =
             validate_lengths::<R>(real_len).map_err(super::BackendInitError::Local)?;
         #[cfg(all(test, feature = "distributed"))]

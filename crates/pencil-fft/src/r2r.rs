@@ -35,6 +35,20 @@ pub enum R2rKind {
 }
 
 impl R2rKind {
+    #[cfg(feature = "fftw")]
+    fn native_kind(self) -> pencil_fftw::R2rKind {
+        match self {
+            Self::DctI => pencil_fftw::R2rKind::DctI,
+            Self::DctII => pencil_fftw::R2rKind::DctII,
+            Self::DctIII => pencil_fftw::R2rKind::DctIII,
+            Self::DctIV => pencil_fftw::R2rKind::DctIV,
+            Self::DstI => pencil_fftw::R2rKind::DstI,
+            Self::DstII => pencil_fftw::R2rKind::DstII,
+            Self::DstIII => pencil_fftw::R2rKind::DstIII,
+            Self::DstIV => pencil_fftw::R2rKind::DstIV,
+        }
+    }
+
     #[cfg(feature = "distributed")]
     pub(crate) const fn descriptor_code(self) -> u64 {
         match self {
@@ -97,7 +111,8 @@ impl AxisR2rKind {
 /// This trait is sealed and is implemented for exactly `f32`, `f64`,
 /// `Complex<f32>`, and `Complex<f64>`. For complex element types the real and
 /// imaginary components are transformed independently. For real element types
-/// the imaginary component of the FFT embedding is discarded on output.
+/// RustFFT discards the imaginary component of its embedding on output; FFTW
+/// transforms only the real component.
 ///
 /// ```compile_fail
 /// use pencil_fft::R2rScalar;
@@ -110,7 +125,7 @@ impl AxisR2rKind {
 /// }
 /// ```
 pub trait R2rScalar: private::SealedR2rScalar + Copy + Send + Sync + 'static {
-    /// The real type used by the native RustFFT embedding.
+    /// The real type used by the selected transform backend.
     type Real: FftReal;
 }
 
@@ -223,8 +238,8 @@ pub enum LocalR2rError {
 ///
 /// `T` may be `f32`, `f64`, `Complex<f32>`, or `Complex<f64>`. Every data
 /// slice contains consecutive lines of [`Self::line_len`] values. Each call
-/// uses a caller-owned initialized complex embedding line of at least
-/// [`Self::embedding_len`] values and initialized native scratch of at least
+/// uses a caller-owned initialized complex workspace line of at least
+/// [`Self::embedding_len`] values and initialized FFT scratch of at least
 /// [`Self::scratch_len`] values; neither workspace is retained by the plan.
 /// The out-of-place methods preserve their source slices.
 ///
@@ -235,9 +250,12 @@ pub enum LocalR2rError {
 /// other kind. This divisor is the logical FFTW transform factor, never the
 /// complex embedding length.
 ///
-/// The deliberately simple embedding uses at most `8 * n` complex values per
-/// line, plus the queried native scratch. `ponytail: replace the extension
-/// line with a compact embedding only if measured memory use requires it.`
+/// RustFFT uses an embedding of at most `8 * n` complex values plus its queried
+/// scratch. FFTW uses native DCT/DST kernels, requiring only `n` complex workspace
+/// values as two contiguous real component buffers, with zero FFT scratch.
+/// Larger workspaces remain valid; their unused tails and all native scratch
+/// are preserved. Mixed-plan error estimates use a separate, backend-independent
+/// model length, unchanged by this compact native workspace.
 ///
 /// # Example
 ///
@@ -270,13 +288,56 @@ pub struct LocalR2rPlan<T: R2rScalar> {
     line_len: usize,
     kind: R2rKind,
     embedding_len: usize,
+    #[cfg(feature = "distributed")]
+    error_model_len: usize,
     scratch_len: usize,
     normalization_factor: usize,
-    fft: Arc<dyn Fft<T::Real>>,
+    fft: R2rKernel<T::Real>,
     marker: PhantomData<T>,
     backend: super::BackendKind,
     #[cfg(feature = "fftw")]
     backend_options: Option<super::PlanOptions>,
+}
+
+pub(crate) enum R2rKernel<R: FftReal> {
+    Rust(Arc<dyn Fft<R>>),
+    #[cfg(feature = "fftw")]
+    Native([Arc<pencil_fftw::R2rPlan<R>>; 2]),
+}
+
+// ponytail: native staging needs n complex values; RustFFT needs its full embedding.
+// Numerical error-model length stays backend-independent.
+#[cfg(feature = "fftw")]
+pub(crate) fn native_r2r_line<T: R2rScalar>(
+    plan: &pencil_fftw::R2rPlan<T::Real>,
+    source: &[T],
+    workspace: &mut [Complex<T::Real>],
+) {
+    let n = plan.len();
+    let (real, imaginary) =
+        bytemuck::cast_slice_mut::<Complex<T::Real>, T::Real>(&mut workspace[..n]).split_at_mut(n);
+    for ((re, im), &value) in real.iter_mut().zip(imaginary.iter_mut()).zip(source) {
+        let value = r2r_to_complex(value);
+        *re = value.re;
+        *im = value.im;
+    }
+    plan.process_in_place(real)
+        .expect("validated native line length");
+    if <T as private::SealedR2rScalar>::VALUE_KIND == 2 {
+        plan.process_in_place(imaginary)
+            .expect("validated native line length");
+    }
+}
+
+#[cfg(feature = "fftw")]
+pub(crate) fn native_r2r_output<R: FftReal>(
+    workspace: &[Complex<R>],
+    n: usize,
+) -> impl Iterator<Item = Complex<R>> + '_ {
+    let (real, imaginary) = bytemuck::cast_slice::<Complex<R>, R>(&workspace[..n]).split_at(n);
+    real.iter()
+        .zip(imaginary)
+        .map(|(&re, &im)| Complex::new(re, im))
 }
 
 impl<T: R2rScalar> fmt::Debug for LocalR2rPlan<T> {
@@ -300,71 +361,61 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
     /// failures and backend panics are not converted into
     /// [`LocalR2rError`].
     pub fn new(line_len: usize, kind: R2rKind) -> Result<Self, LocalR2rError> {
-        let (embedding_len, normalization_factor) = validate_lengths::<T>(line_len, kind)?;
+        let (model_len, normalization_factor) = validate_lengths::<T>(line_len, kind)?;
         let mut planner = FftPlanner::<T::Real>::new();
-        let fft = planner.plan_fft_forward(embedding_len);
-        Self::from_embedding(
-            line_len,
-            kind,
-            embedding_len,
-            normalization_factor,
-            fft,
-            super::BackendKind::RustFft,
-            #[cfg(feature = "fftw")]
-            None,
-        )
-    }
-
-    fn from_embedding(
-        line_len: usize,
-        kind: R2rKind,
-        embedding_len: usize,
-        normalization_factor: usize,
-        fft: Arc<dyn Fft<T::Real>>,
-        backend: super::BackendKind,
-        #[cfg(feature = "fftw")] backend_options: Option<super::PlanOptions>,
-    ) -> Result<Self, LocalR2rError> {
+        let fft = planner.plan_fft_forward(model_len);
         let scratch_len = fft.get_inplace_scratch_len();
         validate_addressable(scratch_len, size_of::<Complex<T::Real>>())?;
         Ok(Self {
             line_len,
             kind,
-            embedding_len,
+            embedding_len: model_len,
+            #[cfg(feature = "distributed")]
+            error_model_len: model_len,
             scratch_len,
             normalization_factor,
-            fft,
+            fft: R2rKernel::Rust(fft),
             marker: PhantomData,
-            backend,
+            backend: super::BackendKind::RustFft,
             #[cfg(feature = "fftw")]
-            backend_options,
+            backend_options: None,
         })
     }
 
-    /// Builds a plan using the runtime-loaded FFTW backend.
+    /// Builds native DCT/DST plans using runtime-loaded FFTW.
+    /// Logical and derived length validation matches [`Self::new`] and precedes
+    /// native loading, even though workspace capacity is only `line_len` complex
+    /// values. Native lengths must also fit `c_int`; no complex FFT embedding
+    /// is executed.
     #[cfg(feature = "fftw")]
-    #[allow(private_bounds)]
     pub fn new_fftw(
         line_len: usize,
         kind: R2rKind,
         options: super::PlanOptions,
-    ) -> Result<Self, super::BackendInitError<LocalR2rError>>
-    where
-        T::Real: super::backend::FftwReal,
-    {
-        let (embedding_len, normalization_factor) =
+    ) -> Result<Self, super::BackendInitError<LocalR2rError>> {
+        let (_model_len, normalization_factor) =
             validate_lengths::<T>(line_len, kind).map_err(super::BackendInitError::Local)?;
-        let fft = super::backend::c2c(embedding_len, rustfft::FftDirection::Forward, options)
+        let forward = super::backend::r2r(line_len, kind.native_kind(), options)
             .map_err(super::BackendInitError::Native)?;
-        Self::from_embedding(
+        let backward = if kind.backward_kind() == kind {
+            Arc::clone(&forward)
+        } else {
+            super::backend::r2r(line_len, kind.backward_kind().native_kind(), options)
+                .map_err(super::BackendInitError::Native)?
+        };
+        Ok(Self {
             line_len,
             kind,
-            embedding_len,
+            embedding_len: line_len,
+            #[cfg(feature = "distributed")]
+            error_model_len: _model_len,
             normalization_factor,
-            fft,
-            super::BackendKind::Fftw,
-            Some(options),
-        )
-        .map_err(super::BackendInitError::Local)
+            scratch_len: 0,
+            fft: R2rKernel::Native([forward, backward]),
+            marker: PhantomData,
+            backend: super::BackendKind::Fftw,
+            backend_options: Some(options),
+        })
     }
 
     /// Returns the selected backend.
@@ -393,12 +444,24 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         self.kind.backward_kind()
     }
 
-    /// Returns the number of complex values required in the embedding line.
+    /// Returns the minimum initialized complex workspace capacity.
+    ///
+    /// RustFFT requires its full FFT embedding: `2 * (n - 1)` for DCT-I,
+    /// `2 * (n + 1)` for DST-I, `4 * n` for type II/III, and `8 * n` for type IV.
+    /// FFTW requires only `n = line_len` complex values for native staging.
+    /// This backend-specific capacity is independent of the numerical model
+    /// and normalization factor. Oversized workspace tails are preserved.
     pub fn embedding_len(&self) -> usize {
         self.embedding_len
     }
 
-    /// Returns the native RustFFT in-place scratch length.
+    /// Returns the backend-independent model length for mixed-plan error estimates.
+    #[cfg(feature = "distributed")]
+    pub(crate) fn error_model_len(&self) -> usize {
+        self.error_model_len
+    }
+
+    /// Returns the FFT scratch length (zero for native FFTW R2R).
     pub fn scratch_len(&self) -> usize {
         self.scratch_len
     }
@@ -639,11 +702,7 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         scratch: &mut [Complex<T::Real>],
         scale: Option<T::Real>,
     ) {
-        self.build_embedding(kind, source, embedding_line);
-        self.fft.process_with_scratch(
-            &mut embedding_line[..self.embedding_len],
-            &mut scratch[..self.scratch_len],
-        );
+        self.transform_line(kind, source, embedding_line, scratch);
         self.write_output(kind, destination, embedding_line, scale);
     }
 
@@ -655,12 +714,34 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         scratch: &mut [Complex<T::Real>],
         scale: Option<T::Real>,
     ) {
-        self.build_embedding(kind, data, embedding_line);
-        self.fft.process_with_scratch(
-            &mut embedding_line[..self.embedding_len],
-            &mut scratch[..self.scratch_len],
-        );
+        self.transform_line(kind, data, embedding_line, scratch);
         self.write_output(kind, data, embedding_line, scale);
+    }
+
+    fn transform_line(
+        &self,
+        kind: R2rKind,
+        source: &[T],
+        embedding_line: &mut [Complex<T::Real>],
+        scratch: &mut [Complex<T::Real>],
+    ) {
+        match &self.fft {
+            R2rKernel::Rust(fft) => {
+                self.build_embedding(kind, source, embedding_line);
+                fft.process_with_scratch(
+                    &mut embedding_line[..self.embedding_len],
+                    &mut scratch[..self.scratch_len],
+                );
+            }
+            #[cfg(feature = "fftw")]
+            R2rKernel::Native(plans) => {
+                native_r2r_line(
+                    &plans[usize::from(kind != self.kind)],
+                    source,
+                    embedding_line,
+                );
+            }
+        }
     }
 
     fn build_embedding(
@@ -728,6 +809,20 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         embedding_line: &[Complex<T::Real>],
         scale: Option<T::Real>,
     ) {
+        #[cfg(feature = "fftw")]
+        if matches!(self.fft, R2rKernel::Native(_)) {
+            for (out, mut value) in destination
+                .iter_mut()
+                .zip(native_r2r_output(embedding_line, self.line_len))
+            {
+                if let Some(scale) = scale {
+                    value.re = value.re * scale;
+                    value.im = value.im * scale;
+                }
+                *out = T::from_complex(value);
+            }
+            return;
+        }
         for (k, destination_value) in destination.iter_mut().enumerate() {
             let mut value = embedding_line[output_bin(kind, k)];
             if kind.is_dst() {
@@ -828,7 +923,7 @@ mod tests {
     use rustfft::num_traits::FromPrimitive;
     use std::f64::consts::PI;
 
-    trait TestScalar: R2rScalar {
+    trait TestScalar: R2rScalar + bytemuck::Pod {
         fn from_f64(re: f64, im: f64) -> Self;
         fn as_f64(self) -> (f64, f64);
         fn tolerance() -> f64;
@@ -989,13 +1084,11 @@ mod tests {
         Complex::new(re, im)
     }
 
-    fn assert_scalar_preserved<T: TestScalar>(actual: &[T], expected: &[T]) {
-        for (actual, expected) in actual.iter().copied().zip(expected) {
-            let (actual_re, actual_im) = actual.as_f64();
-            let (expected_re, expected_im) = expected.as_f64();
-            assert_eq!(actual_re.to_bits(), expected_re.to_bits());
-            assert_eq!(actual_im.to_bits(), expected_im.to_bits());
-        }
+    fn assert_scalar_preserved<T: bytemuck::Pod>(actual: &[T], expected: &[T]) {
+        assert_eq!(
+            bytemuck::cast_slice::<T, u8>(actual),
+            bytemuck::cast_slice::<T, u8>(expected)
+        );
     }
 
     fn initialized_workspace<T: TestScalar>(len: usize, offset: usize) -> Vec<Complex<T::Real>> {
@@ -1100,8 +1193,9 @@ mod tests {
         expected
     }
 
-    fn exercise_kind<T: TestScalar>(kind: R2rKind, n: usize, batches: usize) {
-        let plan = LocalR2rPlan::<T>::new(n, kind).unwrap();
+    fn exercise_plan<T: TestScalar>(plan: LocalR2rPlan<T>, batches: usize) {
+        let kind = plan.kind();
+        let n = plan.line_len();
         let arbitrary = independent_input::<T>(n, batches);
         let arbitrary_before = arbitrary.clone();
 
@@ -1188,10 +1282,10 @@ mod tests {
                 if kind == R2rKind::DctI && n == 1 {
                     continue;
                 }
-                exercise_kind::<f32>(kind, n, 2);
-                exercise_kind::<f64>(kind, n, 2);
-                exercise_kind::<Complex<f32>>(kind, n, 2);
-                exercise_kind::<Complex<f64>>(kind, n, 2);
+                exercise_plan(LocalR2rPlan::<f32>::new(n, kind).unwrap(), 2);
+                exercise_plan(LocalR2rPlan::<f64>::new(n, kind).unwrap(), 2);
+                exercise_plan(LocalR2rPlan::<Complex<f32>>::new(n, kind).unwrap(), 2);
+                exercise_plan(LocalR2rPlan::<Complex<f64>>::new(n, kind).unwrap(), 2);
             }
         }
     }
@@ -1227,6 +1321,89 @@ mod tests {
         assert_eq!(R2rKind::DctIII.backward_kind(), R2rKind::DctII);
         assert_eq!(R2rKind::DstII.backward_kind(), R2rKind::DstIII);
         assert_eq!(R2rKind::DstIII.backward_kind(), R2rKind::DstII);
+    }
+
+    #[cfg(all(feature = "distributed", feature = "fftw"))]
+    #[test]
+    #[ignore = "requires both native FFTW runtimes"]
+    fn numerical_model_contract() {
+        fn check<T: TestScalar>(n: usize, kind: R2rKind, expected: (usize, usize)) {
+            for mut plan in [
+                LocalR2rPlan::<T>::new(n, kind).unwrap(),
+                LocalR2rPlan::<T>::new_fftw(n, kind, super::super::PlanOptions::default()).unwrap(),
+            ] {
+                assert_eq!(
+                    plan.embedding_len(),
+                    match plan.backend_kind() {
+                        super::super::BackendKind::RustFft => expected.0,
+                        super::super::BackendKind::Fftw => n,
+                    }
+                );
+                assert_eq!(
+                    (plan.error_model_len(), plan.normalization_factor()),
+                    expected
+                );
+                if plan.backend_kind() == super::super::BackendKind::RustFft && n < expected.0 {
+                    // A compact native buffer is not sufficient for RustFFT.
+                    let source = input::<T>(n, 1);
+                    for direction in DIRECTIONS {
+                        let mut destination = source.clone();
+                        let mut embedding = initialized_workspace::<T>(n, 0);
+                        let mut scratch = initialized_workspace::<T>(plan.scratch_len(), 100);
+                        let error = LocalR2rError::ComplexLineTooSmall {
+                            required: expected.0,
+                            actual: n,
+                        };
+                        assert_out_of_place_error(
+                            direction,
+                            &plan,
+                            &source,
+                            &mut destination,
+                            &mut embedding,
+                            &mut scratch,
+                            error,
+                        );
+                        assert_in_place_error(
+                            direction,
+                            &plan,
+                            &mut destination,
+                            &mut embedding,
+                            &mut scratch,
+                            error,
+                        );
+                    }
+                }
+                // Metadata-only mutation: never execute this altered plan.
+                plan.embedding_len = 0;
+                assert_eq!(
+                    (plan.error_model_len(), plan.normalization_factor()),
+                    expected
+                );
+            }
+        }
+
+        // Independent (model length, normalization) table for n = 1, 2, 5, 8.
+        // DCT-I at n = 1 is invalid; its placeholder is skipped below.
+        for (kind, cases) in [
+            (R2rKind::DctI, [(0, 0), (2, 2), (8, 8), (14, 14)]),
+            (R2rKind::DctII, [(4, 2), (8, 4), (20, 10), (32, 16)]),
+            (R2rKind::DctIII, [(4, 2), (8, 4), (20, 10), (32, 16)]),
+            (R2rKind::DctIV, [(8, 2), (16, 4), (40, 10), (64, 16)]),
+            (R2rKind::DstI, [(4, 4), (6, 6), (12, 12), (18, 18)]),
+            (R2rKind::DstII, [(4, 2), (8, 4), (20, 10), (32, 16)]),
+            (R2rKind::DstIII, [(4, 2), (8, 4), (20, 10), (32, 16)]),
+            (R2rKind::DstIV, [(8, 2), (16, 4), (40, 10), (64, 16)]),
+        ] {
+            for (n, expected) in [1, 2, 5, 8].into_iter().zip(cases) {
+                if kind == R2rKind::DctI && n == 1 {
+                    continue;
+                }
+                check::<f32>(n, kind, expected);
+                check::<f64>(n, kind, expected);
+                check::<Complex<f32>>(n, kind, expected);
+                check::<Complex<f64>>(n, kind, expected);
+            }
+        }
     }
 
     #[test]
@@ -1286,8 +1463,7 @@ mod tests {
         assert_eq!(scratch, scratch_before);
     }
 
-    fn validation_cases<T: TestScalar>() {
-        let plan = LocalR2rPlan::<T>::new(4, R2rKind::DctIV).unwrap();
+    fn validation_cases<T: TestScalar>(plan: LocalR2rPlan<T>) {
         let empty = Vec::new();
 
         for direction in DIRECTIONS {
@@ -1370,31 +1546,33 @@ mod tests {
                 LocalR2rError::BufferLengthMismatch,
             );
 
-            let source = input::<T>(plan.line_len() - 1, 1);
-            let mut destination = vec![T::from_f64(2.0, -3.0); source.len()];
-            let mut embedding = initialized_workspace::<T>(plan.embedding_len(), 1000);
-            let mut scratch = initialized_workspace::<T>(plan.scratch_len(), 1100);
-            assert_out_of_place_error(
-                direction,
-                &plan,
-                &source,
-                &mut destination,
-                &mut embedding,
-                &mut scratch,
-                LocalR2rError::NonIntegralBatch,
-            );
+            if plan.line_len() > 1 {
+                let source = input::<T>(plan.line_len() - 1, 1);
+                let mut destination = vec![T::from_f64(2.0, -3.0); source.len()];
+                let mut embedding = initialized_workspace::<T>(plan.embedding_len(), 1000);
+                let mut scratch = initialized_workspace::<T>(plan.scratch_len(), 1100);
+                assert_out_of_place_error(
+                    direction,
+                    &plan,
+                    &source,
+                    &mut destination,
+                    &mut embedding,
+                    &mut scratch,
+                    LocalR2rError::NonIntegralBatch,
+                );
 
-            let mut data = input::<T>(plan.line_len() - 1, 1);
-            let mut embedding = initialized_workspace::<T>(plan.embedding_len(), 1200);
-            let mut scratch = initialized_workspace::<T>(plan.scratch_len(), 1300);
-            assert_in_place_error(
-                direction,
-                &plan,
-                &mut data,
-                &mut embedding,
-                &mut scratch,
-                LocalR2rError::NonIntegralBatch,
-            );
+                let mut data = input::<T>(plan.line_len() - 1, 1);
+                let mut embedding = initialized_workspace::<T>(plan.embedding_len(), 1200);
+                let mut scratch = initialized_workspace::<T>(plan.scratch_len(), 1300);
+                assert_in_place_error(
+                    direction,
+                    &plan,
+                    &mut data,
+                    &mut embedding,
+                    &mut scratch,
+                    LocalR2rError::NonIntegralBatch,
+                );
+            }
 
             let source = input::<T>(plan.line_len(), 1);
             let mut destination = vec![T::from_f64(2.0, -3.0); source.len()];
@@ -1466,10 +1644,153 @@ mod tests {
 
     #[test]
     fn validation_empty_batches_tails_and_errors_are_atomic_all_directions() {
-        validation_cases::<f32>();
-        validation_cases::<f64>();
-        validation_cases::<Complex<f32>>();
-        validation_cases::<Complex<f64>>();
+        validation_cases(LocalR2rPlan::<f32>::new(4, R2rKind::DctIV).unwrap());
+        validation_cases(LocalR2rPlan::<f64>::new(4, R2rKind::DctIV).unwrap());
+        validation_cases(LocalR2rPlan::<Complex<f32>>::new(4, R2rKind::DctIV).unwrap());
+        validation_cases(LocalR2rPlan::<Complex<f64>>::new(4, R2rKind::DctIV).unwrap());
+    }
+
+    #[cfg(feature = "fftw")]
+    fn native_workspace_cases<T: TestScalar>(plan: &LocalR2rPlan<T>) {
+        let n = plan.line_len();
+        let kind = plan.kind();
+        // Independent historical capacities, never the new capacity getter.
+        let legacy = match kind {
+            R2rKind::DctI => 2 * (n - 1),
+            R2rKind::DstI => 2 * (n + 1),
+            R2rKind::DctII | R2rKind::DctIII | R2rKind::DstII | R2rKind::DstIII => 4 * n,
+            R2rKind::DctIV | R2rKind::DstIV => 8 * n,
+        };
+        let nan = f64::from_bits(0x7ff8_1234_5678_9abc);
+        let guard = T::from_f64(nan, -nan);
+        let workspace_guard = Complex::new(
+            T::Real::from_f64(nan).unwrap(),
+            T::Real::from_f64(-nan).unwrap(),
+        );
+        for batches in [0, 2] {
+            let arbitrary = independent_input::<T>(n, batches);
+            let end = 1 + arbitrary.len();
+            let mut source = vec![guard; end + 1];
+            source[1..end].copy_from_slice(&arbitrary);
+            let source_before = source.clone();
+            for direction in DIRECTIONS {
+                let oracle = expected(kind, direction, n, &arbitrary);
+                for (capacity, scratch_len) in
+                    [(n - 1, 3), (n, 0), (n, 3), (legacy, 3), (legacy + 3, 3)]
+                {
+                    for in_place in [false, true] {
+                        let mut data = vec![guard; source.len()];
+                        if in_place {
+                            data[1..end].copy_from_slice(&arbitrary);
+                        }
+                        let data_before = data.clone();
+                        let mut embedding = vec![workspace_guard; capacity + 2];
+                        let embedding_before = embedding.clone();
+                        let mut scratch = vec![workspace_guard; scratch_len + 2];
+                        let scratch_before = scratch.clone();
+                        // Offset every supplied slice, including zero-length scratch.
+                        let result = if in_place {
+                            direction.in_place(
+                                plan,
+                                &mut data[1..end],
+                                &mut embedding[1..1 + capacity],
+                                &mut scratch[1..1 + scratch_len],
+                            )
+                        } else {
+                            direction.out_of_place(
+                                plan,
+                                &source[1..end],
+                                &mut data[1..end],
+                                &mut embedding[1..1 + capacity],
+                                &mut scratch[1..1 + scratch_len],
+                            )
+                        };
+                        assert_scalar_preserved(&source, &source_before);
+                        assert_scalar_preserved(&scratch, &scratch_before);
+                        if capacity < n {
+                            assert_eq!(
+                                result,
+                                Err(LocalR2rError::ComplexLineTooSmall {
+                                    required: n,
+                                    actual: n - 1,
+                                })
+                            );
+                            assert_scalar_preserved(&data, &data_before);
+                            assert_scalar_preserved(&embedding, &embedding_before);
+                        } else {
+                            assert_eq!(result, Ok(()));
+                            assert_close(&data[1..end], &oracle);
+                            assert_scalar_preserved(&data[..1], &data_before[..1]);
+                            assert_scalar_preserved(&data[end..], &data_before[end..]);
+                            let used = if batches == 0 { 0 } else { n };
+                            assert_scalar_preserved(&embedding[..1], &embedding_before[..1]);
+                            assert_scalar_preserved(
+                                &embedding[1 + used..],
+                                &embedding_before[1 + used..],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "fftw")]
+    #[test]
+    #[ignore = "requires both native FFTW runtimes"]
+    fn native_r2r_oracles_and_workspace_contracts() {
+        fn check<T: TestScalar>(n: usize, kind: R2rKind) {
+            let plan = || {
+                LocalR2rPlan::<T>::new_fftw(n, kind, super::super::PlanOptions::default()).unwrap()
+            };
+            assert_eq!(plan().embedding_len(), n);
+            assert_eq!(plan().scratch_len(), 0);
+            native_workspace_cases(&plan());
+            exercise_plan(plan(), 2);
+            validation_cases(plan());
+        }
+        for kind in kinds() {
+            for n in [1, 2, 3, 4, 5, 6, 7, 8, 9, 11] {
+                if kind == R2rKind::DctI && n == 1 {
+                    continue;
+                }
+                check::<f32>(n, kind);
+                check::<f64>(n, kind);
+                check::<Complex<f32>>(n, kind);
+                check::<Complex<f64>>(n, kind);
+            }
+        }
+    }
+
+    #[cfg(feature = "fftw")]
+    #[test]
+    fn native_r2r_invalid_lengths_precede_loading() {
+        use super::super::{BackendInitError, PlanOptions};
+        fn check<T: R2rScalar>() {
+            for n in [0, 1] {
+                assert!(matches!(
+                    LocalR2rPlan::<T>::new_fftw(n, R2rKind::DctI, PlanOptions::default()),
+                    Err(BackendInitError::Local(LocalR2rError::InvalidLength))
+                ));
+            }
+            // Both the logical line and compact workspace fit, but even the
+            // smallest derived model (DCT-I) exceeds complex addressability.
+            let derived_overflow = isize::MAX as usize / size_of::<Complex<T::Real>>() / 2 + 2;
+            assert!(derived_overflow <= isize::MAX as usize / size_of::<T>());
+            assert!(derived_overflow <= isize::MAX as usize / size_of::<Complex<T::Real>>());
+            for kind in kinds() {
+                for n in [usize::MAX, derived_overflow] {
+                    assert!(matches!(
+                        LocalR2rPlan::<T>::new_fftw(n, kind, PlanOptions::default()),
+                        Err(BackendInitError::Local(LocalR2rError::LengthOverflow))
+                    ));
+                }
+            }
+        }
+        check::<f32>();
+        check::<f64>();
+        check::<Complex<f32>>();
+        check::<Complex<f64>>();
     }
 
     #[test]

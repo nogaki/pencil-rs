@@ -231,6 +231,71 @@ pub fn plan_c2r<R: Real>(
         plan: ffi::Plan::new(n, ffi::Kind::Inverse, options)?,
     }))
 }
+/// Native FFTW real-to-real kinds, using FFTW's unnormalized definitions.
+/// DCT-I requires at least two values; every other kind accepts length one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum R2rKind {
+    Dht = 2,
+    DctI = 3,
+    DctII = 5,
+    DctIII = 4,
+    DctIV = 6,
+    DstI = 7,
+    DstII = 9,
+    DstIII = 8,
+    DstIV = 10,
+}
+
+/// Plans distinct in-place and input-preserving out-of-place native R2R
+/// transforms. Execution is unnormalized and needs no caller scratch.
+pub fn plan_r2r<R: Real>(
+    n: usize,
+    kind: R2rKind,
+    options: PlanOptions,
+) -> Result<Arc<R2rPlan<R>>, FftwError> {
+    Ok(Arc::new(R2rPlan {
+        n,
+        kind,
+        oop: ffi::Plan::new(n, ffi::Kind::R2r(kind, false), options)?,
+        ip: ffi::Plan::new(n, ffi::Kind::R2r(kind, true), options)?,
+    }))
+}
+
+/// Immutable, shareable native real-to-real plan for one f32 or f64 line.
+/// Complex consumers transform the two components separately.
+pub struct R2rPlan<R: Real> {
+    n: usize,
+    kind: R2rKind,
+    oop: ffi::Plan<R>,
+    ip: ffi::Plan<R>,
+}
+impl<R: Real> R2rPlan<R> {
+    pub fn len(&self) -> usize {
+        self.n
+    }
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+    pub fn kind(&self) -> R2rKind {
+        self.kind
+    }
+    /// Both slices must have exactly `len()` elements. Invalid lengths return
+    /// `FftError` before writes; valid execution preserves the input.
+    pub fn process(&self, input: &[R], output: &mut [R]) -> Result<(), FftError> {
+        preflight(input.len(), output.len(), self.n, self.n)?;
+        self.oop.r2r(input, output);
+        Ok(())
+    }
+    /// The slice must have exactly `len()` elements. Invalid lengths return
+    /// `FftError::InputBuffer` before writes.
+    pub fn process_in_place(&self, data: &mut [R]) -> Result<(), FftError> {
+        preflight(data.len(), self.n, self.n, self.n)?;
+        self.ip.r2r_inplace(data);
+        Ok(())
+    }
+}
+
 // Native execution requires no caller scratch. The trait accepts any extra
 // scratch capacity; it and its tail remain untouched.
 struct ComplexPlan<R: Real> {

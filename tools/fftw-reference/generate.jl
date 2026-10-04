@@ -526,52 +526,19 @@ function write_case(output_directory::String, item::ReferenceCase, ::Type{T}, pr
     filename = joinpath(output_directory, item.name * suffix * "_" * precision_name(T) * ".txt")
     open(filename, "w") do io
         print_header(io, item, T, provider, native_version)
-        if item.kind in (:c2c, :mixed_c2c)
-            values = item.kind == :c2c ? c2c_values(T, item) : mixed_c2c_values(T, item)
-            input, inverse_input, forward, inverse, backward = values
-            print_complex_section(io, "input", input)
-            print_complex_section(io, "inverse_input", inverse_input)
-            print_complex_section(io, "forward_expected", forward)
-            print_complex_section(io, "inverse_expected", inverse)
-            print_complex_section(io, "backward_expected", backward)
+        values = if item.kind in (:c2c, :mixed_c2c)
+            item.kind == :c2c ? c2c_values(T, item) : mixed_c2c_values(T, item)
         elseif item.kind in (:r2c, :mixed_r2c)
-            values = item.kind == :r2c ? r2c_values(T, item) : mixed_r2c_values(T, item)
-            input, inverse_input, forward, inverse, backward = values
-            print_real_section(io, "input", input)
-            print_complex_section(io, "inverse_input", inverse_input)
-            print_complex_section(io, "forward_expected", forward)
-            print_real_section(io, "inverse_expected", inverse)
-            print_real_section(io, "backward_expected", backward)
+            item.kind == :r2c ? r2c_values(T, item) : mixed_r2c_values(T, item)
         elseif item.kind == :dht
-            input, inverse_input, forward, inverse, backward = dht_values(T, item)
-            if T <: Complex
-                print_complex_section(io, "input", input)
-                print_complex_section(io, "inverse_input", inverse_input)
-                print_complex_section(io, "forward_expected", forward)
-                print_complex_section(io, "inverse_expected", inverse)
-                print_complex_section(io, "backward_expected", backward)
-            else
-                print_real_section(io, "input", input)
-                print_real_section(io, "inverse_input", inverse_input)
-                print_real_section(io, "forward_expected", forward)
-                print_real_section(io, "inverse_expected", inverse)
-                print_real_section(io, "backward_expected", backward)
-            end
+            dht_values(T, item)
         else
-            input, inverse_input, forward, inverse, backward = r2r_values(T, item)
-            if T <: Complex
-                print_complex_section(io, "input", input)
-                print_complex_section(io, "inverse_input", inverse_input)
-                print_complex_section(io, "forward_expected", forward)
-                print_complex_section(io, "inverse_expected", inverse)
-                print_complex_section(io, "backward_expected", backward)
-            else
-                print_real_section(io, "input", input)
-                print_real_section(io, "inverse_input", inverse_input)
-                print_real_section(io, "forward_expected", forward)
-                print_real_section(io, "inverse_expected", inverse)
-                print_real_section(io, "backward_expected", backward)
-            end
+            r2r_values(T, item)
+        end
+        names = ("input", "inverse_input", "forward_expected", "inverse_expected", "backward_expected")
+        for (name, array) in zip(names, values)
+            printer = eltype(array) <: Complex ? print_complex_section : print_real_section
+            printer(io, name, array)
         end
     end
 end

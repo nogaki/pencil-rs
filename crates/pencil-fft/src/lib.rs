@@ -21,7 +21,12 @@
 //! With the opt-in `distributed` feature, `C2cPlan` and its workspaces provide
 //! input-preserving distributed C2C transforms, while `R2cPlan` provides
 //! input-preserving out-of-place R2C/C2R forward, normalized inverse, and raw
-//! backward with a selected-axis reduction. `AxisSelection` keeps the full
+//! backward with a selected-axis reduction. `C2rPlan` is the independent
+//! canonical-complex-input BRFFT counterpart: raw positive-sign forward,
+//! raw negative-sign backward, and normalized negative-sign inverse. Its
+//! reduction axis is the lowest selected Rust axis. It currently supports
+//! out-of-place calls only (no timing, collections, or overlap variants).
+//! `AxisSelection` keeps the full
 //! canonical route while making unselected stages identities; C2C also retains
 //! its state-checked single-buffer API; distributed R2C also provides a
 //! state-checked single-allocation real/complex buffer. Point-to-point plans
@@ -43,14 +48,72 @@
 //! noncollective. Allocation failures must be coordinated by callers before
 //! the next collective call. The default feature set remains MPI-free.
 //!
+//! # Distributed compatibility and failure contract
+//!
+//! With `distributed` enabled, this contract applies to `C2cPlan`, `R2cPlan`,
+//! `C2rPlan`, `R2rPlan`, `DhtPlan`, `MixedC2cPlan`, and `MixedR2cPlan`.
+//! For out-of-place execution, forward expects `input_pencil()` as its source
+//! endpoint and `output_pencil()` as its destination; inverse and backward
+//! reverse those roles. Endpoint compatibility depends on how the plan was built:
+//!
+//! | Construction | Required out-of-place endpoint compatibility |
+//! | --- | --- |
+//! | Direct RustFFT constructors, including `from_shape_with_fft_directions` | `same_layout` with the expected endpoint and exact `ExtraShape` equality |
+//! | FFTW constructors and `with_fftw` rebuilds | The above, plus exact expected endpoint-pencil `Arc` identity |
+//! | `C2cPlan`, `MixedC2cPlan`, or `MixedR2cPlan` rebuilt with `with_fft_directions` | The same strict endpoint-pencil `Arc` identity rule, even with RustFFT or unchanged directions |
+//!
+//! `same_layout` compares topology **object identity**, global spatial shape,
+//! ordered decomposition, and memory-axis permutation. Equal local lengths or
+//! an equivalent process grid do not suffice. Cloning an endpoint-pencil `Arc`
+//! preserves its identity; constructing a separate, equivalent pencil does not.
+//! The plan's allocation helpers use the expected endpoint `Arc`s, as can
+//! caller-built arrays using clones of those `Arc`s and the required `ExtraShape`.
+//!
+//! Every distributed workspace is bound to the exact internal plan core that
+//! allocated it. Opaque in-place arrays are also bound to that core and must
+//! be in the operation's required state. Independent construction or rebuilding
+//! creates a new core: allocate new workspaces and in-place arrays from the
+//! returned plan. Sufficient buffer size or initialized length does not make
+//! an old workspace reusable with it. Rebuilding does not mutate the original
+//! plan; Fourier-direction rebuilding preserves the selected backend.
+//!
+//! Compatibility checks do not establish mathematical provenance: they do not
+//! prove that input values were produced by this plan, its transform kinds,
+//! Fourier signs, or normalization. Spectrum endpoint validation, where
+//! applicable, is an additional acceptance check, not a provenance guarantee.
+//!
+//! ## Failure boundaries
+//!
+//! These are guarantees for checked, returned errors in supported execution
+//! variants, not a general transaction or rollback mechanism:
+//!
+//! | Failure boundary | Preservation guarantee |
+//! | --- | --- |
+//! | Initial descriptor or structural preflight rejection, before execution starts | Source, destination, workspace, and in-place data/state are unchanged. |
+//! | Single-array out-of-place `InvalidSpectrum` (`R2cPlan`/`MixedR2cPlan` reverse or `C2rPlan` forward, including overlap wrappers where supported) | Source and destination are unchanged; workspace may already have changed. |
+//! | Other post-start out-of-place error | Source is unchanged; destination and workspace may have changed. There is no blanket destination rollback. |
+//! | Post-start in-place failure, including `InvalidSpectrum` | The array is poisoned, not restored; data and workspace may have changed. Reallocate the poisoned array rather than retrying it. |
+//! | Collection failure after member execution starts | Completed members are not rolled back. The failing member follows its single-array contract; an `InvalidSpectrum` failure does not undo earlier outputs. |
+//!
+//! Initial collection preflight checks all members before any member executes.
+//! In-place poisoning during unwinding is a local state guard, not a promise
+//! of recovery from arbitrary panics, MPI failure, or process loss. Collection
+//! member panics abort the communicator after unwinding owned guards.
+//! Collective agreement can return different local and peer error variants
+//! on different ranks. Ranks must not branch subsequent collective calls or
+//! their order on the error variant; coordinate any recovery decision and keep
+//! the same collective sequence on every rank.
+//!
 //! # Optional native FFTW
 //!
 //! The `fftw` feature enables explicit `new_fftw` local constructors and
 //! distributed `with_fftw` rebuilds. Existing constructors always use RustFFT,
 //! including when both features are enabled. Native initialization errors are
 //! reported by [`BackendInitError`]; there is no fallback to RustFFT.
-//! DCT/DST and Hartley plans retain the existing embedding kernels, using
-//! native complex FFTs rather than native FFTW DCT/DST plans.
+//! FFTW DCT/DST and Hartley plans use dedicated native real-to-real kernels,
+//! applying them componentwise to complex inputs. RustFFT retains its embedding
+//! algorithms; native plans require `line_len()` complex workspace values and no
+//! FFT scratch. Mixed endpoint tolerances retain their independent logical model.
 //!
 //! The Rust wrapper is MIT-licensed. FFTW is a separately loaded native library
 //! licensed under the GPL or a commercial license; enabling or distributing
@@ -257,10 +320,11 @@ pub use distributed::mixed::{
 #[cfg(feature = "distributed")]
 pub use distributed::{
     AxisSelection, AxisSelectionError, C2cInPlaceArray, C2cInPlaceWorkspace,
-    C2cOutOfPlaceWorkspace, C2cPlan, C2cState, CollectionError, DhtPlan, DistributedLayout,
-    FftError, FftOverlapError, FourierDirection, FourierDirections, R2cError, R2cInPlaceArray,
-    R2cInPlaceWorkspace, R2cPlan, R2cWorkspace, R2rError, R2rInPlaceArray, R2rInPlaceWorkspace,
-    R2rPlan, R2rState, R2rWorkspace, StageGeometry, StageTiming, TransformTiming, TransposeMethod,
+    C2cOutOfPlaceWorkspace, C2cPlan, C2cState, C2rError, C2rPlan, C2rWorkspace, CollectionError,
+    DhtPlan, DistributedLayout, FftError, FftOverlapError, FourierDirection, FourierDirections,
+    R2cError, R2cInPlaceArray, R2cInPlaceWorkspace, R2cPlan, R2cWorkspace, R2rError,
+    R2rInPlaceArray, R2rInPlaceWorkspace, R2rPlan, R2rState, R2rWorkspace, StageGeometry,
+    StageTiming, TransformTiming, TransposeMethod,
 };
 
 /// Errors returned by local C2C plan construction and execution.
@@ -373,27 +437,19 @@ impl<R: FftReal> LocalC2cPlan<R> {
 
     /// Builds a plan using the runtime-loaded FFTW backend.
     #[cfg(feature = "fftw")]
-    #[allow(private_bounds)]
     pub fn new_fftw(
         line_len: usize,
         options: PlanOptions,
-    ) -> Result<Self, BackendInitError<LocalC2cError>>
-    where
-        R: backend::FftwReal,
-    {
+    ) -> Result<Self, BackendInitError<LocalC2cError>> {
         Self::new_fftw_with_sign(line_len, false, options)
     }
 
     #[cfg(feature = "fftw")]
-    #[allow(private_bounds)]
     pub(crate) fn new_fftw_with_sign(
         line_len: usize,
         positive_forward: bool,
         options: PlanOptions,
-    ) -> Result<Self, BackendInitError<LocalC2cError>>
-    where
-        R: backend::FftwReal,
-    {
+    ) -> Result<Self, BackendInitError<LocalC2cError>> {
         validate_line_len::<R>(line_len).map_err(BackendInitError::Local)?;
         let forward = backend::c2c(line_len, rustfft::FftDirection::Forward, options)
             .map_err(BackendInitError::Native)?;

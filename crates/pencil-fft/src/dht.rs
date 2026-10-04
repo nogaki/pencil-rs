@@ -1,33 +1,38 @@
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem::size_of;
+#[cfg(feature = "fftw")]
 use std::sync::Arc;
 
-use rustfft::{Fft, FftPlanner};
+use rustfft::FftPlanner;
 
-use super::r2r::{LocalR2rError, R2rScalar, r2r_from_complex, r2r_to_complex};
+use super::r2r::{LocalR2rError, R2rKernel, R2rScalar, r2r_from_complex, r2r_to_complex};
+#[cfg(feature = "fftw")]
+use super::r2r::{native_r2r_line, native_r2r_output};
 use super::{Complex, FftReal};
 
 /// A local batched discrete Hartley transform plan.
 ///
 /// `T` may be `f32`, `f64`, `Complex<f32>`, or `Complex<f64>`. Each data
 /// slice contains consecutive lines of [`Self::line_len`] values. The plan
-/// owns an immutable forward RustFFT plan; callers own an initialized complex
-/// embedding line of at least [`Self::embedding_len`] values and initialized
-/// native scratch of at least [`Self::scratch_len`] values.
+/// owns immutable backend plans; callers own an initialized complex workspace
+/// line of at least [`Self::embedding_len`] values and initialized FFT scratch
+/// of at least [`Self::scratch_len`] values.
 ///
 /// `forward` and `backward` compute the same unnormalized Hartley transform.
 /// `inverse` computes that transform and divides each line by `line_len`.
 /// For real `T`, only the real component is written; for complex `T`, the real
 /// and imaginary components are transformed independently.
 ///
-/// The implementation uses one native complex FFT per line and no full-array
-/// temporary storage. Non-finite values follow ordinary IEEE arithmetic.
+/// RustFFT uses one complex FFT per line. FFTW uses a native DHT for each real
+/// component, staging two contiguous real lines in the complex workspace, with
+/// zero FFT scratch. Neither backend needs full-array temporary storage.
+/// Non-finite values follow ordinary IEEE arithmetic.
 pub struct LocalDhtPlan<T: R2rScalar> {
     line_len: usize,
     embedding_len: usize,
     scratch_len: usize,
-    fft: Arc<dyn Fft<T::Real>>,
+    fft: R2rKernel<T::Real>,
     marker: PhantomData<T>,
     backend: super::BackendKind,
     #[cfg(feature = "fftw")]
@@ -56,50 +61,39 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
 
         let mut planner = FftPlanner::<T::Real>::new();
         let fft = planner.plan_fft_forward(line_len);
-        Self::from_embedding(
-            line_len,
-            fft,
-            super::BackendKind::RustFft,
-            #[cfg(feature = "fftw")]
-            None,
-        )
-    }
-
-    fn from_embedding(
-        line_len: usize,
-        fft: Arc<dyn Fft<T::Real>>,
-        backend: super::BackendKind,
-        #[cfg(feature = "fftw")] backend_options: Option<super::PlanOptions>,
-    ) -> Result<Self, LocalR2rError> {
         let scratch_len = fft.get_inplace_scratch_len();
         validate_addressable(scratch_len, size_of::<Complex<T::Real>>())?;
         Ok(Self {
             line_len,
             embedding_len: line_len,
             scratch_len,
-            fft,
+            fft: R2rKernel::Rust(fft),
             marker: PhantomData,
-            backend,
+            backend: super::BackendKind::RustFft,
             #[cfg(feature = "fftw")]
-            backend_options,
+            backend_options: None,
         })
     }
 
-    /// Builds a plan using the runtime-loaded FFTW backend.
+    /// Builds a native DHT plan using runtime-loaded FFTW. Length validation
+    /// matches [`Self::new`], and the native length must also fit `c_int`.
     #[cfg(feature = "fftw")]
-    #[allow(private_bounds)]
     pub fn new_fftw(
         line_len: usize,
         options: super::PlanOptions,
-    ) -> Result<Self, super::BackendInitError<LocalR2rError>>
-    where
-        T::Real: super::backend::FftwReal,
-    {
+    ) -> Result<Self, super::BackendInitError<LocalR2rError>> {
         validate_lengths::<T>(line_len).map_err(super::BackendInitError::Local)?;
-        let fft = super::backend::c2c(line_len, rustfft::FftDirection::Forward, options)
+        let plan = super::backend::r2r(line_len, pencil_fftw::R2rKind::Dht, options)
             .map_err(super::BackendInitError::Native)?;
-        Self::from_embedding(line_len, fft, super::BackendKind::Fftw, Some(options))
-            .map_err(super::BackendInitError::Local)
+        Ok(Self {
+            line_len,
+            embedding_len: line_len,
+            scratch_len: 0,
+            fft: R2rKernel::Native([Arc::clone(&plan), plan]),
+            marker: PhantomData,
+            backend: super::BackendKind::Fftw,
+            backend_options: Some(options),
+        })
     }
 
     /// Returns the selected backend.
@@ -118,12 +112,13 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
         self.line_len
     }
 
-    /// Returns the number of complex values required in the embedding line.
+    /// Returns the required complex workspace capacity (`line_len`). FFTW uses
+    /// it for two contiguous real component lines, not a complex FFT embedding.
     pub fn embedding_len(&self) -> usize {
         self.embedding_len
     }
 
-    /// Returns the native RustFFT in-place scratch length.
+    /// Returns the FFT scratch length (zero for native FFTW DHT).
     pub fn scratch_len(&self) -> usize {
         self.scratch_len
     }
@@ -286,13 +281,21 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
         embedding_line: &mut [Complex<T::Real>],
         scratch: &mut [Complex<T::Real>],
     ) {
-        for (embedding, &value) in embedding_line[..self.embedding_len].iter_mut().zip(source) {
-            *embedding = r2r_to_complex(value);
+        match &self.fft {
+            R2rKernel::Rust(fft) => {
+                for (embedding, &value) in
+                    embedding_line[..self.embedding_len].iter_mut().zip(source)
+                {
+                    *embedding = r2r_to_complex(value);
+                }
+                fft.process_with_scratch(
+                    &mut embedding_line[..self.embedding_len],
+                    &mut scratch[..self.scratch_len],
+                );
+            }
+            #[cfg(feature = "fftw")]
+            R2rKernel::Native(plans) => native_r2r_line(&plans[0], source, embedding_line),
         }
-        self.fft.process_with_scratch(
-            &mut embedding_line[..self.embedding_len],
-            &mut scratch[..self.scratch_len],
-        );
     }
 
     fn write_line(
@@ -301,6 +304,16 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
         embedding_line: &[Complex<T::Real>],
         normalize: bool,
     ) {
+        #[cfg(feature = "fftw")]
+        if matches!(self.fft, R2rKernel::Native(_)) {
+            for (out, value) in destination
+                .iter_mut()
+                .zip(native_r2r_output(embedding_line, self.line_len))
+            {
+                *out = r2r_from_complex(scaled(value, normalize, self.line_len));
+            }
+            return;
+        }
         for (k, destination) in destination.iter_mut().enumerate() {
             let value = embedding_line[k];
             let value = if k == 0 || (self.line_len % 2 == 0 && k == self.line_len / 2) {
@@ -621,13 +634,14 @@ mod tests {
         assert_eq!(scratch, scratch_before.as_slice());
     }
 
-    fn exercise<T: TestScalar>(line_len: usize, batches: usize) {
-        let plan = LocalDhtPlan::<T>::new(line_len).unwrap();
+    fn exercise_plan<T: TestScalar>(plan: LocalDhtPlan<T>, batches: usize) {
+        let line_len = plan.line_len();
         assert_eq!(plan.line_len(), line_len);
         assert_eq!(plan.embedding_len(), line_len);
         assert_eq!(plan.normalization_factor(), line_len);
 
         let source = input::<T>(line_len, batches);
+        let source_before = complex_input(&source);
         for direction in DIRECTIONS {
             let expected = expected(&source, line_len, direction.normalize());
             let mut destination = vec![T::from_f64(17.0, -19.0); source.len()];
@@ -645,6 +659,7 @@ mod tests {
                 )
                 .unwrap();
             assert_close(&destination, &expected);
+            assert_eq!(complex_input(&source), source_before);
             assert_eq!(&embedding[plan.embedding_len()..], &embedding_tail);
             assert_eq!(&scratch[plan.scratch_len()..], &scratch_tail);
 
@@ -683,10 +698,74 @@ mod tests {
     #[test]
     fn all_scalar_types_and_lengths_match_independent_dht_oracles() {
         for line_len in [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13] {
-            exercise::<f32>(line_len, 2);
-            exercise::<f64>(line_len, 2);
-            exercise::<Complex<f32>>(line_len, 2);
-            exercise::<Complex<f64>>(line_len, 2);
+            exercise_plan(LocalDhtPlan::<f32>::new(line_len).unwrap(), 2);
+            exercise_plan(LocalDhtPlan::<f64>::new(line_len).unwrap(), 2);
+            exercise_plan(LocalDhtPlan::<Complex<f32>>::new(line_len).unwrap(), 2);
+            exercise_plan(LocalDhtPlan::<Complex<f64>>::new(line_len).unwrap(), 2);
+        }
+    }
+
+    #[cfg(feature = "fftw")]
+    #[test]
+    #[ignore = "requires both native FFTW runtimes"]
+    fn native_dht_oracles_and_workspace_contracts() {
+        fn check<T: TestScalar>(n: usize) {
+            let plan =
+                LocalDhtPlan::<T>::new_fftw(n, super::super::PlanOptions::default()).unwrap();
+            assert_eq!(plan.scratch_len(), 0);
+            for direction in DIRECTIONS {
+                for batches in [0, 2] {
+                    let source = input::<T>(n, batches);
+                    let mut destination = source.clone();
+                    let mut embedding = workspace::<T>(n - 1, 10.0);
+                    let saved = embedding.clone();
+                    let mut scratch = workspace::<T>(2, 20.0);
+                    let scratch_before = scratch.clone();
+                    let error = LocalR2rError::ComplexLineTooSmall {
+                        required: n,
+                        actual: n - 1,
+                    };
+                    assert_eq!(
+                        direction.out_of_place(
+                            &plan,
+                            &source,
+                            &mut destination,
+                            &mut embedding,
+                            &mut scratch
+                        ),
+                        Err(error)
+                    );
+                    assert!(destination == source);
+                    assert_eq!(embedding, saved);
+                    assert_eq!(scratch, scratch_before);
+                    assert_eq!(
+                        direction.in_place(&plan, &mut destination, &mut embedding, &mut scratch),
+                        Err(error)
+                    );
+                    assert!(destination == source);
+                    assert_eq!(embedding, saved);
+                    assert_eq!(scratch, scratch_before);
+                }
+                let mut embedding = workspace::<T>(n + 2, 30.0);
+                let saved = embedding.clone();
+                let mut scratch = workspace::<T>(2, 40.0);
+                let scratch_before = scratch.clone();
+                direction
+                    .out_of_place(&plan, &[], &mut [], &mut embedding, &mut scratch)
+                    .unwrap();
+                direction
+                    .in_place(&plan, &mut [], &mut embedding, &mut scratch)
+                    .unwrap();
+                assert_eq!(embedding, saved);
+                assert_eq!(scratch, scratch_before);
+            }
+            exercise_plan(plan, 2);
+        }
+        for n in [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13] {
+            check::<f32>(n);
+            check::<f64>(n);
+            check::<Complex<f32>>(n);
+            check::<Complex<f64>>(n);
         }
     }
 

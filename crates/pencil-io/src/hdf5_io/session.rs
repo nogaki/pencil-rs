@@ -70,8 +70,17 @@ impl std::error::Error for Hdf5SessionError {}
 /// and 16 MiB of aggregate path/metadata bytes.
 /// MPI hints are applied when opening the native file and cannot be changed on
 /// an open handle. Per-operation hints must be empty or equal the opening hints.
-/// Successful reads publish after per-operation cleanup; a later file-close
-/// failure cannot roll back values from an earlier successful read.
+///
+/// Successful operations complete before the session's final close. Reads
+/// publish only after staging, validation, per-operation cleanup, and collective
+/// agreement; a later close cannot roll back published values or file mutations.
+///
+/// Not every `Err` poisons the session: preflight rejections and read errors do
+/// not poison an otherwise usable session. Failures after native group or
+/// dataset creation is attempted leave it poisoned. Only collective
+/// [`Self::close`] is then allowed, subject to the same identity, state, file
+/// path, and mode agreement. Unrecoverable native close failures are fail-stop,
+/// unlike ordinary returned cleanup/post-cleanup errors.
 pub struct Hdf5FileSession<'c> {
     comm: &'c CartesianCommunicator,
     file: Option<native::Hid>,
@@ -417,8 +426,12 @@ impl<'c> Hdf5FileSession<'c> {
             (_, Err(e)) => Err(e.into()),
         }
     }
-    /// Explicit collective close. Preflight mismatches leave the session retryable;
-    /// poisoned sessions remain closeable. Repeated agreed closes are harmless.
+    /// Closes the session collectively, including when already closed.
+    ///
+    /// Preflight mismatches leave the session unchanged. Poisoned sessions can
+    /// close only when ranks agree on the operation, session identity, state,
+    /// file path, and mode. An agreed repeated close performs no native close
+    /// but still participates in those collective checks.
     pub fn close(&mut self) -> Result<(), Hdf5SessionError> {
         self.entry(0x708, "")?;
         self.close_native()

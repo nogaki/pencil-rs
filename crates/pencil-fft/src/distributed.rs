@@ -36,7 +36,10 @@
 //! original real endpoint followed by homogeneous complex tail stages. Its
 //! reduced output shape and post-tail constrained-plane validation are
 //! implemented in the child module, which also provides a single-allocation
-//! real in-place API.
+//! real in-place API. [`C2rPlan`] instead accepts canonical complex input and
+//! uses a descending C2R route with its lowest selected axis reduced. It
+//! provides raw positive-sign forward, raw negative-sign backward, and
+//! normalized negative-sign inverse, out-of-place only.
 //!
 //! [`R2rPlan`] keeps the original shape for real or complex DCT/DST data. Its
 //! public constructors accept only the legacy FFTW kind array; Hartley and
@@ -415,6 +418,7 @@ impl From<FftError> for BackendInitError<R2rError> {
 
 pub mod collections;
 pub use collections::CollectionError;
+mod c2r;
 #[cfg(all(test, feature = "fftw"))]
 pub(crate) mod fftw_tests;
 pub mod mixed;
@@ -425,10 +429,11 @@ mod r2r;
 pub(crate) static MPI_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
     std::sync::OnceLock::new();
 
+pub use c2r::{C2rError, C2rPlan, C2rWorkspace};
 pub use r2c::{R2cInPlaceArray, R2cInPlaceWorkspace, R2cPlan, R2cWorkspace};
 pub use r2r::{DhtPlan, R2rInPlaceArray, R2rInPlaceWorkspace, R2rPlan, R2rWorkspace};
 
-/// Selects the distributed transition transport used by [`C2cPlan`], [`R2cPlan`], and [`R2rPlan`].
+/// Selects the checked transition transport used by distributed transform plans.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransposeMethod {
     /// Use one checked `MPI_Alltoallv` for each distributed transition.
@@ -605,6 +610,9 @@ impl<const N: usize> AxisSelection<N> {
 }
 
 /// An immutable, checked distributed complex-to-complex FFT plan.
+///
+/// See the [crate-level compatibility and failure contract](crate#distributed-compatibility-and-failure-contract)
+/// for endpoint identity, workspace ownership, and error boundaries.
 ///
 /// Construction and transform calls are collective on the topology's
 /// Cartesian communicator. Every rank must use the same communicator context,
@@ -1551,8 +1559,10 @@ where
         Ok(timing)
     }
 
-    /// Builds a plan with explicit per-axis Fourier signs.
+    /// Builds a RustFFT plan with explicit per-axis Fourier signs.
     ///
+    /// Unlike [`Self::with_fft_directions`], this direct constructor uses the
+    /// non-strict endpoint rules in the [crate-level contract](crate#distributed-compatibility-and-failure-contract).
     /// Forward uses the configured signs; inverse and backward use their opposites.
     pub fn from_shape_with_fft_directions(
         topology: Arc<MpiTopology<M>>,
@@ -1577,7 +1587,11 @@ where
         )
     }
 
-    /// Rebuilds this plan with new Fourier signs and fresh array/workspace identities.
+    /// Collectively rebuilds with new Fourier signs, preserving the backend.
+    ///
+    /// Use the returned plan's endpoint-pencil `Arc`s and allocate new workspaces
+    /// and in-place arrays, even with RustFFT or unchanged signs. See the
+    /// [crate-level contract](crate#distributed-compatibility-and-failure-contract).
     /// Forward is unscaled with these signs; inverse uses opposite signs with
     /// normalization, and backward uses opposite signs without normalization.
     /// Non-selected axes must use `Forward` (checked collectively).
@@ -1622,16 +1636,12 @@ where
 
     #[cfg(feature = "fftw")]
     /// Collectively builds a distributed C2C plan using FFTW on every rank.
-    #[allow(private_bounds)]
     pub fn from_shape_with_fftw(
         topology: Arc<MpiTopology<M>>,
         global_shape: [usize; N],
         extra_shape: ExtraShape,
         options: PlanOptions,
-    ) -> Result<Self, BackendInitError<FftError>>
-    where
-        R: crate::backend::FftwReal,
-    {
+    ) -> Result<Self, BackendInitError<FftError>> {
         let input = Pencil::new(
             Arc::clone(&topology),
             global_shape,
@@ -1650,14 +1660,13 @@ where
         )
     }
 
-    /// Rebuilds this plan with FFTW while preserving its shape, layout,
+    /// Collectively rebuilds with FFTW while preserving its shape, layout,
     /// selected axes, and Fourier signs.
+    ///
+    /// Use the returned plan's endpoint-pencil `Arc`s and allocate new workspaces
+    /// and in-place arrays. See the [crate-level contract](crate#distributed-compatibility-and-failure-contract).
     #[cfg(feature = "fftw")]
-    #[allow(private_bounds)]
-    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<FftError>>
-    where
-        R: crate::backend::FftwReal,
-    {
+    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<FftError>> {
         let topology = Arc::clone(self.input_pencil().topology());
         let shape = *self.input_pencil().global_shape();
         let input = Pencil::new(
@@ -2276,16 +2285,10 @@ fn prepare_complex_stage_for_backend<R: FftReal, const N: usize, const M: usize>
     let sign = directions.get(axis_index) == Some(FourierDirection::Backward);
     #[cfg(feature = "fftw")]
     let plan = match backend {
-        BackendChoice::Fftw(options) => LocalC2cPlan::new_fftw_with_sign(
-            global_shape[axis_index],
-            sign,
-            options,
-        )
-        .map_err(|error| match error {
-            BackendInitError::Local(error) => BackendInitError::Local(FftError::LocalC2c(error)),
-            BackendInitError::Native(error) => BackendInitError::Native(error),
-            BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
-        })?,
+        BackendChoice::Fftw(options) => {
+            LocalC2cPlan::new_fftw_with_sign(global_shape[axis_index], sign, options)
+                .map_err(|error| error.map_local(FftError::LocalC2c))?
+        }
         BackendChoice::RustFft => unreachable!(),
     };
     Ok(TransformStage {

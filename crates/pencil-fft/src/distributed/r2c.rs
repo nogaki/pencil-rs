@@ -67,6 +67,9 @@ const OPERATION_R2C_BACKWARD_IN_PLACE_TIMED: u64 = 84;
 
 /// An immutable, checked distributed real-to-half-complex FFT plan.
 ///
+/// See the [crate-level compatibility and failure contract](crate#distributed-compatibility-and-failure-contract)
+/// for endpoint identity, workspace ownership, and error boundaries.
+///
 /// This API requires `N >= 2` and `1 <= M < N`. The input uses identity
 /// permutation and decomposition `[0..M)` with the original real global shape.
 /// A non-empty [`AxisSelection`] chooses the largest selected axis as the
@@ -242,6 +245,9 @@ const OPERATION_R2C_BACKWARD_IN_PLACE_TIMED: u64 = 84;
 pub struct R2cPlan<R: FftReal, const N: usize, const M: usize> {
     core: Arc<TransformPlanCore<R, N, M>>,
     raw_absolute_threshold: f64,
+    // Preserve the private core's orientation when rebuilding native plans.
+    #[cfg(feature = "fftw")]
+    c2r_real_len: Option<usize>,
 }
 
 /// Reusable storage for [`R2cPlan`] forward, inverse, and backward execution.
@@ -642,6 +648,10 @@ where
         &self.core.descriptor
     }
 
+    pub(super) fn selection(&self) -> AxisSelection<N> {
+        self.core.selection
+    }
+
     /// Returns the exact extra shape required by this plan.
     pub fn extra_shape(&self) -> &ExtraShape {
         &self.core.extra_shape
@@ -845,7 +855,7 @@ where
         destination: &mut PencilArray<Complex<R>, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
     ) -> Result<(), R2cError> {
-        self.execute_forward(source, destination, workspace, None)
+        self.execute_forward(source, destination, workspace, OPERATION_R2C_FORWARD, None)
     }
 
     /// Runs [`Self::forward`] and returns per-stage timing.
@@ -856,7 +866,13 @@ where
         workspace: &mut R2cWorkspace<R, N, M>,
     ) -> Result<TransformTiming<N>, R2cError> {
         let mut timing = TransformTiming::default();
-        self.execute_forward(source, destination, workspace, Some(&mut timing))?;
+        self.execute_forward(
+            source,
+            destination,
+            workspace,
+            OPERATION_R2C_FORWARD_TIMED,
+            Some(&mut timing),
+        )?;
         Ok(timing)
     }
 
@@ -932,7 +948,14 @@ where
         destination: &mut PencilArray<R, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
     ) -> Result<(), R2cError> {
-        self.execute_reverse(source, destination, workspace, true, None)
+        self.execute_reverse(
+            source,
+            destination,
+            workspace,
+            true,
+            OPERATION_R2C_INVERSE,
+            None,
+        )
     }
 
     /// Runs [`Self::inverse`] and returns per-stage timing.
@@ -943,7 +966,14 @@ where
         workspace: &mut R2cWorkspace<R, N, M>,
     ) -> Result<TransformTiming<N>, R2cError> {
         let mut timing = TransformTiming::default();
-        self.execute_reverse(source, destination, workspace, true, Some(&mut timing))?;
+        self.execute_reverse(
+            source,
+            destination,
+            workspace,
+            true,
+            OPERATION_R2C_INVERSE_TIMED,
+            Some(&mut timing),
+        )?;
         Ok(timing)
     }
 
@@ -965,7 +995,14 @@ where
         destination: &mut PencilArray<R, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
     ) -> Result<(), R2cError> {
-        self.execute_reverse(source, destination, workspace, false, None)
+        self.execute_reverse(
+            source,
+            destination,
+            workspace,
+            false,
+            OPERATION_R2C_BACKWARD,
+            None,
+        )
     }
 
     /// Runs [`Self::backward`] and returns per-stage timing.
@@ -976,7 +1013,14 @@ where
         workspace: &mut R2cWorkspace<R, N, M>,
     ) -> Result<TransformTiming<N>, R2cError> {
         let mut timing = TransformTiming::default();
-        self.execute_reverse(source, destination, workspace, false, Some(&mut timing))?;
+        self.execute_reverse(
+            source,
+            destination,
+            workspace,
+            false,
+            OPERATION_R2C_BACKWARD_TIMED,
+            Some(&mut timing),
+        )?;
         Ok(timing)
     }
 
@@ -1045,17 +1089,13 @@ where
     }
 
     #[cfg(feature = "fftw")]
-    #[allow(private_bounds)]
     /// Collectively constructs native FFTW plans with default selection and layout.
     pub fn from_shape_with_fftw(
         topology: Arc<MpiTopology<M>>,
         global_shape: [usize; N],
         extra_shape: ExtraShape,
         options: PlanOptions,
-    ) -> Result<Self, BackendInitError<R2cError>>
-    where
-        R: crate::backend::FftwReal,
-    {
+    ) -> Result<Self, BackendInitError<R2cError>> {
         let input = Pencil::new(
             Arc::clone(&topology),
             global_shape,
@@ -1073,23 +1113,27 @@ where
         )
     }
 
-    /// Rebuilds this plan with FFTW while preserving its shape, layout, and
+    /// Collectively rebuilds with FFTW while preserving its shape, layout, and
     /// selected axes.
+    ///
+    /// Use the returned plan's endpoint-pencil `Arc`s and allocate new workspaces
+    /// and in-place arrays. See the [crate-level contract](crate#distributed-compatibility-and-failure-contract).
     #[cfg(feature = "fftw")]
-    #[allow(private_bounds)]
-    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<R2cError>>
-    where
-        R: crate::backend::FftwReal,
-    {
-        let topology = Arc::clone(self.input_pencil().topology());
-        let shape = *self.input_pencil().global_shape();
+    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<R2cError>> {
+        let canonical = if self.c2r_real_len.is_some() {
+            self.output_pencil()
+        } else {
+            self.input_pencil()
+        };
+        let topology = Arc::clone(canonical.topology());
+        let shape = *canonical.global_shape();
         let input = Pencil::new(
             Arc::clone(&topology),
             shape,
             std::array::from_fn(|axis| axis),
         )
         .map_err(FftError::Pencil);
-        let mut plan = Self::construct_with_backend(
+        let mut plan = Self::construct_oriented(
             topology,
             shape,
             self.core.extra_shape.clone(),
@@ -1097,6 +1141,7 @@ where
             self.core.selection,
             self.core.layout,
             super::BackendChoice::Fftw(options),
+            self.c2r_real_len,
         )?;
         Arc::get_mut(&mut plan.core)
             .expect("fresh core")
@@ -1141,24 +1186,53 @@ where
         layout: DistributedLayout,
         backend: super::BackendChoice,
     ) -> Result<Self, BackendInitError<R2cError>> {
+        Self::construct_oriented(
+            topology,
+            global_shape,
+            extra_shape,
+            input,
+            selection,
+            layout,
+            backend,
+            None,
+        )
+    }
+
+    pub(super) fn construct_oriented(
+        topology: Arc<MpiTopology<M>>,
+        mut global_shape: [usize; N],
+        extra_shape: ExtraShape,
+        input: Result<Arc<Pencil<N, M>>, FftError>,
+        selection: AxisSelection<N>,
+        layout: DistributedLayout,
+        backend: super::BackendChoice,
+        c2r_real_len: Option<usize>,
+    ) -> Result<Self, BackendInitError<R2cError>> {
+        let c2r = c2r_real_len.is_some();
         let communicator = topology.communicator();
-        let expected_len = descriptor_len::<N, M>(&extra_shape)
-            .and_then(|length| length.checked_add(super::BACKEND_DESCRIPTOR_WORDS));
+        let suffix_len = super::BACKEND_DESCRIPTOR_WORDS + usize::from(c2r);
+        let expected_len =
+            descriptor_len::<N, M>(&extra_shape).and_then(|length| length.checked_add(suffix_len));
         let descriptor = expected_len.and_then(|_| {
             build_descriptor::<R, N, M>(
                 &topology,
                 global_shape,
                 &extra_shape,
                 selection,
-                VALUE_KIND_R2C,
+                if c2r {
+                    super::c2r::VALUE_KIND_C2R
+                } else {
+                    VALUE_KIND_R2C
+                },
                 layout,
             )
             .ok()
             .and_then(|mut descriptor| {
-                descriptor
-                    .try_reserve_exact(super::BACKEND_DESCRIPTOR_WORDS)
-                    .ok()?;
+                descriptor.try_reserve_exact(suffix_len).ok()?;
                 descriptor.extend(backend.descriptor_words::<R>());
+                if let Some(real_len) = c2r_real_len {
+                    descriptor.push(u64::try_from(real_len).ok()?);
+                }
                 Some(descriptor)
             })
         });
@@ -1167,10 +1241,13 @@ where
             .unwrap_or(INVALID_WORD);
         let header = [
             DESCRIPTOR_SCHEMA,
-            match backend {
-                super::BackendChoice::RustFft => OPERATION_R2C_PLAN,
+            match (c2r, backend) {
+                (false, super::BackendChoice::RustFft) => OPERATION_R2C_PLAN,
+                (true, super::BackendChoice::RustFft) => super::c2r::OPERATION_C2R_PLAN,
                 #[cfg(feature = "fftw")]
-                super::BackendChoice::Fftw(_) => OPERATION_NATIVE_R2C_PLAN,
+                (false, super::BackendChoice::Fftw(_)) => OPERATION_NATIVE_R2C_PLAN,
+                #[cfg(feature = "fftw")]
+                (true, super::BackendChoice::Fftw(_)) => super::c2r::OPERATION_NATIVE_C2R_PLAN,
             },
             u64::try_from(N).unwrap_or(INVALID_WORD),
             u64::try_from(M).unwrap_or(INVALID_WORD),
@@ -1187,16 +1264,35 @@ where
                 FftError::InvalidDimensions,
             )));
         }
-        let reduction_axis = selection
-            .mask()
-            .iter()
-            .rposition(|&selected| selected)
-            .expect("collectively accepted R2C selection is nonempty");
-        let boundary = N - 1 - reduction_axis;
+        let mut selected = selection.mask().iter();
+        let reduction_axis = if c2r {
+            selected.position(|&selected| selected)
+        } else {
+            selected.rposition(|&selected| selected)
+        }
+        .expect("collectively accepted real FFT selection is nonempty");
         let input_pencil = agree_result(
             communicator,
             super::validate_input(input, &topology, global_shape),
         )?;
+        let boundary = if c2r {
+            reduction_axis
+        } else {
+            N - 1 - reduction_axis
+        };
+        if let Some(real_len) = c2r_real_len {
+            agree_result(
+                communicator,
+                if real_len == 0 {
+                    Err(R2cError::LocalR2c(crate::LocalR2cError::InvalidLength))
+                } else if global_shape[reduction_axis] != real_len / 2 + 1 {
+                    Err(R2cError::Fft(FftError::InputLayoutMismatch))
+                } else {
+                    Ok(())
+                },
+            )?;
+            global_shape[reduction_axis] = real_len;
+        }
         let raw_absolute_threshold = agree_result(
             communicator,
             raw_absolute_threshold_for_shape::<R, N>(global_shape, selection, reduction_axis)
@@ -1207,31 +1303,46 @@ where
         let mut reduced_shape = global_shape;
         reduced_shape[reduction_axis] = complex_len;
 
-        let original_route = agree_result(
+        let other_input = agree_result(
+            communicator,
+            Pencil::new(
+                Arc::clone(&topology),
+                if c2r { global_shape } else { reduced_shape },
+                std::array::from_fn(|axis| axis),
+            )
+            .map_err(FftError::Pencil),
+        )?;
+        let (original_input, reduced_input) = if c2r {
+            (other_input, input_pencil)
+        } else {
+            (input_pencil, other_input)
+        };
+        let mut original_route = agree_result(
             communicator,
             build_route(
-                Ok(Arc::clone(&input_pencil)),
+                Ok(original_input),
                 &topology,
                 global_shape,
                 layout.permute_dims,
             ),
         )?;
-        let reduced_input = Pencil::new(
-            Arc::clone(&topology),
-            reduced_shape,
-            std::array::from_fn(|axis| axis),
-        )
-        .map_err(FftError::Pencil);
-        let reduced_input = agree_result(communicator, reduced_input)?;
-        let reduced_route = agree_result(
+        let mut reduced_route = agree_result(
             communicator,
             build_route(
-                Ok(Arc::clone(&reduced_input)),
+                Ok(reduced_input),
                 &topology,
                 reduced_shape,
                 layout.permute_dims,
             ),
         )?;
+        if c2r {
+            // Reverse edges as well as stages: real/complex transition types
+            // are chosen by their position relative to the boundary below.
+            for route in [&mut original_route, &mut reduced_route] {
+                route.stages.reverse();
+                route.distributed.reverse();
+            }
+        }
         let prepared = prepare_r2c_stages::<R, N, M>(
             &original_route,
             &reduced_route,
@@ -1241,6 +1352,7 @@ where
             selection,
             real_len,
             backend,
+            c2r,
         );
         if !collective_valid(communicator, prepared.is_ok()) {
             return Err(match prepared {
@@ -1316,6 +1428,8 @@ where
         Ok(Self {
             core: Arc::new(core),
             raw_absolute_threshold,
+            #[cfg(feature = "fftw")]
+            c2r_real_len,
         })
     }
 }
@@ -1329,8 +1443,13 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
     selection: AxisSelection<N>,
     real_len: usize,
     backend: super::BackendChoice,
+    c2r: bool,
 ) -> Result<StagePreparation<R, N, M>, BackendInitError<R2cError>> {
-    let boundary = N - 1 - reduction_axis;
+    let boundary = if c2r {
+        reduction_axis
+    } else {
+        N - 1 - reduction_axis
+    };
     if original_route.stages.len() != N || reduced_route.stages.len() != N {
         return Err(BackendInitError::Local(R2cError::Fft(
             FftError::PreparationFailed,
@@ -1342,7 +1461,7 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
         .map_err(|_| FftError::AllocationFailed { required: N })?;
     let mut fft_scratch_len = 0usize;
     for index in 0..N {
-        let axis = N - 1 - index;
+        let axis = if c2r { index } else { N - 1 - index };
         let stage = match index.cmp(&boundary) {
             Ordering::Less => prepare_complex_stage_for_backend(
                 &original_route.stages[index],
@@ -1352,12 +1471,7 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
                 FourierDirections::default(),
                 backend,
             )
-            .map_err(|error| match error {
-                BackendInitError::Local(error) => BackendInitError::Local(error.into()),
-                #[cfg(feature = "fftw")]
-                BackendInitError::Native(error) => BackendInitError::Native(error),
-                BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
-            })?,
+            .map_err(|error| error.map_local(R2cError::Fft))?,
             Ordering::Equal => {
                 let pencil = &original_route.stages[index];
                 if pencil
@@ -1375,13 +1489,8 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
                         .map_err(|error| BackendInitError::Local(R2cError::LocalR2c(error)))?,
                     #[cfg(feature = "fftw")]
                     super::BackendChoice::Fftw(options) => {
-                        LocalR2cPlan::new_fftw(real_len, options).map_err(|error| match error {
-                            BackendInitError::Local(error) => {
-                                BackendInitError::Local(R2cError::LocalR2c(error))
-                            }
-                            BackendInitError::Native(error) => BackendInitError::Native(error),
-                            BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
-                        })?
+                        LocalR2cPlan::new_fftw(real_len, options)
+                            .map_err(|error| error.map_local(R2cError::LocalR2c))?
                     }
                 };
                 TransformStage {
@@ -1399,12 +1508,7 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
                 FourierDirections::default(),
                 backend,
             )
-            .map_err(|error| match error {
-                BackendInitError::Local(error) => BackendInitError::Local(error.into()),
-                #[cfg(feature = "fftw")]
-                BackendInitError::Native(error) => BackendInitError::Native(error),
-                BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
-            })?,
+            .map_err(|error| error.map_local(R2cError::Fft))?,
         };
         fft_scratch_len = fft_scratch_len.max(stage.local.scratch_len());
         stages.push(stage);
@@ -1742,7 +1846,10 @@ fn cast_complex_vec_to_real<R: FftReal>(storage: Vec<Complex<R>>) -> Result<Vec<
     try_cast_vec(storage).map_err(|(_, _)| R2cError::Fft(FftError::StorageLayoutMismatch))
 }
 
-fn validate_recast_capacity<T, U>(capacity: usize, required_bytes: usize) -> Result<(), FftError> {
+pub(super) fn validate_recast_capacity<T, U>(
+    capacity: usize,
+    required_bytes: usize,
+) -> Result<(), FftError> {
     let source_size = size_of::<T>();
     let target_size = size_of::<U>();
     if source_size == 0
@@ -1903,24 +2010,17 @@ impl<R: FftReal, const N: usize, const M: usize> R2cPlan<R, N, M>
 where
     Complex<R>: Equivalence,
 {
-    fn execute_forward(
+    pub(super) fn execute_forward(
         &self,
         source: &PencilArray<R, N, M>,
         destination: &mut PencilArray<Complex<R>, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
+        operation: u64,
         mut report: Option<&mut TransformTiming<N>>,
     ) -> Result<(), R2cError> {
         let started = Instant::now();
         let communicator = self.input_pencil().topology().communicator();
-        agree_execution_descriptor_ref::<N, M>(
-            communicator,
-            if report.is_some() {
-                OPERATION_R2C_FORWARD_TIMED
-            } else {
-                OPERATION_R2C_FORWARD
-            },
-            &self.core.descriptor,
-        )?;
+        agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
         let preflight = self.preflight_forward(source, destination, workspace);
         if !collective_valid(communicator, preflight.is_ok()) {
             return Err(preflight
@@ -2003,29 +2103,17 @@ where
         )
     }
 
-    fn execute_reverse(
+    pub(super) fn execute_reverse(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
         destination: &mut PencilArray<R, N, M>,
         workspace: &mut R2cWorkspace<R, N, M>,
         normalize_inverse: bool,
+        operation: u64,
         mut report: Option<&mut TransformTiming<N>>,
     ) -> Result<(), R2cError> {
         let started = Instant::now();
         let communicator = self.input_pencil().topology().communicator();
-        let operation = if normalize_inverse {
-            if report.is_some() {
-                OPERATION_R2C_INVERSE_TIMED
-            } else {
-                OPERATION_R2C_INVERSE
-            }
-        } else {
-            if report.is_some() {
-                OPERATION_R2C_BACKWARD_TIMED
-            } else {
-                OPERATION_R2C_BACKWARD
-            }
-        };
         agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
         let preflight = self.preflight_inverse(source, destination, workspace);
         if !collective_valid(communicator, preflight.is_ok()) {
@@ -4785,12 +4873,8 @@ where
     let view = intermediate.active_view().map_err(FftError::Array)?;
     let local_len = view.pencil().local_len();
     let (real_len, complex_len) = r2c_lengths(core);
-    let reduction_axis = core
-        .selection
-        .mask()
-        .iter()
-        .rposition(|&selected| selected)
-        .expect("R2C core has a selected reduction axis");
+    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
+    let reduction_axis = core.stages[boundary].axis;
     let stride = super::memory_stride(view.pencil(), reduction_axis)?;
     let local_axis_len = view.pencil().local_shape_logical()[reduction_axis];
     let global_axis_start = view.pencil().local_ranges()[reduction_axis].start;
@@ -4910,12 +4994,8 @@ fn zero_accepted_boundary<R: FftReal, const N: usize, const M: usize>(
     let mut view = intermediate.active_view_mut().map_err(FftError::Array)?;
     let local_len = view.pencil().local_len();
     let (real_len, complex_len) = r2c_lengths(core);
-    let reduction_axis = core
-        .selection
-        .mask()
-        .iter()
-        .rposition(|&selected| selected)
-        .expect("R2C core has a selected reduction axis");
+    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
+    let reduction_axis = core.stages[boundary].axis;
     let stride = super::memory_stride(view.pencil(), reduction_axis)?;
     let local_axis_len = view.pencil().local_shape_logical()[reduction_axis];
     let global_axis_start = view.pencil().local_ranges()[reduction_axis].start;
@@ -4948,7 +5028,7 @@ fn normalization_depth<const N: usize>(
 ) -> f64 {
     let mut depth = 1.0_f64;
     for (axis, length) in shape.into_iter().enumerate() {
-        if axis < reduction_axis && selection.contains(axis) && length > 1 {
+        if axis != reduction_axis && selection.contains(axis) && length > 1 {
             depth += (usize::BITS - (length - 1).leading_zeros()) as f64;
         }
     }
@@ -4962,7 +5042,7 @@ fn raw_absolute_threshold_for_shape<R: FftReal, const N: usize>(
 ) -> Result<f64, FftError> {
     let mut transverse = 1.0_f64;
     for (axis, length) in shape.into_iter().enumerate() {
-        if axis < reduction_axis && selection.contains(axis) {
+        if axis != reduction_axis && selection.contains(axis) {
             transverse *= length as f64;
             if !transverse.is_finite() || transverse <= 0.0 {
                 return Err(FftError::PreparationFailed);

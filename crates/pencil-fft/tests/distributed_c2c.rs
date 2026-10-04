@@ -741,30 +741,16 @@ fn run_partial_r2c_delta<const N: usize, const M: usize>(
 }
 
 fn set_delta_complex<const N: usize, const M: usize>(array: &mut PencilArray<Complex<f64>, N, M>) {
-    let local_shape = array.pencil().local_shape_logical();
-    let starts: [usize; N] = std::array::from_fn(|axis| array.pencil().local_ranges()[axis].start);
-    for linear in 0..array.pencil().local_len() {
-        let local = unravel_spatial(linear, local_shape);
-        let global: [usize; N] = std::array::from_fn(|axis| starts[axis] + local[axis]);
-        *array.get_local_mut(&[], local).unwrap() = if global.iter().all(|&value| value == 0) {
-            Complex::new(1.0, 0.0)
-        } else {
-            Complex::new(0.0, 0.0)
-        };
+    array.as_mut_slice().fill(Complex::new(0.0, 0.0));
+    if let Some(x) = array.get_global_mut(&[], [0; N]) {
+        *x = Complex::new(1.0, 0.0);
     }
 }
 
 fn set_delta_real<const N: usize, const M: usize>(array: &mut PencilArray<f64, N, M>) {
-    let local_shape = array.pencil().local_shape_logical();
-    let starts: [usize; N] = std::array::from_fn(|axis| array.pencil().local_ranges()[axis].start);
-    for linear in 0..array.pencil().local_len() {
-        let local = unravel_spatial(linear, local_shape);
-        let global: [usize; N] = std::array::from_fn(|axis| starts[axis] + local[axis]);
-        *array.get_local_mut(&[], local).unwrap() = if global.iter().all(|&value| value == 0) {
-            1.0
-        } else {
-            0.0
-        };
+    array.as_mut_slice().fill(0.0);
+    if let Some(x) = array.get_global_mut(&[], [0; N]) {
+        *x = 1.0;
     }
 }
 
@@ -772,16 +758,9 @@ fn set_delta_complex_in_place<const N: usize, const M: usize>(
     array: &mut C2cInPlaceArray<f64, N, M>,
 ) {
     let mut view = array.view_mut().unwrap();
-    let local_shape = view.pencil().local_shape_logical();
-    let starts: [usize; N] = std::array::from_fn(|axis| view.pencil().local_ranges()[axis].start);
-    for linear in 0..view.pencil().local_len() {
-        let local = unravel_spatial(linear, local_shape);
-        let global: [usize; N] = std::array::from_fn(|axis| starts[axis] + local[axis]);
-        *view.get_local_mut(&[], local).unwrap() = if global.iter().all(|&value| value == 0) {
-            Complex::new(1.0, 0.0)
-        } else {
-            Complex::new(0.0, 0.0)
-        };
+    view.as_mut_slice().fill(Complex::new(0.0, 0.0));
+    if let Some(x) = view.get_global_mut(&[], [0; N]) {
+        *x = Complex::new(1.0, 0.0);
     }
 }
 

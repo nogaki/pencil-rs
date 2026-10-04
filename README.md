@@ -148,7 +148,8 @@ lists are rejected; zero-element arrays remain valid.
 
 ## Collections of separate arrays
 
-All six distributed plan families provide `forward_many`, `inverse_many`, and
+The six original distributed plan families (excluding the independent `C2rPlan`)
+provide `forward_many`, `inverse_many`, and
 `backward_many`, plus `*_many_in_place` for their existing in-place array types.
 They take standard slices of separate arrays and reuse one plan-bound workspace
 sequentially. This differs from one array with `ExtraShape` batch axes. Use
@@ -218,6 +219,47 @@ times the product of the selected transverse extents, excluding the real axis
 and extra dimensions. That finite-positive factor is collectively validated at
 plan construction. A forward/backward pair scales by the product of all
 selected spatial extents; identity axes do not contribute.
+
+## Independent distributed C2R (BRFFT)
+
+`C2rPlan<R, N, M>` accepts a canonical **complex** input pencil or array;
+no preceding R2C plan or forward transform is required. `from_shape` takes the
+reduced complex shape and an explicit original real length, since `n/2+1`
+does not determine whether `n` was odd or even. `from_array` and `from_pencil`
+accept the same real length.
+
+```rust,ignore
+let plan = C2rPlan::<f64, 3, 2>::from_shape(
+    topology, [5, 6, 7], 8, ExtraShape::scalar(),
+)?;
+// Input: canonical complex [5, 6, 7]; output: real [8, 6, 7].
+let mut input = plan.allocate_input()?;
+let mut output = plan.allocate_output()?;
+let mut workspace = plan.allocate_workspace()?;
+// Populate input with a valid half-spectrum before execution.
+plan.forward(&input, &mut output, &mut workspace)?; // raw positive-sign C2R
+plan.inverse(&output, &mut input, &mut workspace)?; // normalized negative-sign R2C
+```
+
+The lowest selected Rust axis is the C2R boundary, visited last among selected
+axes of the descending route (the opposite endpoint to `R2cPlan`). `forward`
+uses the unnormalized Julia `BRFFT` convention; `backward` is raw negative-sign
+R2C, while `inverse` divides R2C output by the product of selected real extents.
+Default output decomposition is `[1..=M]` with reversed spatial memory order.
+Each of the three constructors has one `_with_selection_and_layout` variant;
+pass `AxisSelection::all()` or `DistributedLayout::default()` for unchanged options.
+These support extra batches, both transpose methods and `permute_dims = false`;
+`with_fftw(options)` preserves this orientation.
+Defaults remain RustFFT even when `fftw` is enabled.
+
+Sources are preserved. Collective descriptor/preflight failures also preserve
+destinations and workspaces. Forward uses the existing R2C reverse endpoint
+validation, including all selected transverse axes in its tolerance; invalid
+DC/Nyquist planes leave the destination unchanged after private workspace use.
+Constructors and execution require matching collective call order on every rank;
+workspace allocation is noncollective and workspaces are plan-bound. This initial
+API is **out-of-place only**, without in-place, timing, collection, or overlap
+variants. It does not add C2R stages to arbitrary mixed-axis plans.
 
 ## Distributed C2C FFT
 
@@ -306,15 +348,18 @@ transport policy, so mixed and legacy calls cannot accidentally agree.
 
 Mixed reverse endpoint acceptance is checked after undoing the complex suffix
 and before C2R, separately for every extra batch and constrained DC/Nyquist plane.
-All endpoint components must be finite. For each nonidentity suffix stage `a`,
-let `E_a` be its FFT line length (FFT) or public `embedding_len()` (R2R/DHT),
-`s_a` its logical normalization factor, and `b_a` zero for FFT or two for
-R2R/DHT. Define `D = 1 + sum(ceil_log2(E_a) + b_a)` and
-`P = product(s_a)`. RFFT, real-prefix stages and identities are excluded.
+All endpoint components must be finite. For each nonidentity suffix stage `a`
+of length `n`, let `E_a` be its backend-independent logical error-model length:
+`n` for FFT/DHT, `2 * (n - 1)` for DCT-I, `2 * (n + 1)` for DST-I,
+`4 * n` for DCT/DST-II/III, and `8 * n` for DCT/DST-IV. This is not the public
+workspace-capacity accessor. Let `s_a` be its logical normalization factor,
+and `b_a` zero for FFT or two for R2R/DHT.
+Define `D = 1 + sum(ceil_log2(E_a) + b_a)` and `P = product(s_a)`.
+RFFT, real-prefix stages and identities are excluded.
 A plane passes if either its maximum absolute imaginary component is at most
 `128 * min_subnormal_R * D`, or its imaginary L2 norm is at most
 `128 * epsilon_R * D` times its real L2 norm. Raw `backward` multiplies only
-the absolute threshold by `P`; `inverse` does not. R2R/DHT embedding lengths
+the absolute threshold by `P`; `inverse` does not. R2R/DHT error-model lengths
 are not generally their normalization factors. Odd lengths constrain DC only
 (including length one); even lengths also constrain Nyquist. The
 `MixedR2cPlan` reverse-method rustdoc specifies the same policy and failure
@@ -331,13 +376,15 @@ coverage is in `crates/pencil-fft/tests/distributed_mixed.rs`.
 `FourierDirections<N>` selects `FourierDirection::Forward` (negative exponent)
 or `Backward` (positive exponent) per complex FFT axis. `C2cPlan`,
 `MixedC2cPlan`, and `MixedR2cPlan` expose `with_fft_directions`; it collectively
-creates a fresh plan core, so allocate workspaces/in-place arrays from the
-returned plan. Existing constructors keep their original signs. A configured
-positive-sign forward pairs with a negative-sign reverse; only `inverse`
-normalizes. Identity, R2R and RFFT axes must retain the default direction.
+creates a fresh core with strict endpoint-pencil `Arc` identity, even with
+RustFFT or unchanged signs. Use the returned plan's endpoint pencils and new
+workspaces/in-place arrays. Direct `from_shape_with_fft_directions` constructors
+instead accept `same_layout` plus matching `ExtraShape`. Existing constructors
+keep their original signs. A configured positive-sign forward pairs with a
+negative-sign reverse; only `inverse` normalizes. Identity, R2R and RFFT axes must retain the default direction.
 The existing closed `AxisTransform` and error enums remain unchanged.
 
-All distributed CPU plan families provide `forward_with_timing`,
+The six original distributed CPU plan families (not `C2rPlan`) provide `forward_with_timing`,
 `inverse_with_timing`, `backward_with_timing`, and corresponding in-place
 methods. `TransformTiming<N>` stores local-rank, fixed-size route-stage records:
 local transform time/call count, transition time/call count, and pack/unpack and
@@ -357,11 +404,14 @@ old, profiled and overlap calls have distinct collective operation words.
 ## Optional native CPU FFTW backend
 
 Enable `pencil-fft/fftw` to use explicit `new_fftw` constructors for local C2C,
-R2C/C2R, R2R and DHT plans. All distributed families provide `with_fftw(options)`
-and native shape constructors. Existing constructors **always select RustFFT /
+R2C/C2R, R2R and DHT plans. All distributed families provide `with_fftw(options)`;
+the six original families also provide native shape constructors. Existing constructors **always select RustFFT /
 RealFFT**, even when the feature is enabled; default builds need no native FFTW.
-A rebuilt distributed plan has a fresh identity, so allocate its own workspaces
-and in-place arrays. Fourier-direction rebuilding preserves the selected backend.
+Distributed FFTW construction and `with_fftw` rebuilds require the exact expected
+endpoint-pencil `Arc`s, not just matching layouts. Rebuilds need new plan-bound workspaces and
+in-place arrays; sufficient buffer size does not make old ones reusable.
+Fourier-direction rebuilding preserves the selected backend. See the
+[`pencil-fft` crate-level compatibility and failure contract](https://docs.rs/pencil-fft/latest/pencil_fft/#distributed-compatibility-and-failure-contract).
 
 `PlanOptions` selects `PlanningRigor::{Estimate, Measure, Patient, Exhaustive}`
 and an optional positive `Duration` planning budget. It is FFTW's approximate
@@ -373,11 +423,24 @@ option accessors expose the actual selection.
 
 The MPI-free adapter dynamically loads Linux `libfftw3.so.3` and
 `libfftw3f.so.3`, with initialized private planning buffers, separate native
-in-place/out-of-place plans, and unaligned new-array execution. R2R/DHT retain
-their current embedding algorithms with FFTW complex kernels; this is not a
-claim of native specialized DCT/DST performance. Planning/destruction are locked
-per precision, and the adapter resets its planning time limit to NO_TIMELIMIT.
-Uncoordinated foreign FFTW planner/state changes are outside its guarantee.
+in-place/out-of-place plans, and unaligned new-array execution. R2R/DHT now use native
+`fftw[f]_plan_r2r_1d` / `execute_r2r` DCT/DST-I-IV and Hartley kernels, not
+complex FFT embeddings. Complex inputs transform their real and imaginary
+components independently. Native DCT/DST and DHT of length `n` report
+`embedding_len() = n` initialized complex elements and `scratch_len() = 0`.
+RustFFT workspace requirements are unchanged.
+
+Compatibility: native DCT/DST `embedding_len()` and too-small-buffer errors'
+`required` values now use `n`, not the historical RustFFT extension lengths.
+Old larger local buffers remain valid, with unused tails untouched; a compact
+native buffer is not sufficient for a RustFFT plan unless it meets that plan's
+getters. Distributed shared embedding lines use the maximum stage requirement,
+so they may not shrink when another stage dominates. Mixed-plan endpoint
+acceptance still uses the independent, unchanged logical tolerance model above.
+No RSS reduction or speedup is promised.
+Planning/destruction are locked per precision, and the adapter resets its
+planning time limit to NO_TIMELIMIT. Uncoordinated foreign FFTW planner/state
+changes are outside its guarantee.
 
 `PlanOptions::with_threads(n)` requests a positive per-plan CPU thread count
 (default one); `requested_threads()` reports that request, not observed thread
@@ -422,6 +485,8 @@ Native tests are explicitly opt-in and fail if the runtime is unavailable:
 ```bash
 cargo test -p pencil-fftw -- --ignored
 cargo test -p pencil-fft --features fftw --test fftw_local -- --ignored
+cargo test -p pencil-fft --features fftw --lib native_r2r_oracles_and_workspace_contracts -- --ignored
+cargo test -p pencil-fft --features fftw --lib native_dht_oracles_and_workspace_contracts -- --ignored
 PENCIL_FFT_BACKEND=fftw tools/fftw-reference/check.sh
 PENCIL_FFT_BACKEND=fftw PENCIL_FFT_DIRECTION_ORDER=directions-first tools/fftw-reference/check.sh
 PENCIL_FFT_BACKEND=fftw PENCIL_FFT_THREADS=2 tools/fftw-reference/check.sh
@@ -664,6 +729,8 @@ pkg-config --modversion hdf5-openmpi
 
 ## Prerequisites
 
+The default build uses upstream rsmpi and native MPI bindings:
+
 - Rust stable, with a minimum supported Rust version of 1.85
 - A C MPI implementation such as Open MPI or MPICH (for `pencil-array` and
   distributed tests; local `pencil-fft` tests do not require MPI)
@@ -671,7 +738,63 @@ pkg-config --modversion hdf5-openmpi
 - libclang and its C development headers, required by bindgen while building
   the MPI bindings
 
+### Experimental runtime MPI (rsmpi-rt)
+
+`pencil-array` and distributed `pencil-fft` can instead use
+[rsmpi-rt](https://github.com/tensor4all/rsmpi-rt), without MPI headers, `mpicc`,
+or libclang at Rust build time. Their public APIs are unchanged. This is an
+experimental opt-in, not a replacement for the default upstream MPI dependency.
+MPI default features are disabled: `pencil-rs` does not need `user-operations`
+(libffi), and runtime builds must not enable the fork's default `mpi-sys-backend`.
+
+From the repository root, in a **separate checkout**:
+
+```bash
+cargo --config tools/rsmpi-rt.toml check -p pencil-array -p pencil-fft \
+  --features distributed,mpi/mpi-rt-sys-backend --all-targets
+
+# Runtime only: use MPIwrapper built against the MPI used by mpiexec.
+# This must be libmpiwrapper.so, not the native libmpi.so.
+export MPI_RT_LIB=/absolute/path/to/libmpiwrapper.so
+mpiexec -n 4 cargo --config tools/rsmpi-rt.toml test -p pencil-array \
+  --features mpi/mpi-rt-sys-backend --test topology --locked -- --test-threads=1
+mpiexec -n 4 cargo --config tools/rsmpi-rt.toml test -p pencil-fft \
+  --features distributed,mpi/mpi-rt-sys-backend --test distributed_c2c \
+  --locked -- --test-threads=1
+```
+
+The config pins the fork's Git revision via Cargo's `[patch.crates-io]`.
+The first command intentionally omits `--locked`: changing dependency sources
+updates `Cargo.lock`. Keep that runtime lockfile in your separate checkout;
+the repository's committed lockfile remains on upstream rsmpi. Pass both the
+config and runtime feature on every MPI build. The fork's two backend features
+are mutually exclusive; do not enable its default features or `mpi-sys-backend`.
+See [rsmpi-rt's setup instructions](https://github.com/tensor4all/rsmpi-rt#mpi-rt-sys-backend-recommended-for-this-fork)
+for building MPIwrapper. The CI job pins and builds MPIwrapper, checks the absence
+of native MPI build dependencies, and runs topology tests at 1/4 ranks plus
+transpose, collective, and distributed FFT tests at 1/4/6 ranks.
+
+In a consuming application, put the patch at **your workspace root** (dependency
+patches are not transitive), and enable the runtime backend on your direct MPI
+dependency so it shares the same types as `pencil-array` and `pencil-fft`:
+
+```toml
+[dependencies]
+mpi = { version = "=0.8.2", default-features = false, features = ["mpi-rt-sys-backend"] }
+
+[patch.crates-io]
+mpi = { git = "https://github.com/tensor4all/rsmpi-rt", rev = "736d45cdfd816e4013f9b46801d7ee5eb17ad2e8" }
+```
+
+**Not supported yet:** `pencil-io`, including MPI-IO and parallel HDF5. It uses
+native FFI constants and handles which differ from rsmpi-rt's MPIABI interface;
+HDF5 also needs an ABI-compatible MPI stack. Do not use `--workspace` with this
+runtime configuration. Default local `pencil-fft` remains MPI-free.
+
 ## Verification
+
+The following checks use the default native MPI backend, without the runtime
+patch above.
 
 ```bash
 set -euo pipefail
@@ -722,6 +845,11 @@ for n in 1 4 6; do
   timeout --foreground --kill-after=5s 120s mpiexec --oversubscribe -n "$n" \
     cargo test -p pencil-fft --features distributed --test distributed_c2c \
       --locked -- --nocapture --test-threads=1 || exit 1
+  timeout --foreground --kill-after=5s 120s mpiexec --oversubscribe -n "$n" \
+    cargo test -p pencil-fft --features distributed --test distributed_c2r \
+      --locked -- --nocapture --test-threads=1 || exit 1
+  # Optional FFTW counterpart: add --features distributed,fftw and run
+  # distributed_c2r_fftw_one_mpi_binary with --exact --ignored.
   timeout --foreground --kill-after=5s 120s mpiexec --oversubscribe -n "$n" \
     cargo test -p pencil-fft --features distributed --test distributed_r2r \
       --locked -- --nocapture --test-threads=1 || exit 1

@@ -7,11 +7,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::{
-    mem::{align_of, size_of},
-    sync::Arc,
-    time::Instant,
-};
+use std::{mem::size_of, sync::Arc, time::Instant};
 
 use bytemuck::{try_cast_slice, try_cast_vec};
 use mpi::{
@@ -50,7 +46,8 @@ use super::{
     TransformTiming, TransposeMethod, VALUE_KIND_C2C, VALUE_KIND_R2C,
     agree_execution_descriptor_ref, agree_header, agree_result, build_route, build_transitions,
     collective_descriptor, collective_valid, initialized_vec, map_array_allocation, memory_stride,
-    strided_line_count, validate_input, validate_workspace_lengths_values, zero_complex,
+    r2c::validate_recast_capacity, strided_line_count, validate_input,
+    validate_workspace_lengths_values, zero_complex,
 };
 
 use crate::r2r::AxisR2rKind;
@@ -404,12 +401,18 @@ pub struct MixedR2cInPlaceWorkspace<R: FftReal, const N: usize, const M: usize> 
 }
 
 /// A heterogeneous complex-to-complex distributed transform.
+///
+/// See the [crate-level compatibility and failure contract](crate#distributed-compatibility-and-failure-contract)
+/// for endpoint identity, workspace ownership, and error boundaries.
 #[derive(Debug)]
 pub struct MixedC2cPlan<R: FftReal, const N: usize, const M: usize> {
     core: Arc<MixedC2cCore<R, N, M>>,
 }
 
 /// A heterogeneous real-to-complex distributed transform.
+///
+/// See the [crate-level compatibility and failure contract](crate#distributed-compatibility-and-failure-contract)
+/// for endpoint identity, workspace ownership, and error boundaries.
 ///
 /// # Reverse endpoint contract
 ///
@@ -418,16 +421,18 @@ pub struct MixedC2cPlan<R: FftReal, const N: usize, const M: usize> {
 /// Only nonidentity stages after the real stage in forward execution order
 /// contribute; the RFFT itself and the real prefix are excluded. For each suffix axis a:
 ///
-/// - `Fft`: native_len_a = axis length, factor_a = axis length, allowance_a = 0.
-/// - `R2r` (including DHT): native_len_a = E_a, factor_a = the logical
-///   normalization factor, allowance_a = 2. E_a is
-///   [`LocalR2rPlan::embedding_len`] or [`crate::LocalDhtPlan::embedding_len`];
-///   factor_a is [`LocalR2rPlan::normalization_factor`] or
-///   [`crate::LocalDhtPlan::normalization_factor`] for that axis length/kind.
-///   The logical R2R factor is not generally its FFT embedding length.
+/// - `Fft`: E_a = axis length, factor_a = axis length, allowance_a = 0.
+/// - `R2r` (including DHT): factor_a = the logical normalization factor,
+///   allowance_a = 2. E_a is a backend-independent logical error-model length:
+///   for axis length n, `2 * (n - 1)` for DCT-I, `2 * (n + 1)` for DST-I,
+///   `4 * n` for DCT/DST-II/III, `8 * n` for DCT/DST-IV, and n for DHT.
+///   It is not a workspace-capacity requirement. factor_a is
+///   [`LocalR2rPlan::normalization_factor`] or
+///   [`crate::LocalDhtPlan::normalization_factor`] for that axis length/kind,
+///   and is not generally equal to E_a.
 ///
 /// In plaintext formulas:
-/// `depth = 1 + sum_a(ceil_log2(native_len_a) + allowance_a)`,
+/// `depth = 1 + sum_a(ceil_log2(E_a) + allowance_a)`,
 /// `relative = 128 * epsilon * depth`, and
 /// `inverse_absolute = 128 * min_subnormal * depth`.
 /// Raw backward uses `absolute = inverse_absolute * product_a(factor_a)`;
@@ -545,7 +550,10 @@ where
         )
     }
 
-    /// Builds a mixed complex plan with explicit Fourier signs.
+    /// Builds a mixed complex RustFFT plan with explicit Fourier signs.
+    ///
+    /// Unlike [`Self::with_fft_directions`], this direct constructor uses the
+    /// non-strict endpoint rules in the [crate-level contract](crate#distributed-compatibility-and-failure-contract).
     pub fn from_shape_with_fft_directions(
         topology: Arc<MpiTopology<M>>,
         global_shape: [usize; N],
@@ -570,8 +578,11 @@ where
         )
     }
 
-    /// Rebuilds this plan with fresh array/workspace identities and Fourier signs.
+    /// Collectively rebuilds with new Fourier signs, preserving the backend.
     ///
+    /// Use the returned plan's endpoint-pencil `Arc`s and allocate new workspaces
+    /// and in-place arrays, even with RustFFT or unchanged signs. See the
+    /// [crate-level contract](crate#distributed-compatibility-and-failure-contract).
     /// Forward is unscaled with these signs; inverse uses opposite signs and
     /// normalization, and backward uses opposite signs without normalization.
     /// Non-FFT axes must use `Forward`; other signs are rejected collectively.
@@ -935,7 +946,6 @@ where
     }
 
     /// Runs [`Self::forward`] and returns measured per-stage timing.
-    /// Computes the mixed forward transform and records per-stage timing.
     pub fn forward_with_timing(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
@@ -953,7 +963,6 @@ where
         Ok(t)
     }
     /// Runs [`Self::inverse`] and returns measured per-stage timing.
-    /// Computes the mixed inverse transform and records per-stage timing.
     pub fn inverse_with_timing(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
@@ -971,7 +980,6 @@ where
         Ok(t)
     }
     /// Runs [`Self::backward`] and returns measured per-stage timing.
-    /// Computes the mixed backward transform and records per-stage timing.
     pub fn backward_with_timing(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
@@ -989,7 +997,6 @@ where
         Ok(t)
     }
     /// Runs [`Self::forward_in_place`] and returns measured per-stage timing.
-    /// Computes the in-place mixed forward transform and records timing.
     pub fn forward_in_place_with_timing(
         &self,
         array: &mut MixedC2cInPlaceArray<R, N, M>,
@@ -1000,7 +1007,6 @@ where
         Ok(t)
     }
     /// Runs [`Self::inverse_in_place`] and returns measured per-stage timing.
-    /// Computes the in-place mixed inverse transform and records timing.
     pub fn inverse_in_place_with_timing(
         &self,
         array: &mut MixedC2cInPlaceArray<R, N, M>,
@@ -1011,7 +1017,6 @@ where
         Ok(t)
     }
     /// Runs [`Self::backward_in_place`] and returns measured per-stage timing.
-    /// Computes the in-place mixed backward transform and records timing.
     pub fn backward_in_place_with_timing(
         &self,
         array: &mut MixedC2cInPlaceArray<R, N, M>,
@@ -1048,7 +1053,6 @@ where
     }
 
     #[cfg(feature = "fftw")]
-    #[allow(private_bounds)]
     /// Builds a mixed plan from a shape using FFTW.
     pub fn from_shape_with_fftw(
         topology: Arc<MpiTopology<M>>,
@@ -1056,10 +1060,7 @@ where
         extra_shape: ExtraShape,
         transforms: [AxisTransform; N],
         options: PlanOptions,
-    ) -> Result<Self, BackendInitError<MixedError>>
-    where
-        R: crate::backend::FftwReal,
-    {
+    ) -> Result<Self, BackendInitError<MixedError>> {
         let input = Pencil::new(
             Arc::clone(&topology),
             global_shape,
@@ -1079,12 +1080,11 @@ where
     }
 
     #[cfg(feature = "fftw")]
-    #[allow(private_bounds)]
-    /// Rebuilds this mixed plan using FFTW.
-    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<MixedError>>
-    where
-        R: crate::backend::FftwReal,
-    {
+    /// Collectively rebuilds with FFTW, preserving transforms, layout, and Fourier signs.
+    ///
+    /// Use the returned plan's endpoint-pencil `Arc`s and allocate new workspaces
+    /// and in-place arrays. See the [crate-level contract](crate#distributed-compatibility-and-failure-contract).
+    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<MixedError>> {
         let topology = Arc::clone(self.input_pencil().topology());
         let shape = *self.input_pencil().global_shape();
         let input = Pencil::new(
@@ -1152,7 +1152,7 @@ where
             #[cfg(feature = "fftw")]
             BackendChoice::Fftw(_) => OPERATION_MIXED_C2C_PLAN_NATIVE,
         };
-        let header = mixed_header::<N, M>(operation, N, M, expected_len);
+        let header = mixed_header::<N, M>(operation, expected_len);
         if !agree_header(communicator, header) {
             return Err(BackendInitError::Local(MixedError::Fft(
                 FftError::CollectiveDescriptorMismatch,
@@ -1506,8 +1506,6 @@ pub(super) fn panic_after_reverse_detach_for_r2c_test<
 
 fn mixed_header<const N: usize, const M: usize>(
     operation: u64,
-    _n: usize,
-    _m: usize,
     descriptor_len: Option<usize>,
 ) -> [u64; super::HEADER_WORDS] {
     [
@@ -1677,23 +1675,13 @@ fn mixed_r2r_local<T: R2rScalar>(
         )),
         #[cfg(feature = "fftw")]
         (AxisR2rKind::Fftw(kind), BackendChoice::Fftw(options)) => Ok(MixedR2rLocal::Transform(
-            LocalR2rPlan::new_fftw(length, kind, options).map_err(|error| match error {
-                BackendInitError::Local(error) => {
-                    BackendInitError::Local(MixedError::LocalR2r(error))
-                }
-                BackendInitError::Native(error) => BackendInitError::Native(error),
-                BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
-            })?,
+            LocalR2rPlan::new_fftw(length, kind, options)
+                .map_err(|error| error.map_local(MixedError::LocalR2r))?,
         )),
         #[cfg(feature = "fftw")]
         (AxisR2rKind::Dht, BackendChoice::Fftw(options)) => Ok(MixedR2rLocal::Hartley(
-            crate::LocalDhtPlan::new_fftw(length, options).map_err(|error| match error {
-                BackendInitError::Local(error) => {
-                    BackendInitError::Local(MixedError::LocalR2r(error))
-                }
-                BackendInitError::Native(error) => BackendInitError::Native(error),
-                BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
-            })?,
+            crate::LocalDhtPlan::new_fftw(length, options)
+                .map_err(|error| error.map_local(MixedError::LocalR2r))?,
         )),
     }
 }
@@ -3084,7 +3072,10 @@ where
         )
     }
 
-    /// Builds a mixed real-to-complex plan with explicit Fourier signs.
+    /// Builds a mixed real-to-complex RustFFT plan with explicit Fourier signs.
+    ///
+    /// Unlike [`Self::with_fft_directions`], this direct constructor uses the
+    /// non-strict endpoint rules in the [crate-level contract](crate#distributed-compatibility-and-failure-contract).
     pub fn from_shape_with_fft_directions(
         topology: Arc<MpiTopology<M>>,
         global_shape: [usize; N],
@@ -3170,8 +3161,11 @@ where
         )
     }
 
-    /// Rebuilds this plan with fresh array/workspace identities and Fourier signs.
+    /// Collectively rebuilds with new Fourier signs, preserving the backend.
     ///
+    /// Use the returned plan's endpoint-pencil `Arc`s and allocate new workspaces
+    /// and in-place arrays, even with RustFFT or unchanged signs. See the
+    /// [crate-level contract](crate#distributed-compatibility-and-failure-contract).
     /// Forward is unscaled with these signs; inverse uses opposite signs and
     /// normalization, and backward uses opposite signs without normalization.
     /// Non-FFT axes must use `Forward`; other signs are rejected collectively.
@@ -3639,7 +3633,6 @@ where
     }
 
     #[cfg(feature = "fftw")]
-    #[allow(private_bounds)]
     /// Builds a mixed plan from a shape using FFTW.
     pub fn from_shape_with_fftw(
         topology: Arc<MpiTopology<M>>,
@@ -3647,10 +3640,7 @@ where
         extra_shape: ExtraShape,
         transforms: [AxisTransform; N],
         options: PlanOptions,
-    ) -> Result<Self, BackendInitError<MixedError>>
-    where
-        R: crate::backend::FftwReal,
-    {
+    ) -> Result<Self, BackendInitError<MixedError>> {
         let input = Pencil::new(
             Arc::clone(&topology),
             global_shape,
@@ -3670,12 +3660,11 @@ where
     }
 
     #[cfg(feature = "fftw")]
-    #[allow(private_bounds)]
-    /// Rebuilds this mixed plan using FFTW.
-    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<MixedError>>
-    where
-        R: crate::backend::FftwReal,
-    {
+    /// Collectively rebuilds with FFTW, preserving transforms, layout, and Fourier signs.
+    ///
+    /// Use the returned plan's endpoint-pencil `Arc`s and allocate new workspaces
+    /// and in-place arrays. See the [crate-level contract](crate#distributed-compatibility-and-failure-contract).
+    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<MixedError>> {
         let topology = Arc::clone(self.input_pencil().topology());
         let shape = *self.input_pencil().global_shape();
         let input = Pencil::new(
@@ -3749,7 +3738,7 @@ where
             #[cfg(feature = "fftw")]
             BackendChoice::Fftw(_) => OPERATION_MIXED_R2C_PLAN_NATIVE,
         };
-        let header = mixed_header::<N, M>(operation, N, M, expected_len);
+        let header = mixed_header::<N, M>(operation, expected_len);
         if !agree_header(communicator, header) {
             return Err(BackendInitError::Local(MixedError::Fft(
                 FftError::CollectiveDescriptorMismatch,
@@ -4421,16 +4410,14 @@ fn mixed_raw_threshold<R: FftReal, const N: usize, const M: usize>(
             }
             MixedR2cStageLocal::Complex(MixedComplexLocal::R2r(MixedR2rLocal::Transform(plan))) => {
                 (
-                    plan.embedding_len(),
+                    plan.error_model_len(),
                     plan.normalization_factor() as f64,
                     2.0,
                 )
             }
-            MixedR2cStageLocal::Complex(MixedComplexLocal::R2r(MixedR2rLocal::Hartley(plan))) => (
-                plan.embedding_len(),
-                plan.normalization_factor() as f64,
-                2.0,
-            ),
+            MixedR2cStageLocal::Complex(MixedComplexLocal::R2r(MixedR2rLocal::Hartley(plan))) => {
+                (plan.line_len(), plan.normalization_factor() as f64, 2.0)
+            }
             MixedR2cStageLocal::Real(_) => continue,
         };
         depth += ceil_log2_len(native_len) + allowance;
@@ -5790,16 +5777,14 @@ fn mixed_endpoint_policy<R: FftReal, const N: usize, const M: usize>(
             }
             MixedR2cStageLocal::Complex(MixedComplexLocal::R2r(MixedR2rLocal::Transform(plan))) => {
                 (
-                    plan.embedding_len(),
+                    plan.error_model_len(),
                     plan.normalization_factor() as f64,
                     2.0,
                 )
             }
-            MixedR2cStageLocal::Complex(MixedComplexLocal::R2r(MixedR2rLocal::Hartley(plan))) => (
-                plan.embedding_len(),
-                plan.normalization_factor() as f64,
-                2.0,
-            ),
+            MixedR2cStageLocal::Complex(MixedComplexLocal::R2r(MixedR2rLocal::Hartley(plan))) => {
+                (plan.line_len(), plan.normalization_factor() as f64, 2.0)
+            }
             MixedR2cStageLocal::Real(_) => continue,
         };
         depth += ceil_log2_len(native_len) + allowance;
@@ -6214,19 +6199,13 @@ fn validate_mixed_r2c_ip<R: FftReal, const N: usize, const M: usize>(
             if real.storage_len() != real_len {
                 return Err(MixedError::Fft(FftError::StorageLayoutMismatch));
             }
-            validate_mixed_recast_capacity::<R, Complex<R>>(
-                real.storage_capacity(),
-                storage_bytes,
-            )?;
+            validate_recast_capacity::<R, Complex<R>>(real.storage_capacity(), storage_bytes)?;
         }
         (Direction::Inverse | Direction::Backward, MixedR2cStorage::Complex(complex)) => {
             if complex.storage_len() != complex_len {
                 return Err(MixedError::Fft(FftError::StorageLayoutMismatch));
             }
-            validate_mixed_recast_capacity::<Complex<R>, R>(
-                complex.storage_capacity(),
-                storage_bytes,
-            )?;
+            validate_recast_capacity::<Complex<R>, R>(complex.storage_capacity(), storage_bytes)?;
         }
         _ => return Err(MixedError::Fft(FftError::StorageLayoutMismatch)),
     }
@@ -6286,30 +6265,6 @@ fn mixed_boundary_rows<R: FftReal, const N: usize, const M: usize>(
     (local_len / line_len)
         .checked_mul(core.extra_shape.element_count())
         .ok_or(MixedError::Fft(FftError::PreparationFailed))
-}
-
-fn validate_mixed_recast_capacity<T, U>(
-    capacity: usize,
-    required_bytes: usize,
-) -> Result<(), MixedError> {
-    let source_size = size_of::<T>();
-    let target_size = size_of::<U>();
-    if source_size == 0
-        || target_size == 0
-        || align_of::<T>() != align_of::<U>()
-        || capacity
-            .checked_mul(source_size)
-            .is_none_or(|bytes| bytes > isize::MAX as usize || bytes < required_bytes)
-    {
-        return Err(MixedError::Fft(FftError::StorageLayoutMismatch));
-    }
-    let capacity_bytes = capacity
-        .checked_mul(source_size)
-        .ok_or(MixedError::Fft(FftError::StorageLayoutMismatch))?;
-    if capacity_bytes % target_size != 0 {
-        return Err(MixedError::Fft(FftError::StorageLayoutMismatch));
-    }
-    Ok(())
 }
 
 fn mixed_fail_real_forward<R: FftReal, const N: usize, const M: usize>(
@@ -7408,8 +7363,69 @@ mod reverse_overlap_tests {
         super::super::consume_c2c_callback_injection().map_err(MixedError::Fft)
     }
 
+    fn endpoint_threshold_probes<R: FftReal, const N: usize>(
+        plan: &MixedR2cPlan<R, N, 2>,
+        extra_indices: &[usize],
+        normalize: bool,
+        depth: f64,
+        factor: f64,
+    ) where
+        Complex<R>: Equivalence,
+    {
+        let core = &plan.core;
+        let stage = &core.stages[core.real_stage_index];
+        let pencil = &stage.output;
+        let relative = 128.0 * <R as crate::private::Sealed>::pencil_fft_epsilon_f64() * depth;
+        let absolute = 128.0
+            * <R as crate::private::Sealed>::pencil_fft_min_subnormal_f64()
+            * depth
+            * if normalize { 1.0 } else { factor };
+        let mut data = PencilArray::from_elem(
+            Arc::clone(pencil),
+            core.extra_shape.clone(),
+            zero_complex::<R>(),
+        )
+        .unwrap();
+        let plane_count = if core.real_len % 2 == 0 { 2 } else { 1 };
+        for plane in 0..plane_count {
+            let mut position = [0; N];
+            position[stage.axis] = if plane == 0 { 0 } else { core.complex_len - 1 };
+            for (re, threshold) in [(1.0, relative), (0.0, absolute)] {
+                let neighbors = if size_of::<R>() == size_of::<f32>() {
+                    let bits = (threshold as f32).to_bits();
+                    [bits - 1, bits, bits + 1].map(|bits| f32::from_bits(bits) as f64)
+                } else {
+                    let bits = threshold.to_bits();
+                    [bits - 1, bits, bits + 1].map(f64::from_bits)
+                };
+                assert_eq!(neighbors[1], threshold, "fixture threshold must be exact");
+                for (im, accepted) in neighbors.into_iter().zip([true, true, false]) {
+                    // One globally nonzero entry avoids norm-summation roundoff.
+                    data.as_mut_slice().fill(zero_complex::<R>());
+                    if let Some(value) = data.get_global_mut(extra_indices, position) {
+                        *value = Complex::new(R::from_f64(re).unwrap(), R::from_f64(im).unwrap());
+                    }
+                    let result = validate_mixed_boundary_data(
+                        core,
+                        Ok((pencil, data.as_slice())),
+                        normalize,
+                    );
+                    assert_eq!(
+                        result.is_ok(),
+                        accepted,
+                        "real_len={} batch={extra_indices:?} plane={plane} normalize={normalize} re={re} im={im}: {result:?}",
+                        core.real_len,
+                    );
+                    if !accepted {
+                        assert!(matches!(result, Err(MixedError::InvalidSpectrum)));
+                    }
+                }
+            }
+        }
+    }
+
     // Direct boundary data avoids FFT roundoff and an expected-value self-oracle.
-    fn endpoint_contract<R: FftReal>(topology: &Arc<MpiTopology<2>>)
+    fn endpoint_contract<R: FftReal>(topology: &Arc<MpiTopology<2>>, backend: BackendChoice)
     where
         Complex<R>: Equivalence,
     {
@@ -7427,10 +7443,14 @@ mod reverse_overlap_tests {
                 DistributedLayout::default(),
             )
             .unwrap();
+            let plan = match backend {
+                BackendChoice::RustFft => plan,
+                #[cfg(feature = "fftw")]
+                BackendChoice::Fftw(options) => plan.with_fftw(options).unwrap(),
+            };
             // DCT-IV: E=8*12=96, factor=2*12=24; DHT: E=factor=8;
             // FFT: E=factor=6. Ceil logs are 7, 3, 3, respectively.
-            let depth = 1.0 + (7.0 + 2.0) + (3.0 + 2.0) + 3.0;
-            let factor = 24.0 * 8.0 * 6.0;
+            let (depth, factor) = (18.0, 1152.0);
             assert_eq!(mixed_endpoint_policy(&plan.core).unwrap(), (depth, factor));
             let epsilon = <R as crate::private::Sealed>::pencil_fft_epsilon_f64();
             let min_subnormal = <R as crate::private::Sealed>::pencil_fft_min_subnormal_f64();
@@ -7440,6 +7460,7 @@ mod reverse_overlap_tests {
                 if !normalize {
                     assert_eq!(plan.core.raw_absolute_threshold, absolute);
                 }
+                endpoint_threshold_probes(&plan, &[], normalize, depth, factor);
                 for (re, im, accepted) in [
                     (1.0, 0.99 * 128.0 * epsilon * depth, true),
                     (1.0, 1.01 * 128.0 * epsilon * depth, false),
@@ -7467,7 +7488,7 @@ mod reverse_overlap_tests {
         }
     }
 
-    fn batched_endpoint_contract<R: FftReal>(topology: &Arc<MpiTopology<2>>)
+    fn batched_endpoint_contract<R: FftReal>(topology: &Arc<MpiTopology<2>>, backend: BackendChoice)
     where
         Complex<R>: Equivalence,
     {
@@ -7488,6 +7509,11 @@ mod reverse_overlap_tests {
                 DistributedLayout::default(),
             )
             .unwrap();
+            let plan = match backend {
+                BackendChoice::RustFft => plan,
+                #[cfg(feature = "fftw")]
+                BackendChoice::Fftw(options) => plan.with_fftw(options).unwrap(),
+            };
             assert_eq!(mixed_endpoint_policy(&plan.core).unwrap(), (7.0, 12.0));
             let pencil = &plan.core.stages[plan.core.real_stage_index].output;
             let stride = memory_stride(pencil, 2).unwrap();
@@ -7495,6 +7521,7 @@ mod reverse_overlap_tests {
             let reduced = real_len / 2 + 1;
             for normalize in [true, false] {
                 for batch in 0..2 {
+                    endpoint_threshold_probes(&plan, &[batch], normalize, 7.0, 12.0);
                     for bin in [0, reduced - 1] {
                         // Huge clean other planes/batches must not mask this plane's error.
                         let mut data = vec![
@@ -7571,6 +7598,325 @@ mod reverse_overlap_tests {
         }
     }
 
+    #[cfg(feature = "fftw")]
+    fn native_workspace_contract<R: FftReal>(topology: &Arc<MpiTopology<1>>)
+    where
+        Complex<R>: Equivalence,
+    {
+        let rank = topology.communicator().rank();
+        let value = R::from_f64(0.25).unwrap();
+        let complex_value = Complex::new(value, -value);
+        let sentinel = Complex::new(R::from_f64(7.0).unwrap(), R::from_f64(-3.0).unwrap());
+        let nan = Complex::new(
+            R::from_f64(f64::NAN).unwrap(),
+            R::from_f64(-f64::NAN).unwrap(),
+        );
+        let dct = AxisTransform::R2r(AxisR2rKind::Fftw(crate::R2rKind::DctIV));
+        let dht = AxisTransform::R2r(AxisR2rKind::Dht);
+        // DCT-IV n=8 previously needed 64; the shared max only shrinks for h=16.
+        // The final graph has only FFT/RFFT/identity stages and needs no embedding.
+        for (h, required, rust_required) in
+            [(16, 16, 64), (64, 64, 64), (128, 128, 128), (16, 0, 0)]
+        {
+            let tail_bits =
+                |line: &[Complex<R>]| bytemuck::cast_slice::<_, u8>(&line[required..]).to_vec();
+            let assert_short_error = |error: MixedError| match (rank, error) {
+                (
+                    0,
+                    MixedError::Fft(FftError::WorkspaceTooSmall {
+                        kind: "complex embedding",
+                        required: actual_required,
+                        actual,
+                    }),
+                ) => assert_eq!((actual_required, actual), (required, required - 1)),
+                (_, MixedError::Fft(FftError::CollectivePreconditionFailed)) if rank != 0 => {}
+                (_, error) => panic!("unexpected rank {rank} embedding preflight error: {error:?}"),
+            };
+            let transforms = if required == 0 {
+                [AxisTransform::Fft, AxisTransform::None]
+            } else {
+                [dct, dht]
+            };
+            let rust_plan = MixedC2cPlan::<R, 2, 1>::from_shape(
+                Arc::clone(topology),
+                [8, h],
+                ExtraShape::scalar(),
+                transforms,
+            )
+            .unwrap();
+            assert_eq!(rust_plan.core.embedding_len, rust_required);
+            assert_eq!(
+                rust_plan.allocate_workspace().unwrap().embedding_line.len(),
+                rust_required
+            );
+            assert_eq!(
+                rust_plan
+                    .allocate_in_place_workspace()
+                    .unwrap()
+                    .embedding_line
+                    .len(),
+                rust_required
+            );
+            let plan = rust_plan.with_fftw(PlanOptions::default()).unwrap();
+            assert_eq!(
+                (plan.core.embedding_len, plan.core.fft_scratch_len),
+                (required, 0)
+            );
+            // Allocate from the rebuilt plan so strict endpoint/core identity stays valid.
+            let mut source = plan.allocate_input().unwrap();
+            source.as_mut_slice().fill(complex_value);
+            let source_before = source.as_slice().to_vec();
+            let mut destination = plan.allocate_output().unwrap();
+            destination.as_mut_slice().fill(sentinel);
+            let mut workspace = plan.allocate_workspace().unwrap();
+            let mut array = plan.allocate_in_place().unwrap();
+            array.view_mut().unwrap().as_mut_slice().fill(complex_value);
+            let mut ip_workspace = plan.allocate_in_place_workspace().unwrap();
+            // These are initialized lengths, not allocator capacities.
+            assert_eq!(
+                (workspace.embedding_line.len(), workspace.fft_scratch.len()),
+                (required, 0)
+            );
+            assert_eq!(
+                (
+                    ip_workspace.embedding_line.len(),
+                    ip_workspace.fft_scratch.len()
+                ),
+                (required, 0)
+            );
+            if h == 16 && required != 0 {
+                workspace.embedding_line.fill(sentinel);
+                ip_workspace.embedding_line.fill(sentinel);
+                if rank == 0 {
+                    // truncate retains capacity: validation must still reject M-1.
+                    workspace.embedding_line.truncate(required - 1);
+                    ip_workspace.embedding_line.truncate(required - 1);
+                }
+                let destination_before = destination.as_slice().to_vec();
+                let workspace_before = format!("{workspace:?}");
+                assert_short_error(
+                    plan.forward(&source, &mut destination, &mut workspace)
+                        .unwrap_err(),
+                );
+                assert_eq!(source.as_slice(), source_before);
+                assert_eq!(destination.as_slice(), destination_before);
+                assert_eq!(format!("{workspace:?}"), workspace_before);
+
+                let array_before = format!("{array:?}");
+                let workspace_before = format!("{ip_workspace:?}");
+                assert_short_error(
+                    plan.forward_in_place(&mut array, &mut ip_workspace)
+                        .unwrap_err(),
+                );
+                assert_eq!(array.state(), C2cState::Input);
+                assert_eq!(format!("{array:?}"), array_before);
+                assert_eq!(format!("{ip_workspace:?}"), workspace_before);
+                workspace
+                    .embedding_line
+                    .resize(required, zero_complex::<R>());
+                ip_workspace
+                    .embedding_line
+                    .resize(required, zero_complex::<R>());
+            }
+            for padding in [0, 3] {
+                workspace.embedding_line.resize(required + padding, nan);
+                ip_workspace.embedding_line.resize(required + padding, nan);
+                // Only [M..] is a tail: other stages may use the DCT's [n..M).
+                let tail = tail_bits(&workspace.embedding_line);
+                let ip_tail = tail_bits(&ip_workspace.embedding_line);
+                plan.forward(&source, &mut destination, &mut workspace)
+                    .unwrap();
+                assert_eq!(source.as_slice(), source_before);
+                assert_eq!(tail_bits(&workspace.embedding_line), tail);
+                let spectrum_before = destination.as_slice().to_vec();
+                let mut recovered = plan.allocate_input().unwrap();
+                for raw in [false, true] {
+                    if raw {
+                        plan.backward(&destination, &mut recovered, &mut workspace)
+                            .unwrap();
+                    } else {
+                        plan.inverse(&destination, &mut recovered, &mut workspace)
+                            .unwrap();
+                    }
+                    assert_eq!(destination.as_slice(), spectrum_before);
+                    assert_eq!(tail_bits(&workspace.embedding_line), tail);
+                    array
+                        .view_mut()
+                        .unwrap()
+                        .as_mut_slice()
+                        .copy_from_slice(&source_before);
+                    plan.forward_in_place(&mut array, &mut ip_workspace)
+                        .unwrap();
+                    assert_eq!(array.state(), C2cState::Output);
+                    assert_eq!(tail_bits(&ip_workspace.embedding_line), ip_tail);
+                    if raw {
+                        plan.backward_in_place(&mut array, &mut ip_workspace)
+                            .unwrap();
+                    } else {
+                        plan.inverse_in_place(&mut array, &mut ip_workspace)
+                            .unwrap();
+                    }
+                    assert_eq!(array.state(), C2cState::Input);
+                    assert_eq!(tail_bits(&ip_workspace.embedding_line), ip_tail);
+                }
+            }
+
+            let transforms = if required == 0 {
+                [AxisTransform::Fft, AxisTransform::None, AxisTransform::Rfft]
+            } else {
+                [dct, dht, AxisTransform::Rfft]
+            };
+            let rust_plan = MixedR2cPlan::<R, 3, 1>::from_shape(
+                Arc::clone(topology),
+                [8, h, 8],
+                ExtraShape::scalar(),
+                transforms,
+            )
+            .unwrap();
+            assert_eq!(rust_plan.core.embedding_len, rust_required);
+            assert_eq!(
+                rust_plan.allocate_workspace().unwrap().embedding_line.len(),
+                rust_required
+            );
+            assert_eq!(
+                rust_plan
+                    .allocate_in_place_workspace()
+                    .unwrap()
+                    .embedding_line
+                    .len(),
+                rust_required
+            );
+            let plan = rust_plan.with_fftw(PlanOptions::default()).unwrap();
+            assert_eq!(
+                (plan.core.embedding_len, plan.core.fft_scratch_len),
+                (required, 0)
+            );
+            let mut source = plan.allocate_input().unwrap();
+            source.as_mut_slice().fill(value);
+            let source_before = source.as_slice().to_vec();
+            let mut destination = plan.allocate_output().unwrap();
+            destination.as_mut_slice().fill(sentinel);
+            let mut workspace = plan.allocate_workspace().unwrap();
+            let mut array = plan.allocate_in_place().unwrap();
+            array.real_view_mut().unwrap().as_mut_slice().fill(value);
+            let mut ip_workspace = plan.allocate_in_place_workspace().unwrap();
+            assert_eq!(
+                (workspace.embedding_line.len(), workspace.fft_scratch.len()),
+                (required, 0)
+            );
+            assert_eq!(
+                (
+                    ip_workspace.embedding_line.len(),
+                    ip_workspace.fft_scratch.len()
+                ),
+                (required, 0)
+            );
+            if h == 16 && required != 0 {
+                workspace.embedding_line.fill(sentinel);
+                ip_workspace.embedding_line.fill(sentinel);
+                if rank == 0 {
+                    workspace.embedding_line.truncate(required - 1);
+                    ip_workspace.embedding_line.truncate(required - 1);
+                }
+                let destination_before = destination.as_slice().to_vec();
+                let workspace_before = format!("{workspace:?}");
+                assert_short_error(
+                    plan.forward(&source, &mut destination, &mut workspace)
+                        .unwrap_err(),
+                );
+                assert_eq!(source.as_slice(), source_before);
+                assert_eq!(destination.as_slice(), destination_before);
+                assert_eq!(format!("{workspace:?}"), workspace_before);
+
+                let array_before = format!("{array:?}");
+                let workspace_before = format!("{ip_workspace:?}");
+                assert_short_error(
+                    plan.forward_in_place(&mut array, &mut ip_workspace)
+                        .unwrap_err(),
+                );
+                assert_eq!(array.state(), R2cState::RealInput);
+                assert_eq!(format!("{array:?}"), array_before);
+                assert_eq!(format!("{ip_workspace:?}"), workspace_before);
+                workspace
+                    .embedding_line
+                    .resize(required, zero_complex::<R>());
+                ip_workspace
+                    .embedding_line
+                    .resize(required, zero_complex::<R>());
+            }
+            for padding in [0, 3] {
+                workspace.embedding_line.resize(required + padding, nan);
+                ip_workspace.embedding_line.resize(required + padding, nan);
+                let tail = tail_bits(&workspace.embedding_line);
+                let ip_tail = tail_bits(&ip_workspace.embedding_line);
+                plan.forward(&source, &mut destination, &mut workspace)
+                    .unwrap();
+                assert_eq!(source.as_slice(), source_before);
+                assert_eq!(tail_bits(&workspace.embedding_line), tail);
+                let spectrum_before = destination.as_slice().to_vec();
+                let mut recovered = plan.allocate_input().unwrap();
+                for raw in [false, true] {
+                    if raw {
+                        plan.backward(&destination, &mut recovered, &mut workspace)
+                            .unwrap();
+                    } else {
+                        plan.inverse(&destination, &mut recovered, &mut workspace)
+                            .unwrap();
+                    }
+                    assert_eq!(destination.as_slice(), spectrum_before);
+                    assert_eq!(tail_bits(&workspace.embedding_line), tail);
+                    array
+                        .real_view_mut()
+                        .unwrap()
+                        .as_mut_slice()
+                        .copy_from_slice(&source_before);
+                    plan.forward_in_place(&mut array, &mut ip_workspace)
+                        .unwrap();
+                    assert_eq!(array.state(), R2cState::ComplexOutput);
+                    assert_eq!(tail_bits(&ip_workspace.embedding_line), ip_tail);
+                    if raw {
+                        plan.backward_in_place(&mut array, &mut ip_workspace)
+                            .unwrap();
+                    } else {
+                        plan.inverse_in_place(&mut array, &mut ip_workspace)
+                            .unwrap();
+                    }
+                    assert_eq!(array.state(), R2cState::RealInput);
+                    assert_eq!(tail_bits(&ip_workspace.embedding_line), ip_tail);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "fftw")]
+    #[test]
+    #[ignore = "MPI and native FFTW require a separate test process (1, 4, or 6 ranks)"]
+    fn native_workspace_capacity_contract() {
+        let universe = mpi::initialize().unwrap();
+        let world = universe.world();
+        let size = world.size() as usize;
+        assert!(matches!(size, 1 | 4 | 6));
+        let topology = pencil_array::MpiTopology::<1>::new(&world, [size]).unwrap();
+        native_workspace_contract::<f32>(&topology);
+        native_workspace_contract::<f64>(&topology);
+    }
+
+    #[cfg(feature = "fftw")]
+    #[test]
+    #[ignore = "MPI and native FFTW require a separate test process (1, 4, or 6 ranks)"]
+    fn native_endpoint_policy_contract() {
+        let universe = mpi::initialize().unwrap();
+        let world = universe.world();
+        let size = world.size() as usize;
+        assert!(matches!(size, 1 | 4 | 6));
+        let topology = pencil_array::MpiTopology::<2>::new(&world, [size, 1]).unwrap();
+        let backend = BackendChoice::Fftw(PlanOptions::default());
+        endpoint_contract::<f32>(&topology, backend);
+        endpoint_contract::<f64>(&topology, backend);
+        batched_endpoint_contract::<f32>(&topology, backend);
+        batched_endpoint_contract::<f64>(&topology, backend);
+    }
+
     #[test]
     #[ignore = "MPI must be initialized in a separate test process"]
     fn reverse_local_routes_run_callbacks_and_independent_spectrum() {
@@ -7579,10 +7925,10 @@ mod reverse_overlap_tests {
         let size = world.size() as usize;
         assert!(matches!(size, 1 | 4 | 6));
         let topology = pencil_array::MpiTopology::<2>::new(&world, [size, 1]).unwrap();
-        endpoint_contract::<f32>(&topology);
-        endpoint_contract::<f64>(&topology);
-        batched_endpoint_contract::<f32>(&topology);
-        batched_endpoint_contract::<f64>(&topology);
+        endpoint_contract::<f32>(&topology, BackendChoice::RustFft);
+        endpoint_contract::<f64>(&topology, BackendChoice::RustFft);
+        batched_endpoint_contract::<f32>(&topology, BackendChoice::RustFft);
+        batched_endpoint_contract::<f64>(&topology, BackendChoice::RustFft);
         for permute_dims in [false, true] {
             for boundary in 0..4 {
                 let mut transforms = [AxisTransform::R2r(AxisR2rKind::Dht); 4];

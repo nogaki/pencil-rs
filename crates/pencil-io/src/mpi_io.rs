@@ -14,7 +14,7 @@ use crate::format::{IoElement, element_count, pack_view, prepare_physical_values
 use crate::options::{InfoGuard, MpiIoMode, MpiIoOptions, agree_options};
 use crate::{
     COMMIT_MARKER, FORMAT_VERSION, INCOMPLETE_MARKER, IO_NAMESPACE, IoError, MAX_DESCRIPTOR_BYTES,
-    MAX_HEADER_BYTES, MAX_PROTOCOL_RANK, OP_READ_MPI, OP_WRITE_MPI,
+    MAX_HEADER_BYTES, MAX_PROTOCOL_RANK, OP_READ_MPI, OP_WRITE_MPI, ScalarType,
 };
 
 const HEADER_PREFIX_BYTES: usize = 96;
@@ -155,9 +155,9 @@ pub(crate) fn duplicate_comm(
     Ok(duplicate)
 }
 
-/// Returns whether every rank succeeded and whether at least one rank
-/// succeeded.  The second bit distinguishes an all-failed ordinary error from
-/// a mixed native-handle state that cannot be cleaned up collectively.
+/// Returns `(all_succeeded, mixed)`: `(true, false)` for all-success,
+/// `(false, false)` for all-failure, and `(false, true)` for mixed results.
+/// Uses a minimum reduction followed by a maximum reduction.
 pub(crate) fn collective_state<C: CommunicatorCollectives>(
     comm: &C,
     local_ok: bool,
@@ -178,6 +178,9 @@ pub(crate) fn abort_unrecoverable(comm: ffi::MPI_Comm, _operation: &'static str)
 }
 
 /// Writes one view collectively using native MPI-IO.
+///
+/// Failure does not roll back file mutations, and a valid commit may remain.
+/// [`IoError::CommitUncertain`] is not a safe-retry guarantee.
 pub fn write_mpi<P, T, const N: usize, const M: usize>(
     path: P,
     view: PencilArrayView<'_, T, N, M>,
@@ -311,15 +314,12 @@ where
         }
         Err(_) => false,
     };
-    if let Err(agreement) = agree_phase(comm, header_ok, "MPI-IO header write") {
+    if agree_phase(comm, header_ok, "MPI-IO header write").is_err() {
         let primary = IoError::WriteIncomplete {
             stage: "header write",
         };
         let cleanup = finish_resources(comm, duplicate, file, None);
-        return Err(cleanup_result(
-            cleanup,
-            error_or_agreement(primary, agreement),
-        ));
+        return Err(cleanup_result(cleanup, primary));
     }
     let header_flush = ffi::file_sync(file.raw).checked_success();
     if let Err(agreement) = agree_phase(comm, header_flush.is_ok(), "MPI-IO header flush") {
@@ -327,10 +327,7 @@ where
             stage: "header flush",
         };
         let cleanup = finish_resources(comm, duplicate, file, None);
-        let primary = header_flush
-            .err()
-            .map(|code| primary_from_mpi(primary, "MPI_File_sync", code))
-            .unwrap_or(agreement);
+        let primary = header_flush.err().map(|_| primary).unwrap_or(agreement);
         return Err(cleanup_result(cleanup, primary));
     }
 
@@ -352,15 +349,7 @@ where
             stage: "byte-subarray preparation",
         };
         let cleanup = finish_resources(comm, duplicate, file, None);
-        return Err(cleanup_result(
-            cleanup,
-            error_or_agreement(
-                primary,
-                IoError::CollectivePrecondition {
-                    phase: "MPI byte-subarray preparation",
-                },
-            ),
-        ));
+        return Err(cleanup_result(cleanup, primary));
     }
     let filetype = datatype
         .as_ref()
@@ -372,10 +361,7 @@ where
             stage: "MPI_File_set_view",
         };
         let cleanup = finish_resources(comm, duplicate, file, datatype);
-        let primary = set_view
-            .err()
-            .map(|code| primary_from_mpi(primary, "MPI_File_set_view", code))
-            .unwrap_or(agreement);
+        let primary = set_view.err().map(|_| primary).unwrap_or(agreement);
         return Err(cleanup_result(cleanup, primary));
     }
 
@@ -385,15 +371,12 @@ where
         ffi::file_write_all(file.raw, &packed)
     };
     let payload_ok = matches!(payload_write, Ok(actual) if actual == packed.len());
-    if let Err(agreement) = agree_phase(comm, payload_ok, "MPI-IO payload write") {
+    if agree_phase(comm, payload_ok, "MPI-IO payload write").is_err() {
         let primary = IoError::WriteIncomplete {
             stage: "payload write",
         };
         let cleanup = finish_resources(comm, duplicate, file, datatype);
-        return Err(cleanup_result(
-            cleanup,
-            error_or_agreement(primary, agreement),
-        ));
+        return Err(cleanup_result(cleanup, primary));
     }
     let payload_flush = ffi::file_sync(file.raw).checked_success();
     if let Err(agreement) = agree_phase(comm, payload_flush.is_ok(), "MPI-IO payload flush") {
@@ -401,10 +384,7 @@ where
             stage: "payload flush",
         };
         let cleanup = finish_resources(comm, duplicate, file, datatype);
-        let primary = payload_flush
-            .err()
-            .map(|code| primary_from_mpi(primary, "MPI_File_sync", code))
-            .unwrap_or(agreement);
+        let primary = payload_flush.err().map(|_| primary).unwrap_or(agreement);
         return Err(cleanup_result(cleanup, primary));
     }
 
@@ -412,15 +392,12 @@ where
         Ok(size) => u64::try_from(size).ok() == Some(expected_size),
         Err(_) => false,
     };
-    if let Err(agreement) = agree_phase(comm, size_ok, "MPI-IO payload file size") {
+    if agree_phase(comm, size_ok, "MPI-IO payload file size").is_err() {
         let primary = IoError::WriteIncomplete {
             stage: "payload size",
         };
         let cleanup = finish_resources(comm, duplicate, file, datatype);
-        return Err(cleanup_result(
-            cleanup,
-            error_or_agreement(primary, agreement),
-        ));
+        return Err(cleanup_result(cleanup, primary));
     }
 
     // Explicit-offset MPI-IO offsets are expressed in the current view's
@@ -433,10 +410,7 @@ where
             stage: "commit marker view",
         };
         let cleanup = finish_resources(comm, duplicate, file, datatype);
-        let primary = marker_view
-            .err()
-            .map(|code| primary_from_mpi(primary, "MPI_File_set_view", code))
-            .unwrap_or(agreement);
+        let primary = marker_view.err().map(|_| primary).unwrap_or(agreement);
         return Err(cleanup_result(cleanup, primary));
     }
 
@@ -453,15 +427,12 @@ where
         }
         Err(_) => false,
     };
-    if let Err(agreement) = agree_phase(comm, marker_ok, "MPI-IO commit marker write") {
+    if agree_phase(comm, marker_ok, "MPI-IO commit marker write").is_err() {
         let primary = IoError::CommitUncertain {
             stage: "commit marker write",
         };
         let cleanup = finish_resources(comm, duplicate, file, datatype);
-        return Err(cleanup_result(
-            cleanup,
-            error_or_agreement(primary, agreement),
-        ));
+        return Err(cleanup_result(cleanup, primary));
     }
     let marker_flush = ffi::file_sync(file.raw).checked_success();
     if let Err(agreement) = agree_phase(comm, marker_flush.is_ok(), "MPI-IO commit marker flush") {
@@ -469,10 +440,7 @@ where
             stage: "commit marker flush",
         };
         let cleanup = finish_resources(comm, duplicate, file, datatype);
-        let primary = marker_flush
-            .err()
-            .map(|code| primary_from_mpi(primary, "MPI_File_sync", code))
-            .unwrap_or(agreement);
+        let primary = marker_flush.err().map(|_| primary).unwrap_or(agreement);
         return Err(cleanup_result(cleanup, primary));
     }
 
@@ -503,8 +471,9 @@ where
     write_mpi_inner(path, view, true, None)
 }
 
-/// Reads one MPI-IO file collectively into a view, committing the destination
-/// only after the complete read and all explicit resource closes succeed.
+/// Reads one MPI-IO file collectively into a view. The destination is published
+/// only after staging, validation, explicit native cleanup, and collective
+/// success agreement; a returned error leaves it unchanged.
 pub fn read_mpi<P, T, const N: usize, const M: usize>(
     path: P,
     view: PencilArrayViewMut<'_, T, N, M>,
@@ -917,7 +886,7 @@ fn cleanup_comm_error(
     finish_comm(comm, duplicate).unwrap_or(primary)
 }
 
-fn cleanup_result(cleanup: Option<IoError>, primary: IoError) -> IoError {
+pub(crate) fn cleanup_result(cleanup: Option<IoError>, primary: IoError) -> IoError {
     if matches!(
         &primary,
         IoError::WriteIncomplete { .. } | IoError::CommitUncertain { .. }
@@ -929,9 +898,9 @@ fn cleanup_result(cleanup: Option<IoError>, primary: IoError) -> IoError {
 }
 
 /// Aggregates a post-cleanup result before a caller mutates its destination.
-/// Native close failures fail-stop in the cleanup functions; this extra
-/// agreement is for the remaining synthetic/test result and keeps the commit
-/// point collective even when only one rank reports it.
+/// Unrecoverable native close failures already fail-stop in cleanup; a returned
+/// cleanup/post-cleanup error instead prevents publication on every rank.
+/// The local error is retained; peers report `CollectivePrecondition`.
 pub(crate) fn aggregate_cleanup_result<C: CommunicatorCollectives>(
     comm: &C,
     local: Option<IoError>,
@@ -1370,7 +1339,7 @@ impl Header {
                 reason: "payload offset",
             });
         }
-        if !valid_type_pair(get_u64(bytes, 40), get_u64(bytes, 48)) {
+        if ScalarType::decode(get_u64(bytes, 40), get_u64(bytes, 48)).is_none() {
             return Err(IoError::InvalidFile {
                 reason: "type descriptor",
             });
@@ -1571,7 +1540,7 @@ fn get_u64(bytes: &[u8], offset: usize) -> u64 {
     )
 }
 
-fn valid_dimensions(values: &[u64]) -> bool {
+pub(crate) fn valid_dimensions(values: &[u64]) -> bool {
     !values.is_empty()
         && values
             .iter()
@@ -1580,11 +1549,11 @@ fn valid_dimensions(values: &[u64]) -> bool {
             .is_some()
 }
 
-fn valid_extents(values: &[u64]) -> bool {
+pub(crate) fn valid_extents(values: &[u64]) -> bool {
     valid_dimensions(values) && values.iter().copied().all(|value| value > 0)
 }
 
-fn is_permutation(values: &[u64], n: usize) -> bool {
+pub(crate) fn is_permutation(values: &[u64], n: usize) -> bool {
     if values.len() != n {
         return false;
     }
@@ -1603,13 +1572,6 @@ fn is_permutation(values: &[u64], n: usize) -> bool {
         seen[index] = true;
     }
     true
-}
-
-fn valid_type_pair(code: u64, width: u64) -> bool {
-    matches!(
-        (code, width),
-        (1 | 2, 1) | (3 | 4, 2) | (5 | 6 | 9, 4) | (7 | 8 | 10, 8) | (11, 8) | (12, 16)
-    )
 }
 
 pub(crate) struct MpiLayout {
@@ -1726,7 +1688,7 @@ pub(crate) fn path_bytes(path: &Path) -> Result<&[u8], IoError> {
     }
 }
 
-fn try_u64_values(values: &[usize], what: &'static str) -> Result<Vec<u64>, IoError> {
+pub(crate) fn try_u64_values(values: &[usize], what: &'static str) -> Result<Vec<u64>, IoError> {
     let mut converted = Vec::new();
     converted
         .try_reserve_exact(values.len())
@@ -1739,7 +1701,10 @@ fn try_u64_values(values: &[usize], what: &'static str) -> Result<Vec<u64>, IoEr
     Ok(converted)
 }
 
-fn first_error2<T, U>(first: &Result<T, IoError>, second: &Result<U, IoError>) -> Option<IoError> {
+pub(crate) fn first_error2<T, U>(
+    first: &Result<T, IoError>,
+    second: &Result<U, IoError>,
+) -> Option<IoError> {
     first
         .as_ref()
         .err()
@@ -1753,21 +1718,6 @@ fn first_error3<T, U, V>(
     third: &Result<V, IoError>,
 ) -> Option<IoError> {
     first_error2(first, second).or_else(|| third.as_ref().err().cloned())
-}
-
-fn error_or_agreement(primary: IoError, agreement: IoError) -> IoError {
-    match agreement {
-        IoError::CollectivePrecondition { .. } => primary,
-        other => other,
-    }
-}
-
-fn primary_from_mpi(primary: IoError, operation: &'static str, code: i32) -> IoError {
-    match primary {
-        IoError::WriteIncomplete { stage } => IoError::WriteIncomplete { stage },
-        IoError::CommitUncertain { stage } => IoError::CommitUncertain { stage },
-        _ => IoError::Mpi { operation, code },
-    }
 }
 
 trait MpiCodeExt {

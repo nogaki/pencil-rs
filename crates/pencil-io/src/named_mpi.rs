@@ -21,7 +21,7 @@ use crate::format::{IoElement, element_count, pack_view, prepare_physical_values
 use crate::mpi_io::agree_phase;
 use crate::mpi_io::{DatatypeGuard, build_layout, duplicate_comm, finish_resources, path_bytes};
 use crate::options::{InfoGuard, MpiIoMode, MpiIoOptions, agree_options};
-use crate::{COMMIT_MARKER, IoError, MAX_PROTOCOL_RANK, NamedIoError};
+use crate::{COMMIT_MARKER, IoError, MAX_PROTOCOL_RANK, NamedIoError, ScalarType};
 
 const MAGIC: &[u8; 8] = b"PIONAM02";
 const RECORD_MAGIC: &[u8; 8] = b"PIOREC02";
@@ -341,15 +341,9 @@ pub(crate) fn scan_file_bounded<C: CommunicatorCollectives>(
             Some(x) => x,
             None => break,
         };
-        let known = match typ {
-            1 | 2 => 1,
-            3 | 4 => 2,
-            5 | 6 | 9 => 4,
-            7 | 8 | 10 | 11 => 8,
-            12 => 16,
-            _ => 0,
-        };
-        if known == 0 || width != known || elements.checked_mul(width) != Some(payload) {
+        if ScalarType::decode(typ, width as u64).is_none()
+            || elements.checked_mul(width) != Some(payload)
+        {
             break;
         }
         let marker = read_segment(comm, file, end - 8, 8)?;

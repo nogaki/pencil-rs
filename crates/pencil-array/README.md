@@ -4,9 +4,12 @@ MPI-distributed pencil arrays, Cartesian decompositions, local views, global
 collectives, and Alltoallv or point-to-point transposes. This crate provides the
 array layer; it does not depend on FFT or I/O crates.
 
-Requires Rust 1.85 or newer, a native MPI installation (including headers and
-`mpicc`), and libclang for MPI bindings. Build and run against the same MPI
-implementation. Julia, FFTW, HDF5, and GPUs are not required.
+Requires Rust 1.85 or newer. The default build needs a native MPI installation
+(including headers and `mpicc`) and libclang for MPI bindings. Build and run
+against the same MPI implementation. Julia, FFTW, HDF5, and GPUs are not required.
+Experimental [rsmpi-rt support](https://github.com/nogaki/pencil-rs#experimental-runtime-mpi-rsmpi-rt)
+allows building without native MPI tools and loading MPIwrapper at runtime;
+it requires an application-level Cargo patch and backend feature selection.
 
 Initialize MPI before constructing topologies. Every participating rank must
 enter collective construction, transpose, and global reduction operations in

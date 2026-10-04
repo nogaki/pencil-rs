@@ -1,7 +1,7 @@
 use std::convert::TryInto;
 
 use num_complex::Complex;
-use pencil_array::{PencilArrayView, PencilArrayViewMut};
+use pencil_array::{Pencil, PencilArrayView, PencilArrayViewMut};
 
 use crate::IoError;
 
@@ -27,7 +27,7 @@ pub trait IoElement: sealed::Sealed + Copy + 'static {
     fn decode_le(bytes: &[u8]) -> Self;
 }
 
-macro_rules! impl_integer {
+macro_rules! impl_primitive {
     ($ty:ty, $code:expr, $width:expr) => {
         impl sealed::Sealed for $ty {}
         impl IoElement for $ty {
@@ -45,37 +45,48 @@ macro_rules! impl_integer {
     };
 }
 
-impl_integer!(i8, 1, 1);
-impl_integer!(u8, 2, 1);
-impl_integer!(i16, 3, 2);
-impl_integer!(u16, 4, 2);
-impl_integer!(i32, 5, 4);
-impl_integer!(u32, 6, 4);
-impl_integer!(i64, 7, 8);
-impl_integer!(u64, 8, 8);
+impl_primitive!(i8, 1, 1);
+impl_primitive!(u8, 2, 1);
+impl_primitive!(i16, 3, 2);
+impl_primitive!(u16, 4, 2);
+impl_primitive!(i32, 5, 4);
+impl_primitive!(u32, 6, 4);
+impl_primitive!(i64, 7, 8);
+impl_primitive!(u64, 8, 8);
+impl_primitive!(f32, 9, 4);
+impl_primitive!(f64, 10, 8);
 
-macro_rules! impl_float {
-    ($ty:ty, $bits:ty, $code:expr, $width:expr) => {
-        impl sealed::Sealed for $ty {}
-        impl IoElement for $ty {
-            const CODE: u64 = $code;
-            const WIDTH: usize = $width;
-
-            fn encode_le(self, out: &mut Vec<u8>) {
-                out.extend_from_slice(&self.to_bits().to_le_bytes());
-            }
-
-            fn decode_le(bytes: &[u8]) -> Self {
-                <$ty>::from_bits(<$bits>::from_le_bytes(
-                    bytes.try_into().expect("validated scalar width"),
-                ))
-            }
-        }
-    };
+#[cfg(test)]
+#[test]
+fn float_codec_preserves_ieee_bits() {
+    assert_eq!(
+        (f32::CODE, f32::WIDTH, f64::CODE, f64::WIDTH),
+        (9, 4, 10, 8)
+    );
+    // Signed zero, subnormal, infinities, and signalling/quiet NaN payloads.
+    for bits in [
+        0, 1, 0x80000000, 0x7f800000, 0xff800000, 0x7f800001, 0x7fc01234,
+    ] {
+        let mut bytes = Vec::new();
+        f32::from_bits(bits).encode_le(&mut bytes);
+        assert_eq!(bytes, bits.to_le_bytes());
+        assert_eq!(f32::decode_le(&bytes).to_bits(), bits);
+    }
+    for bits in [
+        0,
+        1,
+        0x8000000000000000,
+        0x7ff0000000000000,
+        0xfff0000000000000,
+        0x7ff0000000000001,
+        0x7ff8000000001234,
+    ] {
+        let mut bytes = Vec::new();
+        f64::from_bits(bits).encode_le(&mut bytes);
+        assert_eq!(bytes, bits.to_le_bytes());
+        assert_eq!(f64::decode_le(&bytes).to_bits(), bits);
+    }
 }
-
-impl_float!(f32, u32, 9, 4);
-impl_float!(f64, u64, 10, 8);
 
 impl sealed::Sealed for Complex<f32> {}
 impl IoElement for Complex<f32> {
@@ -111,10 +122,10 @@ impl IoElement for Complex<f64> {
     }
 }
 
-pub(crate) fn canonical_dims<T, const N: usize, const M: usize>(
-    view: &PencilArrayView<'_, T, N, M>,
+fn canonical_dims<const N: usize, const M: usize>(
+    extra: &[usize],
+    pencil: &Pencil<N, M>,
 ) -> Result<Vec<usize>, IoError> {
-    let extra = view.extra_shape().dimensions();
     let rank = extra.len().checked_add(N).ok_or(IoError::SizeLimit {
         what: "logical rank",
     })?;
@@ -129,7 +140,7 @@ pub(crate) fn canonical_dims<T, const N: usize, const M: usize>(
             requested: rank * 8,
         })?;
     dims.extend_from_slice(extra);
-    dims.extend_from_slice(&view.local_spatial_shape());
+    dims.extend_from_slice(&pencil.local_shape_logical());
     Ok(dims)
 }
 
@@ -144,7 +155,7 @@ pub(crate) fn element_count(dims: &[usize]) -> Result<usize, IoError> {
 pub(crate) fn pack_view<T: IoElement, const N: usize, const M: usize>(
     view: &PencilArrayView<'_, T, N, M>,
 ) -> Result<Vec<u8>, IoError> {
-    let dims = canonical_dims(view)?;
+    let dims = canonical_dims(view.extra_shape().dimensions(), view.pencil())?;
     let elements = element_count(&dims)?;
     if elements != view.len() {
         return Err(IoError::InvalidInput(
@@ -190,7 +201,7 @@ pub(crate) fn prepare_physical_values<T: IoElement, const N: usize, const M: usi
     view: &PencilArrayViewMut<'_, T, N, M>,
     packed: &[u8],
 ) -> Result<Vec<T>, IoError> {
-    let logical_dims = canonical_dims_mut(view)?;
+    let logical_dims = canonical_dims(view.extra_shape().dimensions(), view.pencil())?;
     let elements = element_count(&logical_dims)?;
     let bytes = elements.checked_mul(T::WIDTH).ok_or(IoError::SizeLimit {
         what: "local payload bytes",
@@ -259,28 +270,6 @@ pub(crate) fn prepare_physical_values<T: IoElement, const N: usize, const M: usi
     }
     debug_assert_eq!(values.len(), view.len());
     Ok(values)
-}
-
-fn canonical_dims_mut<T, const N: usize, const M: usize>(
-    view: &PencilArrayViewMut<'_, T, N, M>,
-) -> Result<Vec<usize>, IoError> {
-    let extra = view.extra_shape().dimensions();
-    let rank = extra.len().checked_add(N).ok_or(IoError::SizeLimit {
-        what: "logical rank",
-    })?;
-    if rank == 0 || rank > crate::MAX_PROTOCOL_RANK {
-        return Err(IoError::SizeLimit {
-            what: "logical rank",
-        });
-    }
-    let mut dims = Vec::new();
-    dims.try_reserve_exact(rank)
-        .map_err(|_| IoError::AllocationFailed {
-            requested: rank * 8,
-        })?;
-    dims.extend_from_slice(extra);
-    dims.extend_from_slice(&view.local_spatial_shape());
-    Ok(dims)
 }
 
 fn set_indices(flat: usize, dims: &[usize], indices: &mut [usize]) {

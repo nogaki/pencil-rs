@@ -66,6 +66,89 @@ fn profiled_alltoallv_and_callback_regression() {
     assert_eq!(destination.as_slice(), all_destination.as_slice());
     let source_before = source.as_slice().to_vec();
     let rank = world.rank();
+    // Timed entries must preserve the same local/peer error and atomicity contract.
+    for point_to_point in [false, true] {
+        for in_place in [false, true] {
+            for short_on_root in [true, false] {
+                let send_len = req.send_len - usize::from(short_on_root && rank == 0);
+                let mut checked_workspace =
+                    TransposeWorkspace::from_vecs(vec![71; send_len], vec![73; req.receive_len]);
+                let mut checked_destination = PencilArray::from_elem(
+                    Arc::clone(&destination_pencil),
+                    extra.clone(),
+                    u64::MAX,
+                )
+                .unwrap();
+                let mut checked_array = ManyPencilArray::from_elem(
+                    vec![Arc::clone(&source_pencil), Arc::clone(&destination_pencil)],
+                    0,
+                    extra.clone(),
+                    79_u64,
+                )
+                .unwrap();
+                checked_array
+                    .active_view_mut()
+                    .unwrap()
+                    .as_mut_slice()
+                    .copy_from_slice(source.as_slice());
+                let workspace_before = format!("{checked_workspace:?}");
+                let array_before = format!("{checked_array:?}");
+                let destination_before = checked_destination.as_slice().to_vec();
+                let result = match (point_to_point, in_place) {
+                    (false, false) => all.execute_views_with_timing(
+                        source.view(),
+                        checked_destination.view_mut(),
+                        &mut checked_workspace,
+                    ),
+                    (true, false) => p2p.execute_views_with_timing(
+                        source.view(),
+                        checked_destination.view_mut(),
+                        &mut checked_workspace,
+                    ),
+                    (false, true) => {
+                        all.execute_in_place_with_timing(&mut checked_array, &mut checked_workspace)
+                    }
+                    (true, true) => {
+                        p2p.execute_in_place_with_timing(&mut checked_array, &mut checked_workspace)
+                    }
+                };
+                if short_on_root {
+                    let error = if rank == 0 {
+                        pencil_array::TransposeError::WorkspaceTooSmall {
+                            send_required: req.send_len,
+                            send_len,
+                            receive_required: req.receive_len,
+                            receive_len: req.receive_len,
+                        }
+                    } else {
+                        pencil_array::TransposeError::CollectivePreconditionFailed
+                    };
+                    assert_eq!(result, Err(error));
+                    assert_eq!(format!("{checked_workspace:?}"), workspace_before);
+                    assert_eq!(format!("{checked_array:?}"), array_before);
+                    assert_eq!(checked_destination.as_slice(), destination_before);
+                } else {
+                    let timing = result.unwrap();
+                    assert!(timing.total >= timing.pack + timing.collective_wait + timing.unpack);
+                    if in_place {
+                        assert!(
+                            checked_array
+                                .active_pencil()
+                                .unwrap()
+                                .same_layout(destination_pencil.as_ref())
+                        );
+                        assert_eq!(
+                            checked_array.active_view().unwrap().as_slice(),
+                            all_destination.as_slice()
+                        );
+                    } else {
+                        assert_eq!(checked_destination.as_slice(), all_destination.as_slice());
+                    }
+                }
+                assert_eq!(source.as_slice(), source_before);
+            }
+        }
+    }
     if size > 1 {
         for callback in [false, true] {
             let before = destination.as_slice().to_vec();

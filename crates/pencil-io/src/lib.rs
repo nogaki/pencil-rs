@@ -16,13 +16,18 @@
 //! overlap an I/O call with another operation on that topology communicator;
 //! the call temporarily installs `MPI_ERRORS_RETURN` only around
 //! `MPI_Comm_dup`, then restores the caller's original handler. Native MPI
-//! process failure is not promised to recover as a Rust error. Native cleanup
-//! failures that may leave a live or invalid handle are documented fail-stop
-//! paths; ordinary missing, existing, and malformed-file errors return normally.
+//! process failure is not promised to recover as a Rust error. Unrecoverable
+//! native cleanup failures that may leave a live or invalid handle are fail-stop
+//! paths, distinct from ordinary returned cleanup/post-cleanup errors. Missing,
+//! existing, and malformed-file errors return normally.
 //! The optional `parallel-hdf5` feature provides the same two operations over
 //! a native parallel HDF5 file.  It uses one versioned dataset at
 //! `/pencil_io_v1/data`; that is a self-describing HDF5 representation, not a
 //! binary-compatible Julia PencilIO custom format.
+//!
+//! Single-call `read_mpi` and `read_hdf5` reads publish the destination only after
+//! staging, validation, explicit native cleanup, and collective success
+//! agreement. A returned error leaves that destination unchanged.
 //!
 //! [`write_mpi_named`], [`append_mpi_named`], and [`read_mpi_named`] add a separate
 //! append-only named-dataset container. Append creates a new name without
@@ -35,8 +40,10 @@
 //! All ranks must participate even when an options API selects independent
 //! payload transfers. Writers (including appenders) to the same file require
 //! external serialization across jobs and communicators; no whole-file rollback
-//! is promised after a write failure. Raw input is explicitly requested through
-//! [`read_mpi_raw`], never inferred by the strict versioned readers.
+//! is promised after a write failure. Even a write error can leave a valid
+//! commit; [`IoError::CommitUncertain`] is not a safe-retry guarantee. Raw input
+//! is explicitly requested through [`read_mpi_raw`], never inferred by the strict
+//! versioned readers.
 
 mod catalog;
 mod chunked;
@@ -86,6 +93,11 @@ pub use hdf5_options::{
 use thiserror::Error;
 
 /// Errors returned by collective native I/O.
+///
+/// Variants can differ across ranks: a flush failure on rank zero may report
+/// [`IoError::WriteIncomplete`] there and [`IoError::CollectivePrecondition`] on
+/// peers. All ranks must still follow the same subsequent collective call order,
+/// not branch independently on their local error variant.
 #[derive(Debug, Clone, Error)]
 pub enum IoError {
     /// A rank-local operation argument was invalid.
@@ -160,6 +172,7 @@ pub enum IoError {
     },
 
     /// A write failed before its marker was durably flushed.
+    /// The file may already be modified; no rollback is implied.
     #[error("write is incomplete; the failed file was preserved ({stage})")]
     WriteIncomplete {
         /// The last write stage reached before failure.
@@ -167,6 +180,8 @@ pub enum IoError {
     },
 
     /// The commit marker write or flush did not reach a known state.
+    /// The file may contain a valid commit; this is not a guarantee of rollback
+    /// or a safe retry.
     #[error("write commit state is uncertain; the failed file was preserved ({stage})")]
     CommitUncertain {
         /// The marker stage whose durability is unknown.
@@ -231,8 +246,7 @@ const OP_READ_HDF5_NAMED: u64 = 7;
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::path::Path;
 
     use mpi::collective::{Root, SystemOperation};
     use mpi::raw::AsRaw;
@@ -240,6 +254,11 @@ mod tests {
     use pencil_array::{ExtraShape, MpiTopology, Pencil, PencilArray};
 
     use super::{IoError, read_mpi, write_mpi};
+
+    mod support {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/mod.rs"));
+    }
+    use support::{cleanup_owned_temp_dir, owned_temp_dir};
 
     fn root_status<C, F>(world: &C, operation: F)
     where
@@ -265,93 +284,20 @@ mod tests {
         }
     }
 
-    fn owned_temp_dir<C>(world: &C, prefix: &str) -> PathBuf
-    where
-        C: Communicator + CommunicatorCollectives,
-    {
-        let setup = if world.rank() == 0 {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|error| error.to_string())
-                .and_then(|nanos| {
-                    let pid = std::process::id();
-                    let mut attempt = 0u64;
-                    loop {
-                        let path = std::env::temp_dir()
-                            .join(format!("{prefix}-{}-{pid}-{attempt}", nanos.as_nanos()));
-                        match std::fs::create_dir(&path) {
-                            Ok(()) => {
-                                return path.to_str().map(str::to_owned).ok_or_else(|| {
-                                    let _ = std::fs::remove_dir_all(&path);
-                                    "temporary path is not valid UTF-8".to_owned()
-                                });
-                            }
-                            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                                attempt = attempt.saturating_add(1);
-                            }
-                            Err(error) => return Err(error.to_string()),
-                        }
-                    }
-                })
-        } else {
-            Ok(String::new())
-        };
-        let mut status = i32::from(setup.is_ok());
-        world.process_at_rank(0).broadcast_into(&mut status);
-        let mut all_ok = 0;
-        world.all_reduce_into(&status, &mut all_ok, SystemOperation::min());
-        if all_ok != 1 {
-            panic!(
-                "owned private-test directory setup failed: {}",
-                setup.err().unwrap_or_default()
-            );
-        }
-
-        let mut path = if world.rank() == 0 {
-            setup
-                .expect("directory setup agreement established")
-                .into_bytes()
-        } else {
-            Vec::new()
-        };
-        let mut length = i32::try_from(path.len()).expect("temporary path fits MPI count");
-        world.process_at_rank(0).broadcast_into(&mut length);
-        path.resize(
-            usize::try_from(length).expect("temporary path length is non-negative"),
-            0,
-        );
-        world.process_at_rank(0).broadcast_into(&mut path[..]);
-        PathBuf::from(String::from_utf8(path).expect("temporary path is UTF-8"))
-    }
-
-    fn cleanup_owned_temp_dir<C>(world: &C, path: &Path)
-    where
-        C: Communicator + CommunicatorCollectives,
-    {
-        world.barrier();
-        let cleanup = if world.rank() == 0 {
-            std::fs::remove_dir_all(path).map_err(|error| error.to_string())
-        } else {
-            Ok(())
-        };
-        let mut status = i32::from(cleanup.is_ok());
-        world.process_at_rank(0).broadcast_into(&mut status);
-        let mut all_ok = 0;
-        world.all_reduce_into(&status, &mut all_ok, SystemOperation::min());
-        if all_ok != 1 {
-            panic!(
-                "owned private-test directory cleanup failed: {}",
-                cleanup.err().unwrap_or_default()
-            );
-        }
-        world.barrier();
-    }
-
     #[test]
     fn post_cleanup_errors_preserve_destination_and_valid_commits() {
         let universe = mpi::initialize().expect("MPI must initialize once");
         let world = universe.world();
         let size = usize::try_from(world.size()).unwrap();
+        assert_eq!(crate::mpi_io::collective_state(&world, true), (true, false));
+        assert_eq!(
+            crate::mpi_io::collective_state(&world, false),
+            (false, false)
+        );
+        assert_eq!(
+            crate::mpi_io::collective_state(&world, world.rank() == 0),
+            (size == 1, size > 1)
+        );
         let directory = owned_temp_dir(&world, "pencil-io-private-hook");
 
         let writer_topology = MpiTopology::<2>::new(&world, [size, 1]).unwrap();
@@ -482,6 +428,35 @@ mod tests {
         .unwrap();
         assert_eq!(handler_before, handler_after);
         assert_i32_values(&destination);
+        world.barrier();
+
+        // A native flush error is local; peers keep the agreement failure.
+        let failed_flush = directory.join("failed-flush.pio");
+        crate::ffi::FAIL_FILE_SYNC.with(|f| f.set(world.rank() == 0));
+        let error = write_mpi(&failed_flush, source.view()).expect_err("injected header flush");
+        assert!(
+            matches!(
+                (&error, world.rank() == 0),
+                (
+                    IoError::WriteIncomplete {
+                        stage: "header flush"
+                    },
+                    true
+                ) | (
+                    IoError::CollectivePrecondition {
+                        phase: "MPI-IO header flush"
+                    },
+                    false
+                )
+            ),
+            "{error:?}"
+        );
+        let before_flush_read = destination.as_slice().to_vec();
+        assert!(matches!(
+            read_mpi(&failed_flush, destination.view_mut()),
+            Err(IoError::IncompleteFile)
+        ));
+        assert_eq!(destination.as_slice(), before_flush_read);
         world.barrier();
 
         #[cfg(feature = "parallel-hdf5")]

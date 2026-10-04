@@ -12,8 +12,9 @@ use crate::ffi;
 use crate::ffi::hdf5 as native;
 use crate::format::{IoElement, pack_view, prepare_physical_values};
 use crate::mpi_io::{
-    CommGuard, abort_unrecoverable, aggregate_cleanup_result, agree_phase, collective_state,
-    descriptor_agreement, duplicate_comm,
+    CommGuard, abort_unrecoverable, aggregate_cleanup_result, agree_phase, cleanup_result,
+    collective_state, descriptor_agreement, duplicate_comm, first_error2, is_permutation,
+    try_u64_values, valid_dimensions, valid_extents,
 };
 use crate::{
     COMMIT_MARKER, FORMAT_VERSION, INCOMPLETE_MARKER, IoError, MAX_PROTOCOL_RANK, NamedIoError,
@@ -635,6 +636,68 @@ pub(crate) fn write_named<T: IoElement, const N: usize, const M: usize>(
     .map_err(NamedIoError::Io)
 }
 
+fn check_named_absent(
+    comm: &mpi::topology::CartesianCommunicator,
+    path: &Path,
+    link: &CStr,
+    hints: &[(String, String)],
+) -> Result<(), NamedIoError> {
+    let pc = path_cstring(path, comm).map_err(NamedIoError::Io)?;
+    let dup = duplicate_comm(comm).map_err(NamedIoError::Io)?;
+    let fapl = match prepare_hdf5_fapl(comm, dup.raw, hints) {
+        Ok(fapl) => fapl,
+        Err(error) => return Err(NamedIoError::Io(cleanup_comm_only(comm, dup, error))),
+    };
+    let file = match open_hdf5_mode(comm, fapl, &pc, false, true) {
+        Ok(file) => file,
+        Err(error) => return Err(NamedIoError::Io(cleanup_comm_only(comm, dup, error))),
+    };
+    let group = match collective_handle_phase(
+        comm,
+        native::group_open(file, cstr(NAMED_GROUP)),
+        "HDF5 named group open",
+    ) {
+        Ok(group) => group,
+        Err(error) => {
+            return Err(NamedIoError::Io(cleanup_ready(
+                comm,
+                dup,
+                file,
+                Hdf5Resources::default(),
+                error,
+            )));
+        }
+    };
+    let exists_result = native::link_exists(group, link);
+    let query_agreement = agree_phase(comm, exists_result.is_ok(), "HDF5 named link query");
+    let cleanup = finish_hdf5(
+        comm,
+        dup,
+        file,
+        Hdf5Resources {
+            group: Some(group),
+            ..Default::default()
+        },
+    );
+    let exists = match query_agreement {
+        Ok(()) => {
+            exists_result.map_err(|c| NamedIoError::Io(hdf5_error("HDF5 named link query", c)))?
+        }
+        Err(error) => return Err(NamedIoError::Io(error)),
+    };
+    if let Some(error) = cleanup {
+        return Err(NamedIoError::Io(error));
+    }
+    let (all_exist, mixed) = collective_state(comm, exists);
+    if mixed {
+        return Err(IoError::CollectiveDescriptorMismatch.into());
+    }
+    if all_exist {
+        return Err(NamedIoError::DuplicateName);
+    }
+    Ok(())
+}
+
 /// Appends a named dataset to an existing parallel HDF5 container.
 ///
 /// The operation fails with [`NamedIoError::DuplicateName`] without changing
@@ -663,59 +726,7 @@ where
     )
     .map_err(NamedIoError::Io)?;
     let link = named_link(comm, name.as_ref())?;
-    let pc = path_cstring(path.as_ref(), comm).map_err(NamedIoError::Io)?;
-    let dup = duplicate_comm(comm).map_err(NamedIoError::Io)?;
-    let fapl = match prepare_hdf5_fapl(comm, dup.raw, &[]) {
-        Ok(fapl) => fapl,
-        Err(error) => return Err(NamedIoError::Io(cleanup_comm_only(comm, dup, error))),
-    };
-    let file = match open_hdf5_mode(comm, fapl, &pc, false, true) {
-        Ok(file) => file,
-        Err(error) => return Err(NamedIoError::Io(cleanup_comm_only(comm, dup, error))),
-    };
-    let group = match collective_handle_phase(
-        comm,
-        native::group_open(file, cstr(NAMED_GROUP)),
-        "HDF5 named group open",
-    ) {
-        Ok(group) => group,
-        Err(error) => {
-            return Err(NamedIoError::Io(cleanup_ready(
-                comm,
-                dup,
-                file,
-                Hdf5Resources::default(),
-                error,
-            )));
-        }
-    };
-    let exists_result = native::link_exists(group, &link);
-    let query_agreement = agree_phase(comm, exists_result.is_ok(), "HDF5 named link query");
-    let cleanup = finish_hdf5(
-        comm,
-        dup,
-        file,
-        Hdf5Resources {
-            group: Some(group),
-            ..Default::default()
-        },
-    );
-    let exists = match query_agreement {
-        Ok(()) => {
-            exists_result.map_err(|c| NamedIoError::Io(hdf5_error("HDF5 named link query", c)))?
-        }
-        Err(error) => return Err(NamedIoError::Io(error)),
-    };
-    if let Some(error) = cleanup {
-        return Err(NamedIoError::Io(error));
-    }
-    let (all_exist, mixed) = collective_state(comm, exists);
-    if mixed {
-        return Err(IoError::CollectiveDescriptorMismatch.into());
-    }
-    if all_exist {
-        return Err(NamedIoError::DuplicateName);
-    }
+    check_named_absent(comm, path.as_ref(), &link, &[])?;
     write_hdf5_inner(
         path,
         view,
@@ -764,59 +775,7 @@ where
     )
     .map_err(NamedIoError::Io)?;
     let link = named_link(comm, name.as_ref())?;
-    let pc = path_cstring(path.as_ref(), comm).map_err(NamedIoError::Io)?;
-    let dup = duplicate_comm(comm).map_err(NamedIoError::Io)?;
-    let fapl = match prepare_hdf5_fapl(comm, dup.raw, options.settings().hints) {
-        Ok(fapl) => fapl,
-        Err(error) => return Err(NamedIoError::Io(cleanup_comm_only(comm, dup, error))),
-    };
-    let file = match open_hdf5_mode(comm, fapl, &pc, false, true) {
-        Ok(file) => file,
-        Err(error) => return Err(NamedIoError::Io(cleanup_comm_only(comm, dup, error))),
-    };
-    let group = match collective_handle_phase(
-        comm,
-        native::group_open(file, cstr(NAMED_GROUP)),
-        "HDF5 named group open",
-    ) {
-        Ok(group) => group,
-        Err(error) => {
-            return Err(NamedIoError::Io(cleanup_ready(
-                comm,
-                dup,
-                file,
-                Hdf5Resources::default(),
-                error,
-            )));
-        }
-    };
-    let exists_result = native::link_exists(group, &link);
-    let query_agreement = agree_phase(comm, exists_result.is_ok(), "HDF5 named link query");
-    let cleanup = finish_hdf5(
-        comm,
-        dup,
-        file,
-        Hdf5Resources {
-            group: Some(group),
-            ..Default::default()
-        },
-    );
-    let exists = match query_agreement {
-        Ok(()) => {
-            exists_result.map_err(|c| NamedIoError::Io(hdf5_error("HDF5 named link query", c)))?
-        }
-        Err(error) => return Err(NamedIoError::Io(error)),
-    };
-    if let Some(error) = cleanup {
-        return Err(NamedIoError::Io(error));
-    }
-    let (all_exist, mixed) = collective_state(comm, exists);
-    if mixed {
-        return Err(IoError::CollectiveDescriptorMismatch.into());
-    }
-    if all_exist {
-        return Err(NamedIoError::DuplicateName);
-    }
+    check_named_absent(comm, path.as_ref(), &link, options.settings().hints)?;
     write_hdf5_inner(
         path,
         view,
@@ -1107,110 +1066,8 @@ where
         }
     }
 
-    macro_rules! read_attr {
-        ($name:expr, $expected:expr, $max:expr, $phase:expr) => {
-            match read_attr_phase(comm, duplicate.raw, dataset, $name, $expected, $max, $phase) {
-                Ok(values) => values,
-                Err(error) => return Err(cleanup_ready(comm, duplicate, opened, resources, error)),
-            }
-        };
-    }
-    let version = read_attr!(ATTR_VERSION, Some(1), 1, "HDF5 version metadata");
-    let commit = read_attr!(ATTR_COMMIT, Some(1), 1, "HDF5 commit metadata");
-    let n = read_attr!(ATTR_N, Some(1), 1, "HDF5 rank metadata");
-    let type_code = read_attr!(ATTR_TYPE, Some(1), 1, "HDF5 type metadata");
-    let width = read_attr!(ATTR_WIDTH, Some(1), 1, "HDF5 width metadata");
-    let extra_rank = read_attr!(ATTR_EXTRA_RANK, Some(1), 1, "HDF5 extra-rank metadata");
-    let metadata_ok = version == [FORMAT_VERSION]
-        && n == [N as u64]
-        && type_code == [T::CODE]
-        && width == [T::WIDTH as u64]
-        && usize::try_from(extra_rank[0]).ok() == Some(view.extra_shape().dimensions().len())
-        && extra_rank[0] <= MAX_PROTOCOL_RANK as u64;
-    let commit_state = if commit == [COMMIT_MARKER] {
-        Ok(())
-    } else if commit == [INCOMPLETE_MARKER] {
-        Err(IoError::IncompleteFile)
-    } else {
-        Err(IoError::InvalidFile {
-            reason: "HDF5 commit marker",
-        })
-    };
-    let scalar_ok = metadata_ok && commit_state.is_ok();
-    if let Err(agreement) = agree_phase(comm, scalar_ok, "HDF5 scalar metadata validation") {
-        let local_error = if !metadata_ok {
-            IoError::MetadataMismatch {
-                field: "version, rank, or type",
-            }
-        } else {
-            commit_state.err().unwrap_or(agreement)
-        };
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            resources,
-            local_error,
-        ));
-    }
-
-    let extra = if extra_rank[0] == 0 {
-        match attribute_exists_phase(comm, dataset, ATTR_EXTRA, "HDF5 zero-extra metadata") {
-            Ok(false) => Vec::new(),
-            Ok(true) => {
-                return Err(cleanup_ready(
-                    comm,
-                    duplicate,
-                    opened,
-                    resources,
-                    IoError::MetadataMismatch {
-                        field: "extra shape",
-                    },
-                ));
-            }
-            Err(error) => return Err(cleanup_ready(comm, duplicate, opened, resources, error)),
-        }
-    } else {
-        read_attr!(
-            ATTR_EXTRA,
-            Some(extra_rank[0] as usize),
-            extra_rank[0] as usize,
-            "HDF5 extra shape metadata"
-        )
-    };
-    let global = read_attr!(ATTR_GLOBAL, Some(N), N, "HDF5 global shape metadata");
-    let writer_grid = read_attr!(
-        ATTR_GRID,
-        None,
-        MAX_PROTOCOL_RANK,
-        "HDF5 writer grid metadata"
-    );
-    let writer_perm = read_attr!(ATTR_PERM, Some(N), N, "HDF5 writer permutation metadata");
-    let metadata_ok = valid_dimensions(&global)
-        && global
-            .iter()
-            .copied()
-            .eq(view.pencil().global_shape().iter().map(|&v| v as u64))
-        && extra
-            .iter()
-            .copied()
-            .eq(view.extra_shape().dimensions().iter().map(|&v| v as u64))
-        && valid_extents(&writer_grid)
-        && is_permutation(&writer_perm, N);
-    if let Err(agreement) = agree_phase(comm, metadata_ok, "HDF5 shape metadata validation") {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            resources,
-            if metadata_ok {
-                agreement
-            } else {
-                IoError::MetadataMismatch {
-                    field: "shape or writer provenance",
-                }
-            },
-        ));
+    if let Err(error) = validate_read_metadata(comm, duplicate.raw, dataset, &view) {
+        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
     }
 
     let (dataset_type, error) = local_handle_phase(
@@ -1676,9 +1533,9 @@ fn write_metadata<const N: usize, const M: usize>(
 ) -> Result<(), IoError> {
     let prepared = (|| {
         Ok::<_, IoError>((
-            to_u64_values(global)?,
-            to_u64_values(extra)?,
-            to_u64_values(grid)?,
+            try_u64_values(global, "HDF5 metadata value")?,
+            try_u64_values(extra, "HDF5 metadata value")?,
+            try_u64_values(grid, "HDF5 metadata value")?,
             to_permutation_values(permutation)?,
         ))
     })();
@@ -2098,6 +1955,93 @@ fn finish_attr_handles(
     first
 }
 
+fn validate_read_metadata<T: IoElement, const N: usize, const M: usize>(
+    comm: &mpi::topology::CartesianCommunicator,
+    duplicate: ffi::MPI_Comm,
+    dataset: native::Hid,
+    view: &PencilArrayViewMut<'_, T, N, M>,
+) -> Result<(), IoError> {
+    let read_attr = |name, expected, max, phase| {
+        read_attr_phase(comm, duplicate, dataset, name, expected, max, phase)
+    };
+    let version = read_attr(ATTR_VERSION, Some(1), 1, "HDF5 version metadata")?;
+    let commit = read_attr(ATTR_COMMIT, Some(1), 1, "HDF5 commit metadata")?;
+    let n = read_attr(ATTR_N, Some(1), 1, "HDF5 rank metadata")?;
+    let type_code = read_attr(ATTR_TYPE, Some(1), 1, "HDF5 type metadata")?;
+    let width = read_attr(ATTR_WIDTH, Some(1), 1, "HDF5 width metadata")?;
+    let extra_rank = read_attr(ATTR_EXTRA_RANK, Some(1), 1, "HDF5 extra-rank metadata")?;
+    let metadata_ok = version == [FORMAT_VERSION]
+        && n == [N as u64]
+        && type_code == [T::CODE]
+        && width == [T::WIDTH as u64]
+        && usize::try_from(extra_rank[0]).ok() == Some(view.extra_shape().dimensions().len())
+        && extra_rank[0] <= MAX_PROTOCOL_RANK as u64;
+    let commit_state = if commit == [COMMIT_MARKER] {
+        Ok(())
+    } else if commit == [INCOMPLETE_MARKER] {
+        Err(IoError::IncompleteFile)
+    } else {
+        Err(IoError::InvalidFile {
+            reason: "HDF5 commit marker",
+        })
+    };
+    let scalar_ok = metadata_ok && commit_state.is_ok();
+    if let Err(agreement) = agree_phase(comm, scalar_ok, "HDF5 scalar metadata validation") {
+        return Err(if !metadata_ok {
+            IoError::MetadataMismatch {
+                field: "version, rank, or type",
+            }
+        } else {
+            commit_state.err().unwrap_or(agreement)
+        });
+    }
+
+    let extra = if extra_rank[0] == 0 {
+        if attribute_exists_phase(comm, dataset, ATTR_EXTRA, "HDF5 zero-extra metadata")? {
+            return Err(IoError::MetadataMismatch {
+                field: "extra shape",
+            });
+        }
+        Vec::new()
+    } else {
+        read_attr(
+            ATTR_EXTRA,
+            Some(extra_rank[0] as usize),
+            extra_rank[0] as usize,
+            "HDF5 extra shape metadata",
+        )?
+    };
+    let global = read_attr(ATTR_GLOBAL, Some(N), N, "HDF5 global shape metadata")?;
+    let writer_grid = read_attr(
+        ATTR_GRID,
+        None,
+        MAX_PROTOCOL_RANK,
+        "HDF5 writer grid metadata",
+    )?;
+    let writer_perm = read_attr(ATTR_PERM, Some(N), N, "HDF5 writer permutation metadata")?;
+    let metadata_ok = valid_dimensions(&global)
+        && global
+            .iter()
+            .copied()
+            .eq(view.pencil().global_shape().iter().map(|&v| v as u64))
+        && extra
+            .iter()
+            .copied()
+            .eq(view.extra_shape().dimensions().iter().map(|&v| v as u64))
+        && valid_extents(&writer_grid)
+        && is_permutation(&writer_perm, N);
+    if let Err(agreement) = agree_phase(comm, metadata_ok, "HDF5 shape metadata validation") {
+        return Err(if metadata_ok {
+            agreement
+        } else {
+            IoError::MetadataMismatch {
+                field: "shape or writer provenance",
+            }
+        });
+    }
+    Ok(())
+}
+
 fn read_attr_phase(
     comm: &mpi::topology::CartesianCommunicator,
     duplicate: ffi::MPI_Comm,
@@ -2294,17 +2238,6 @@ fn cleanup_comm_only(
     primary
 }
 
-fn cleanup_result(cleanup: Option<IoError>, primary: IoError) -> IoError {
-    if matches!(
-        &primary,
-        IoError::WriteIncomplete { .. } | IoError::CommitUncertain { .. }
-    ) {
-        primary
-    } else {
-        cleanup.unwrap_or(primary)
-    }
-}
-
 fn cleanup_ready(
     comm: &mpi::topology::CartesianCommunicator,
     duplicate: CommGuard,
@@ -2435,21 +2368,6 @@ fn to_permutation_values<const N: usize>(
     Ok(result)
 }
 
-fn to_u64_values(values: &[usize]) -> Result<Vec<u64>, IoError> {
-    let mut result = Vec::new();
-    result
-        .try_reserve_exact(values.len())
-        .map_err(|_| IoError::AllocationFailed {
-            requested: values.len() * std::mem::size_of::<u64>(),
-        })?;
-    for &value in values {
-        result.push(u64::try_from(value).map_err(|_| IoError::SizeLimit {
-            what: "HDF5 metadata value",
-        })?);
-    }
-    Ok(result)
-}
-
 fn build_layout<const N: usize>(
     global: &[usize; N],
     extra: &[usize],
@@ -2543,48 +2461,6 @@ fn hdf5_error(operation: &'static str, code: i32) -> IoError {
         operation,
         code: i64::from(code),
     }
-}
-
-fn first_error2<T, U>(first: &Result<T, IoError>, second: &Result<U, IoError>) -> Option<IoError> {
-    first
-        .as_ref()
-        .err()
-        .cloned()
-        .or_else(|| second.as_ref().err().cloned())
-}
-
-fn valid_dimensions(values: &[u64]) -> bool {
-    !values.is_empty()
-        && values
-            .iter()
-            .copied()
-            .try_fold(1u64, |product, value| product.checked_mul(value))
-            .is_some()
-}
-
-fn valid_extents(values: &[u64]) -> bool {
-    valid_dimensions(values) && values.iter().copied().all(|value| value > 0)
-}
-
-fn is_permutation(values: &[u64], n: usize) -> bool {
-    if values.len() != n {
-        return false;
-    }
-    let mut seen = Vec::new();
-    if seen.try_reserve_exact(n).is_err() {
-        return false;
-    }
-    seen.resize(n, false);
-    for &value in values {
-        let Ok(index) = usize::try_from(value) else {
-            return false;
-        };
-        if index >= n || seen[index] {
-            return false;
-        }
-        seen[index] = true;
-    }
-    true
 }
 
 fn catalog_agree_bytes(

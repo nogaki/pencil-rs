@@ -1,68 +1,14 @@
-use std::fmt::Debug;
 use std::path::Path;
 
-use mpi::collective::SystemOperation;
 use mpi::traits::*;
 use num_complex::Complex;
 use pencil_array::{AxisPermutation, ExtraShape, MpiTopology, Pencil, PencilArray};
-use pencil_io::{IoElement, IoError, read_mpi, write_mpi};
+use pencil_io::{IoError, read_mpi, write_mpi};
 
 mod support;
-use support::{cleanup_owned_temp_dir, owned_temp_dir};
-
-fn root_status<C, F>(world: &C, operation: F)
-where
-    C: CommunicatorCollectives,
-    F: FnOnce() -> Result<(), String>,
-{
-    let result = if world.rank() == 0 {
-        operation()
-    } else {
-        Ok(())
-    };
-    let local_ok = i32::from(result.is_ok());
-    let mut all_ok = 0;
-    world.all_reduce_into(&local_ok, &mut all_ok, SystemOperation::min());
-    if all_ok != 1 {
-        panic!(
-            "root filesystem operation failed: {}",
-            result.err().unwrap_or_default()
-        );
-    }
-}
-
-fn root_read<C>(world: &C, path: &Path) -> Vec<u8>
-where
-    C: CommunicatorCollectives,
-{
-    let result = if world.rank() == 0 {
-        std::fs::read(path).map_err(|error| error.to_string())
-    } else {
-        Ok(Vec::new())
-    };
-    let local_ok = i32::from(result.is_ok());
-    let mut all_ok = 0;
-    world.all_reduce_into(&local_ok, &mut all_ok, SystemOperation::min());
-    if all_ok != 1 {
-        panic!(
-            "root file read failed: {}",
-            result.err().unwrap_or_default()
-        );
-    }
-    result.unwrap_or_default()
-}
-
-fn reset_file<C>(world: &C, path: &Path)
-where
-    C: CommunicatorCollectives,
-{
-    root_status(world, || match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
-    });
-    world.barrier();
-}
+use support::{
+    cleanup_owned_temp_dir, owned_temp_dir, reset_file, root_read, root_status, run_scalar_case,
+};
 
 fn patch_u64(bytes: &mut [u8], offset: usize, value: u64) -> Result<(), String> {
     let end = offset
@@ -101,55 +47,6 @@ fn assert_mpi_failure<C, F>(
     let error = read_mpi(path, destination.view_mut()).expect_err("read must fail");
     assert!(expected(&error), "unexpected MPI error: {error:?}");
     assert_eq!(destination.as_slice(), before.as_slice());
-    world.barrier();
-}
-
-fn run_mpi_scalar_case<C, T, F>(world: &C, directory: &Path, name: &str, make_value: F)
-where
-    C: Communicator + CommunicatorCollectives,
-    T: IoElement + Debug + PartialEq,
-    F: Fn(usize, usize) -> T,
-{
-    let size = usize::try_from(world.size()).unwrap();
-    let path = directory.join(name);
-    reset_file(world, &path);
-    let writer_topology = MpiTopology::<2>::new(world, [size, 1]).unwrap();
-    let writer_pencil = Pencil::<2, 2>::new_permuted(
-        writer_topology,
-        [4, 5],
-        [0, 1],
-        AxisPermutation::new([1, 0]).unwrap(),
-    )
-    .unwrap();
-    let mut source =
-        PencilArray::from_elem(writer_pencil, ExtraShape::scalar(), make_value(0, 0)).unwrap();
-    {
-        let mut view = source.view_mut();
-        let ranges = view.pencil().local_ranges().clone();
-        for x in 0..ranges[0].len() {
-            for y in 0..ranges[1].len() {
-                *view.get_local_mut(&[], [x, y]).unwrap() =
-                    make_value(ranges[0].start + x, ranges[1].start + y);
-            }
-        }
-    }
-    write_mpi(&path, source.view()).unwrap();
-    world.barrier();
-    let reader_topology = MpiTopology::<2>::new(world, [1, size]).unwrap();
-    let reader_pencil = Pencil::<2, 2>::new(reader_topology, [4, 5], [1, 0]).unwrap();
-    let mut destination =
-        PencilArray::from_elem(reader_pencil, ExtraShape::scalar(), make_value(0, 0)).unwrap();
-    read_mpi(&path, destination.view_mut()).unwrap();
-    let view = destination.view();
-    let ranges = view.pencil().local_ranges().clone();
-    for x in 0..ranges[0].len() {
-        for y in 0..ranges[1].len() {
-            assert_eq!(
-                view.get_local(&[], [x, y]),
-                Some(&make_value(ranges[0].start + x, ranges[1].start + y)),
-            );
-        }
-    }
     world.barrier();
 }
 
@@ -454,7 +351,14 @@ fn mpi_io_preserves_logical_order_and_rejects_bad_files() {
 
     macro_rules! scalar_case {
         ($name:literal, $ty:ty, $make:expr) => {
-            run_mpi_scalar_case::<_, $ty, _>(&world, &directory, $name, $make);
+            run_scalar_case::<_, $ty, _>(
+                &world,
+                &directory,
+                $name,
+                $make,
+                |path, view| write_mpi(path, view).unwrap(),
+                |path, view| read_mpi(path, view).unwrap(),
+            );
         };
     }
     scalar_case!("i8.pio", i8, |x, y| (x * 100 + y) as i8);

@@ -31,6 +31,18 @@ pub enum BackendInitError<E> {
     PeerPreflight,
 }
 
+#[cfg(feature = "distributed")]
+impl<E> BackendInitError<E> {
+    pub(crate) fn map_local<F>(self, map: impl FnOnce(E) -> F) -> BackendInitError<F> {
+        match self {
+            Self::Local(error) => BackendInitError::Local(map(error)),
+            #[cfg(feature = "fftw")]
+            Self::Native(error) => BackendInitError::Native(error),
+            Self::PeerPreflight => BackendInitError::PeerPreflight,
+        }
+    }
+}
+
 impl<E> From<E> for BackendInitError<E> {
     fn from(error: E) -> Self {
         Self::Local(error)
@@ -38,13 +50,7 @@ impl<E> From<E> for BackendInitError<E> {
 }
 
 #[cfg(feature = "fftw")]
-pub(crate) trait FftwReal: FftReal + pencil_fftw::Real + crate::private::FftwBound {}
-
-#[cfg(feature = "fftw")]
-impl<T: FftReal + pencil_fftw::Real> FftwReal for T {}
-
-#[cfg(feature = "fftw")]
-pub(crate) fn c2c<R: FftwReal>(
+pub(crate) fn c2c<R: FftReal>(
     n: usize,
     direction: FftDirection,
     options: pencil_fftw::PlanOptions,
@@ -52,4 +58,39 @@ pub(crate) fn c2c<R: FftwReal>(
     #[cfg(all(test, feature = "distributed"))]
     crate::distributed::fftw_tests::before_factory()?;
     pencil_fftw::plan_c2c(n, direction, options)
+}
+
+#[cfg(feature = "fftw")]
+pub(crate) fn r2r<R: FftReal>(
+    n: usize,
+    kind: pencil_fftw::R2rKind,
+    options: pencil_fftw::PlanOptions,
+) -> Result<Arc<pencil_fftw::R2rPlan<R>>, pencil_fftw::FftwError> {
+    #[cfg(all(test, feature = "distributed"))]
+    crate::distributed::fftw_tests::before_factory()?;
+    pencil_fftw::plan_r2r(n, kind, options)
+}
+
+#[cfg(all(test, feature = "distributed"))]
+mod tests {
+    use super::BackendInitError;
+
+    #[test]
+    fn map_local_preserves_failure_kind() {
+        assert!(matches!(
+            BackendInitError::Local("bad").map_local(str::len),
+            BackendInitError::Local(3)
+        ));
+        let unexpected = |_: &str| -> usize { panic!("not a local failure") };
+        assert!(matches!(
+            BackendInitError::PeerPreflight.map_local(unexpected),
+            BackendInitError::PeerPreflight
+        ));
+        #[cfg(feature = "fftw")]
+        assert!(matches!(
+            BackendInitError::Native(pencil_fftw::FftwError::InvalidOptions("native"))
+                .map_local(unexpected),
+            BackendInitError::Native(pencil_fftw::FftwError::InvalidOptions("native"))
+        ));
+    }
 }

@@ -97,6 +97,9 @@ impl sealed::NormOutput for f64 {}
 /// Implementations are deliberately sealed to the crate's fixed scalar set:
 /// `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`,
 /// `Complex32`, and `Complex64`.
+///
+/// These are low-level hooks. Calls that enter MPI require matching scalar
+/// types, communicators, and collective call order on every rank.
 pub trait SupportedScalar: sealed::Scalar + Equivalence + Copy + 'static {
     /// The precision used for this scalar's L2 norm.
     type Norm: NormOutput;
@@ -104,17 +107,26 @@ pub trait SupportedScalar: sealed::Scalar + Equivalence + Copy + 'static {
     /// Returns the additive identity.
     fn zero() -> Self;
 
-    /// Computes a checked local sum.
+    /// Computes a checked local sum without calling MPI.
+    ///
+    /// Errors are local; callers must agree them across ranks before entering
+    /// a subsequent collective sum.
     fn local_sum(values: &[Self]) -> Result<Self, CollectiveError>;
 
     /// Completes a global sum from a locally checked partial.
+    ///
+    /// This does not perform high-level descriptor or local-error agreement.
     fn collective_sum<C: CommunicatorCollectives>(
         communicator: &C,
         local: Self,
         local_flags: [u32; 6],
     ) -> Result<Self, CollectiveError>;
 
-    /// Prepares rank partial storage before a mapped callback is invoked.
+    /// Prepares storage before a mapped callback is invoked.
+    ///
+    /// Integer implementations allocate one partial per communicator rank and
+    /// collectively agree allocation success. The default used by floating-point
+    /// and complex scalars returns an empty `Vec` without calling MPI.
     fn prepare_collective_sum<C: CommunicatorCollectives>(
         communicator: &C,
     ) -> Result<Vec<Self>, CollectiveError> {
@@ -123,6 +135,13 @@ pub trait SupportedScalar: sealed::Scalar + Equivalence + Copy + 'static {
     }
 
     /// Completes a sum using storage prepared before callbacks.
+    ///
+    /// The floating-point and complex default ignores `partials` and delegates
+    /// to [`Self::collective_sum`]. Integer implementations require `partials`
+    /// to contain exactly one element per communicator rank, gather into it,
+    /// and perform a checked rank-order sum. This low-level call provides no
+    /// high-level descriptor, local-error, or buffer-size agreement; callers
+    /// must establish those preconditions before entering it on every rank.
     fn collective_sum_prepared<C: CommunicatorCollectives>(
         communicator: &C,
         local: Self,
@@ -1765,23 +1784,11 @@ where
     let shape = shape.expect("broadcast shape validated");
     let left_dims = left.extra_shape().dimensions();
     let right_dims = right.extra_shape().dimensions();
-    let strides = |dims: &[usize]| -> Result<Vec<usize>, CollectiveError> {
-        let mut out = Vec::new();
-        out.try_reserve_exact(dims.len())
-            .map_err(|_| CollectiveError::AllocationFailed {
-                elements: dims.len(),
-            })?;
-        let mut stride = 1usize;
-        for i in (0..dims.len()).rev() {
-            out.push(stride);
-            stride = stride
-                .checked_mul(dims[i])
-                .ok_or(CollectiveError::CountOverflow)?;
-        }
-        out.reverse();
-        Ok(out)
-    };
-    let prepared = (strides(left_dims), strides(right_dims), strides(&shape));
+    let prepared = (
+        strides_for_dims(left_dims),
+        strides_for_dims(right_dims),
+        strides_for_dims(&shape),
+    );
     let preparation_error = prepared
         .0
         .as_ref()

@@ -4,11 +4,11 @@ use mpi::{
     collective::{CommunicatorCollectives, SystemOperation},
     topology::Communicator,
 };
-use num_complex::Complex32;
+use num_complex::{Complex32, Complex64};
 use pencil_array::{
     AllToAllvTransposePlan, AxisPermutation, CollectiveError, ExtraShape, MpiTopology, Pencil,
-    PencilArray, TransposeError, all, all_by, any, any_by, gather, global_max, global_min,
-    global_sum, l2_norm, norm_by, sum_by,
+    PencilArray, SupportedScalar, TransposeError, all, all_by, any, any_by, gather, global_max,
+    global_min, global_sum, l2_norm, norm_by, sum_by,
 };
 
 fn check_all<C: CommunicatorCollectives>(communicator: &C, local: bool) {
@@ -16,6 +16,22 @@ fn check_all<C: CommunicatorCollectives>(communicator: &C, local: bool) {
     let mut all_valid = 0i32;
     communicator.all_reduce_into(&local_word, &mut all_valid, SystemOperation::min());
     assert_eq!(all_valid, 1, "a rank failed the collective test check");
+}
+
+fn check_prepared_sum<T: SupportedScalar + PartialEq>(
+    communicator: &impl CommunicatorCollectives,
+    expected_partials: usize,
+) {
+    let partials = T::prepare_collective_sum(communicator);
+    check_all(
+        communicator,
+        partials
+            .as_ref()
+            .is_ok_and(|partials| partials.len() == expected_partials),
+    );
+    let mut partials = partials.unwrap();
+    let result = T::collective_sum_prepared(communicator, T::zero(), [0; 6], &mut partials);
+    check_all(communicator, result == Ok(T::zero()));
 }
 
 fn descriptor_mismatch<T>(result: &Result<T, CollectiveError>) -> bool {
@@ -425,6 +441,20 @@ fn reductions_and_logical_gather_cover_permuted_pencils() {
     let universe = mpi::initialize().expect("MPI initialization failed");
     let world = universe.world();
     let size = usize::try_from(world.size()).unwrap();
+
+    check_prepared_sum::<i8>(&world, size);
+    check_prepared_sum::<i16>(&world, size);
+    check_prepared_sum::<i32>(&world, size);
+    check_prepared_sum::<i64>(&world, size);
+    check_prepared_sum::<u8>(&world, size);
+    check_prepared_sum::<u16>(&world, size);
+    check_prepared_sum::<u32>(&world, size);
+    check_prepared_sum::<u64>(&world, size);
+    check_prepared_sum::<f32>(&world, 0);
+    check_prepared_sum::<f64>(&world, 0);
+    check_prepared_sum::<Complex32>(&world, 0);
+    check_prepared_sum::<Complex64>(&world, 0);
+
     let grid = match size {
         1 => [1, 1],
         4 => [2, 2],

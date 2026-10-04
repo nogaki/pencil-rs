@@ -60,6 +60,9 @@ use pencil_array::{
 
 /// An immutable, checked distributed FFTW-compatible DCT/DST plan.
 ///
+/// See the [crate-level compatibility and failure contract](crate#distributed-compatibility-and-failure-contract)
+/// for endpoint identity, workspace ownership, and error boundaries.
+///
 /// `None` entries are identity stages. Discrete Hartley and mixed-axis
 /// construction is separate from this legacy API. Out-of-place overlap is
 /// available with [`Self::forward_with_overlap`], [`Self::inverse_with_overlap`],
@@ -70,6 +73,9 @@ pub struct R2rPlan<T: R2rScalar, const N: usize, const M: usize> {
 }
 
 /// A distributed separable discrete Hartley transform plan.
+///
+/// See the [crate-level compatibility and failure contract](crate#distributed-compatibility-and-failure-contract)
+/// for endpoint identity, workspace ownership, and error boundaries.
 ///
 /// Out-of-place overlap is available through the `*_with_overlap` methods and
 /// requires point-to-point transitions.
@@ -350,17 +356,13 @@ where
     }
 
     #[cfg(feature = "fftw")]
-    #[allow(private_bounds)]
-    /// Collectively constructs native FFTW embedding plans with default layout.
+    /// Collectively constructs native FFTW Hartley plans with default layout.
     pub fn from_shape_with_fftw(
         topology: Arc<MpiTopology<M>>,
         global_shape: [usize; N],
         extra_shape: ExtraShape,
         options: PlanOptions,
-    ) -> Result<Self, BackendInitError<R2rError>>
-    where
-        T::Real: crate::backend::FftwReal,
-    {
+    ) -> Result<Self, BackendInitError<R2rError>> {
         let input = Pencil::new(
             Arc::clone(&topology),
             global_shape,
@@ -470,12 +472,12 @@ where
     }
 
     #[cfg(feature = "fftw")]
-    #[allow(private_bounds)]
-    /// Rebuilds with native FFTW embedding plans, preserving configuration and invalidating old arrays/workspaces.
-    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<R2rError>>
-    where
-        T::Real: crate::backend::FftwReal,
-    {
+    /// Collectively rebuilds with native FFTW Hartley plans, preserving configuration.
+    ///
+    /// Use the returned plan's endpoint-pencil `Arc`s and allocate new workspaces
+    /// and in-place arrays. The original plan is unchanged; see the
+    /// [crate-level contract](crate#distributed-compatibility-and-failure-contract).
+    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<R2rError>> {
         let topology = Arc::clone(self.input_pencil().topology());
         let shape = *self.input_pencil().global_shape();
         let input = Pencil::new(
@@ -704,29 +706,7 @@ where
         destination: &PencilArray<T, N, M>,
         workspace: &R2rWorkspace<T, N, M>,
     ) -> Result<(), R2rError> {
-        validate_r2r_out_of_place(
-            &self.core,
-            &workspace.core,
-            direction,
-            source,
-            destination,
-            &workspace.intermediate,
-            (
-                workspace.fft_scratch.len(),
-                workspace.transpose.send_len(),
-                workspace.transpose.receive_len(),
-            ),
-            workspace.embedding_line.len(),
-        )?;
-        if workspace.line_buffer.len() < self.core.strided_line_len {
-            return Err(FftError::WorkspaceTooSmall {
-                kind: "real line",
-                required: self.core.strided_line_len,
-                actual: workspace.line_buffer.len(),
-            }
-            .into());
-        }
-        Ok(())
+        validate_r2r_out_of_place(&self.core, direction, source, destination, workspace)
     }
 
     pub(super) fn collection_preflight_in_place(
@@ -735,56 +715,7 @@ where
         array: &R2rInPlaceArray<T, N, M>,
         workspace: &R2rInPlaceWorkspace<T, N, M>,
     ) -> Result<(), R2rError> {
-        if !Arc::ptr_eq(&array.core, &self.core) {
-            return Err(FftError::Array(pencil_array::ArrayError::IncompatiblePencils).into());
-        }
-        if !Arc::ptr_eq(&workspace.core, &self.core) {
-            return Err(FftError::WorkspaceMismatch.into());
-        }
-        let expected_state = match direction {
-            Direction::Forward => super::R2rState::Input,
-            Direction::Inverse | Direction::Backward => super::R2rState::Output,
-        };
-        match array.state {
-            super::R2rState::Poisoned => {
-                return Err(FftError::Array(pencil_array::ArrayError::Poisoned).into());
-            }
-            state if state != expected_state => return Err(FftError::InputLayoutMismatch.into()),
-            _ => {}
-        }
-        if array.array.extra_shape() != &self.core.extra_shape {
-            return Err(FftError::ExtraShapeMismatch.into());
-        }
-        let expected = match direction {
-            Direction::Forward => self.input_pencil(),
-            Direction::Inverse | Direction::Backward => self.output_pencil(),
-        };
-        if !array
-            .array
-            .active_pencil()
-            .map_err(FftError::Array)?
-            .same_layout(expected.as_ref())
-        {
-            return Err(FftError::InputLayoutMismatch.into());
-        }
-        validate_workspace_lengths_values(
-            workspace.fft_scratch.len(),
-            self.core.fft_scratch_len,
-            workspace.transpose.send_len(),
-            self.core.transpose_send_len,
-            workspace.transpose.receive_len(),
-            self.core.transpose_receive_len,
-        )?;
-        validate_embedding_len(workspace.embedding_line.len(), self.core.embedding_len)?;
-        if workspace.line_buffer.len() < self.core.strided_line_len {
-            return Err(FftError::WorkspaceTooSmall {
-                kind: "real line",
-                required: self.core.strided_line_len,
-                actual: workspace.line_buffer.len(),
-            }
-            .into());
-        }
-        Ok(())
+        validate_r2r_in_place(&self.core, direction, array, workspace)
     }
 
     /// Computes the selected Hartley transforms in place.
@@ -1251,18 +1182,14 @@ where
     }
 
     #[cfg(feature = "fftw")]
-    #[allow(private_bounds)]
-    /// Collectively constructs native FFTW embedding plans with default layout.
+    /// Collectively constructs native FFTW DCT/DST plans with default layout.
     pub fn from_shape_with_fftw(
         topology: Arc<MpiTopology<M>>,
         global_shape: [usize; N],
         extra_shape: ExtraShape,
         kinds: [Option<R2rKind>; N],
         options: PlanOptions,
-    ) -> Result<Self, BackendInitError<R2rError>>
-    where
-        T::Real: crate::backend::FftwReal,
-    {
+    ) -> Result<Self, BackendInitError<R2rError>> {
         let input = Pencil::new(
             Arc::clone(&topology),
             global_shape,
@@ -1324,12 +1251,12 @@ where
     }
 
     #[cfg(feature = "fftw")]
-    #[allow(private_bounds)]
-    /// Rebuilds with native FFTW embedding plans, preserving configuration and invalidating old arrays/workspaces.
-    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<R2rError>>
-    where
-        T::Real: crate::backend::FftwReal,
-    {
+    /// Collectively rebuilds with native FFTW DCT/DST plans, preserving configuration.
+    ///
+    /// Use the returned plan's endpoint-pencil `Arc`s and allocate new workspaces
+    /// and in-place arrays. The original plan is unchanged; see the
+    /// [crate-level contract](crate#distributed-compatibility-and-failure-contract).
+    pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<R2rError>> {
         let topology = Arc::clone(self.input_pencil().topology());
         let shape = *self.input_pencil().global_shape();
         let input = Pencil::new(
@@ -1919,29 +1846,7 @@ where
         destination: &PencilArray<T, N, M>,
         workspace: &R2rWorkspace<T, N, M>,
     ) -> Result<(), R2rError> {
-        validate_r2r_out_of_place(
-            &self.core,
-            &workspace.core,
-            direction,
-            source,
-            destination,
-            &workspace.intermediate,
-            (
-                workspace.fft_scratch.len(),
-                workspace.transpose.send_len(),
-                workspace.transpose.receive_len(),
-            ),
-            workspace.embedding_line.len(),
-        )?;
-        if workspace.line_buffer.len() < self.core.strided_line_len {
-            return Err(FftError::WorkspaceTooSmall {
-                kind: "real line",
-                required: self.core.strided_line_len,
-                actual: workspace.line_buffer.len(),
-            }
-            .into());
-        }
-        Ok(())
+        validate_r2r_out_of_place(&self.core, direction, source, destination, workspace)
     }
 
     fn execute_in_place(
@@ -2012,56 +1917,7 @@ where
         array: &R2rInPlaceArray<T, N, M>,
         workspace: &R2rInPlaceWorkspace<T, N, M>,
     ) -> Result<(), R2rError> {
-        if !Arc::ptr_eq(&array.core, &self.core) {
-            return Err(FftError::Array(pencil_array::ArrayError::IncompatiblePencils).into());
-        }
-        if !Arc::ptr_eq(&workspace.core, &self.core) {
-            return Err(FftError::WorkspaceMismatch.into());
-        }
-        let expected_state = match direction {
-            Direction::Forward => super::R2rState::Input,
-            Direction::Inverse | Direction::Backward => super::R2rState::Output,
-        };
-        match array.state {
-            super::R2rState::Poisoned => {
-                return Err(FftError::Array(pencil_array::ArrayError::Poisoned).into());
-            }
-            state if state != expected_state => return Err(FftError::InputLayoutMismatch.into()),
-            _ => {}
-        }
-        if array.array.extra_shape() != &self.core.extra_shape {
-            return Err(FftError::ExtraShapeMismatch.into());
-        }
-        let expected = match direction {
-            Direction::Forward => self.input_pencil(),
-            Direction::Inverse | Direction::Backward => self.output_pencil(),
-        };
-        if !array
-            .array
-            .active_pencil()
-            .map_err(FftError::Array)?
-            .same_layout(expected.as_ref())
-        {
-            return Err(FftError::InputLayoutMismatch.into());
-        }
-        validate_workspace_lengths_values(
-            workspace.fft_scratch.len(),
-            self.core.fft_scratch_len,
-            workspace.transpose.send_len(),
-            self.core.transpose_send_len,
-            workspace.transpose.receive_len(),
-            self.core.transpose_receive_len,
-        )?;
-        validate_embedding_len(workspace.embedding_line.len(), self.core.embedding_len)?;
-        if workspace.line_buffer.len() < self.core.strided_line_len {
-            return Err(FftError::WorkspaceTooSmall {
-                kind: "real line",
-                required: self.core.strided_line_len,
-                actual: workspace.line_buffer.len(),
-            }
-            .into());
-        }
-        Ok(())
+        validate_r2r_in_place(&self.core, direction, array, workspace)
     }
 }
 
@@ -2169,15 +2025,8 @@ fn prepare_r2r_stages_backend<T: R2rScalar, const N: usize, const M: usize>(
                 ),
                 #[cfg(feature = "fftw")]
                 super::BackendChoice::Fftw(options) => R2rLocal::Transform(
-                    LocalR2rPlan::new_fftw(global_shape[axis], kind, options).map_err(|error| {
-                        match error {
-                            BackendInitError::Local(error) => {
-                                BackendInitError::Local(R2rError::LocalR2r(error))
-                            }
-                            BackendInitError::Native(error) => BackendInitError::Native(error),
-                            BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
-                        }
-                    })?,
+                    LocalR2rPlan::new_fftw(global_shape[axis], kind, options)
+                        .map_err(|error| error.map_local(R2rError::LocalR2r))?,
                 ),
             },
             Some(AxisR2rKind::Dht) => match backend {
@@ -2186,17 +2035,10 @@ fn prepare_r2r_stages_backend<T: R2rScalar, const N: usize, const M: usize>(
                         .map_err(|error| BackendInitError::Local(R2rError::LocalR2r(error)))?,
                 ),
                 #[cfg(feature = "fftw")]
-                super::BackendChoice::Fftw(options) => {
-                    R2rLocal::Hartley(LocalDhtPlan::new_fftw(global_shape[axis], options).map_err(
-                        |error| match error {
-                            BackendInitError::Local(error) => {
-                                BackendInitError::Local(R2rError::LocalR2r(error))
-                            }
-                            BackendInitError::Native(error) => BackendInitError::Native(error),
-                            BackendInitError::PeerPreflight => BackendInitError::PeerPreflight,
-                        },
-                    )?)
-                }
+                super::BackendChoice::Fftw(options) => R2rLocal::Hartley(
+                    LocalDhtPlan::new_fftw(global_shape[axis], options)
+                        .map_err(|error| error.map_local(R2rError::LocalR2r))?,
+                ),
             },
         };
         embedding_len = embedding_len.max(local.embedding_len());
@@ -2971,122 +2813,7 @@ fn execute_strided_r2r_reverse_in_place<T: R2rScalar, const N: usize, const M: u
     Ok(())
 }
 
-fn execute_strided_dht_forward<T: R2rScalar, const N: usize, const M: usize>(
-    plan: &LocalDhtPlan<T>,
-    pencil: &Pencil<N, M>,
-    axis: usize,
-    source: &[T],
-    destination: &mut [T],
-    embedding_line: &mut [Complex<T::Real>],
-    fft_scratch: &mut [Complex<T::Real>],
-    line_buffer: &mut [T],
-) -> Result<(), R2rError> {
-    let stride = super::memory_stride(pencil, axis)?;
-    if stride <= 1 {
-        return plan
-            .forward(source, destination, embedding_line, fft_scratch)
-            .map_err(R2rError::LocalR2r);
-    }
-    if line_buffer.len() < plan.line_len() {
-        return Err(FftError::WorkspaceTooSmall {
-            kind: "real line",
-            required: plan.line_len(),
-            actual: line_buffer.len(),
-        }
-        .into());
-    }
-    let count =
-        super::strided_line_count(source.len(), plan.line_len(), stride).map_err(R2rError::Fft)?;
-    if destination.len() != source.len() {
-        return Err(FftError::PreparationFailed.into());
-    }
-    if source.is_empty() {
-        return plan
-            .forward(source, destination, embedding_line, fft_scratch)
-            .map_err(R2rError::LocalR2r);
-    }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = source[base + k * stride + inner];
-            }
-            plan.forward_in_place(
-                &mut line_buffer[..plan.line_len()],
-                embedding_line,
-                fft_scratch,
-            )
-            .map_err(R2rError::LocalR2r)?;
-            for k in 0..plan.line_len() {
-                destination[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
-}
-
-fn execute_strided_dht_forward_in_place<T: R2rScalar, const N: usize, const M: usize>(
-    plan: &LocalDhtPlan<T>,
-    pencil: &Pencil<N, M>,
-    axis: usize,
-    data: &mut [T],
-    embedding_line: &mut [Complex<T::Real>],
-    fft_scratch: &mut [Complex<T::Real>],
-    line_buffer: &mut [T],
-) -> Result<(), R2rError> {
-    let stride = super::memory_stride(pencil, axis)?;
-    if stride <= 1 {
-        return plan
-            .forward_in_place(data, embedding_line, fft_scratch)
-            .map_err(R2rError::LocalR2r);
-    }
-    if line_buffer.len() < plan.line_len() {
-        return Err(FftError::WorkspaceTooSmall {
-            kind: "real line",
-            required: plan.line_len(),
-            actual: line_buffer.len(),
-        }
-        .into());
-    }
-    let count =
-        super::strided_line_count(data.len(), plan.line_len(), stride).map_err(R2rError::Fft)?;
-    if data.is_empty() {
-        return plan
-            .forward_in_place(data, embedding_line, fft_scratch)
-            .map_err(R2rError::LocalR2r);
-    }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = data[base + k * stride + inner];
-            }
-            plan.forward_in_place(
-                &mut line_buffer[..plan.line_len()],
-                embedding_line,
-                fft_scratch,
-            )
-            .map_err(R2rError::LocalR2r)?;
-            for k in 0..plan.line_len() {
-                data[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
-}
-
+// ponytail: DHT is self-paired; forward and raw backward both use normalize=false.
 fn execute_strided_dht_reverse<T: R2rScalar, const N: usize, const M: usize>(
     plan: &LocalDhtPlan<T>,
     pencil: &Pencil<N, M>,
@@ -3261,7 +2988,7 @@ fn execute_local_forward<T: R2rScalar, const N: usize, const M: usize>(
             fft_scratch,
             line_buffer,
         ),
-        R2rLocal::Hartley(plan) => execute_strided_dht_forward(
+        R2rLocal::Hartley(plan) => execute_strided_dht_reverse(
             plan,
             pencil,
             axis,
@@ -3270,6 +2997,7 @@ fn execute_local_forward<T: R2rScalar, const N: usize, const M: usize>(
             embedding_line,
             fft_scratch,
             line_buffer,
+            false,
         ),
     }
 }
@@ -3294,7 +3022,7 @@ fn execute_local_forward_in_place<T: R2rScalar, const N: usize, const M: usize>(
             fft_scratch,
             line_buffer,
         ),
-        R2rLocal::Hartley(plan) => execute_strided_dht_forward_in_place(
+        R2rLocal::Hartley(plan) => execute_strided_dht_reverse_in_place(
             plan,
             pencil,
             axis,
@@ -3302,6 +3030,7 @@ fn execute_local_forward_in_place<T: R2rScalar, const N: usize, const M: usize>(
             embedding_line,
             fft_scratch,
             line_buffer,
+            false,
         ),
     }
 }
@@ -3483,18 +3212,14 @@ fn execute_local_reverse_in_place_timed<T: R2rScalar, const N: usize, const M: u
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_r2r_out_of_place<T: R2rScalar, const N: usize, const M: usize>(
     core: &Arc<R2rCore<T, N, M>>,
-    workspace_core: &Arc<R2rCore<T, N, M>>,
     direction: Direction,
     source: &PencilArray<T, N, M>,
     destination: &PencilArray<T, N, M>,
-    intermediate: &ManyPencilArray<T, N, M>,
-    lengths: (usize, usize, usize),
-    embedding_len: usize,
+    workspace: &R2rWorkspace<T, N, M>,
 ) -> Result<(), R2rError> {
-    if !Arc::ptr_eq(workspace_core, core) {
+    if !Arc::ptr_eq(&workspace.core, core) {
         return Err(FftError::WorkspaceMismatch.into());
     }
     let input = &core.stages[0].input;
@@ -3526,24 +3251,99 @@ fn validate_r2r_out_of_place<T: R2rScalar, const N: usize, const M: usize>(
         return Err(FftError::ExtraShapeMismatch.into());
     }
     validate_workspace_lengths_values(
-        lengths.0,
+        workspace.fft_scratch.len(),
         core.fft_scratch_len,
-        lengths.1,
+        workspace.transpose.send_len(),
         core.transpose_send_len,
-        lengths.2,
+        workspace.transpose.receive_len(),
         core.transpose_receive_len,
     )?;
-    validate_embedding_len(embedding_len, core.embedding_len)?;
-    if intermediate.extra_shape() != &core.extra_shape {
+    validate_embedding_len(workspace.embedding_line.len(), core.embedding_len)?;
+    if workspace.intermediate.extra_shape() != &core.extra_shape {
         return Err(FftError::WorkspaceMismatch.into());
     }
-    let active = intermediate.active_pencil().map_err(FftError::Array)?;
+    let active = workspace
+        .intermediate
+        .active_pencil()
+        .map_err(FftError::Array)?;
     if !core
         .stages
         .iter()
         .any(|stage| active.same_layout(stage.output.as_ref()))
     {
         return Err(FftError::WorkspaceMismatch.into());
+    }
+    if workspace.line_buffer.len() < core.strided_line_len {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "real line",
+            required: core.strided_line_len,
+            actual: workspace.line_buffer.len(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_r2r_in_place<T: R2rScalar, const N: usize, const M: usize>(
+    core: &Arc<R2rCore<T, N, M>>,
+    direction: Direction,
+    array: &R2rInPlaceArray<T, N, M>,
+    workspace: &R2rInPlaceWorkspace<T, N, M>,
+) -> Result<(), R2rError> {
+    if !Arc::ptr_eq(&array.core, core) {
+        return Err(FftError::Array(pencil_array::ArrayError::IncompatiblePencils).into());
+    }
+    if !Arc::ptr_eq(&workspace.core, core) {
+        return Err(FftError::WorkspaceMismatch.into());
+    }
+    let expected_state = match direction {
+        Direction::Forward => super::R2rState::Input,
+        Direction::Inverse | Direction::Backward => super::R2rState::Output,
+    };
+    match array.state {
+        super::R2rState::Poisoned => {
+            return Err(FftError::Array(pencil_array::ArrayError::Poisoned).into());
+        }
+        state if state != expected_state => return Err(FftError::InputLayoutMismatch.into()),
+        _ => {}
+    }
+    if array.array.extra_shape() != &core.extra_shape {
+        return Err(FftError::ExtraShapeMismatch.into());
+    }
+    let expected = match direction {
+        Direction::Forward => &core.stages[0].input,
+        Direction::Inverse | Direction::Backward => {
+            &core
+                .stages
+                .last()
+                .expect("distributed R2R has at least two stages")
+                .output
+        }
+    };
+    if !array
+        .array
+        .active_pencil()
+        .map_err(FftError::Array)?
+        .same_layout(expected.as_ref())
+    {
+        return Err(FftError::InputLayoutMismatch.into());
+    }
+    validate_workspace_lengths_values(
+        workspace.fft_scratch.len(),
+        core.fft_scratch_len,
+        workspace.transpose.send_len(),
+        core.transpose_send_len,
+        workspace.transpose.receive_len(),
+        core.transpose_receive_len,
+    )?;
+    validate_embedding_len(workspace.embedding_line.len(), core.embedding_len)?;
+    if workspace.line_buffer.len() < core.strided_line_len {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "real line",
+            required: core.strided_line_len,
+            actual: workspace.line_buffer.len(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -3778,6 +3578,221 @@ mod tests {
             &mut corrupted_array,
             &mut corrupted_workspace,
         );
+    }
+
+    #[cfg(feature = "fftw")]
+    #[test]
+    #[ignore = "requires native FFTW and a fresh MPI process with 1, 4, or 6 ranks"]
+    fn native_workspace_capacity_contract() {
+        let _mpi_test_lock = super::super::MPI_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let universe = mpi::initialize().expect("MPI initialization failed");
+        let world = universe.world();
+        let size = usize::try_from(world.size()).unwrap();
+        assert!(matches!(size, 1 | 4 | 6), "run with 1, 4, or 6 MPI ranks");
+        let topology = MpiTopology::<1>::new(&world, [size]).unwrap();
+        let shape = [4 * size, 8];
+        let options = PlanOptions::default();
+        let embedding_bits = |values: &[Complex<f64>]| {
+            values
+                .iter()
+                .map(|value| (value.re.to_bits(), value.im.to_bits()))
+                .collect::<Vec<_>>()
+        };
+
+        // Hartley already uses logical line lengths; it must not change.
+        let dht = DhtPlan::<f64, 2, 1>::from_shape_with_fftw(
+            Arc::clone(&topology),
+            shape,
+            ExtraShape::scalar(),
+            options,
+        )
+        .unwrap();
+        let dht_required = shape[0].max(shape[1]);
+        for stage in &dht.core.stages {
+            assert_eq!(stage.local.embedding_len(), shape[stage.axis]);
+        }
+        assert_eq!(dht.core.embedding_len, dht_required);
+        assert_eq!(
+            dht.allocate_workspace().unwrap().embedding_line.len(),
+            dht_required
+        );
+        assert_eq!(
+            dht.allocate_in_place_workspace()
+                .unwrap()
+                .embedding_line
+                .len(),
+            dht_required
+        );
+
+        // An untransformed axis does not contribute, even when it is longer.
+        // The empty selection is identity with M = 0.
+        for (kind, required) in [(Some(R2rKind::DctIV), 8), (None, 0)] {
+            let plan = R2rPlan::<f64, 2, 1>::from_shape_with_fftw(
+                Arc::clone(&topology),
+                shape,
+                ExtraShape::scalar(),
+                [None, kind],
+                options,
+            )
+            .unwrap();
+            assert_eq!(plan.backend_kind(), crate::BackendKind::Fftw);
+            let mut workspace = plan.allocate_workspace().unwrap();
+            let mut ip_workspace = plan.allocate_in_place_workspace().unwrap();
+            assert_eq!(plan.core.embedding_len, required);
+            assert_eq!(workspace.embedding_line.len(), required);
+            assert_eq!(ip_workspace.embedding_line.len(), required);
+
+            let mut input = plan.allocate_input().unwrap();
+            for (index, value) in input.as_mut_slice().iter_mut().enumerate() {
+                *value = f64::from(world.rank()) + (index + 1) as f64 / 8.0;
+            }
+            let original = input.as_slice().to_vec();
+            let mut output = plan.allocate_output().unwrap();
+            output.as_mut_slice().fill(-23.0);
+            let mut array = plan.allocate_in_place().unwrap();
+            array
+                .view_mut()
+                .unwrap()
+                .as_mut_slice()
+                .copy_from_slice(&original);
+
+            if required > 0 {
+                let mut short_workspace = plan.allocate_workspace().unwrap();
+                let mut short_ip_workspace = plan.allocate_in_place_workspace().unwrap();
+                short_workspace
+                    .embedding_line
+                    .fill(Complex::new(17.0, -19.0));
+                short_ip_workspace
+                    .embedding_line
+                    .fill(Complex::new(17.0, -19.0));
+                // Only rank zero fails local preflight; all peers call forward too.
+                if world.rank() == 0 {
+                    short_workspace.embedding_line.truncate(required - 1);
+                    short_ip_workspace.embedding_line.truncate(required - 1);
+                }
+                let assert_short_error = |result: Result<(), R2rError>| {
+                    if world.rank() == 0 {
+                        assert!(
+                            matches!(
+                                &result,
+                                Err(R2rError::Fft(FftError::WorkspaceTooSmall {
+                                    kind: "complex embedding",
+                                    required: needed,
+                                    actual,
+                                })) if *needed == required && *actual == required - 1
+                            ),
+                            "{result:?}"
+                        );
+                    } else {
+                        assert!(
+                            matches!(
+                                &result,
+                                Err(R2rError::Fft(FftError::CollectivePreconditionFailed))
+                            ),
+                            "{result:?}"
+                        );
+                    }
+                };
+                let output_before = output.as_slice().to_vec();
+                let workspace_before = format!("{short_workspace:?}");
+                assert_short_error(plan.forward(&input, &mut output, &mut short_workspace));
+                assert_eq!(input.as_slice(), original);
+                assert_eq!(output.as_slice(), output_before);
+                assert_eq!(format!("{short_workspace:?}"), workspace_before);
+
+                let array_before = format!("{array:?}");
+                let workspace_before = format!("{short_ip_workspace:?}");
+                assert_short_error(plan.forward_in_place(&mut array, &mut short_ip_workspace));
+                assert_eq!(array.state(), super::super::R2rState::Input);
+                assert_eq!(array.view().unwrap().as_slice(), original);
+                assert_eq!(format!("{array:?}"), array_before);
+                assert_eq!(format!("{short_ip_workspace:?}"), workspace_before);
+            }
+
+            // First recover with exactly M entries, then exercise old DCT-IV
+            // model-sized and oversized private vectors belonging to this core.
+            let sentinel = Complex::new(
+                f64::from_bits(0x7ff8_0000_0000_1234),
+                f64::from_bits(0xfff8_0000_0000_5678),
+            );
+            for length in [required, 8 * shape[1], 8 * shape[1] + 3] {
+                input.as_mut_slice().copy_from_slice(&original);
+                array
+                    .view_mut()
+                    .unwrap()
+                    .as_mut_slice()
+                    .copy_from_slice(&original);
+                workspace.embedding_line.resize(length, sentinel);
+                ip_workspace.embedding_line.resize(length, sentinel);
+                workspace.embedding_line.fill(sentinel);
+                ip_workspace.embedding_line.fill(sentinel);
+                let tail_before = embedding_bits(&workspace.embedding_line[required..]);
+                let ip_tail_before = embedding_bits(&ip_workspace.embedding_line[required..]);
+                for direction in [
+                    Direction::Forward,
+                    Direction::Inverse,
+                    Direction::Forward,
+                    Direction::Backward,
+                ] {
+                    let (source, destination) = match direction {
+                        Direction::Forward => (&input, &mut output),
+                        Direction::Inverse | Direction::Backward => (&output, &mut input),
+                    };
+                    let source_before = source.as_slice().to_vec();
+                    match direction {
+                        Direction::Forward => plan.forward(source, destination, &mut workspace),
+                        Direction::Inverse => plan.inverse(source, destination, &mut workspace),
+                        Direction::Backward => plan.backward(source, destination, &mut workspace),
+                    }
+                    .unwrap();
+                    match direction {
+                        Direction::Forward => plan.forward_in_place(&mut array, &mut ip_workspace),
+                        Direction::Inverse => plan.inverse_in_place(&mut array, &mut ip_workspace),
+                        Direction::Backward => {
+                            plan.backward_in_place(&mut array, &mut ip_workspace)
+                        }
+                    }
+                    .unwrap();
+                    assert_eq!(source.as_slice(), source_before);
+                    assert_eq!(
+                        embedding_bits(&workspace.embedding_line[required..]),
+                        tail_before
+                    );
+                    assert_eq!(
+                        embedding_bits(&ip_workspace.embedding_line[required..]),
+                        ip_tail_before
+                    );
+                    assert_eq!(
+                        array.state(),
+                        if matches!(direction, Direction::Forward) {
+                            super::super::R2rState::Output
+                        } else {
+                            super::super::R2rState::Input
+                        }
+                    );
+                    let view = array.view().unwrap();
+                    assert_eq!(view.as_slice().len(), destination.as_slice().len());
+                    for (&actual, &expected) in view.as_slice().iter().zip(destination.as_slice()) {
+                        assert!((actual - expected).abs() <= 1e-10 * expected.abs().max(1.0));
+                    }
+                    if !matches!(direction, Direction::Forward) {
+                        let scale = if matches!(direction, Direction::Backward) && kind.is_some() {
+                            (2 * shape[1]) as f64
+                        } else {
+                            1.0
+                        };
+                        assert_eq!(destination.as_slice().len(), original.len());
+                        for (&actual, &value) in destination.as_slice().iter().zip(&original) {
+                            let expected = scale * value;
+                            assert!((actual - expected).abs() <= 1e-10 * expected.abs().max(1.0));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

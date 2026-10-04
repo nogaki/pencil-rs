@@ -13,6 +13,7 @@ use std::{
 #[cfg(test)]
 thread_local! {
     pub(crate) static COMPLEX_EXECUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static R2R_EXECUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TRACE: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
     static FLAG_TRACE: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
     // Observes completed API calls, not FFTW's (unqueryable) internal state.
@@ -33,6 +34,8 @@ type PlanComplex<R> =
     unsafe extern "C" fn(c_int, *mut Complex<R>, *mut Complex<R>, c_int, c_uint) -> Handle;
 type PlanForward<R> = unsafe extern "C" fn(c_int, *mut R, *mut Complex<R>, c_uint) -> Handle;
 type PlanInverse<R> = unsafe extern "C" fn(c_int, *mut Complex<R>, *mut R, c_uint) -> Handle;
+type PlanR2r<R> = unsafe extern "C" fn(c_int, *mut R, *mut R, c_int, c_uint) -> Handle;
+type ExecR2r<R> = unsafe extern "C" fn(Handle, *mut R, *mut R);
 type ExecComplex<R> = unsafe extern "C" fn(Handle, *mut Complex<R>, *mut Complex<R>);
 type ExecForward<R> = unsafe extern "C" fn(Handle, *mut R, *mut Complex<R>);
 type ExecInverse<R> = unsafe extern "C" fn(Handle, *mut Complex<R>, *mut R);
@@ -47,6 +50,8 @@ struct Table<R> {
     pc: PlanComplex<R>,
     pf: PlanForward<R>,
     pi: PlanInverse<R>,
+    pr: PlanR2r<R>,
+    er: ExecR2r<R>,
     ec: ExecComplex<R>,
     ef: ExecForward<R>,
     ei: ExecInverse<R>,
@@ -110,6 +115,8 @@ impl<R: Real> Table<R> {
             pc: symbol!("plan_dft_1d", PlanComplex<R>),
             pf: symbol!("plan_dft_r2c_1d", PlanForward<R>),
             pi: symbol!("plan_dft_c2r_1d", PlanInverse<R>),
+            pr: symbol!("plan_r2r_1d", PlanR2r<R>),
+            er: symbol!("execute_r2r", ExecR2r<R>),
             ec: symbol!("execute_dft", ExecComplex<R>),
             ef: symbol!("execute_dft_r2c", ExecForward<R>),
             ei: symbol!("execute_dft_c2r", ExecInverse<R>),
@@ -324,6 +331,7 @@ pub(crate) fn version<R: Real>() -> Result<String, FftwError> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
     Complex(FftDirection, bool),
+    R2r(R2rKind, bool),
     Forward,
     Inverse,
 }
@@ -358,6 +366,11 @@ impl<R: Real> Plan<R> {
         flags: u32,
     ) -> Result<Self, FftwError> {
         let native = checked_len::<R>(n)?;
+        if matches!(kind, Kind::R2r(R2rKind::DctI, _)) && n < 2 {
+            return Err(FftwError::InvalidOptions(
+                "DCT-I length must be at least two",
+            ));
+        }
         let table = Table::load()?;
         // Initialized, private buffers: destructive planning never sees caller data.
         let mut a = zeros::<Complex<R>>(n)?;
@@ -394,6 +407,22 @@ impl<R: Real> Plan<R> {
                         a.as_mut_ptr(),
                         if ip { a.as_mut_ptr() } else { b.as_mut_ptr() },
                         if d == FftDirection::Forward { -1 } else { 1 },
+                        flags | FFTW_PRESERVE_INPUT,
+                    )
+                }
+                Kind::R2r(kind, ip) => {
+                    #[cfg(test)]
+                    trace_flags(flags | FFTW_PRESERVE_INPUT);
+                    (table.pr)(
+                        native,
+                        r.as_mut_ptr(),
+                        // a holds 2*n initialized reals; use only its first n.
+                        if ip {
+                            r.as_mut_ptr()
+                        } else {
+                            a.as_mut_ptr().cast()
+                        },
+                        kind as c_int,
                         flags | FFTW_PRESERVE_INPUT,
                     )
                 }
@@ -435,6 +464,29 @@ impl<R: Real> Plan<R> {
         // guarantee disjoint arrays; FFTW accepts a mutable pointer but won't write i.
         unsafe { (self.table.ec)(self.handle.as_ptr(), i.as_ptr().cast_mut(), o.as_mut_ptr()) }
     }
+    pub(crate) fn r2r_inplace(&self, data: &mut [R]) {
+        assert!(matches!(self.kind, Kind::R2r(_, true)));
+        assert_eq!(data.len(), self.n);
+        #[cfg(test)]
+        R2R_EXECUTIONS.with(|count| count.set(count.get() + 1));
+        // SAFETY: exact dimensions and matching in-place alias mode; UNALIGNED.
+        unsafe { (self.table.er)(self.handle.as_ptr(), data.as_mut_ptr(), data.as_mut_ptr()) }
+    }
+    pub(crate) fn r2r(&self, input: &[R], output: &mut [R]) {
+        assert!(matches!(self.kind, Kind::R2r(_, false)));
+        assert_eq!(input.len(), self.n);
+        assert_eq!(output.len(), self.n);
+        #[cfg(test)]
+        R2R_EXECUTIONS.with(|count| count.set(count.get() + 1));
+        // SAFETY: exact disjoint dimensions, UNALIGNED and PRESERVE_INPUT.
+        unsafe {
+            (self.table.er)(
+                self.handle.as_ptr(),
+                input.as_ptr().cast_mut(),
+                output.as_mut_ptr(),
+            )
+        }
+    }
     pub(crate) fn forward(&self, i: &mut [R], o: &mut [Complex<R>]) {
         assert_eq!(self.kind, Kind::Forward);
         assert_eq!(i.len(), self.n);
@@ -471,14 +523,21 @@ mod tests {
                 Some(std::time::Duration::from_millis(1)),
             )
             .unwrap();
-            for mode in 0..3 {
+            for (kind, mode) in [
+                Kind::Complex(FftDirection::Forward, false),
+                Kind::R2r(R2rKind::DctII, false),
+                Kind::R2r(R2rKind::Dht, true),
+            ]
+            .into_iter()
+            .flat_map(|kind| (0..3).map(move |mode| (kind, mode)))
+            {
                 forget_wisdom::<R>().unwrap();
                 LIMIT_TRACE.with(|events| events.borrow_mut().clear());
                 PANIC_AFTER_LIMIT.with(|needle| needle.set(mode == 2));
                 let result = std::panic::catch_unwind(|| {
                     Plan::<R>::new_flags(
                         17,
-                        Kind::Complex(FftDirection::Forward, false),
+                        kind,
                         options,
                         options.flags() | if mode == 1 { FFTW_WISDOM_ONLY } else { 0 },
                     )
@@ -611,6 +670,39 @@ mod tests {
                 assert_eq!(*flags.borrow(), [trained.flags(), trained.flags()]);
             });
             crate::forget_wisdom::<R>().unwrap();
+        }
+        check::<f32>();
+        check::<f64>();
+    }
+
+    #[test]
+    #[ignore = "requires both native FFTW runtimes and pthread libraries"]
+    fn native_r2r_flags_and_threads() {
+        let _serial = crate::tests::NATIVE_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fn check<R: Real>() {
+            let trained = PlanOptions::new(PlanningRigor::Measure, None)
+                .unwrap()
+                .with_threads(2)
+                .unwrap()
+                .with_conserve_memory(true);
+            for kind in [R2rKind::DctII, R2rKind::DstIV, R2rKind::Dht] {
+                drop(crate::plan_r2r::<R>(17, kind, trained).unwrap());
+                let only = trained.with_wisdom_only(true);
+                FLAG_TRACE.with(|events| events.borrow_mut().clear());
+                TRACE.with(|events| events.borrow_mut().clear());
+                drop(crate::plan_r2r::<R>(17, kind, only).unwrap());
+                FLAG_TRACE.with(|events| {
+                    assert_eq!(*events.borrow(), [only.flags() | FFTW_PRESERVE_INPUT; 2])
+                });
+                TRACE.with(|events| {
+                    let events = events.borrow();
+                    for expected in ["set>1", "reset1", "destroy"] {
+                        assert_eq!(events.iter().filter(|&&e| e == expected).count(), 2);
+                    }
+                });
+            }
         }
         check::<f32>();
         check::<f64>();

@@ -235,7 +235,10 @@ impl<const N: usize, const M: usize> Pencil<N, M> {
             && self.decomposition == other.decomposition
     }
 
-    /// Returns true when distribution and memory-axis permutation both match.
+    /// Returns true when both pencils share the same topology object and have
+    /// equal global shapes, ordered decompositions, and memory-axis permutations.
+    ///
+    /// This does not compare array [`crate::ExtraShape`] or data values.
     pub fn same_layout(&self, other: &Self) -> bool {
         self.same_distribution(other) && self.permutation == other.permutation
     }

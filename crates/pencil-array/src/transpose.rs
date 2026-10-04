@@ -333,21 +333,16 @@ impl<const N: usize, const M: usize> TransposePlanCore<N, M> {
         }
         let descriptor = collective_descriptor(communicator, descriptor_result, expected_len.ok())?;
 
-        let local_validation = validate_plan_layout(&source, &destination);
-        if !collective_valid(communicator, local_validation.is_ok()) {
-            return Err(local_validation
-                .err()
-                .unwrap_or(TransposeError::CollectivePreconditionFailed));
-        }
-        let changed_topology_axis = local_validation.expect("collective validation succeeded");
-
-        let pattern = build_peer_metadata(&source, &destination, changed_topology_axis);
-        if !collective_valid(communicator, pattern.is_ok()) {
-            return Err(pattern
-                .err()
-                .unwrap_or(TransposeError::CollectivePreconditionFailed));
-        }
-        let peers = pattern.expect("collective metadata validation succeeded");
+        let changed_topology_axis = agree_preflight(
+            communicator,
+            validate_plan_layout(&source, &destination),
+            TransposeError::CollectivePreconditionFailed,
+        )?;
+        let peers = agree_preflight(
+            communicator,
+            build_peer_metadata(&source, &destination, changed_topology_axis),
+            TransposeError::CollectivePreconditionFailed,
+        )?;
 
         Ok(Self {
             source,
@@ -1144,6 +1139,20 @@ fn agree_header<C: CommunicatorCollectives>(comm: &C, header: [u64; HEADER_WORDS
     comm.all_reduce_into(&header[..], &mut minimum[..], SystemOperation::min());
     comm.all_reduce_into(&header[..], &mut maximum[..], SystemOperation::max());
     minimum == maximum
+}
+
+/// Agrees only success, preserving a local error or returning `peer_error`.
+/// Call after descriptor agreement and local preparation, before payload writes.
+pub(crate) fn agree_preflight<C: CommunicatorCollectives, T, E>(
+    comm: &C,
+    local: Result<T, E>,
+    peer_error: E,
+) -> Result<T, E> {
+    if collective_valid(comm, local.is_ok()) {
+        local
+    } else {
+        Err(local.err().unwrap_or(peer_error))
+    }
 }
 
 pub(crate) fn collective_valid<C: CommunicatorCollectives>(comm: &C, local_valid: bool) -> bool {

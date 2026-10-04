@@ -92,24 +92,8 @@ fn assert_timing<const N: usize>(timing: &TransformTiming<N>) {
 }
 
 fn fill<T: Value>(a: &mut PencilArray<T, 3, 1>) {
-    if a.is_empty() {
-        return;
-    }
-    let ranges = a.pencil().local_ranges().clone();
-    let shape = a.local_spatial_shape();
-    for i in 0..shape[0] {
-        for j in 0..shape[1] {
-            for k in 0..shape[2] {
-                if [
-                    ranges[0].start + i,
-                    ranges[1].start + j,
-                    ranges[2].start + k,
-                ] == [1, 1, 1]
-                {
-                    *a.get_local_mut(&[], [i, j, k]).unwrap() = T::make(1.0, 2.0);
-                }
-            }
-        }
+    if let Some(x) = a.get_global_mut(&[], [1; 3]) {
+        *x = T::make(1.0, 2.0);
     }
 }
 

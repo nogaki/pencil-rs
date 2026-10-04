@@ -9,6 +9,6 @@ license = "MIT"
 repository = "https://github.com/nogaki/pencil-rs"
 
 [workspace.dependencies]
-mpi = "=0.8.2"
+mpi = { version = "=0.8.2", default-features = false }
 thiserror = "2"
 proptest = "1"

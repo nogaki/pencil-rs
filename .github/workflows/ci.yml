@@ -33,6 +33,70 @@ jobs:
       - name: Check native adapter host paths without FFTW installation
         run: cargo test -p pencil-fftw --locked
 
+  rsmpi-rt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check runtime MPI without native build tools
+        env:
+          MPICC: /nonexistent/mpicc
+          LIBCLANG_PATH: /nonexistent/libclang
+          CC: /nonexistent/cc
+        run: |
+          set -euo pipefail
+          # The opt-in patch intentionally regenerates the upstream lockfile.
+          cargo --config tools/rsmpi-rt.toml check -p pencil-array -p pencil-fft \
+            --features distributed,mpi/mpi-rt-sys-backend --all-targets
+          cargo --config tools/rsmpi-rt.toml tree -p pencil-array -p pencil-fft \
+            --features distributed,mpi/mpi-rt-sys-backend --edges normal,build \
+            --prefix none --locked | tee /tmp/rsmpi-rt-tree.txt
+          grep -q '^mpi-rt-sys ' /tmp/rsmpi-rt-tree.txt
+          if grep -Eq '^(mpi-sys|build-probe-mpi|bindgen|libffi|libffi-sys) ' /tmp/rsmpi-rt-tree.txt; then
+            echo "runtime MPI unexpectedly depends on native build tools" >&2
+            exit 1
+          fi
+          cargo --config tools/rsmpi-rt.toml test -p pencil-array -p pencil-fft \
+            --features distributed,mpi/mpi-rt-sys-backend --locked --no-run \
+            --test topology --test alltoallv_transpose --test collectives \
+            --test distributed_c2c --test distributed_c2r --test distributed_r2r --test distributed_mixed
+
+      - name: Install MPIwrapper build and runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libopenmpi-dev openmpi-bin cmake gfortran
+
+      - name: Checkout MPIwrapper
+        uses: actions/checkout@v4
+        with:
+          repository: eschnett/MPIwrapper
+          ref: 966f4231c96153a08295fc7d0bcbd65e916a73fd
+          path: target/mpiwrapper
+
+      - name: Build MPIwrapper
+        run: |
+          cmake -S target/mpiwrapper -B target/mpiwrapper/build
+          cmake --build target/mpiwrapper/build --parallel 2
+          echo "MPI_RT_LIB=$PWD/target/mpiwrapper/build/libmpiwrapper.so" >> "$GITHUB_ENV"
+
+      - name: Run runtime MPI integration tests
+        run: |
+          set -euo pipefail
+          for n in 1 4; do
+            timeout --kill-after=5s 120s mpiexec --oversubscribe -n "$n" \
+              cargo --config tools/rsmpi-rt.toml test -p pencil-array \
+              --features mpi/mpi-rt-sys-backend --test topology --locked -- --test-threads=1
+          done
+          for n in 1 4 6; do
+            for suite in alltoallv_transpose collectives distributed_c2c distributed_c2r distributed_r2r distributed_mixed; do
+              timeout --kill-after=5s 120s mpiexec --oversubscribe -n "$n" \
+                cargo --config tools/rsmpi-rt.toml test -p pencil-array -p pencil-fft \
+                --features distributed,mpi/mpi-rt-sys-backend --test "$suite" --locked -- --test-threads=1
+            done
+          done
+
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -87,71 +151,32 @@ jobs:
       - name: Run distributed FFT library tests
         run: cargo test -p pencil-fft --features distributed --lib --locked
 
-      - name: Run one-rank topology tests
-        run: mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test topology --locked -- --nocapture --test-threads=1
-
-      - name: Run four-rank topology tests
-        run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test topology --locked -- --nocapture --test-threads=1
-
-      - name: Run four-rank pencil tests
-        run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test pencil --locked -- --nocapture --test-threads=1
-
-      - name: Run one-rank pencil tests
-        run: mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test pencil --locked -- --nocapture --test-threads=1
-
-      - name: Run one-rank array tests
-        run: mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test array --locked -- --nocapture --test-threads=1
-
-      - name: Run four-rank array tests
-        run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test array --locked -- --nocapture --test-threads=1
-
-      - name: Run one-rank array access tests
-        run: mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test array_access --locked -- --nocapture --test-threads=1
-
-      - name: Run four-rank array access tests
-        run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test array_access --locked -- --nocapture --test-threads=1
-
-      - name: Run six-rank array access tests
-        run: mpiexec --oversubscribe -n 6 cargo test -p pencil-array --test array_access --locked -- --nocapture --test-threads=1
-
-      - name: Run one-rank collectives tests
-        run: mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test collectives --locked -- --nocapture --test-threads=1
-
-      - name: Run four-rank collectives tests
-        run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test collectives --locked -- --nocapture --test-threads=1
-
-      - name: Run six-rank collectives tests
-        run: mpiexec --oversubscribe -n 6 cargo test -p pencil-array --test collectives --locked -- --nocapture --test-threads=1
-
-      - name: Run one-rank shared array tests
-        run: mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test many --locked -- --nocapture --test-threads=1
-
-      - name: Run four-rank shared array tests
-        run: mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test many --locked -- --nocapture --test-threads=1
-
-      - name: Run one-rank local transpose tests
-        run: timeout --foreground 120s mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test local_transpose --locked -- --nocapture --test-threads=1
-
-      - name: Run four-rank local transpose tests
-        run: timeout --foreground 120s mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test local_transpose --locked -- --nocapture --test-threads=1
-
-      - name: Run one-rank distributed transpose (Alltoallv/P2P out-of-place and in-place) tests
-        run: timeout --foreground 120s mpiexec --oversubscribe -n 1 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
-
-      - name: Run four-rank distributed transpose (Alltoallv/P2P out-of-place and in-place) tests
-        run: timeout --foreground 120s mpiexec --oversubscribe -n 4 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
-
-      - name: Run six-rank distributed transpose (Alltoallv/P2P out-of-place and in-place) tests
-        run: timeout --foreground 120s mpiexec --oversubscribe -n 6 cargo test -p pencil-array --test alltoallv_transpose --locked -- --nocapture --test-threads=1
-
-      - name: Run distributed C2C/R2C/C2R FFT suite (Alltoallv/P2P) on one rank
-        run: timeout --foreground 120s mpiexec --oversubscribe -n 1 cargo test -p pencil-fft --features distributed --test distributed_c2c --locked -- --nocapture --test-threads=1
-
-      - name: Run distributed C2C/R2C/C2R FFT suite (Alltoallv/P2P) on four ranks
-        run: timeout --foreground 120s mpiexec --oversubscribe -n 4 cargo test -p pencil-fft --features distributed --test distributed_c2c --locked -- --nocapture --test-threads=1
-
-      - name: Run distributed C2C/R2C/C2R FFT suite (Alltoallv/P2P) on six ranks
-        run: timeout --foreground 120s mpiexec --oversubscribe -n 6 cargo test -p pencil-fft --features distributed --test distributed_c2c --locked -- --nocapture --test-threads=1
+      - name: Run array and FFT MPI matrices
+        run: |
+          set -euo pipefail
+          for suite in topology pencil array many array_access collectives; do
+            ranks="1 4"
+            if [[ "$suite" == array_access || "$suite" == collectives ]]; then
+              ranks="1 4 6"
+            fi
+            for n in $ranks; do
+              echo "== $suite: $n ranks =="
+              mpiexec --oversubscribe -n "$n" cargo test -p pencil-array \
+                --test "$suite" --locked -- --nocapture --test-threads=1
+            done
+          done
+          for n in 1 4 6; do
+            for suite in local_transpose alltoallv_transpose; do
+              if [[ "$n" == 6 && "$suite" == local_transpose ]]; then continue; fi
+              echo "== $suite: $n ranks =="
+              timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
+                cargo test -p pencil-array --test "$suite" --locked -- --nocapture --test-threads=1
+            done
+            echo "== distributed_c2c: $n ranks =="
+            timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-fft --features distributed --test distributed_c2c \
+                --locked -- --nocapture --test-threads=1
+          done
 
       - name: Run FFT, array-operation, named-I/O, and execution-contract matrices
         run: |
@@ -167,6 +192,14 @@ jobs:
             grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out' "$log"
           }
           for n in 1 4 6; do
+            run_one timeout --kill-after=5s 240s \
+              mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-fft --features distributed --test distributed_c2r \
+                --locked distributed_c2r_one_mpi_binary -- --exact --nocapture --test-threads=1
+            run_one timeout --kill-after=5s 240s \
+              mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-fft --features distributed,fftw --test distributed_c2r \
+                --locked distributed_c2r_fftw_one_mpi_binary -- --exact --ignored --nocapture --test-threads=1
             run_one timeout --kill-after=5s 240s \
               mpiexec --oversubscribe -n "$n" \
               cargo test -p pencil-fft --features distributed --test distributed_r2r \
@@ -237,12 +270,12 @@ jobs:
             cargo test -p pencil-io --features parallel-hdf5 --test mpi_session --locked \
               mpi_file_session_active_drop_is_failstop -- --exact --ignored --nocapture --test-threads=1
           # Ordinary host tests: do not pass --ignored to these exact filters.
-          for contract in distributed::fftw_tests::backend_descriptor_flags distributed::fftw_tests::native_operation_words_do_not_collide; do
+          for contract in backend::tests::map_local_preserves_failure_kind distributed::fftw_tests::backend_descriptor_flags distributed::fftw_tests::native_operation_words_do_not_collide; do
             run_one timeout --kill-after=5s 120s \
               cargo test -p pencil-fft --features distributed,fftw --lib --locked "$contract" -- \
                 --exact --nocapture --test-threads=1
           done
-          for native in tests::native_f32 tests::native_f64 tests::native_f32_wisdom_only_all_kinds tests::native_f64_wisdom_only_all_kinds ffi::tests::native_c2c_second_plan_failure_drops_first_and_resets_threads ffi::tests::native_partial_construction_cleanup ffi::tests::native_wisdom_lifetime_and_threads ffi::tests::native_cached_thread_load_failure ffi::tests::native_initialization_order ffi::tests::native_timelimit_calls_on_success_error_and_unwind; do
+          for native in tests::native_f32 tests::native_f64 tests::native_f32_wisdom_only_all_kinds tests::native_f64_wisdom_only_all_kinds tests::native_r2r_alias_modes_wisdom_and_concurrency ffi::tests::native_r2r_flags_and_threads ffi::tests::native_c2c_second_plan_failure_drops_first_and_resets_threads ffi::tests::native_partial_construction_cleanup ffi::tests::native_wisdom_lifetime_and_threads ffi::tests::native_cached_thread_load_failure ffi::tests::native_initialization_order ffi::tests::native_timelimit_calls_on_success_error_and_unwind; do
             run_one timeout --kill-after=5s 120s \
               cargo test -p pencil-fftw --lib --locked "$native" -- \
                 --exact --ignored --nocapture --test-threads=1
@@ -250,6 +283,11 @@ jobs:
           for native in native_f32_all_local native_f64_all_local native_f32_wisdom_only_r2r_dht native_f64_wisdom_only_r2r_dht; do
             run_one timeout --kill-after=5s 120s \
               cargo test -p pencil-fft --features fftw --test fftw_local --locked "$native" -- \
+                --exact --ignored --nocapture --test-threads=1
+          done
+          for native in r2r::tests::native_r2r_oracles_and_workspace_contracts dht::tests::native_dht_oracles_and_workspace_contracts; do
+            run_one timeout --kill-after=5s 120s \
+              cargo test -p pencil-fft --features fftw --lib --locked "$native" -- \
                 --exact --ignored --nocapture --test-threads=1
           done
           # MPI is initialized once in this separate one-rank test process.

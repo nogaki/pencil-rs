@@ -9,8 +9,8 @@ use crate::{
     ExtraShape, ManyPencilArray, Pencil, PencilArrayView, PencilArrayViewMut,
     transpose::{
         CommunicationMode, PreparedExchange, TransposeError, TransposePlanCore, TransposeWorkspace,
-        TransposeWorkspaceRequirements, agree_execute_descriptor, collective_valid,
-        finish_in_place, pack_source, prepare_in_place, unpack_destination,
+        TransposeWorkspaceRequirements, agree_execute_descriptor, agree_preflight, finish_in_place,
+        pack_source, prepare_in_place, unpack_destination,
     },
 };
 
@@ -112,15 +112,12 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
             CommunicationMode::AllToAllv.views_operation(),
         )?;
 
-        let local_preflight = self
-            .core
-            .prepare_execution(&source, &destination, workspace);
-        if !collective_valid(communicator, local_preflight.is_ok()) {
-            return Err(local_preflight
-                .err()
-                .unwrap_or(TransposeError::CollectivePreconditionFailed));
-        }
-        let prepared = local_preflight.expect("collective execution preflight succeeded");
+        let prepared = agree_preflight(
+            communicator,
+            self.core
+                .prepare_execution(&source, &destination, workspace),
+            TransposeError::CollectivePreconditionFailed,
+        )?;
         let extra_count = source.extra_shape().element_count();
         pack_source(
             self.core.peers(),
@@ -161,15 +158,12 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
             destination.extra_shape(),
             CommunicationMode::AllToAllv.timed_views_operation(),
         )?;
-        let local = self
-            .core
-            .prepare_execution(&source, &destination, workspace);
-        if !collective_valid(communicator, local.is_ok()) {
-            return Err(local
-                .err()
-                .unwrap_or(TransposeError::CollectivePreconditionFailed));
-        }
-        let prepared = local.expect("collective execution preflight succeeded");
+        let prepared = agree_preflight(
+            communicator,
+            self.core
+                .prepare_execution(&source, &destination, workspace),
+            TransposeError::CollectivePreconditionFailed,
+        )?;
         let extra_count = source.extra_shape().element_count();
         let mut timing = crate::TransposeTiming::default();
         let started = Instant::now();
@@ -228,13 +222,11 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
             CommunicationMode::AllToAllv.in_place_operation(),
         )?;
 
-        let local_preflight = prepare_in_place(&self.core, array, workspace);
-        if !collective_valid(communicator, local_preflight.is_ok()) {
-            return Err(local_preflight
-                .err()
-                .unwrap_or(TransposeError::CollectivePreconditionFailed));
-        }
-        let prepared = local_preflight.expect("collective in-place preflight succeeded");
+        let prepared = agree_preflight(
+            communicator,
+            prepare_in_place(&self.core, array, workspace),
+            TransposeError::CollectivePreconditionFailed,
+        )?;
         let extra_count = array.extra_shape().element_count();
         {
             let source = array
@@ -279,13 +271,11 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
             array.extra_shape(),
             CommunicationMode::AllToAllv.timed_in_place_operation(),
         )?;
-        let local = prepare_in_place(&self.core, array, workspace);
-        if !collective_valid(communicator, local.is_ok()) {
-            return Err(local
-                .err()
-                .unwrap_or(TransposeError::CollectivePreconditionFailed));
-        }
-        let prepared = local.expect("collective in-place preflight succeeded");
+        let prepared = agree_preflight(
+            communicator,
+            prepare_in_place(&self.core, array, workspace),
+            TransposeError::CollectivePreconditionFailed,
+        )?;
         let extra_count = array.extra_shape().element_count();
         let mut timing = crate::TransposeTiming::default();
         let started = Instant::now();

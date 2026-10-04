@@ -1,0 +1,5 @@
+# Experimental runtime loading for pencil-array and distributed pencil-fft.
+# Enable mpi/mpi-rt-sys-backend on the Cargo command line; see README.md.
+# ponytail: keep the published dependency on upstream mpi; opt in with Cargo's patch mechanism.
+[patch.crates-io]
+mpi = { git = "https://github.com/tensor4all/rsmpi-rt", rev = "736d45cdfd816e4013f9b46801d7ee5eb17ad2e8" }
