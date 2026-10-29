@@ -99,7 +99,7 @@ jobs:
           fi
           cargo --config tools/rsmpi-rt.toml test -p pencil-array -p pencil-fft \
             --features distributed,mpi/mpi-rt-sys-backend --locked --no-run \
-            --test topology --test alltoallv_transpose --test collectives \
+            --test topology --test alltoallv_transpose --test collectives --test spatial_remap \
             --test distributed_c2c --test distributed_c2r --test distributed_r2r --test distributed_mixed
 
       - name: Install MPIwrapper build and runtime dependencies
@@ -134,6 +134,32 @@ jobs:
                 cargo --config tools/rsmpi-rt.toml test -p pencil-array -p pencil-fft \
                 --features distributed,mpi/mpi-rt-sys-backend --test "$suite" --locked -- --test-threads=1
             done
+          done
+
+      - name: Run runtime spatial remap contract tests
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          trap 'rm -f "$log"' EXIT
+          run_one() {
+            if ! "$@" >"$log" 2>&1; then
+              cat "$log"
+              return 1
+            fi
+            cat "$log"
+            grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out' "$log"
+          }
+          for n in 1 4 6; do
+            run_one timeout --kill-after=5s 180s \
+              mpiexec --oversubscribe -n "$n" \
+              cargo --config tools/rsmpi-rt.toml test -p pencil-array \
+                --features mpi/mpi-rt-sys-backend --test spatial_remap --locked -- --nocapture --test-threads=1
+            run_one timeout --kill-after=5s 180s \
+              mpiexec --oversubscribe -n "$n" \
+              cargo --config tools/rsmpi-rt.toml test -p pencil-array \
+                --features mpi/mpi-rt-sys-backend --lib --locked \
+                spatial_remap::tests::mpi_preflight_failure_preserves_all_plan_state -- \
+                --exact --ignored --nocapture --test-threads=1
           done
 
   rust:
@@ -231,6 +257,15 @@ jobs:
             grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out' "$log"
           }
           for n in 1 4 6; do
+            run_one timeout --kill-after=5s 240s \
+              mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-array --test spatial_remap --locked -- \
+                --nocapture --test-threads=1
+            run_one timeout --kill-after=5s 240s \
+              mpiexec --oversubscribe -n "$n" \
+              cargo test -p pencil-array --lib --locked \
+                spatial_remap::tests::mpi_preflight_failure_preserves_all_plan_state -- \
+                --exact --ignored --nocapture --test-threads=1
             run_one timeout --kill-after=5s 240s \
               mpiexec --oversubscribe -n "$n" \
               cargo test -p pencil-fft --features distributed --test distributed_c2r \

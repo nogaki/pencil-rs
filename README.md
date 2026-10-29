@@ -41,7 +41,10 @@ axis and iterates this rank's spatial coordinates in physical memory order;
 extra batches repeat that spatial grid. `LocalTransposePlan` provides
 process-local memory-axis permutations. `AllToAllvTransposePlan` and
 `PointToPointTransposePlan` provide checked distributed redistribution through
-out-of-place views and shared-storage in-place execution. The optional
+out-of-place views and shared-storage in-place execution. `SpatialRemapPlan`
+provides reusable affine per-axis sign/offset remapping across arbitrary pencil
+decompositions, with collective descriptor checks and allocation-free apply.
+The optional
 `pencil-fft/distributed` feature composes these checked transitions into
 out-of-place and in-place distributed C2C forward/inverse/backward transforms and
 out-of-place plus single-allocation in-place R2C/C2R; this does not change
