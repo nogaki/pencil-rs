@@ -4,10 +4,14 @@
 //! Local one-dimensional FFTs.
 //!
 //! [`LocalC2cPlan`] treats each input slice as a row-major batch of contiguous
-//! complex lines. [`LocalR2cPlan`] does the same for real-to-half-complex and
+//! complex lines. [`LocalC2cNdPlan`] applies selected C2C axes to a column-major
+//! multidimensional slice, with axis zero fastest and unselected dimensions as
+//! independent batches. [`LocalR2cPlan`] does the same for real-to-half-complex and
 //! half-complex-to-real transforms, and also provides a packed, state-checked
-//! single-allocation in-place API. Plans own immutable backend plans, while
-//! callers own initialized line buffers, scratch storage, and data buffers.
+//! single-allocation in-place API. Plans own immutable backend plans. One-dimensional
+//! plans require callers to own initialized line buffers, scratch storage, and
+//! data buffers; [`LocalC2cNdPlan`] owns its line buffers and scratch storage,
+//! while callers own its data buffer.
 //! Local C2C and local R2C/C2R forward and backward transforms are
 //! unnormalized; backward uses the positive-sign convention. Local C2C
 //! inverse and R2C/C2R inverse divide by the line length: the complex length
@@ -288,12 +292,14 @@ impl FftReal for f32 {}
 impl FftReal for f64 {}
 
 mod backend;
+mod c2c_nd;
 mod dht;
 mod r2c;
 mod r2r;
 
 pub use backend::BackendInitError;
 pub use backend::BackendKind;
+pub use c2c_nd::{LocalC2cNdError, LocalC2cNdPlan};
 pub use dht::LocalDhtPlan;
 #[cfg(feature = "fftw")]
 pub use pencil_fftw::{

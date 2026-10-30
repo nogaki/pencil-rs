@@ -26,7 +26,14 @@ including componentwise complex transforms, rather than complex FFT embeddings.
 The portable RustFFT algorithms remain unchanged.
 
 Local forward and backward transforms are unnormalized; inverse methods apply
-normalization. Consult the API documentation for buffer sizes and layout rules.
+normalization. `LocalC2cNdPlan` provides MPI-free C2C transforms over selected
+axes of a column-major `Complex` slice (`shape[0]` is fastest). It preserves the
+supplied axes order, treats unselected dimensions as independent batches, and
+owns its FFT plans and line buffers. Its `forward` and `inverse` methods operate
+in place without Rust allocations; inverse normalization is applied once per
+selected axis. An empty axes list is a validated no-op. Consult the API
+documentation for error and shape rules.
+
 Distributed plan construction and execution are collective: all communicator
 ranks must enter compatible calls in the same order. Coordinate local allocation
 failures before the next collective, and drop MPI-owned objects before MPI
