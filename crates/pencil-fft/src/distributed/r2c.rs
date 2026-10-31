@@ -3737,7 +3737,7 @@ where
     if rows == 0 {
         return Ok(());
     }
-    if rows % stride != 0 {
+    if !rows.is_multiple_of(stride) {
         return Err(FftError::PreparationFailed.into());
     }
     let groups = rows / stride;
@@ -4110,7 +4110,7 @@ where
     if rows == 0 {
         return Ok(());
     }
-    if rows % stride != 0 {
+    if !rows.is_multiple_of(stride) {
         return Err(FftError::PreparationFailed.into());
     }
     let groups = rows / stride;

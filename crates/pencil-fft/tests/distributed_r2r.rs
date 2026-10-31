@@ -137,7 +137,7 @@ fn coefficient(kind: R2rKind, source: usize, target: usize, length: usize) -> f6
         }
         R2rKind::DstIII => {
             if source == length - 1 {
-                if target % 2 == 0 { 1.0 } else { -1.0 }
+                if target.is_multiple_of(2) { 1.0 } else { -1.0 }
             } else {
                 2.0 * (pi * (source as f64 + 1.0) * (target as f64 + 0.5) / length as f64).sin()
             }

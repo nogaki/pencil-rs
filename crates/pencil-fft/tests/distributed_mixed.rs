@@ -242,7 +242,7 @@ fn rfft_reverse(
         for j in 0..original_n {
             let mut sum = line[0];
             for (k, &value) in line.iter().enumerate().skip(1) {
-                let endpoint = original_n % 2 == 0 && k == reduced - 1;
+                let endpoint = original_n.is_multiple_of(2) && k == reduced - 1;
                 let angle = 2.0 * PI * (j * k) as f64 / original_n as f64;
                 let contribution = value * twiddle(angle);
                 sum += if endpoint {

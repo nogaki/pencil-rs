@@ -2546,7 +2546,7 @@ fn strided_line_count(data_len: usize, line_len: usize, stride: usize) -> Result
     let block = line_len
         .checked_mul(stride)
         .ok_or(FftError::PreparationFailed)?;
-    if data_len % block != 0 {
+    if !data_len.is_multiple_of(block) {
         return Err(LocalC2cError::NonIntegralBatch.into());
     }
     Ok(data_len / block)
