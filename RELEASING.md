@@ -16,9 +16,11 @@ availability. No Julia/GPU helper packages are part of this release.
   intercrate dependencies offline. Use recent stable Cargo for staging and set
   `RUSTC`/`RUSTDOC` to the installed 1.96.0 binaries to verify the archives with
   the MSRV compiler; do not substitute workspace paths for packaged dependencies.
-- Native checks need MPI headers, `mpicc`, libclang, and parallel HDF5 built with
-  the same MPI. Use the same MPI at runtime. FFTW checks need separately installed
-  f32/f64 base and thread runtimes. Default `pencil-fft` is RustFFT/RealFFT and
+- Native MPI checks need MPI headers, `mpicc`, and libclang. HDF5 checks require
+  native HDF5 1.12 or newer: serial tests select the serial variant, and parallel
+  tests select parallel HDF5 built with the same MPI. Use the same MPI at runtime.
+  FFTW checks need separately installed f32/f64 base and thread runtimes. Default
+  `pencil-fft` is RustFFT/RealFFT and
   MPI-free; native FFTW remains explicit opt-in. Julia is not required.
 - Use a clean checkout and separate target directories for each compiler.
   A private Cargo home can isolate registry/build settings. Do not include

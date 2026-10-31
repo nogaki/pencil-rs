@@ -523,12 +523,15 @@ available.
 pencil-io = { version = "0.1.0", default-features = false, features = ["hdf5"] }
 ```
 
-An installed serial HDF5 library and headers are still required (Debian/Ubuntu:
-`sudo apt-get install libhdf5-dev pkg-config`); discovery uses `pkg-config` or
-`HDF5_DIR`. The default `mpi` feature preserves the existing collective API.
-`parallel-hdf5` enables both `mpi` and `hdf5` plus native MPIO support and still
-requires parallel HDF5. Features are additive, so enabling either MPI feature
-elsewhere in the dependency graph restores the MPI dependency.
+A native HDF5 library and headers at version 1.12 or newer are required whenever
+`hdf5` or `parallel-hdf5` is enabled. For this serial-only setup, select the
+serial HDF5 variant (e.g. Debian/Ubuntu's `libhdf5-dev` package at version
+1.12 or newer); discovery uses `pkg-config` or `HDF5_DIR`.
+The default `mpi` feature preserves the existing collective API.
+`parallel-hdf5` enables both `mpi` and `hdf5` plus native MPIO support, and
+requires the parallel HDF5 variant built against the same MPI implementation.
+Features are additive, so enabling either MPI feature elsewhere in the
+dependency graph restores the MPI dependency.
 
 `write_hdf5_serial(path, global_shape, extra_shape, values)` and
 `read_hdf5_serial(path, global_shape, extra_shape, destination)` take shape slices
@@ -571,8 +574,8 @@ Enable the optional native parallel HDF5 backend with
 `/pencil_io_v1/data` in the same logical order and strict scalar or `{r,i}`
 compound little-endian type, with typed metadata attributes and the same
 incomplete/committed protocol. This is a native self-describing representation,
-not Julia PencilIO wire compatibility. The feature requires a parallel HDF5
-installation discoverable by `pkg-config` or `HDF5_DIR`; it is intentionally not
+not Julia PencilIO wire compatibility. The feature requires native parallel
+HDF5 >=1.12, discoverable by `pkg-config` or `HDF5_DIR`; it is intentionally not
 enabled by default. Both APIs are
 collective over the view's Cartesian communicator, and every rank must enter
 calls in the same order without overlapping another operation on that

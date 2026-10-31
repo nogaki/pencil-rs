@@ -8,12 +8,12 @@ Requires Rust 1.96 or newer. Native dependencies depend on the selected features
 - `mpi` (default): MPI-IO, named datasets, collections, and persistent sessions.
   Requires native MPI headers, `mpicc`, and libclang for MPI bindings. Build and
   run with the same MPI implementation; HDF5 is not needed.
-- `hdf5`: serial HDF5 over flat slices. Disable default features to exclude MPI
-  and `pencil-array`. An installed HDF5 library and headers are still required;
-  use a serial HDF5 build to avoid native MPI dependencies as well.
-- `parallel-hdf5`: enables `mpi`, `hdf5`, and HDF5 MPIO support. Requires parallel
-  HDF5 headers and libraries built against the same MPI implementation;
-  a serial HDF5 installation is insufficient for this feature.
+- `hdf5`: serial HDF5 over flat slices. Requires native serial HDF5 1.12 or
+  newer. Disable default features to exclude MPI and `pencil-array`; use a serial
+  HDF5 build to avoid native MPI dependencies as well.
+- `parallel-hdf5`: enables `mpi`, `hdf5`, and HDF5 MPIO support. Requires native
+  parallel HDF5 1.12 or newer, built against the same MPI implementation; a
+  serial HDF5 installation is insufficient for this feature.
 
 ## Serial HDF5 without MPI
 
@@ -22,8 +22,9 @@ Requires Rust 1.96 or newer. Native dependencies depend on the selected features
 pencil-io = { version = "0.1.0", default-features = false, features = ["hdf5"] }
 ```
 
-Install serial HDF5 (for example, `sudo apt-get install libhdf5-dev pkg-config`
-on Debian/Ubuntu). Discovery uses `pkg-config` or `HDF5_DIR`. Cargo features are
+Install serial HDF5 1.12 or newer (for example, the Debian/Ubuntu
+`libhdf5-dev` package if it provides that version). Discovery uses `pkg-config`
+or `HDF5_DIR`. Cargo features are
 additive: enabling `mpi` or `parallel-hdf5` elsewhere brings MPI back.
 
 Both serial functions take `(path, global_shape: &[usize], extra_shape: &[usize],
