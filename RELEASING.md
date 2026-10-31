@@ -9,12 +9,12 @@ availability. No Julia/GPU helper packages are part of this release.
 
 - Review a clean, committed tree and each package's metadata, README, LICENSE,
   and NOTICE.md. Keep the four license/notice copies byte-identical to the root.
-- Preserve Rust 1.85 support (edition 2024). Check with exactly Rust 1.85.0 as well
+- Preserve Rust 1.96 support (edition 2024). Check with exactly Rust 1.96.0 as well
   as stable. Workspace staging commands below require a recent stable Cargo
   supporting native `--workspace` packaging/publish dry-runs (tested with 1.98.1).
   Cargo 1.85 accepts `package --workspace` but cannot stage these unpublished
   intercrate dependencies offline. Use recent stable Cargo for staging and set
-  `RUSTC`/`RUSTDOC` to the installed 1.85.0 binaries to verify the archives with
+  `RUSTC`/`RUSTDOC` to the installed 1.96.0 binaries to verify the archives with
   the MSRV compiler; do not substitute workspace paths for packaged dependencies.
 - Native checks need MPI headers, `mpicc`, libclang, and parallel HDF5 built with
   the same MPI. Use the same MPI at runtime. FFTW checks need separately installed
@@ -38,13 +38,13 @@ cargo publish --dry-run --workspace --all-features --locked
 Verify package builds with the installed exact MSRV compiler as well:
 
 ```sh
-RUSTC="$(rustup which --toolchain 1.85.0 rustc)" \
-RUSTDOC="$(rustup which --toolchain 1.85.0 rustdoc)" \
+RUSTC="$(rustup which --toolchain 1.96.0 rustc)" \
+RUSTDOC="$(rustup which --toolchain 1.96.0 rustdoc)" \
 CARGO_TARGET_DIR=target/package-msrv \
   cargo +stable package --workspace --all-features --locked
 ```
 
-This uses stable Cargo's workspace staging while compiling with Rust 1.85.0;
+This uses stable Cargo's workspace staging while compiling with Rust 1.96.0;
 it is not a claim that Cargo 1.85 provides the same staging feature.
 
 During uncommitted preparation only, append `--allow-dirty` to package and
@@ -67,7 +67,7 @@ material, Julia/GPU helpers, or temporary files may ship. Cargo may generate
 Compile all targets and run library/doctest checks on both toolchains:
 
 ```sh
-for toolchain in stable 1.85.0; do
+for toolchain in stable 1.96.0; do
   export CARGO_TARGET_DIR="target/release-check-$toolchain"
   cargo +"$toolchain" check --workspace --all-features --all-targets --locked
   cargo +"$toolchain" test --workspace --all-features --all-targets --no-run --locked

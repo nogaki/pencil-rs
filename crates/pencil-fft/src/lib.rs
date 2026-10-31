@@ -648,7 +648,7 @@ impl<R: FftReal> LocalC2cPlan<R> {
     }
 
     fn validate_batch(&self, buffer_len: usize) -> Result<(), LocalC2cError> {
-        if buffer_len % self.line_len != 0 {
+        if !buffer_len.is_multiple_of(self.line_len) {
             return Err(LocalC2cError::NonIntegralBatch);
         }
         Ok(())

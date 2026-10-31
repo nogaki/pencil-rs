@@ -1,7 +1,7 @@
 # pencil-fft
 
 Local complex, real, and real-to-real transforms, with optional MPI-distributed
-pencil transforms. Requires Rust 1.85 or newer. The default RustFFT/RealFFT CPU
+pencil transforms. Requires Rust 1.96 or newer. The default RustFFT/RealFFT CPU
 backend is MPI-free and needs neither native FFTW nor Julia.
 
 - Default features: local transforms using RustFFT/RealFFT.

@@ -190,7 +190,8 @@ pub fn read_hdf5_serial<P: AsRef<Path>, T: IoElement>(
         result.and(closed)
     })?;
     // IoElement is sealed: decoding exact-width chunks cannot fail or allocate.
-    for (value, bytes) in destination.iter_mut().zip(packed.chunks_exact(T::WIDTH)) {
+    let width = T::WIDTH;
+    for (value, bytes) in destination.iter_mut().zip(packed.chunks_exact(width)) {
         *value = T::decode_le(bytes);
     }
     Ok(())

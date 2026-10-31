@@ -257,26 +257,26 @@ where
         ) {
             return Err(cleanup_session(comm, resources, error));
         }
-        if settings.shuffle {
-            if let Err(error) = phase_code(
+        if settings.shuffle
+            && let Err(error) = phase_code(
                 comm,
                 native::plist_set_shuffle(resources.dcpl.expect("dcpl agreement")),
                 "HDF5 shuffle filter",
-            ) {
-                return Err(cleanup_session(comm, resources, error));
-            }
+            )
+        {
+            return Err(cleanup_session(comm, resources, error));
         }
-        if let Some(level) = settings.deflate {
-            if let Err(error) = phase_code(
+        if let Some(level) = settings.deflate
+            && let Err(error) = phase_code(
                 comm,
                 native::plist_set_deflate(
                     resources.dcpl.expect("dcpl agreement"),
                     u32::from(level),
                 ),
                 "HDF5 deflate filter",
-            ) {
-                return Err(cleanup_session(comm, resources, error));
-            }
+            )
+        {
+            return Err(cleanup_session(comm, resources, error));
         }
     }
     let (xfer, error) = local_handle_phase(

@@ -669,7 +669,7 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         embedding_len: usize,
         scratch_len: usize,
     ) -> Result<(), LocalR2rError> {
-        if data_len % self.line_len != 0 {
+        if !data_len.is_multiple_of(self.line_len) {
             return Err(LocalR2rError::NonIntegralBatch);
         }
         if embedding_len < self.embedding_len {

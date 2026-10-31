@@ -146,7 +146,7 @@ impl<'c> MpiFileSession<'c> {
         let mut id = 0;
         if comm.rank() == 0 {
             id = NEXT_ID
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                 .unwrap_or(0);
         }
         comm.process_at_rank(0).broadcast_into(&mut id);

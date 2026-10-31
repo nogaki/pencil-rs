@@ -56,8 +56,10 @@ fn collections_are_single_payloads_and_atomic_reads() {
             let bytes = std::fs::read(&path).unwrap();
             let offset = u64::from_le_bytes(bytes[64..72].try_into().unwrap()) as usize;
             let actual: Vec<_> = bytes[offset..]
-                .chunks_exact(4)
-                .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| i32::from_le_bytes(*b))
                 .collect();
             assert_eq!(actual, oracle);
         }

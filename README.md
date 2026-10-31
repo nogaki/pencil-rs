@@ -755,8 +755,8 @@ timeout --foreground 120s mpiexec --oversubscribe -n 1 \
 ```
 
 For the declared MSRV, run
-`cargo +1.85.0 check --workspace --all-targets --locked` and
-`cargo +1.85.0 check -p pencil-io --all-features --all-targets --locked` before the native
+`cargo +1.96.0 check --workspace --all-targets --locked` and
+`cargo +1.96.0 check -p pencil-io --all-features --all-targets --locked` before the native
 matrix.
 
 After building the HDF5 test binary, record its resolved native libraries before
@@ -773,7 +773,8 @@ pkg-config --modversion hdf5-openmpi
 
 The default build uses upstream rsmpi and native MPI bindings:
 
-- Rust stable, with a minimum supported Rust version of 1.85
+- Rust stable, with a minimum supported Rust version of 1.96; Rust 1.85–1.95 are
+  no longer supported
 - A C MPI implementation such as Open MPI or MPICH (for `pencil-array`, default
   `pencil-io`, and distributed tests; local `pencil-fft` and serial-only
   `pencil-io` tests do not require MPI)

@@ -119,15 +119,19 @@ fn raw_oracle(bytes: &[u8]) {
                 })
                 .collect();
             let actual: Vec<i32> = bytes[data..data + payload]
-                .chunks_exact(4)
-                .map(|v| i32::from_le_bytes(v.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| i32::from_le_bytes(*v))
                 .collect();
             assert_eq!(actual, expected);
         } else {
             assert!(
                 bytes[data..data + payload]
-                    .chunks_exact(8)
-                    .all(|v| f64::from_le_bytes(v.try_into().unwrap()) == 3.25)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .all(|v| f64::from_le_bytes(*v) == 3.25)
             );
         }
         p += total;

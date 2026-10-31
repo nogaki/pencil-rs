@@ -316,26 +316,26 @@ where
         ) {
             return Err(cleanup_ready(comm, duplicate, opened, resources, error));
         }
-        if settings.shuffle {
-            if let Err(error) = phase_code(
+        if settings.shuffle
+            && let Err(error) = phase_code(
                 comm,
                 native::plist_set_shuffle(resources.dcpl.expect("dcpl agreement")),
                 "HDF5 shuffle filter",
-            ) {
-                return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-            }
+            )
+        {
+            return Err(cleanup_ready(comm, duplicate, opened, resources, error));
         }
-        if let Some(level) = settings.deflate {
-            if let Err(error) = phase_code(
+        if let Some(level) = settings.deflate
+            && let Err(error) = phase_code(
                 comm,
                 native::plist_set_deflate(
                     resources.dcpl.expect("dcpl agreement"),
                     u32::from(level),
                 ),
                 "HDF5 deflate filter",
-            ) {
-                return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-            }
+            )
+        {
+            return Err(cleanup_ready(comm, duplicate, opened, resources, error));
         }
     }
     let dataset = match collective_handle_phase(
@@ -354,16 +354,16 @@ where
     };
     resources.dataset = Some(dataset);
 
-    if let Some(name) = original_name {
-        if let Err(error) = write_original_name(
+    if let Some(name) = original_name
+        && let Err(error) = write_original_name(
             comm,
             duplicate.raw,
             dataset,
             name,
             "HDF5 original-name attribute",
-        ) {
-            return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-        }
+        )
+    {
+        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
     }
     if let Err(error) = write_metadata(
         comm,
@@ -2198,10 +2198,8 @@ fn read_attr_phase(
     }
     // `values` was reserved and bytes have an exact validated length, so this
     // decode cannot allocate or fail after the read agreement.
-    for chunk in bytes.chunks_exact(8) {
-        values.push(u64::from_le_bytes(
-            chunk.try_into().expect("eight-byte HDF5 attribute"),
-        ));
+    for chunk in bytes.as_chunks::<8>().0 {
+        values.push(u64::from_le_bytes(*chunk));
     }
     if let Some(error) = finish_attr_handles(comm, handles) {
         return Err(error);
@@ -2766,7 +2764,7 @@ pub(crate) fn inspect_catalog(
                                 .unwrap_or(e),
                         ));
                     }
-                    for p in link.chunks_exact(2) {
+                    for p in link.as_chunks::<2>().0 {
                         let hi = if p[0] <= b'9' {
                             p[0] - b'0'
                         } else {

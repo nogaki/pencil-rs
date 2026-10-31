@@ -3,7 +3,7 @@
 Collective MPI-IO for `pencil-array` views, plus optional serial or parallel
 HDF5 storage. This is an I/O layer, independent of FFT providers.
 
-Requires Rust 1.85 or newer. Native dependencies depend on the selected features:
+Requires Rust 1.96 or newer. Native dependencies depend on the selected features:
 
 - `mpi` (default): MPI-IO, named datasets, collections, and persistent sessions.
   Requires native MPI headers, `mpicc`, and libclang for MPI bindings. Build and
