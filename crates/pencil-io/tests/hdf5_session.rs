@@ -341,6 +341,7 @@ fn persistent_native_hierarchy_and_protocol() {
             std::fs::create_dir(&mpi_tmp).unwrap();
             let mut command = std::process::Command::new("/bin/bash");
             command.env_clear().env("PATH", std::env::var("PATH").unwrap()).env("LD_LIBRARY_PATH", std::env::var("LD_LIBRARY_PATH").unwrap_or_default())
+                .env("HOME", &mpi_tmp)
                 .env("PENCIL_HDF_SESSION_CHILD", mode).env("PENCIL_HDF_SESSION_PATH", directory.join(format!("child-{mode}.h5")))
                 .arg("-c").arg("ulimit -c 0; exec mpiexec --mca orte_base_help_aggregate 0 --mca orte_tmpdir_base \"$2\" --oversubscribe -n 1 \"$1\" --exact persistent_native_hierarchy_and_protocol --nocapture")
                 .arg("hdf-session-child").arg(std::env::current_exe().unwrap()).arg(mpi_tmp);
