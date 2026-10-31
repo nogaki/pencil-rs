@@ -57,6 +57,8 @@ where
     C: CommunicatorCollectives,
     F: FnOnce() -> Result<(), String>,
 {
+    // Fence per-rank work before the root-only HDF5 action.
+    world.barrier();
     let result = if world.rank() == 0 { f() } else { Ok(()) };
     let ok = i32::from(result.is_ok());
     let mut all = 0;
