@@ -34,6 +34,14 @@ in place without Rust allocations; inverse normalization is applied once per
 selected axis. An empty axes list is a validated no-op. Consult the API
 documentation for error and shape rules.
 
+`LocalC2cNdPlan::owned_bytes()` reports the capacity-based size of the plan's
+`shape` and `axes` vectors and each axis's line and scratch buffers. The `axes`
+vector count includes its inline axis-plan handles, metadata, and padding; the
+getter excludes the plan's inline storage, backend-internal allocations,
+caller-owned data, and allocator overhead. It is a diagnostic of these direct
+`Vec` allocations, not RSS or total backend memory, and can vary by precision
+and enabled backend features.
+
 Distributed plan construction and execution are collective: all communicator
 ranks must enter compatible calls in the same order. Coordinate local allocation
 failures before the next collective, and drop MPI-owned objects before MPI

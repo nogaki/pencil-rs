@@ -203,8 +203,25 @@ fn check_first_and_repeated<R: FftReal>(
     values: &mut [Complex<R>],
     inverse: bool,
 ) {
+    let shape = plan.shape().to_vec();
+    let first_bytes = assert_no_allocations(|| black_box(plan.owned_bytes()));
+    let repeated_bytes = assert_no_allocations(|| {
+        let mut bytes = 0;
+        for _ in 0..8 {
+            bytes = black_box(plan.owned_bytes());
+        }
+        black_box(bytes)
+    });
+    assert_eq!(first_bytes, repeated_bytes);
+    assert_eq!(plan.shape(), shape);
+
     let first = assert_no_allocations(|| run_operation(plan, values, inverse));
     assert_eq!(first, Ok(()));
+    let first_output = values.to_vec();
+    let bytes_after_first = assert_no_allocations(|| black_box(plan.owned_bytes()));
+    assert_eq!(bytes_after_first, first_bytes);
+    assert_eq!(values, first_output);
+    assert_eq!(plan.shape(), shape);
 
     let repeated = assert_no_allocations(|| {
         for _ in 0..8 {

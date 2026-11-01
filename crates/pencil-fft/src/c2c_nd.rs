@@ -143,6 +143,26 @@ impl<R: FftReal> LocalC2cNdPlan<R> {
         &self.shape
     }
 
+    /// Returns the capacity-based size, in bytes, of this plan's directly owned `Vec` storage.
+    ///
+    /// This counts the allocations for `shape`, the `axes` entries (including
+    /// each private axis plan's inline handles, metadata, and padding), and the
+    /// `line_in`, `line_out`, and `scratch` buffers of each axis. It excludes
+    /// this plan's inline storage, allocations owned internally by FFT backends,
+    /// caller-owned data, and allocator overhead. This is a diagnostic of those
+    /// `Vec` allocations, not total RSS or total backend memory; its value can
+    /// vary with precision and enabled backend features.
+    pub fn owned_bytes(&self) -> usize {
+        let mut bytes = self.shape.capacity() * size_of::<usize>()
+            + self.axes.capacity() * size_of::<AxisPlan<R>>();
+        for axis in &self.axes {
+            bytes += axis.line_in.capacity() * size_of::<Complex<R>>();
+            bytes += axis.line_out.capacity() * size_of::<Complex<R>>();
+            bytes += axis.scratch.capacity() * size_of::<Complex<R>>();
+        }
+        bytes
+    }
+
     /// Computes the unnormalized negative-exponent transform in place.
     ///
     /// The data length is checked before any values are changed, including
@@ -378,6 +398,98 @@ mod tests {
     #[test]
     fn f64_ranked_axes_match_independent_direct_dft() {
         exercise_numeric_cases::<f64>();
+    }
+
+    fn expected_owned_bytes<R: FftReal>(plan: &LocalC2cNdPlan<R>) -> usize {
+        plan.shape.capacity() * size_of::<usize>()
+            + plan.axes.capacity() * size_of::<AxisPlan<R>>()
+            + plan
+                .axes
+                .iter()
+                .map(|axis| {
+                    (axis.line_in.capacity() + axis.line_out.capacity() + axis.scratch.capacity())
+                        * size_of::<Complex<R>>()
+                })
+                .sum::<usize>()
+    }
+
+    fn grow_capacity<T>(values: &mut Vec<T>) -> usize {
+        let previous = values.capacity();
+        values.reserve(previous + 1);
+        let growth = values.capacity() - previous;
+        assert!(growth > 0);
+        growth
+    }
+
+    fn exercise_owned_bytes<R: TestReal>() {
+        let empty_axes = LocalC2cNdPlan::<R>::new_col_major(&[2, 3], &[]).unwrap();
+        assert!(empty_axes.axes.is_empty());
+        assert_eq!(empty_axes.owned_bytes(), expected_owned_bytes(&empty_axes));
+
+        let unit_axis = LocalC2cNdPlan::<R>::new_col_major(&[1], &[0]).unwrap();
+        assert_eq!(unit_axis.owned_bytes(), expected_owned_bytes(&unit_axis));
+
+        let shape = [2, 3, 5];
+        let axes = [2, 0];
+        let mut plan = LocalC2cNdPlan::<R>::new_col_major(&shape, &axes).unwrap();
+        assert_eq!(plan.owned_bytes(), expected_owned_bytes(&plan));
+
+        let before = plan.owned_bytes();
+        let growth = grow_capacity(&mut plan.shape);
+        assert_eq!(plan.owned_bytes() - before, growth * size_of::<usize>());
+        assert_eq!(plan.owned_bytes(), expected_owned_bytes(&plan));
+
+        let before = plan.owned_bytes();
+        let growth = grow_capacity(&mut plan.axes);
+        assert_eq!(
+            plan.owned_bytes() - before,
+            growth * size_of::<AxisPlan<R>>()
+        );
+        assert_eq!(plan.owned_bytes(), expected_owned_bytes(&plan));
+
+        let before = plan.owned_bytes();
+        let mut growth = 0;
+        for axis in &mut plan.axes {
+            for buffer in [&mut axis.line_in, &mut axis.line_out, &mut axis.scratch] {
+                growth += grow_capacity(buffer);
+            }
+        }
+        assert_eq!(
+            plan.owned_bytes() - before,
+            growth * size_of::<Complex<R>>()
+        );
+        assert_eq!(plan.owned_bytes(), expected_owned_bytes(&plan));
+        assert_eq!(plan.shape(), &shape);
+
+        let input = sample::<R>(shape.iter().product());
+        let expected_forward = direct_dft(&input, &shape, &axes, false);
+        let expected_inverse = direct_dft(&input, &shape, &axes, true);
+        let owned_bytes = plan.owned_bytes();
+        let mut caller_data = input.clone();
+        let caller_capacity = caller_data.capacity();
+        caller_data.reserve(caller_capacity + 1);
+        assert!(caller_data.capacity() > caller_capacity);
+        assert_eq!(plan.owned_bytes(), owned_bytes);
+
+        let shape_before = plan.shape().to_vec();
+        let mut forward = input.clone();
+        assert_eq!(plan.owned_bytes(), owned_bytes);
+        plan.forward(&mut forward).unwrap();
+        assert_error(&forward, &expected_forward);
+        assert_eq!(plan.owned_bytes(), owned_bytes);
+
+        let mut inverse = input;
+        assert_eq!(plan.owned_bytes(), owned_bytes);
+        plan.inverse(&mut inverse).unwrap();
+        assert_error(&inverse, &expected_inverse);
+        assert_eq!(plan.owned_bytes(), owned_bytes);
+        assert_eq!(plan.shape(), shape_before);
+    }
+
+    #[test]
+    fn owned_bytes_is_capacity_based_and_read_only_for_both_precisions() {
+        exercise_owned_bytes::<f32>();
+        exercise_owned_bytes::<f64>();
     }
 
     #[test]
