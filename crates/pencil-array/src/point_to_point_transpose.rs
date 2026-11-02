@@ -51,9 +51,11 @@ use crate::{
 ///
 /// [`Self::workspace_requirements`] and [`TransposeWorkspace::from_vecs`] are
 /// noncollective local operations. Requirements and workspace checks use
-/// initialized `len`, not capacity, and all counts, displacements, totals,
-/// offsets, and source/destination/workspace lengths are checked before any
-/// payload request is posted. Ordinary descriptor or preflight errors leave
+/// initialized `len`, not capacity. Each peer message count must fit
+/// `mpi::Count`. Displacements, segment ends, offsets, and total lengths use
+/// checked `usize` arithmetic and need not fit `mpi::Count`. Execution validates
+/// all segments and source/destination/workspace lengths before any payload
+/// request is posted. Ordinary descriptor or preflight errors leave
 /// the source, destination, and workspace unchanged. `execute_views` preserves
 /// its source on success and writes the destination view from the received data.
 /// `execute_in_place` replaces the active layout and its data on success; it
@@ -103,6 +105,9 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
     /// This method is noncollective and does not call MPI or allocate storage.
     /// The result is local to the calling rank; use initialized workspace
     /// `len` values at least as large as the returned send and receive lengths.
+    /// Each peer message count is checked against `mpi::Count`; segment ends and
+    /// total lengths use checked `usize` arithmetic. The returned lengths may
+    /// exceed `mpi::Count::MAX`.
     pub fn workspace_requirements(
         &self,
         extra_shape: &ExtraShape,
@@ -119,9 +124,12 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
     /// errors are returned on all ranks before packing or posting any request;
     /// the source, destination, and workspace are unchanged on those paths.
     /// Workspace vectors are used only through initialized prefixes and are
-    /// never resized or reallocated. Every count and displacement, including
-    /// checked sums, totals, exact extra-shape agreement, and view/workspace
-    /// lengths, must fit `mpi::Count` and the buffer-prefix limits. All requests
+    /// never resized or reallocated. Each peer message count must fit
+    /// `mpi::Count`. Displacements, segment ends, and total lengths use checked
+    /// `usize` arithmetic, and every segment must lie within its required
+    /// initialized prefix. These displacements, segment ends, and total lengths
+    /// need not fit `mpi::Count`. The source and destination views must have
+    /// exactly equal extra shapes. All requests
     /// are waited before this method returns; the fixed `0x5054` tag must not be
     /// used for another unfinished transpose on the same topology context.
     /// After a request is posted, MPI failure, arbitrary panic, or process loss
@@ -366,6 +374,8 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
     }
 
     /// Executes the transpose by replacing the active layout in shared storage.
+    ///
+    /// The count and buffer limits of [`Self::execute_views`] also apply.
     ///
     /// Every rank must call this method in the same order on the same source
     /// communicator context with the same `T` and a correct `Equivalence`

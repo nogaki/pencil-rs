@@ -2172,6 +2172,43 @@ fn run_3d_tail_check(topology: &Arc<MpiTopology<2>>) {
     }
 }
 
+#[cfg(target_pointer_width = "64")]
+fn run_metadata_only_count_limits(topology: &Arc<MpiTopology<1>>) {
+    let size = topology.process_grid()[0];
+    let (x, peer_count) = match size {
+        4 => (2_147_483_648usize, 536_870_912usize),
+        6 => (2_147_483_652usize, 357_913_942usize),
+        _ => return,
+    };
+
+    assert_eq!(peer_count.checked_mul(size), Some(x));
+    let last_displacement = peer_count.checked_mul(size - 1).unwrap();
+    assert!(mpi::Count::try_from(peer_count).is_ok());
+    assert!(mpi::Count::try_from(last_displacement).is_ok());
+    assert!(mpi::Count::try_from(x).is_err());
+
+    let source = Pencil::<2, 1>::new(Arc::clone(topology), [x, size], [0]).unwrap();
+    let destination = source.with_decomposition([1]).unwrap();
+    assert_eq!(source.local_len(), x);
+    assert_eq!(destination.local_len(), x);
+
+    let alltoallv =
+        AllToAllvTransposePlan::new(Arc::clone(&source), Arc::clone(&destination)).unwrap();
+    let point_to_point =
+        PointToPointTransposePlan::new(Arc::clone(&source), Arc::clone(&destination)).unwrap();
+    let extra = ExtraShape::scalar();
+    let expected = pencil_array::TransposeWorkspaceRequirements {
+        send_len: x,
+        receive_len: x,
+    };
+
+    assert_eq!(alltoallv.workspace_requirements(&extra).unwrap(), expected);
+    assert_eq!(
+        point_to_point.workspace_requirements(&extra).unwrap(),
+        expected,
+    );
+}
+
 #[test]
 fn alltoallv_transpose_integration() {
     let universe = mpi::initialize().expect("MPI initialization failed");
@@ -2226,6 +2263,8 @@ fn alltoallv_transpose_integration() {
     run_2d_empty_partition_success(&topology_1d);
     run_3d_in_place_success(&topology_2d);
     run_3d_tail_check(&topology_2d);
+    #[cfg(target_pointer_width = "64")]
+    run_metadata_only_count_limits(&topology_1d);
     world.barrier();
 
     let source_pencil = Pencil::<2, 1>::new_permuted(
@@ -3223,6 +3262,10 @@ fn alltoallv_transpose_integration() {
     let giant_p2p_plan =
         PointToPointTransposePlan::new(Arc::clone(&giant_source), Arc::clone(&giant_destination))
             .unwrap();
+    assert!(matches!(
+        giant_p2p_plan.workspace_requirements(&ExtraShape::scalar()),
+        Err(pencil_array::TransposeError::CountOverflow)
+    ));
     let giant_p2p_requirements = giant_p2p_plan.workspace_requirements(&zero_extra).unwrap();
     assert_eq!(giant_p2p_requirements.send_len, 0);
     assert_eq!(giant_p2p_requirements.receive_len, 0);

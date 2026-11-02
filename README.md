@@ -69,10 +69,13 @@ replace that communicator, collective-order, type, or `Equivalence` contract.
 `AllToAllvTransposeWorkspaceRequirements` names are compatibility aliases for
 the same types. `workspace_requirements` and
 `TransposeWorkspace::from_vecs` are noncollective and do not call MPI;
-execution checks initialized `len` (not capacity), does not resize or
-reallocate workspace vectors, and checks count/length/displacement/offset
-limits before payload communication. Ordinary out-of-place preflight errors
-preserve the source, destination, and workspace. Ordinary in-place preflight
+execution checks initialized `len` (not capacity) and does not resize or
+reallocate workspace vectors. Each peer count must fit `mpi::Count`; Alltoallv
+additionally requires each displacement to fit `mpi::Count`. Segment ends,
+total lengths, and point-to-point displacements use checked `usize` arithmetic
+and may exceed `mpi::Count::MAX`. All segments and view/workspace lengths are
+validated before payload communication. Ordinary out-of-place preflight
+errors preserve the source, destination, and workspace. Ordinary in-place
 errors preserve the array state, active data, and workspace for both
 Alltoallv and point-to-point. Point-to-point uses a fixed internal tag on the
 topology-owned changed-axis context, posts all receives before sends, waits for
