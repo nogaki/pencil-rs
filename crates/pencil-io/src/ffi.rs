@@ -29,6 +29,10 @@ fn record_at(write: bool, collective: bool, len: usize) {
     });
 }
 #[cfg(test)]
+pub(crate) fn test_at_calls() -> [usize; 5] {
+    AT_CALLS.with(std::cell::Cell::get)
+}
+#[cfg(test)]
 thread_local! {
     pub(crate) static FILE_CALLS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
     pub(crate) static FAIL_FILE_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

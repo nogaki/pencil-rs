@@ -52,6 +52,18 @@
 //! the packing is local and never gathers data at rank zero.  Readers may use
 //! a different process grid or memory-axis permutation.
 //!
+//! MPI local payloads are limited to 2147483647 bytes/rank, checked as
+//! `local_elements * scalar_width` (for `f64`, up to 268435455 elements). If
+//! any rank exceeds it, every rank returns the same underlying
+//! [`IoError::SizeLimit`] with `what == "MPI local byte count"` (wrapped by the
+//! API's error type) before packing or staging that payload.
+//! Collections apply the limit to their combined payload and sessions to each
+//! record; this is not a whole-file or container byte cap. Existing dimension,
+//! start and offset representation limits remain. Normal successful paths still
+//! pack the full local payload and allocate byte or typed staging. HDF5 and
+//! metadata-only catalog operations are not subject to this MPI local byte
+//! limit.
+//!
 //! `write_mpi` and `read_mpi` are collective over the view's Cartesian
 //! communicator. Views may borrow an owning `pencil_array::PencilArray` or
 //! validated external slices. Every rank must pass the same global shape, extra
@@ -172,7 +184,11 @@ use thiserror::Error;
 ///
 /// For collective I/O, variants can differ across ranks: a flush failure on rank
 /// zero may report [`IoError::WriteIncomplete`] there and
-/// [`IoError::CollectivePrecondition`] on peers. All ranks must still follow the
+/// [`IoError::CollectivePrecondition`] on peers.  The MPI local payload byte
+/// limit is agreed collectively instead: every rank returns the same
+/// [`IoError::SizeLimit`] with `what == "MPI local byte count"` before packing
+/// or staging the payload.  That limit is per local payload, not a whole-file or
+/// container cap.  All ranks must still follow the
 /// same subsequent collective call order,
 /// not branch independently on their local error variant.
 #[derive(Debug, Clone, Error)]
@@ -197,6 +213,9 @@ pub enum IoError {
     },
 
     /// A checked size calculation overflowed or exceeded the native limit.
+    /// For MPI I/O, the `"MPI local byte count"` case is agreed by every rank
+    /// before payload packing or staging allocation and is not a whole-file or
+    /// container cap.
     #[error("I/O size or native count limit exceeded: {what}")]
     SizeLimit {
         /// The checked quantity that exceeded its native representation.
@@ -333,6 +352,9 @@ const OP_APPEND_HDF5_NAMED: u64 = 6;
 const OP_READ_HDF5_NAMED: u64 = 7;
 
 #[cfg(all(test, feature = "mpi"))]
+mod mpi_preflight_tests;
+
+#[cfg(all(test, feature = "mpi"))]
 mod tests {
     use std::path::Path;
 
@@ -342,6 +364,12 @@ mod tests {
     use pencil_array::{ExtraShape, MpiTopology, Pencil, PencilArray};
 
     use super::{IoError, read_mpi, write_mpi};
+
+    #[test]
+    #[ignore = "requires an MPI launcher and one fresh MPI process"]
+    fn mpi_payload_limit_precedes_allocation() {
+        crate::mpi_preflight_tests::run();
+    }
 
     mod support {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/mod.rs"));

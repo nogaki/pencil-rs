@@ -19,7 +19,10 @@ use pencil_array::{PencilArrayView, PencilArrayViewMut};
 use crate::ffi;
 use crate::format::{IoElement, element_count, pack_view, prepare_physical_values};
 use crate::mpi_io::agree_phase;
-use crate::mpi_io::{DatatypeGuard, build_layout, duplicate_comm, finish_resources, path_bytes};
+use crate::mpi_io::{
+    DatatypeGuard, agree_mpi_preparation, build_layout, duplicate_comm, finish_resources,
+    path_bytes,
+};
 use crate::options::{InfoGuard, MpiIoMode, MpiIoOptions, agree_options};
 use crate::{COMMIT_MARKER, IoError, MAX_PROTOCOL_RANK, NamedIoError, ScalarType};
 
@@ -477,7 +480,11 @@ fn container_header() -> [u8; CONTAINER_BYTES] {
 /// Creates an exclusive v2 named container and collectively writes its first record.
 /// Keys are nonempty UTF-8 (at most 1024 bytes), without NUL; slashes are literal.
 /// Container offsets must fit MPI_Offset; local transfer counts and subarray
-/// dimensions must fit native MPI integers. Global payloads have no fixed byte cap.
+/// dimensions must fit native MPI integers. Each record's local payload is limited
+/// to 2147483647 bytes/rank (`local_elements * scalar_width`; for `f64`, up to
+/// 268435455 elements), which is not a whole-container cap. If any rank exceeds
+/// it, every rank returns `NamedIoError::Io(IoError::SizeLimit { what: "MPI local
+/// byte count" })` before packing or staging that record.
 pub fn write_mpi_named<
     P: AsRef<Path>,
     S: AsRef<str>,
@@ -492,7 +499,8 @@ pub fn write_mpi_named<
     write_named(path.as_ref(), name.as_ref(), view, false, false, None)
 }
 
-/// Create a named MPI container with explicit native controls.
+/// Create a named MPI container with explicit native controls. Applies the same
+/// per-record MPI local payload limit as [`write_mpi_named`].
 pub fn write_mpi_named_with_options<
     P: AsRef<Path>,
     S: AsRef<str>,
@@ -516,7 +524,11 @@ pub fn write_mpi_named_with_options<
 }
 
 /// Appends an independently committed record without modifying the committed prefix.
-/// Duplicate keys and malformed or incomplete tails are rejected before writing.
+/// Each appended record is independently limited to 2147483647 bytes/rank
+/// (`local_elements * scalar_width`; for `f64`, up to 268435455 elements), not
+/// the whole container; every rank returns the same wrapped `SizeLimit` as
+/// [`write_mpi_named`] before packing or staging that record. Duplicate keys and
+/// malformed or incomplete tails are rejected before writing.
 pub fn append_mpi_named<
     P: AsRef<Path>,
     S: AsRef<str>,
@@ -531,7 +543,9 @@ pub fn append_mpi_named<
     write_named(path.as_ref(), name.as_ref(), view, true, false, None)
 }
 
-/// Append a new name with native controls. Same-file writers require external serialization.
+/// Append a new name with native controls. Same-file writers require external
+/// serialization. Applies the same per-record MPI local payload limit as
+/// [`append_mpi_named`].
 pub fn append_mpi_named_with_options<
     P: AsRef<Path>,
     S: AsRef<str>,
@@ -590,19 +604,23 @@ fn write_named<T: IoElement, const N: usize, const M: usize>(
         agree_options(comm, options, &[])?;
     }
     let pc = prepared(comm, path_c(path), "named path preparation")?;
-    let packed = prepared(comm, pack_view(&view), "named payload packing")?;
-    let layout = prepared(
+    let layout_result = build_layout(
+        view.pencil().global_shape(),
+        view.extra_shape().dimensions(),
+        &view.local_spatial_shape(),
+        view.pencil().local_ranges(),
+        view.len(),
+        T::WIDTH,
+    );
+    if let Err(agreement) = agree_mpi_preparation(
         comm,
-        build_layout(
-            view.pencil().global_shape(),
-            view.extra_shape().dimensions(),
-            &view.local_spatial_shape(),
-            view.pencil().local_ranges(),
-            view.len(),
-            T::WIDTH,
-        ),
+        layout_result.as_ref().err(),
         "named layout preparation",
-    )?;
+    ) {
+        return Err(NamedIoError::Io(agreement));
+    }
+    let layout = layout_result.map_err(NamedIoError::Io)?;
+    let packed = prepared(comm, pack_view(&view), "named payload packing")?;
     // Build bounded metadata before opening. Append adjusts only the absolute end.
     let record_result = record(name, &view, 0);
     agree_phase(comm, record_result.is_ok(), "named record preparation")?;
@@ -765,7 +783,9 @@ fn write_metadata<C: CommunicatorCollectives>(
 
 /// Reads a committed named record using collective MPI payload I/O.
 /// A damaged tail does not hide earlier records. The destination changes only
-/// after staging, native cleanup, and final collective success.
+/// after staging, native cleanup, and final collective success. Each record is
+/// subject to the 2147483647 bytes/rank local payload limit described by
+/// [`write_mpi_named`]; a rejected read leaves the destination unchanged.
 pub fn read_mpi_named<
     P: AsRef<Path>,
     S: AsRef<str>,
@@ -780,7 +800,9 @@ pub fn read_mpi_named<
     read_named(path.as_ref(), name.as_ref(), view, false, None)
 }
 
-/// Read a named MPI payload with explicit native controls.
+/// Read a named MPI payload with explicit native controls. Applies the same
+/// per-record MPI local payload limit and destination guarantee as
+/// [`read_mpi_named`].
 pub fn read_mpi_named_with_options<
     P: AsRef<Path>,
     S: AsRef<str>,
@@ -825,18 +847,20 @@ fn read_named<T: IoElement, const N: usize, const M: usize>(
         agree_options(comm, options, &[])?;
     }
     let pc = prepared(comm, path_c(path), "named path preparation")?;
-    let layout = prepared(
-        comm,
-        build_layout(
-            view.pencil().global_shape(),
-            view.extra_shape().dimensions(),
-            &view.local_spatial_shape(),
-            view.pencil().local_ranges(),
-            view.len(),
-            T::WIDTH,
-        ),
-        "named read layout",
-    )?;
+    let layout_result = build_layout(
+        view.pencil().global_shape(),
+        view.extra_shape().dimensions(),
+        &view.local_spatial_shape(),
+        view.pencil().local_ranges(),
+        view.len(),
+        T::WIDTH,
+    );
+    if let Err(agreement) =
+        agree_mpi_preparation(comm, layout_result.as_ref().err(), "named read layout")
+    {
+        return Err(NamedIoError::Io(agreement));
+    }
+    let layout = layout_result.map_err(NamedIoError::Io)?;
     let size = view.len().checked_mul(T::WIDTH).ok_or(IoError::SizeLimit {
         what: "named read buffer",
     });

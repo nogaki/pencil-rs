@@ -1,4 +1,7 @@
-use crate::mpi_io::{agree_phase, descriptor_agreement};
+use crate::mpi_io::{
+    MPI_LOCAL_BYTE_LIMIT_WHAT, agree_mpi_preparation, agree_phase, build_layout,
+    checked_local_byte_count, descriptor_agreement, mpi_preparation_error,
+};
 use crate::named_mpi::agree_name;
 use crate::options::{MpiIoOptions, agree_options};
 use crate::{FORMAT_VERSION, IO_NAMESPACE, IoElement, IoError, NamedIoError};
@@ -103,7 +106,26 @@ fn prepare<'a, T: IoElement + 'a, const N: usize, const M: usize>(
             index: first_bad as usize,
         });
     }
+    let mpi_operation = matches!(
+        operation,
+        MPI_WRITE
+            | MPI_READ
+            | MPI_WRITE_OPTIONS
+            | MPI_READ_OPTIONS
+            | MPI_NAMED_WRITE_OPTIONS
+            | MPI_NAMED_APPEND_OPTIONS
+            | MPI_NAMED_READ_OPTIONS
+    );
     let dims = (|| {
+        let combined = if mpi_operation {
+            let combined = data.len().checked_mul(count).ok_or(IoError::SizeLimit {
+                what: MPI_LOCAL_BYTE_LIMIT_WHAT,
+            })?;
+            checked_local_byte_count(combined, T::WIDTH)?;
+            combined
+        } else {
+            0
+        };
         let n = extra
             .dimensions()
             .len()
@@ -123,10 +145,34 @@ fn prepare<'a, T: IoElement + 'a, const N: usize, const M: usize>(
             })?;
         dims.push(count);
         dims.extend_from_slice(extra.dimensions());
+        if mpi_operation {
+            build_layout(
+                first.global_shape(),
+                &dims,
+                &first.local_shape_logical(),
+                first.local_ranges(),
+                combined,
+                T::WIDTH,
+            )?;
+        }
         Ok::<_, IoError>(dims)
     })();
-    if let Err(e) = agree_phase(comm, dims.is_ok(), "collection descriptor allocation") {
-        return Err(dims.err().unwrap_or(e).into());
+    let agreement = if mpi_operation {
+        agree_mpi_preparation(
+            comm,
+            dims.as_ref().err(),
+            "collection descriptor allocation",
+        )
+    } else {
+        agree_phase(comm, dims.is_ok(), "collection descriptor allocation")
+    };
+    if let Err(agreement) = agreement {
+        let error = if mpi_operation {
+            mpi_preparation_error(dims.err(), agreement)
+        } else {
+            dims.err().unwrap_or(agreement)
+        };
+        return Err(error.into());
     }
     let dims = dims?;
     descriptor_agreement(
@@ -211,6 +257,13 @@ fn mpi_write<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
 }
 /// Write one native combined `[component, extra..., spatial...]` MPI payload.
 ///
+/// Each rank's combined local payload is limited to 2147483647 bytes/rank
+/// (`combined_local_elements * scalar_width`; for `f64`, up to 268435455
+/// elements), not each member separately or the whole file. If any rank exceeds
+/// it, every rank returns `CollectionIoError::Io(IoError::SizeLimit { what: "MPI
+/// local byte count" })` before combined typed storage is allocated. Successful
+/// paths still allocate and copy the combined typed storage.
+///
 /// All ranks in `comm` participate. Writers using the same file from different
 /// jobs or communicators must be externally serialized. A failed write is not
 /// rolled back, and this operation does not overwrite or resize an existing
@@ -222,7 +275,8 @@ pub fn write_mpi_collection<P: AsRef<Path>, T: IoElement, const N: usize, const 
 ) -> Result<(), CollectionIoError> {
     mpi_write(path, comm, views, None, MPI_WRITE)
 }
-/// Write a collection with explicit MPI-IO controls.
+/// Write a collection with explicit MPI-IO controls. Applies the same
+/// combined-payload MPI local byte limit as [`write_mpi_collection`].
 ///
 /// Writers using the same file from different jobs or communicators must be
 /// externally serialized. A failed write is not rolled back, and this
@@ -274,6 +328,9 @@ fn mpi_read<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
     Ok(())
 }
 /// Read a combined MPI collection; destinations change only after staging succeeds.
+/// The same combined-payload 2147483647 bytes/rank limit as
+/// [`write_mpi_collection`] applies before staging; a rejected read leaves every
+/// destination unchanged.
 ///
 /// All ranks in `comm` participate; the file is not overwritten or resized.
 pub fn read_mpi_collection<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
@@ -283,7 +340,8 @@ pub fn read_mpi_collection<P: AsRef<Path>, T: IoElement, const N: usize, const M
 ) -> Result<(), CollectionIoError> {
     mpi_read(path, comm, views, None, MPI_READ)
 }
-/// Read a collection with explicit MPI-IO controls.
+/// Read a collection with explicit MPI-IO controls. Applies the same
+/// combined-payload MPI local byte limit as [`read_mpi_collection`].
 ///
 /// All ranks in `comm` participate; the file is not overwritten or resized.
 pub fn read_mpi_collection_with_options<
@@ -316,7 +374,9 @@ fn named_prepare<T: IoElement, const N: usize, const M: usize>(
             .map(|v| (v.pencil(), v.extra_shape(), v.as_slice())),
     )
 }
-/// Write a named combined MPI collection.
+/// Write a named combined MPI collection. Applies the same combined-payload MPI
+/// local byte limit as [`write_mpi_collection`] to each named record, not the
+/// whole container.
 ///
 /// Writers using the same file from different jobs or communicators must be
 /// externally serialized. A failed write is not rolled back, and this
@@ -341,7 +401,8 @@ pub fn write_mpi_named_collection<
     crate::write_mpi_named_with_options(path, name, a.view(), o)?;
     Ok(())
 }
-/// Append a named combined MPI collection.
+/// Append a named combined MPI collection. Applies the same combined-payload MPI
+/// local byte limit as [`write_mpi_collection`] to the appended record.
 ///
 /// Writers using the same file from different jobs or communicators must be
 /// externally serialized. Append is not rolled back and does not overwrite or
@@ -367,6 +428,8 @@ pub fn append_mpi_named_collection<
     Ok(())
 }
 /// Read a named combined MPI collection atomically into member destinations.
+/// Applies the same combined-payload MPI local byte limit as
+/// [`read_mpi_collection`]; a rejected read leaves all destinations unchanged.
 ///
 /// The file is not overwritten or resized.
 pub fn read_mpi_named_collection<

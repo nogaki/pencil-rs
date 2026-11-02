@@ -2,8 +2,9 @@
 //! Reads require exactly the writer's grid, rank mapping, decomposition and
 //! permutation. Files are create-exclusive; concurrent access is unsupported.
 use crate::mpi_io::{
-    FileGuard, abort_unrecoverable, aggregate_cleanup_result, agree_phase, collective_state,
-    descriptor_agreement, duplicate_comm, finish_comm, finish_resources, path_bytes,
+    FileGuard, abort_unrecoverable, aggregate_cleanup_result, agree_mpi_preparation, agree_phase,
+    checked_local_byte_count, collective_state, descriptor_agreement, duplicate_comm, finish_comm,
+    finish_resources, mpi_preparation_error, path_bytes,
 };
 use crate::options::{InfoGuard, agree_options};
 use crate::{
@@ -332,7 +333,8 @@ fn view_header<T: IoElement, const N: usize, const M: usize>(
     op: u64,
     pencil: &pencil_array::Pencil<N, M>,
     extra: &[usize],
-) -> Result<Header, IoError> {
+    local_elements: usize,
+) -> Result<(Header, usize), IoError> {
     descriptor_agreement(
         c,
         path,
@@ -346,9 +348,9 @@ fn view_header<T: IoElement, const N: usize, const M: usize>(
         T::WIDTH,
     )?;
     crate::options::agree_decomposition(pencil)?;
-    prepared(
-        c,
-        header(
+    let prepared = (|| {
+        let bytes = checked_local_byte_count(local_elements, T::WIDTH)?;
+        let h = header(
             c,
             ScalarType::decode(T::CODE, T::WIDTH as u64).ok_or_else(invalid)?,
             pencil.global_shape(),
@@ -356,13 +358,26 @@ fn view_header<T: IoElement, const N: usize, const M: usize>(
             pencil.topology().process_grid(),
             &pencil.decomposition().map(|a| a.index()),
             &pencil.permutation().axes().map(|a| a.index()),
-        ),
-    )
+        )?;
+        if local_elements != h.counts[c.rank() as usize] {
+            return Err(invalid());
+        }
+        Ok((h, bytes))
+    })();
+    if let Err(agreement) = agree_mpi_preparation(c, prepared.as_ref().err(), "chunked preparation")
+    {
+        return Err(mpi_preparation_error(prepared.err(), agreement));
+    }
+    prepared
 }
 /// Write canonical little-endian elements in each rank's physical slice order.
 /// Options are mandatory; existing files are never replaced. Metadata is bounded
-/// to 1 MiB and each rank's payload to `i32::MAX` bytes. All ranks must participate,
-/// including in independent mode. Repartitioning on read is unsupported.
+/// to 1 MiB and each rank's payload to 2147483647 bytes (`local_elements *
+/// scalar_width`; for `f64`, up to 268435455 elements). If any rank exceeds that
+/// payload limit, every rank returns `IoError::SizeLimit { what: "MPI local byte
+/// count" }` before buffer allocation; successful paths still pack the full local
+/// payload. All ranks must participate, including in independent mode.
+/// Repartitioning on read is unsupported.
 pub fn write_mpi_chunked<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
     path: P,
     view: PencilArrayView<'_, T, N, M>,
@@ -370,21 +385,18 @@ pub fn write_mpi_chunked<P: AsRef<Path>, T: IoElement, const N: usize, const M: 
 ) -> Result<(), IoError> {
     let c = view.pencil().topology().communicator();
     entry(c, 1)?;
-    let mut h = view_header::<T, N, M>(
+    let (mut h, n) = view_header::<T, N, M>(
         c,
         path.as_ref(),
         1,
         view.pencil(),
         view.extra_shape().dimensions(),
+        view.len(),
     )?;
     let rank = c.rank() as usize;
     let payload = prepared(
         c,
         (|| {
-            let n = view.len().checked_mul(T::WIDTH).ok_or_else(invalid)?;
-            if view.len() != h.counts[rank] || n > i32::MAX as usize {
-                return Err(invalid());
-            }
             let mut b = buffer(n)?;
             b.clear();
             for &v in view.as_slice() {
@@ -438,7 +450,9 @@ pub fn write_mpi_chunked<P: AsRef<Path>, T: IoElement, const N: usize, const M: 
 }
 /// Read into the identical writer grid, rank mapping, decomposition and
 /// permutation (no repartitioning). Destination is unchanged on error,
-/// including errors reported after actual native cleanup.
+/// including errors reported after actual native cleanup. The same 2147483647
+/// bytes/rank local payload limit as [`write_mpi_chunked`] applies before buffer
+/// allocation.
 pub fn read_mpi_chunked<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
     path: P,
     view: PencilArrayViewMut<'_, T, N, M>,
@@ -454,21 +468,19 @@ fn read_inner<T: IoElement, const N: usize, const M: usize>(
 ) -> Result<(), IoError> {
     let c = view.pencil().topology().communicator();
     entry(c, 2)?;
-    let h = view_header::<T, N, M>(c, path, 2, view.pencil(), view.extra_shape().dimensions())?;
+    let (h, n) = view_header::<T, N, M>(
+        c,
+        path,
+        2,
+        view.pencil(),
+        view.extra_shape().dimensions(),
+        view.len(),
+    )?;
     let rank = c.rank() as usize;
     let values = with_file(c, path, options, false, inject, |f| {
         let found = scan(c, f)?;
         agree_phase(c, found.bytes == h.bytes, "chunked writer layout")?;
-        let mut b = prepared(
-            c,
-            (|| {
-                let n = view.len().checked_mul(T::WIDTH).ok_or_else(invalid)?;
-                if view.len() != h.counts[rank] || n > i32::MAX as usize {
-                    return Err(invalid());
-                }
-                buffer(n)
-            })(),
-        )?;
+        let mut b = prepared(c, buffer(n))?;
         agree_phase(
             c,
             matches!(ffi::file_read_at(f,h.offsets[rank] as i64,&mut b,options.mode==MpiIoMode::Collective),Ok(n) if n==b.len()),
