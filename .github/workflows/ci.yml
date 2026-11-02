@@ -313,7 +313,7 @@ jobs:
               cargo test -p pencil-fft --features distributed --lib --locked \
                 distributed::tests::in_place_transaction_poison_survives_error_and_panic -- \
                 --exact --nocapture --test-threads=1
-            for suite in array_ops timing_overlap multi_input external_views; do
+            for suite in array_ops timing_overlap multi_input external_views mapped_reduction_alloc; do
               run_one timeout --kill-after=5s 240s \
                 mpiexec --oversubscribe -n "$n" \
                 cargo test -p pencil-array --test "$suite" --locked -- \

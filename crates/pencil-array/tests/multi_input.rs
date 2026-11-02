@@ -8,9 +8,9 @@ use std::{fmt, sync::Arc};
 use mpi::traits::*;
 use num_complex::Complex64;
 use pencil_array::{
-    CollectiveError, ExtraShape, MpiTopology, Pencil, PencilArray, map_reduce_many, map_reduce3,
-    max_many_by, min_many_by, norm_many_by, pointwise_many, pointwise_many_in_place, pointwise3,
-    pointwise3_in_place, sum_many_by,
+    CollectiveError, ExtraShape, MpiTopology, Pencil, PencilArray, all_ranks_succeeded,
+    map_reduce_many, map_reduce3, max_many_by, min_many_by, norm_many_by, pointwise_many,
+    pointwise_many_in_place, pointwise3, pointwise3_in_place, sum_many_by,
 };
 
 #[derive(Debug, PartialEq)]
@@ -319,8 +319,16 @@ fn multi_input_current_api_and_edge_cases() {
         );
     }
 
-    let overflow = sum_many_by(topology.communicator(), &views4, |_| i64::MAX);
-    assert!(matches!(overflow, Err(CollectiveError::IntegerOverflow)));
+    let overflow_calls = std::cell::Cell::new(0usize);
+    let overflow = sum_many_by(topology.communicator(), &views4, |_| {
+        overflow_calls.set(overflow_calls.get() + 1);
+        i64::MAX
+    });
+    assert!(all_ranks_succeeded(
+        &topology,
+        matches!(overflow, Err(CollectiveError::IntegerOverflow))
+            && overflow_calls.get() == 6 * pencil.local_len()
+    ));
     let extremes = array(
         Arc::clone(&pencil),
         ExtraShape::scalar(),

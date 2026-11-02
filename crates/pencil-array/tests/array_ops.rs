@@ -130,7 +130,18 @@ fn reductions(p: &Arc<Pencil<2, 1>>, size: usize, rank: usize) {
     let mut expected = vec![0i64; size];
     mpi::collective::CommunicatorCollectives::all_gather_into(comm, &local, &mut expected[..]);
     assert_eq!(&operands[local_calls..], expected);
-    assert!(zip_sum_by(&a.view(), &b.view(), |_, _| i32::MAX).is_err());
+    // The callback still runs for every output position after the checked
+    // local sum overflows.
+    let overflow_calls = Cell::new(0);
+    let overflow = zip_sum_by(&a.view(), &b.view(), |_, _| {
+        overflow_calls.set(overflow_calls.get() + 1);
+        i32::MAX
+    });
+    assert!(all_ranks_succeeded(
+        p.topology(),
+        matches!(overflow, Err(CollectiveError::IntegerOverflow))
+            && overflow_calls.get() == 6 * p.local_len()
+    ));
     for scale in [1e300, 1e-300] {
         let result = zip_norm_by(&a.view(), &b.view(), |_, _| scale).unwrap();
         let expected = scale * (p.global_len() as f64 * 6.0).sqrt();
@@ -188,6 +199,26 @@ fn reductions(p: &Arc<Pencil<2, 1>>, size: usize, rank: usize) {
         Err(CollectiveError::CollectivePreconditionFailed)
     ));
     assert_eq!(calls.get(), 0);
+    let zip_sum_calls = Cell::new(0);
+    let zip_sum = zip_sum_by(&a.view(), &right.view(), |x, y| {
+        zip_sum_calls.set(zip_sum_calls.get() + 1);
+        *x + *y
+    });
+    assert!(all_ranks_succeeded(
+        p.topology(),
+        matches!(zip_sum, Err(CollectiveError::CollectivePreconditionFailed))
+            && zip_sum_calls.get() == 0
+    ));
+    let zip_norm_calls = Cell::new(0);
+    let zip_norm = zip_norm_by(&a.view(), &right.view(), |x, y| {
+        zip_norm_calls.set(zip_norm_calls.get() + 1);
+        (*x + *y) as f64
+    });
+    assert!(all_ranks_succeeded(
+        p.topology(),
+        matches!(zip_norm, Err(CollectiveError::CollectivePreconditionFailed))
+            && zip_norm_calls.get() == 0
+    ));
     if size > 1 {
         for neutral in [
             if rank == 0 { -0.0 } else { 0.0 },
@@ -233,7 +264,9 @@ fn reductions(p: &Arc<Pencil<2, 1>>, size: usize, rank: usize) {
     assert_eq!(global_sum(&a.view()).unwrap(), (p.global_len() * 6) as i64);
 }
 
-// ZST storage exercises real reservation/count failures without allocating huge buffers.
+// Broadcast count and stride overflows are agreed before any callback runs.
+// Rank-local allocation failures for prepared integer partials are covered by
+// tests/mapped_reduction_alloc.rs.
 fn preparation_failures(topology: &Arc<MpiTopology<1>>) {
     let p = Pencil::<2, 1>::new(topology.clone(), [1, 1], [0]).unwrap();
     let make = |dims: &[usize]| {
@@ -241,39 +274,6 @@ fn preparation_failures(topology: &Arc<MpiTopology<1>>) {
         let len = extra.element_count() * p.local_len();
         PencilArray::from_vec(p.clone(), extra, vec![(); len]).unwrap()
     };
-    let huge = make(&[isize::MAX as usize]);
-    let one = make(&[1]);
-    let calls = Cell::new(0);
-    let result = sum_by(&huge.view(), |_| {
-        calls.set(calls.get() + 1);
-        1i64
-    });
-    // Only the nonempty rank cannot reserve mapped storage; peers must agree.
-    if p.local_len() != 0 {
-        assert!(matches!(
-            result,
-            Err(CollectiveError::AllocationFailed { .. })
-        ));
-    } else {
-        assert!(matches!(
-            result,
-            Err(CollectiveError::CollectivePreconditionFailed)
-        ));
-    }
-    assert_eq!(calls.get(), 0);
-    assert_eq!(sum_by(&one.view(), |_| 1i64).unwrap(), 1);
-    assert!(
-        zip_sum_by(&huge.view(), &one.view(), |_, _| -> f64 {
-            panic!("allocation callback")
-        })
-        .is_err()
-    );
-    assert!(
-        zip_norm_by(&huge.view(), &one.view(), |_, _| -> f64 {
-            panic!("allocation callback")
-        })
-        .is_err()
-    );
     let huge = make(&[usize::MAX, 1]);
     let two = make(&[1, 2]);
     assert!(
@@ -284,6 +284,18 @@ fn preparation_failures(topology: &Arc<MpiTopology<1>>) {
             |_, _| panic!("overflow callback"),
             |x, y| x + y
         )
+        .is_err()
+    );
+    assert!(
+        zip_sum_by(&huge.view(), &two.view(), |_, _| -> f64 {
+            panic!("overflow callback")
+        })
+        .is_err()
+    );
+    assert!(
+        zip_norm_by(&huge.view(), &two.view(), |_, _| -> f64 {
+            panic!("overflow callback")
+        })
         .is_err()
     );
     let small = make(&[1]);
