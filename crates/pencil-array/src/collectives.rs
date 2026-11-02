@@ -4,8 +4,12 @@
 //! Every rank must call the same operation in the same order with the same
 //! communicator, layout, callback type, and correct MPI [`Equivalence`]
 //! implementations. A callback is local code: it must not call MPI or panic.
-//! `sum_by` and `norm_by` stage callback results, so the callback is invoked
-//! exactly once per local element before the reduction starts.
+//! Mapped reductions (`sum_by`, `norm_by`, `min_by`, `max_by`, and their
+//! `zip_*` and `*_many_by` forms) fold each callback result immediately instead
+//! of storing mapped values, so their extra storage does not grow with the local
+//! length. All fallible preparation is agreed collectively before the first
+//! callback, and the callback runs once per local output position, even after a
+//! checked integer sum has overflowed.
 //!
 //! Standard integer sums check every addition in the local storage-order fold
 //! and the rank-order fold of partials. An intermediate overflow is an error
@@ -620,6 +624,8 @@ where
 }
 
 /// Computes a global L2 norm after invoking `f` once per local input value.
+/// Uses a one-pass scaled sum of squares, so the last bits can differ from
+/// [`l2_norm`].
 pub fn norm_by<T, U, F, const N: usize, const M: usize>(
     view: &PencilArrayView<'_, T, N, M>,
     f: F,
@@ -632,8 +638,8 @@ where
 }
 
 /// Computes a checked global minimum after mapping each value in memory order.
-/// Empty global inputs return `None`; mapped NaNs propagate. Uses O(local length)
-/// staging. The callback must not panic or call MPI.
+/// Empty global inputs return `None`; mapped NaNs propagate. The callback must
+/// not panic or call MPI.
 pub fn min_by<T, U, F, const N: usize, const M: usize>(
     view: &PencilArrayView<'_, T, N, M>,
     f: F,
@@ -646,8 +652,8 @@ where
 }
 
 /// Computes a checked global maximum after mapping each value in memory order.
-/// Empty global inputs return `None`; mapped NaNs propagate. Uses O(local length)
-/// staging. The callback must not panic or call MPI.
+/// Empty global inputs return `None`; mapped NaNs propagate. The callback must
+/// not panic or call MPI.
 pub fn max_by<T, U, F, const N: usize, const M: usize>(
     view: &PencilArrayView<'_, T, N, M>,
     f: F,
@@ -662,13 +668,13 @@ where
 /// Computes a checked global sum of mapped pairs.
 ///
 /// Traversal follows local row-major memory order (with broadcast dimensions
-/// revisited). Metadata costs O(extra-rank), while staged mapped values use
-/// O(localcount) storage. Captured callback state cannot be verified
-/// collectively; the callback must not panic or call MPI.
+/// revisited). Metadata costs O(extra-rank); mapped values are accumulated as
+/// they are produced and are not stored. Captured callback state cannot be
+/// verified collectively; the callback must not panic or call MPI.
 pub fn zip_sum_by<A, B, U, F, const N: usize, const M: usize>(
     left: &PencilArrayView<'_, A, N, M>,
     right: &PencilArrayView<'_, B, N, M>,
-    f: F,
+    mut f: F,
 ) -> Result<U, CollectiveError>
 where
     U: SupportedScalar,
@@ -677,33 +683,38 @@ where
     let communicator = left.pencil().topology().communicator();
     let plan = prepare_map_reduce2(left, right, U::zero(), type_name::<F>(), OP_ZIP_SUM_BY)?;
     let mut partials = U::prepare_collective_sum(communicator)?;
-    let mapped = map_pairs_collective(left, right, &plan, f)?;
-    let mapped = agree_staged(communicator, Ok(mapped))?;
-    sum_values_prepared(communicator, &mapped, &mut partials)
+    let mut local = Ok(U::zero());
+    let mut flags = [0_u32; 6];
+    for_each_pair(left, right, &plan, |a, b| {
+        let value = f(a, b);
+        flags = merge_flags(flags, value.nonfinite_flags());
+        if let Ok(sum) = local.as_ref() {
+            local = U::local_sum(&[*sum, value]);
+        }
+    });
+    finish_sum_prepared(communicator, local, flags, &mut partials)
 }
 
 /// Computes a scaled global L2 norm of mapped pairs.
 ///
 /// Traversal follows local row-major memory order (with broadcast dimensions
-/// revisited). Metadata costs O(extra-rank), while staged mapped values use
-/// O(localcount) storage. Captured callback state cannot be verified
-/// collectively; the callback must not panic or call MPI.
+/// revisited). Metadata costs O(extra-rank); mapped values are accumulated as
+/// they are produced and are not stored. Captured callback state cannot be
+/// verified collectively; the callback must not panic or call MPI.
 pub fn zip_norm_by<A, B, U, F, const N: usize, const M: usize>(
     left: &PencilArrayView<'_, A, N, M>,
     right: &PencilArrayView<'_, B, N, M>,
-    f: F,
+    mut f: F,
 ) -> Result<U::Norm, CollectiveError>
 where
     U: SupportedScalar,
     F: FnMut(&A, &B) -> U,
 {
+    let communicator = left.pencil().topology().communicator();
     let plan = prepare_map_reduce2(left, right, U::zero(), type_name::<F>(), OP_ZIP_NORM_BY)?;
-    let mapped = map_pairs_collective(left, right, &plan, f)?;
-    let mapped = agree_staged(left.pencil().topology().communicator(), Ok(mapped))?;
-    let prepared = PreparedLayout {
-        global_count: plan.global_count,
-    };
-    norm_values(left.pencil().topology().communicator(), &mapped, prepared)
+    let mut state = NormState::default();
+    for_each_pair(left, right, &plan, |a, b| state.push(f(a, b)));
+    Ok(state.finish(communicator, plan.global_count))
 }
 
 /// Maps three locally aligned inputs and folds their mapped triples in rank order.
@@ -811,7 +822,7 @@ where
 pub fn sum_many_by<T, U, F, const N: usize, const M: usize>(
     communicator: &CartesianCommunicator,
     inputs: &[PencilArrayView<'_, T, N, M>],
-    f: F,
+    mut f: F,
 ) -> Result<U, CollectiveError>
 where
     T: 'static,
@@ -826,8 +837,17 @@ where
         OP_SUM_MANY,
     )?;
     let mut partials = U::prepare_collective_sum(communicator)?;
-    let values = map_many_values_prepared(communicator, inputs, &plan, f)?;
-    sum_values_prepared(communicator, &values, &mut partials)
+    let mut refs = prepare_many_refs(communicator, inputs.len())?;
+    let mut local = Ok(U::zero());
+    let mut flags = [0_u32; 6];
+    for_each_many(inputs, &plan, &mut refs, |values| {
+        let value = f(values);
+        flags = merge_flags(flags, value.nonfinite_flags());
+        if let Ok(sum) = local.as_ref() {
+            local = U::local_sum(&[*sum, value]);
+        }
+    });
+    finish_sum_prepared(communicator, local, flags, &mut partials)
 }
 
 /// Computes a scaled norm after mapping each tuple of homogeneous inputs.
@@ -837,7 +857,7 @@ where
 pub fn norm_many_by<T, U, F, const N: usize, const M: usize>(
     communicator: &CartesianCommunicator,
     inputs: &[PencilArrayView<'_, T, N, M>],
-    f: F,
+    mut f: F,
 ) -> Result<U::Norm, CollectiveError>
 where
     T: 'static,
@@ -851,14 +871,10 @@ where
         type_name::<F>(),
         OP_NORM_MANY,
     )?;
-    let values = map_many_values_prepared(communicator, inputs, &plan, f)?;
-    norm_values(
-        communicator,
-        &values,
-        PreparedLayout {
-            global_count: plan.global_count,
-        },
-    )
+    let mut refs = prepare_many_refs(communicator, inputs.len())?;
+    let mut state = NormState::default();
+    for_each_many(inputs, &plan, &mut refs, |values| state.push(f(values)));
+    Ok(state.finish(communicator, plan.global_count))
 }
 
 /// Computes the minimum after mapping each tuple of homogeneous inputs.
@@ -868,7 +884,7 @@ where
 pub fn min_many_by<T, U, F, const N: usize, const M: usize>(
     communicator: &CartesianCommunicator,
     inputs: &[PencilArrayView<'_, T, N, M>],
-    f: F,
+    mut f: F,
 ) -> Result<Option<U>, CollectiveError>
 where
     T: 'static,
@@ -882,10 +898,16 @@ where
         type_name::<F>(),
         OP_MIN_MANY,
     )?;
-    let values = map_many_values_prepared(communicator, inputs, &plan, f)?;
-    let local = U::local_extreme(&values, true);
+    let mut refs = prepare_many_refs(communicator, inputs.len())?;
+    let mut local = U::local_extreme(&[], true);
+    let mut flags = [0_u32; 6];
+    for_each_many(inputs, &plan, &mut refs, |values| {
+        let value = f(values);
+        local = U::local_extreme(&[local, value], true);
+        flags = merge_flags(flags, value.nonfinite_flags());
+    });
     let result = U::collective_extreme(communicator, local, true);
-    let flags = collective_flags(communicator, values_nonfinite_flags(values.iter().copied()));
+    let flags = collective_flags(communicator, flags);
     Ok((plan.global_count != 0).then_some(if flags[0] != 0 {
         U::nan_value()
     } else {
@@ -900,7 +922,7 @@ where
 pub fn max_many_by<T, U, F, const N: usize, const M: usize>(
     communicator: &CartesianCommunicator,
     inputs: &[PencilArrayView<'_, T, N, M>],
-    f: F,
+    mut f: F,
 ) -> Result<Option<U>, CollectiveError>
 where
     T: 'static,
@@ -914,10 +936,16 @@ where
         type_name::<F>(),
         OP_MAX_MANY,
     )?;
-    let values = map_many_values_prepared(communicator, inputs, &plan, f)?;
-    let local = U::local_extreme(&values, false);
+    let mut refs = prepare_many_refs(communicator, inputs.len())?;
+    let mut local = U::local_extreme(&[], false);
+    let mut flags = [0_u32; 6];
+    for_each_many(inputs, &plan, &mut refs, |values| {
+        let value = f(values);
+        local = U::local_extreme(&[local, value], false);
+        flags = merge_flags(flags, value.nonfinite_flags());
+    });
     let result = U::collective_extreme(communicator, local, false);
-    let flags = collective_flags(communicator, values_nonfinite_flags(values.iter().copied()));
+    let flags = collective_flags(communicator, flags);
     Ok((plan.global_count != 0).then_some(if flags[0] != 0 {
         U::nan_value()
     } else {
@@ -927,11 +955,10 @@ where
 
 /// Maps two locally aligned inputs and folds their mapped pairs in rank order.
 /// Traversal follows local row-major memory order (with broadcast dimensions
-/// revisited). Shape/stride metadata costs O(extra-rank); unlike staged zip
-/// reductions, this implementation uses one partial per rank, so its extra
-/// storage and communication cost is O(P). Captured callback state cannot be
-/// verified collectively; callbacks must be associative, neutral-compatible,
-/// non-panicking, and must not call MPI.
+/// revisited). Shape/stride metadata costs O(extra-rank); one partial per rank
+/// makes the extra storage and communication cost O(P). Captured callback state
+/// cannot be verified collectively; callbacks must be associative,
+/// neutral-compatible, non-panicking, and must not call MPI.
 pub fn map_reduce2<A, B, U, F, R, const N: usize, const M: usize>(
     left: &PencilArrayView<'_, A, N, M>,
     right: &PencilArrayView<'_, B, N, M>,
@@ -1298,7 +1325,6 @@ struct ManyPlan {
     output_strides: Vec<usize>,
     spatial: usize,
     extra: usize,
-    count: usize,
     global_count: usize,
 }
 
@@ -1582,7 +1608,8 @@ where
         let output_strides = strides_for_dims(&shape)?;
         let spatial = inputs[0].pencil().local_len();
         let extra = extra_count(&shape)?;
-        let count = spatial
+        // Keep reporting CountOverflow when the local output count does not fit usize.
+        spatial
             .checked_mul(extra)
             .ok_or(CollectiveError::CountOverflow)?;
         let global_count = inputs[0]
@@ -1598,7 +1625,6 @@ where
             output_strides,
             spatial,
             extra,
-            count,
             global_count,
         ))
     })();
@@ -1608,7 +1634,7 @@ where
             .err()
             .unwrap_or(CollectiveError::CollectivePreconditionFailed));
     }
-    let (descriptor, expected, shape, strides, output_strides, spatial, extra, count, global_count) =
+    let (descriptor, expected, shape, strides, output_strides, spatial, extra, global_count) =
         prepared.expect("collective many preparation succeeded");
     let length = u64::try_from(expected).unwrap_or(INVALID_WORD);
     let mut minimum = length;
@@ -1635,7 +1661,6 @@ where
         output_strides,
         spatial,
         extra,
-        count,
         global_count,
     })
 }
@@ -1679,35 +1704,22 @@ fn for_each_many<'v, T, F, const N: usize, const M: usize>(
     }
 }
 
-fn map_many_values_prepared<T, U, F, C, const N: usize, const M: usize>(
-    c: &C,
-    inputs: &[PencilArrayView<'_, T, N, M>],
-    p: &ManyPlan,
-    mut f: F,
-) -> Result<Vec<U>, CollectiveError>
-where
-    T: 'static,
-    U: SupportedScalar,
-    F: FnMut(&[&T]) -> U,
-    C: CommunicatorCollectives,
-{
-    let mut out = Vec::new();
-    let out_ok = out.try_reserve_exact(p.count).is_ok();
+fn prepare_many_refs<'v, T, C: CommunicatorCollectives>(
+    communicator: &C,
+    input_count: usize,
+) -> Result<Vec<&'v T>, CollectiveError> {
     let mut refs = Vec::new();
-    let refs_ok = refs.try_reserve_exact(inputs.len()).is_ok();
-    if !collective_valid(c, out_ok && refs_ok) {
-        return Err(if !out_ok {
-            CollectiveError::AllocationFailed { elements: p.count }
-        } else if !refs_ok {
+    let allocation = refs.try_reserve_exact(input_count);
+    if !collective_valid(communicator, allocation.is_ok()) {
+        return Err(if allocation.is_err() {
             CollectiveError::AllocationFailed {
-                elements: inputs.len(),
+                elements: input_count,
             }
         } else {
             CollectiveError::CollectivePreconditionFailed
         });
     }
-    for_each_many(inputs, p, &mut refs, |v| out.push(f(v)));
-    Ok(out)
+    Ok(refs)
 }
 
 fn prepare_map_reduce2<A, B, U, const N: usize, const M: usize>(
@@ -1862,29 +1874,6 @@ fn extra_count(shape: &[usize]) -> Result<usize, CollectiveError> {
         a.checked_mul(b).ok_or(CollectiveError::CountOverflow)
     })
 }
-fn map_pairs_collective<A, B, U, F, const N: usize, const M: usize>(
-    left: &PencilArrayView<'_, A, N, M>,
-    right: &PencilArrayView<'_, B, N, M>,
-    plan: &MapPlan,
-    mut f: F,
-) -> Result<Vec<U>, CollectiveError>
-where
-    F: FnMut(&A, &B) -> U,
-{
-    let count = plan.count;
-    let mut mapped = Vec::new();
-    let allocation = mapped.try_reserve_exact(count);
-    if !collective_valid(left.pencil().topology().communicator(), allocation.is_ok()) {
-        return Err(allocation
-            .err()
-            .map_or(CollectiveError::CollectivePreconditionFailed, |_| {
-                CollectiveError::AllocationFailed { elements: count }
-            }));
-    }
-    for_each_pair(left, right, plan, |a, b| mapped.push(f(a, b)));
-    Ok(mapped)
-}
-
 fn for_each_pair<A, B, F, const N: usize, const M: usize>(
     left: &PencilArrayView<'_, A, N, M>,
     right: &PencilArrayView<'_, B, N, M>,
@@ -2043,7 +2032,7 @@ where
 fn mapped_sum_layout<L, T, U, F, const N: usize, const M: usize>(
     layout: &L,
     operation: u64,
-    f: F,
+    mut f: F,
 ) -> Result<U, CollectiveError>
 where
     L: LocalArrayLayout<T, N, M>,
@@ -2053,16 +2042,25 @@ where
     let _ = prepare_layout::<L, T, U, N, M>(layout, operation, 0, type_name::<F>())?;
     let communicator = layout.pencil().topology().communicator();
     let mut partials = U::prepare_collective_sum(communicator)?;
-    let mapped = map_values_collective(communicator, layout.as_slice(), f)?;
-    let mapped = agree_staged(communicator, Ok(mapped))?;
-    sum_values_prepared(communicator, &mapped, &mut partials)
+    let mut local = Ok(U::zero());
+    let mut flags = [0_u32; 6];
+    for value in layout.as_slice() {
+        let mapped = f(value);
+        flags = merge_flags(flags, mapped.nonfinite_flags());
+        // local_sum([sum, value]) is one checked step; sum starts at +0.0 and
+        // never becomes -0.0, so the leading +0.0 leaves non-NaN partials unchanged.
+        if let Ok(sum) = local.as_ref() {
+            local = U::local_sum(&[*sum, mapped]);
+        }
+    }
+    finish_sum_prepared(communicator, local, flags, &mut partials)
 }
 
 fn mapped_extreme_layout<L, T, U, F, const N: usize, const M: usize>(
     layout: &L,
     operation: u64,
     minimum: bool,
-    f: F,
+    mut f: F,
 ) -> Result<Option<U>, CollectiveError>
 where
     L: LocalArrayLayout<T, N, M>,
@@ -2070,17 +2068,16 @@ where
     F: FnMut(&T) -> U,
 {
     let prepared = prepare_layout::<L, T, U, N, M>(layout, operation, 0, type_name::<F>())?;
-    let mapped = map_values_collective(
-        layout.pencil().topology().communicator(),
-        layout.as_slice(),
-        f,
-    )?;
-    let local = U::local_extreme(&mapped, minimum);
-    let result = U::collective_extreme(layout.pencil().topology().communicator(), local, minimum);
-    let flags = collective_flags(
-        layout.pencil().topology().communicator(),
-        values_nonfinite_flags(mapped.iter().copied()),
-    );
+    let communicator = layout.pencil().topology().communicator();
+    let mut local = U::local_extreme(&[], minimum);
+    let mut flags = [0_u32; 6];
+    for value in layout.as_slice() {
+        let mapped = f(value);
+        local = U::local_extreme(&[local, mapped], minimum);
+        flags = merge_flags(flags, mapped.nonfinite_flags());
+    }
+    let result = U::collective_extreme(communicator, local, minimum);
+    let flags = collective_flags(communicator, flags);
     Ok(if prepared.global_count == 0 {
         None
     } else if flags[0] != 0 {
@@ -2093,7 +2090,7 @@ where
 fn mapped_norm_layout<L, T, U, F, const N: usize, const M: usize>(
     layout: &L,
     operation: u64,
-    f: F,
+    mut f: F,
 ) -> Result<U::Norm, CollectiveError>
 where
     L: LocalArrayLayout<T, N, M>,
@@ -2101,68 +2098,25 @@ where
     F: FnMut(&T) -> U,
 {
     let prepared = prepare_layout::<L, T, U::Norm, N, M>(layout, operation, 0, type_name::<F>())?;
-    let mapped = map_values_collective(
-        layout.pencil().topology().communicator(),
-        layout.as_slice(),
-        f,
-    )?;
-    let mapped = agree_staged(layout.pencil().topology().communicator(), Ok(mapped))?;
-    norm_values(layout.pencil().topology().communicator(), &mapped, prepared)
+    let communicator = layout.pencil().topology().communicator();
+    let mut state = NormState::default();
+    for value in layout.as_slice() {
+        state.push(f(value));
+    }
+    Ok(state.finish(communicator, prepared.global_count))
 }
 
-fn map_values_collective<T, U, F, C: CommunicatorCollectives>(
+fn finish_sum_prepared<T, C: CommunicatorCollectives>(
     communicator: &C,
-    values: &[T],
-    mut f: F,
-) -> Result<Vec<U>, CollectiveError>
-where
-    F: FnMut(&T) -> U,
-{
-    let mut mapped = Vec::new();
-    let allocation = mapped.try_reserve_exact(values.len());
-    if !collective_valid(communicator, allocation.is_ok()) {
-        return Err(allocation
-            .err()
-            .map_or(CollectiveError::CollectivePreconditionFailed, |_| {
-                CollectiveError::AllocationFailed {
-                    elements: values.len(),
-                }
-            }));
-    }
-    for value in values {
-        mapped.push(f(value));
-    }
-    Ok(mapped)
-}
-
-fn agree_staged<T, C: CommunicatorCollectives>(
-    communicator: &C,
-    staged: Result<Vec<T>, CollectiveError>,
-) -> Result<Vec<T>, CollectiveError> {
-    let local_ok = staged.is_ok();
-    if !collective_valid(communicator, local_ok) {
-        return Err(staged
-            .err()
-            .unwrap_or(CollectiveError::CollectivePreconditionFailed));
-    }
-    Ok(staged.expect("collective staging validation succeeded"))
-}
-
-fn sum_values_prepared<T, C: CommunicatorCollectives>(
-    communicator: &C,
-    values: &[T],
+    local: Result<T, CollectiveError>,
+    local_flags: [u32; 6],
     partials: &mut Vec<T>,
 ) -> Result<T, CollectiveError>
 where
     T: SupportedScalar,
 {
-    let value = agree_sum_result(communicator, T::local_sum(values))?;
-    T::collective_sum_prepared(
-        communicator,
-        value,
-        values_nonfinite_flags(values.iter().copied()),
-        partials,
-    )
+    let value = agree_sum_result(communicator, local)?;
+    T::collective_sum_prepared(communicator, value, local_flags, partials)
 }
 
 fn agree_sum_result<T, C: CommunicatorCollectives>(
@@ -2183,6 +2137,66 @@ fn agree_sum_result<T, C: CommunicatorCollectives>(
         });
     }
     local
+}
+
+#[derive(Default)]
+struct NormState {
+    scale: f64,
+    ssq: f64,
+    flags: [u32; 6],
+}
+
+impl NormState {
+    fn push<T: SupportedScalar>(&mut self, value: T) {
+        self.flags = merge_flags(self.flags, value.nonfinite_flags());
+        let a = value.norm_abs();
+        if a.is_infinite() {
+            self.scale = f64::INFINITY;
+            return;
+        }
+        if a == 0.0 || a.is_nan() || self.scale.is_infinite() {
+            return;
+        }
+        if a > self.scale {
+            // Keep scale^2 * ssq equal to the running sum of squares without
+            // squaring values that may overflow or underflow.
+            let ratio = self.scale / a;
+            self.ssq = 1.0 + (self.ssq * ratio) * ratio;
+            self.scale = a;
+        } else {
+            let ratio = a / self.scale;
+            self.ssq += ratio * ratio;
+        }
+    }
+
+    fn finish<R: NormOutput, C: CommunicatorCollectives>(
+        self,
+        communicator: &C,
+        global_count: usize,
+    ) -> R {
+        let flags = collective_flags(communicator, self.flags);
+        if flags[0] != 0 || flags[3] != 0 {
+            return R::from_f64(f64::NAN);
+        }
+        let mut global_scale = 0.0_f64;
+        communicator.all_reduce_into(&self.scale, &mut global_scale, SystemOperation::max());
+        if flags[1] != 0
+            || flags[2] != 0
+            || flags[4] != 0
+            || flags[5] != 0
+            || global_scale.is_infinite()
+        {
+            return R::from_f64(f64::INFINITY);
+        }
+        if global_scale == 0.0 || global_count == 0 {
+            return R::from_f64(0.0);
+        }
+        let ratio = self.scale / global_scale;
+        let local_scaled = (self.ssq * ratio) * ratio;
+        let mut global_ssq = 0.0_f64;
+        communicator.all_reduce_into(&local_scaled, &mut global_ssq, SystemOperation::sum());
+        R::from_f64(global_scale * global_ssq.sqrt())
+    }
 }
 
 fn norm_values<T, C: CommunicatorCollectives>(
@@ -2866,7 +2880,12 @@ fn unpack_block<T, const N: usize, const M: usize>(
 
 #[cfg(test)]
 mod tests {
-    use super::advance_coordinates;
+    use super::{NormState, advance_coordinates};
+    use num_complex::Complex64;
+
+    fn norm_state_value(state: &NormState) -> f64 {
+        state.scale * state.ssq.sqrt()
+    }
 
     #[test]
     fn coordinate_increment_visits_the_last_tuple_once() {
@@ -2878,5 +2897,86 @@ mod tests {
         }
         assert_eq!(count, 6);
         assert_eq!(coordinates, [0, 0]);
+    }
+
+    #[test]
+    fn norm_state_order_independent() {
+        let expected = 30.0_f64.sqrt();
+        for values in [[1.0_f64, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]] {
+            let mut state = NormState::default();
+            for value in values {
+                state.push(value);
+            }
+            let result = norm_state_value(&state);
+            assert!((result - expected).abs() / expected < 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn norm_state_large_values_stay_finite() {
+        let mut state = NormState::default();
+        state.push(3.0e300_f64);
+        state.push(4.0e300_f64);
+        let result = norm_state_value(&state);
+        assert!(result.is_finite());
+        assert!((result - 5.0e300).abs() / 5.0e300 < 1.0e-12);
+    }
+
+    #[test]
+    fn norm_state_small_values_stay_nonzero() {
+        let mut state = NormState::default();
+        state.push(3.0e-300_f64);
+        state.push(4.0e-300_f64);
+        let result = norm_state_value(&state);
+        assert!(result != 0.0);
+        assert!((result - 5.0e-300).abs() / 5.0e-300 < 1.0e-12);
+    }
+
+    #[test]
+    fn norm_state_subnormal_values_are_exact() {
+        let q = f64::from_bits(1);
+        for values in [[3.0 * q, 4.0 * q], [4.0 * q, 3.0 * q]] {
+            let mut state = NormState::default();
+            for value in values {
+                state.push(value);
+            }
+            assert_eq!(norm_state_value(&state).to_bits(), (5.0 * q).to_bits());
+        }
+    }
+
+    #[test]
+    fn norm_state_signed_zeros_stay_zero() {
+        let mut state = NormState::default();
+        state.push(0.0_f64);
+        state.push(-0.0_f64);
+        assert_eq!(state.scale, 0.0);
+        assert_eq!(state.ssq, 0.0);
+    }
+
+    #[test]
+    fn norm_state_nan_is_flagged_and_skipped() {
+        let mut state = NormState::default();
+        state.push(1.0_f64);
+        state.push(f64::NAN);
+        state.push(2.0_f64);
+        assert_ne!(state.flags[0], 0);
+        assert_eq!(state.scale, 2.0);
+    }
+
+    #[test]
+    fn norm_state_infinity_is_flagged() {
+        let mut state = NormState::default();
+        state.push(1.0_f64);
+        state.push(f64::INFINITY);
+        state.push(2.0_f64);
+        assert_eq!(state.scale, f64::INFINITY);
+        assert_ne!(state.flags[1], 0);
+    }
+
+    #[test]
+    fn norm_state_complex_uses_magnitude() {
+        let mut state = NormState::default();
+        state.push(Complex64::new(3.0, 4.0));
+        assert_eq!(norm_state_value(&state), 5.0);
     }
 }
