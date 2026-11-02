@@ -6,10 +6,130 @@ use hdf5_metno::{File, types::FixedUnicode};
 use mpi::collective::{CommunicatorCollectives, SystemOperation};
 use mpi::traits::Communicator;
 use pencil_array::{AxisPermutation, ExtraShape, MpiTopology, Pencil, PencilArray};
-use pencil_io::{NamedIoError, append_hdf5_named, read_hdf5_named, write_hdf5_named};
+use pencil_io::{IoError, NamedIoError, append_hdf5_named, read_hdf5_named, write_hdf5_named};
 
 mod support;
-use support::{cleanup_owned_temp_dir, owned_temp_dir};
+use support::{
+    cleanup_owned_temp_dir, decomposition_array, decomposition_values_match,
+    mismatched_decomposition, owned_temp_dir, record_case, reset_file, root_read,
+};
+
+// Issue #38: the named HDF5 paths must reject a decomposition that differs
+// between ranks before they touch the container, so an existing name reports a
+// descriptor mismatch rather than `DuplicateName`.
+fn issue38_named_hdf5_cases<C>(world: &C, dir: &std::path::Path) -> Vec<String>
+where
+    C: Communicator + CommunicatorCollectives,
+{
+    let mut failures = Vec::new();
+    let size = usize::try_from(world.size()).unwrap();
+    if size == 1 {
+        if world.rank() == 0 {
+            eprintln!("issue38 skipped: 1 rank");
+        }
+        return failures;
+    }
+
+    let read_path = dir.join("issue38-named-read.h5");
+    reset_file(world, &read_path);
+    let source = decomposition_array(world, [0, 1], None);
+    write_hdf5_named(&read_path, "field", source.view()).unwrap();
+    world.barrier();
+
+    let mut destination = decomposition_array(world, mismatched_decomposition(world), Some(-888));
+    let before = destination.as_slice().to_vec();
+    let result = read_hdf5_named(&read_path, "field", destination.view_mut());
+    let ok = matches!(
+        result,
+        Err(NamedIoError::Io(IoError::CollectiveDescriptorMismatch))
+    ) && destination.as_slice() == before.as_slice();
+    record_case(
+        world,
+        &mut failures,
+        "default_named_hdf5_read_decomposition_mismatch",
+        ok,
+        &format!("{result:?}"),
+    );
+
+    let mut recovered = decomposition_array(world, [1, 0], Some(-888));
+    let result = read_hdf5_named(&read_path, "field", recovered.view_mut());
+    let ok = result.is_ok() && decomposition_values_match(&recovered);
+    record_case(
+        world,
+        &mut failures,
+        "default_named_hdf5_read_decomposition_mismatch/recovery",
+        ok,
+        &format!("{result:?}"),
+    );
+
+    let before_bytes = root_read(world, &read_path);
+    let source = decomposition_array(world, mismatched_decomposition(world), None);
+    let result = append_hdf5_named(&read_path, "field", source.view());
+    world.barrier();
+    let after_bytes = root_read(world, &read_path);
+    let unchanged = world.rank() != 0 || after_bytes == before_bytes;
+    let ok = matches!(
+        result,
+        Err(NamedIoError::Io(IoError::CollectiveDescriptorMismatch))
+    ) && unchanged;
+    record_case(
+        world,
+        &mut failures,
+        "default_named_hdf5_append_existing_name_decomposition_mismatch",
+        ok,
+        &format!("{result:?} unchanged={unchanged}"),
+    );
+
+    let mut recovered = decomposition_array(world, [0, 1], Some(0));
+    let result = read_hdf5_named(&read_path, "field", recovered.view_mut());
+    let ok = result.is_ok() && decomposition_values_match(&recovered);
+    record_case(
+        world,
+        &mut failures,
+        "default_named_hdf5_append_existing_name_decomposition_mismatch/recovery",
+        ok,
+        &format!("{result:?}"),
+    );
+
+    let write_path = dir.join("issue38-named-write.h5");
+    reset_file(world, &write_path);
+    let source = decomposition_array(world, mismatched_decomposition(world), None);
+    let result = write_hdf5_named(&write_path, "field", source.view());
+    world.barrier();
+    let absent = if world.rank() == 0 {
+        write_path
+            .try_exists()
+            .map(|exists| !exists)
+            .unwrap_or(false)
+    } else {
+        true
+    };
+    let ok = matches!(
+        result,
+        Err(NamedIoError::Io(IoError::CollectiveDescriptorMismatch))
+    ) && absent;
+    record_case(
+        world,
+        &mut failures,
+        "default_named_hdf5_write_decomposition_mismatch",
+        ok,
+        &format!("{result:?} file_absent={absent}"),
+    );
+
+    let recovery_path = dir.join("issue38-named-write-recovery.h5");
+    reset_file(world, &recovery_path);
+    let source = decomposition_array(world, [0, 1], None);
+    let result = write_hdf5_named(&recovery_path, "field", source.view());
+    record_case(
+        world,
+        &mut failures,
+        "default_named_hdf5_write_decomposition_mismatch/recovery",
+        result.is_ok(),
+        &format!("{result:?}"),
+    );
+
+    failures
+}
 
 fn check<C: CommunicatorCollectives>(world: &C, name: &str, ok: bool) {
     let local = i32::from(ok);
@@ -360,7 +480,11 @@ fn named_hdf5_matrix() {
     assert!(append_hdf5_named(&v1, "A", a.view()).is_err());
     assert_eq!(std::fs::read(&v1).unwrap(), before_v1);
     world.barrier();
+    let issue38_failures = issue38_named_hdf5_cases(&world, &dir);
     cleanup_owned_temp_dir(&world, &dir);
+    if !issue38_failures.is_empty() {
+        panic!("issue38 failures: {issue38_failures:?}");
+    }
     world.barrier();
     if world.rank() == 0 {
         eprintln!("\nNAMED_HDF5_PASSED ranks={}", world.size());

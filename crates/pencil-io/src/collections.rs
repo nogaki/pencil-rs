@@ -136,6 +136,7 @@ fn prepare<'a, T: IoElement + 'a, const N: usize, const M: usize>(
         first.global_shape(),
         &dims,
         first.topology().process_grid(),
+        first.decomposition(),
         first.permutation().axes(),
         T::CODE,
         T::WIDTH,

@@ -58,6 +58,7 @@ fn read_raw_inner<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
         global,
         extra,
         view.pencil().topology().process_grid(),
+        view.pencil().decomposition(),
         view.pencil().permutation().axes(),
         T::CODE,
         T::WIDTH,

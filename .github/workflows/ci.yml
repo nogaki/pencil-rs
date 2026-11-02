@@ -402,6 +402,13 @@ jobs:
               cargo test -p pencil-io --features parallel-hdf5 --lib --locked \
                 tests::post_cleanup_errors_preserve_destination_and_valid_commits -- --exact --nocapture --test-threads=1
           done
+          # Issue #38: rank-dependent decomposition mismatch, exact two-rank example.
+          for suite in named_mpi named_hdf5; do
+            run_one timeout --kill-after=5s 240s \
+              mpiexec --oversubscribe -n 2 \
+              cargo test -p pencil-io --features parallel-hdf5 --test "$suite" --locked -- \
+                --nocapture --test-threads=1
+          done
           run_one timeout --kill-after=5s 240s \
             cargo test -p pencil-io --features parallel-hdf5 --lib --locked \
               named_mpi::session::native_cleanup_failstop_children -- --exact --ignored --nocapture --test-threads=1
@@ -464,7 +471,7 @@ jobs:
 
       - name: Run pencil-io MPI-IO tests
         run: |
-          for n in 1 4 6; do
+          for n in 1 2 4 6; do
             timeout --foreground 120s mpiexec --oversubscribe -n "$n" \
               cargo test -p pencil-io --no-default-features --features mpi --test mpi_io --locked \
                 -- --nocapture --test-threads=1
@@ -472,7 +479,7 @@ jobs:
 
       - name: Run pencil-io parallel HDF5 tests
         run: |
-          for n in 1 4 6; do
+          for n in 1 2 4 6; do
             timeout --foreground 180s mpiexec --oversubscribe -n "$n" \
               cargo test -p pencil-io --features parallel-hdf5 --test hdf5_io --locked \
                 -- --nocapture --test-threads=1

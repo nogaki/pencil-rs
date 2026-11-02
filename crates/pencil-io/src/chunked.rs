@@ -340,6 +340,7 @@ fn view_header<T: IoElement, const N: usize, const M: usize>(
         pencil.global_shape(),
         extra,
         pencil.topology().process_grid(),
+        pencil.decomposition(),
         pencil.permutation().axes(),
         T::CODE,
         T::WIDTH,

@@ -67,7 +67,11 @@ cargo doc -p pencil-io --no-default-features --features hdf5 --no-deps --locked
 ## Collective I/O (`mpi` / `parallel-hdf5`)
 
 Every participating rank must enter collective open/read/write/close operations
-in the same order with compatible descriptors. Coordinate local failures before
+in the same order with descriptors that agree on the global and extra shapes,
+element type, process grid, ordered decomposition axes, memory permutation, and
+path. Rank-to-rank agreement allows one 64 KiB descriptor per rank and 64 MiB
+in total across all ranks, including 8 bytes per decomposition axis. Coordinate
+local failures before
 the next collective. **Call persistent `session.close()` collectively before
 MPI finalization.** Dropping an open session is fail-stop, not an implicit
 rank-local close. Drop other MPI-owned objects before finalization as well.

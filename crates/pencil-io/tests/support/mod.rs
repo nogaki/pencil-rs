@@ -123,6 +123,92 @@ pub(crate) fn run_scalar_case<C, T, F>(
     world.barrier();
 }
 
+/// Builds the Issue #38 fixture: grid `[size, 1]`, global shape `[2*size, 2*size]`.
+///
+/// `fill = None` stores the canonical value `x * (2*size) + y` at global
+/// coordinate `(x, y)`; `fill = Some(value)` stores `value` everywhere.
+#[allow(dead_code)]
+pub(crate) fn decomposition_array<C>(
+    world: &C,
+    decomposition: [usize; 2],
+    fill: Option<i32>,
+) -> PencilArray<i32, 2, 2>
+where
+    C: Communicator,
+{
+    let size = usize::try_from(world.size()).expect("world size fits usize");
+    let extent = 2 * size;
+    let topology = MpiTopology::<2>::new(world, [size, 1]).unwrap();
+    let pencil = Pencil::<2, 2>::new(topology, [extent, extent], decomposition).unwrap();
+    let mut array =
+        PencilArray::from_elem(pencil, ExtraShape::scalar(), fill.unwrap_or_default()).unwrap();
+    if fill.is_none() {
+        let mut view = array.view_mut();
+        let ranges = view.pencil().local_ranges().clone();
+        for x in 0..ranges[0].len() {
+            for y in 0..ranges[1].len() {
+                let value = ((ranges[0].start + x) * extent + ranges[1].start + y) as i32;
+                *view.get_local_mut(&[], [x, y]).unwrap() = value;
+            }
+        }
+    }
+    array
+}
+
+/// Returns the Issue #38 mismatched decomposition for the calling rank.
+#[allow(dead_code)]
+pub(crate) fn mismatched_decomposition<C>(world: &C) -> [usize; 2]
+where
+    C: Communicator,
+{
+    if world.rank() == 0 { [0, 1] } else { [1, 0] }
+}
+
+/// Returns whether every locally owned element holds the canonical value.
+#[allow(dead_code)]
+pub(crate) fn decomposition_values_match(array: &PencilArray<i32, 2, 2>) -> bool {
+    let view = array.view();
+    let ranges = view.pencil().local_ranges().clone();
+    let extent = view.pencil().global_shape()[0];
+    let mut ok = true;
+    for x in 0..ranges[0].len() {
+        for y in 0..ranges[1].len() {
+            let value = ((ranges[0].start + x) * extent + ranges[1].start + y) as i32;
+            ok &= view.get_local(&[], [x, y]) == Some(&value);
+        }
+    }
+    ok
+}
+
+/// Reports one rank-local observation, then records a collective failure name.
+#[allow(dead_code)]
+pub(crate) fn record_case<C>(
+    world: &C,
+    failures: &mut Vec<String>,
+    name: &str,
+    ok: bool,
+    detail: &str,
+) where
+    C: CommunicatorCollectives,
+{
+    if !ok {
+        let rank = world.rank();
+        eprintln!("issue38 {name} rank={rank}: {detail}");
+    }
+    let local_ok = i32::from(ok);
+    let mut all_ok = 0;
+    world.all_reduce_into(&local_ok, &mut all_ok, SystemOperation::min());
+    if world.rank() == 0 {
+        eprintln!(
+            "issue38 {name}: {}",
+            if all_ok == 1 { "PASS" } else { "FAIL" }
+        );
+    }
+    if all_ok == 0 {
+        failures.push(name.to_owned());
+    }
+}
+
 pub(crate) fn owned_temp_dir<C>(world: &C, prefix: &str) -> PathBuf
 where
     C: Communicator + CommunicatorCollectives,

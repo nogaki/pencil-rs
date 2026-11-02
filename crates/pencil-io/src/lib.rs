@@ -54,7 +54,20 @@
 //!
 //! `write_mpi` and `read_mpi` are collective over the view's Cartesian
 //! communicator. Views may borrow an owning `pencil_array::PencilArray` or
-//! validated external slices. All array, topology, and MPI-IO objects must be
+//! validated external slices. Every rank must pass the same global shape, extra
+//! shape, element type, process grid, ordered decomposition (including axes whose
+//! grid extent is one), memory permutation, and path. When every rank builds its
+//! agreement descriptor and passes the agreement's size and allocation checks,
+//! any such difference makes all ranks return
+//! `IoError::CollectiveDescriptorMismatch`; single-call APIs return before the
+//! file is opened, and persistent sessions return before the member is accessed.
+//! Failures before that comparison, such as an invalid path, the 64 KiB per-rank
+//! or 64 MiB total descriptor limit, or an allocation failure, are reported
+//! instead and can differ between ranks. Writer and reader may still use
+//! different grids or decompositions, and the named and parallel HDF5 APIs apply
+//! the same rule.
+//!
+//! All array, topology, and MPI-IO objects must be
 //! dropped before MPI finalization; persistent sessions require explicit close. Do not
 //! overlap an I/O call with another operation on that topology communicator;
 //! the call temporarily installs `MPI_ERRORS_RETURN` only around

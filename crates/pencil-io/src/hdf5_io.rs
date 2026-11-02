@@ -218,6 +218,7 @@ where
         view.pencil().global_shape(),
         view.extra_shape().dimensions(),
         view.pencil().topology().process_grid(),
+        view.pencil().decomposition(),
         view.pencil().permutation().axes(),
         T::CODE,
         T::WIDTH,
@@ -573,6 +574,7 @@ where
         view.pencil().global_shape(),
         view.extra_shape().dimensions(),
         view.pencil().topology().process_grid(),
+        view.pencil().decomposition(),
         view.pencil().permutation().axes(),
         T::CODE,
         T::WIDTH,
@@ -615,6 +617,7 @@ pub(crate) fn write_named<T: IoElement, const N: usize, const M: usize>(
         view.pencil().global_shape(),
         view.extra_shape().dimensions(),
         view.pencil().topology().process_grid(),
+        view.pencil().decomposition(),
         view.pencil().permutation().axes(),
         T::CODE,
         T::WIDTH,
@@ -701,7 +704,9 @@ fn check_named_absent(
 /// Appends a named dataset to an existing parallel HDF5 container.
 ///
 /// The operation fails with [`NamedIoError::DuplicateName`] without changing
-/// the container when `name` already exists.
+/// the container when `name` already exists. Name duplication is checked after
+/// the rank-to-rank descriptor agreement, so a decomposition mismatch is
+/// reported first as `NamedIoError::Io(IoError::CollectiveDescriptorMismatch)`.
 pub fn append_hdf5_named<P, S, T, const N: usize, const M: usize>(
     path: P,
     name: S,
@@ -720,6 +725,7 @@ where
         view.pencil().global_shape(),
         view.extra_shape().dimensions(),
         view.pencil().topology().process_grid(),
+        view.pencil().decomposition(),
         view.pencil().permutation().axes(),
         T::CODE,
         T::WIDTH,
@@ -761,6 +767,7 @@ where
         view.pencil().global_shape(),
         view.extra_shape().dimensions(),
         view.pencil().topology().process_grid(),
+        view.pencil().decomposition(),
         view.pencil().permutation().axes(),
         T::CODE,
         T::WIDTH,
@@ -818,6 +825,7 @@ pub(crate) fn read_named<T: IoElement, const N: usize, const M: usize>(
         view.pencil().global_shape(),
         view.extra_shape().dimensions(),
         view.pencil().topology().process_grid(),
+        view.pencil().decomposition(),
         view.pencil().permutation().axes(),
         T::CODE,
         T::WIDTH,
@@ -862,6 +870,7 @@ where
         view.pencil().global_shape(),
         view.extra_shape().dimensions(),
         view.pencil().topology().process_grid(),
+        view.pencil().decomposition(),
         view.pencil().permutation().axes(),
         T::CODE,
         T::WIDTH,
@@ -959,6 +968,7 @@ where
         view.pencil().global_shape(),
         view.extra_shape().dimensions(),
         view.pencil().topology().process_grid(),
+        view.pencil().decomposition(),
         view.pencil().permutation().axes(),
         T::CODE,
         T::WIDTH,

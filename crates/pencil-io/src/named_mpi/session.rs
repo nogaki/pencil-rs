@@ -266,6 +266,7 @@ impl<'c> MpiFileSession<'c> {
             pencil.global_shape(),
             extra,
             pencil.topology().process_grid(),
+            pencil.decomposition(),
             pencil.permutation().axes(),
             code,
             width,

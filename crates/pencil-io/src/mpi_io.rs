@@ -227,6 +227,7 @@ where
         global,
         extra,
         grid,
+        view.pencil().decomposition(),
         permutation,
         T::CODE,
         T::WIDTH,
@@ -519,6 +520,7 @@ where
         global,
         extra,
         grid,
+        view.pencil().decomposition(),
         permutation,
         T::CODE,
         T::WIDTH,
@@ -996,6 +998,7 @@ pub(crate) fn descriptor_agreement<const N: usize, const M: usize>(
     global: &[usize; N],
     extra: &[usize],
     grid: &[usize; M],
+    decomposition: &[SpatialAxis; M],
     permutation: &[SpatialAxis; N],
     type_code: u64,
     width: usize,
@@ -1006,6 +1009,7 @@ pub(crate) fn descriptor_agreement<const N: usize, const M: usize>(
         global,
         extra,
         grid,
+        decomposition,
         permutation,
         type_code,
         width,
@@ -1086,6 +1090,7 @@ fn build_descriptor<const N: usize, const M: usize>(
     global: &[usize; N],
     extra: &[usize],
     grid: &[usize; M],
+    decomposition: &[SpatialAxis; M],
     permutation: &[SpatialAxis; N],
     type_code: u64,
     width: usize,
@@ -1123,6 +1128,11 @@ fn build_descriptor<const N: usize, const M: usize>(
     for &extent in grid {
         descriptor.push_u64(u64::try_from(extent).map_err(|_| IoError::SizeLimit {
             what: "process grid",
+        })?)?;
+    }
+    for axis in decomposition {
+        descriptor.push_u64(u64::try_from(axis.index()).map_err(|_| IoError::SizeLimit {
+            what: "decomposition",
         })?)?;
     }
     for axis in permutation {
