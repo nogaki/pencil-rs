@@ -933,20 +933,19 @@ pub(crate) mod hdf5 {
     }
 
     /// Checks a link without resolving it until its class is known to be hard.
-    /// The sys binding's H5Lget_info1 name aliases the HDF5 1.10 H5Lget_info symbol.
+    /// H5Lget_info2 and H5L_info2_t require native HDF5 1.12 or newer.
     pub(crate) fn link_is_hard_and_type(
         loc: Hid,
         name: &CStr,
         expected: LinkObjectType,
     ) -> Result<bool, i32> {
         hdf5_metno::sync::sync(|| {
-            // SAFETY: loc/name are live; both output structs have the native
-            // HDF5 1.10 ABI and remain local for the duration of each call.
+            // SAFETY: loc/name are live and link uses the native HDF5 1.12 ABI;
+            // the result union is intentionally unused because only type_ matters.
             unsafe {
-                let mut link = h5::h5l::H5L_info1_t::default();
+                let mut link = h5::h5l::H5L_info2_t::default();
                 let code =
-                    // hdf5-metno-sys aliases H5Lget_info1 to H5Lget_info for HDF5 1.10.
-                    h5::h5l::H5Lget_info1(loc, name.as_ptr(), &mut link, h5::h5p::H5P_DEFAULT);
+                    h5::h5l::H5Lget_info2(loc, name.as_ptr(), &mut link, h5::h5p::H5P_DEFAULT);
                 if code < 0 {
                     return Err(code as i32);
                 }
@@ -973,12 +972,12 @@ pub(crate) mod hdf5 {
     #[allow(clippy::unnecessary_cast)] // c_ulong is 32-bit on some targets.
     pub(crate) fn hard_object_identity(loc: Hid, name: &CStr) -> Result<(u64, u64), i32> {
         hdf5_metno::sync::sync(|| {
-            // SAFETY: live location/name and native ABI output storage; the link
-            // class is checked before HDF5 is allowed to resolve the object.
+            // SAFETY: live location/name and native HDF5 1.12 ABI output storage;
+            // only type_ is used, and hard-link validation precedes object lookup.
             unsafe {
-                let mut link = h5::h5l::H5L_info1_t::default();
+                let mut link = h5::h5l::H5L_info2_t::default();
                 let code =
-                    h5::h5l::H5Lget_info1(loc, name.as_ptr(), &mut link, h5::h5p::H5P_DEFAULT);
+                    h5::h5l::H5Lget_info2(loc, name.as_ptr(), &mut link, h5::h5p::H5P_DEFAULT);
                 if code < 0 || link.type_ != h5::h5l::H5L_TYPE_HARD {
                     return Err(-1);
                 }

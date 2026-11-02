@@ -411,7 +411,7 @@ impl<R: Real> ComplexToReal<R> for RealPlan<R> {
     ) -> Result<(), FftError> {
         preflight(i.len(), o.len(), self.n / 2 + 1, self.n)?;
         let first = i[0].im != R::zero();
-        let last = self.n % 2 == 0 && i[self.n / 2].im != R::zero();
+        let last = self.n.is_multiple_of(2) && i[self.n / 2].im != R::zero();
         self.plan.inverse(i, o);
         if first || last {
             Err(FftError::InputValues(first, last))

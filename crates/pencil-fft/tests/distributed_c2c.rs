@@ -1498,7 +1498,11 @@ fn assert_raw_boundary_imaginary<R: TestReal, const N: usize, const M: usize>(
     if extra_shape.element_count() == 0 || !original_shape[..N - 1].iter().any(|&n| n > 2) {
         return;
     }
-    let plane_count = if original_shape[N - 1] % 2 == 0 { 2 } else { 1 };
+    let plane_count = if original_shape[N - 1].is_multiple_of(2) {
+        2
+    } else {
+        1
+    };
     let mut local = [0.0_f64; 2];
     let ranges = array.pencil().local_ranges();
     let local_shape = array.pencil().local_shape_logical();
@@ -1744,7 +1748,7 @@ fn arbitrary_half_value<const N: usize>(
     let last = frequency[N - 1];
     let half = shape[N - 1] / 2;
     let base = arbitrary_base_value(extra, frequency, shape, seed);
-    if last != 0 && !(shape[N - 1] % 2 == 0 && last == half) {
+    if last != 0 && !(shape[N - 1].is_multiple_of(2) && last == half) {
         return base;
     }
     let mirror = std::array::from_fn(|axis| {

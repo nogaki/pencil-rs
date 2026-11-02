@@ -822,7 +822,7 @@ impl<R: FftReal> LocalR2cPlan<R> {
             if line[0].im != R::zero() {
                 return Err(LocalR2cError::InvalidSpectrumEndpoint { batch, index: 0 });
             }
-            if self.real_len % 2 == 0 && line[self.complex_len - 1].im != R::zero() {
+            if self.real_len.is_multiple_of(2) && line[self.complex_len - 1].im != R::zero() {
                 return Err(LocalR2cError::InvalidSpectrumEndpoint {
                     batch,
                     index: self.complex_len - 1,
@@ -851,7 +851,7 @@ fn initialized_vec<T: Clone>(length: usize, value: T) -> Result<Vec<T>, LocalR2c
 }
 
 fn batch_count(actual: usize, line_len: usize) -> Result<usize, LocalR2cError> {
-    if actual % line_len != 0 {
+    if !actual.is_multiple_of(line_len) {
         return Err(LocalR2cError::NonIntegralBatch);
     }
     Ok(actual / line_len)
@@ -865,7 +865,7 @@ fn validate_lengths<R: FftReal>(real_len: usize) -> Result<usize, LocalR2cError>
     let complex_len = real_len / 2 + 1;
     validate_addressable(real_len, size_of::<R>())?;
     validate_addressable(complex_len, size_of::<Complex<R>>())?;
-    if real_len % 2 != 0 {
+    if !real_len.is_multiple_of(2) {
         validate_addressable(real_len, size_of::<Complex<R>>())?;
     }
     Ok(complex_len)
@@ -973,7 +973,7 @@ mod tests {
                         let angle = TAU * j as f64 * k as f64 / real_len as f64;
                         let (sine, cosine) = angle.sin_cos();
                         value += spectrum.re.as_f64() * cosine - spectrum.im.as_f64() * sine;
-                        if k != 0 && (real_len % 2 != 0 || k != real_len / 2) {
+                        if k != 0 && (!real_len.is_multiple_of(2) || k != real_len / 2) {
                             value += spectrum.re.as_f64() * cosine - spectrum.im.as_f64() * sine;
                         }
                     }
@@ -1128,7 +1128,7 @@ mod tests {
             .collect::<Vec<_>>();
         for line in arbitrary.chunks_exact_mut(plan.complex_len()) {
             line[0].im = R::convert(0.0);
-            if real_len % 2 == 0 {
+            if real_len.is_multiple_of(2) {
                 line[plan.complex_len() - 1].im = R::convert(0.0);
             }
         }
@@ -1755,7 +1755,7 @@ mod tests {
             .collect::<Vec<_>>();
         for line in arbitrary.chunks_exact_mut(plan.complex_len()) {
             line[0].im = R::convert(0.0);
-            if real_len % 2 == 0 {
+            if real_len.is_multiple_of(2) {
                 line[plan.complex_len() - 1].im = R::convert(0.0);
             }
         }

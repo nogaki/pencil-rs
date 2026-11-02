@@ -139,7 +139,9 @@ fn agree_settings(comm: &CartesianCommunicator, settings: Hdf5Settings<'_>) -> R
         settings.hints.len() as u64,
     ];
     for (dst, value) in bytes
-        .chunks_exact_mut(8)
+        .as_chunks_mut::<8>()
+        .0
+        .iter_mut()
         .zip(words.into_iter().chain(chunks.iter().map(|&x| x as u64)))
     {
         dst.copy_from_slice(&value.to_le_bytes());
@@ -173,7 +175,7 @@ fn agree_member<const N: usize, const M: usize>(
         .chain(pencil.topology().process_grid().iter().map(|&x| x as u64))
         .chain(pencil.permutation().axes().iter().map(|x| x.index() as u64))
         .chain(pencil.decomposition().iter().map(|x| x.index() as u64));
-    for (dst, value) in bytes.chunks_exact_mut(8).zip(words) {
+    for (dst, value) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(words) {
         dst.copy_from_slice(&value.to_le_bytes());
     }
     agree_bytes(comm, &bytes[..len * 8])
@@ -225,7 +227,7 @@ impl<'c> Hdf5FileSession<'c> {
         entry_header(comm, op)?;
         let mut id = if comm.rank() == 0 {
             NEXT_ID
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                 .unwrap_or(0)
         } else {
             0

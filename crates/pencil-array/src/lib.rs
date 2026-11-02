@@ -67,6 +67,13 @@
 //! not guarantee global recovery or a recovered `Result`;
 //! `mpi::request::scope` may abort if it exits with unfinished requests.
 //!
+//! [`SpatialRemapPlan`] collectively routes source values to destination points
+//! under an independent per-axis sign/offset map. It owns its checked routes,
+//! datatype and reusable initialized payload buffers; `apply_views` performs no
+//! Rust allocation and ordinary preflight failures leave views and plan state
+//! unchanged. Callers creating checked views locally must agree any construction
+//! failure before entering the collective call.
+//!
 //! Global reductions (`global_sum`, `global_min`, `global_max`, `l2_norm`,
 //! `any`, `all`, `sum_by`, and `norm_by`) and root `gather` apply the same
 //! collective descriptor and count preflight. Gather returns logical global
@@ -306,6 +313,8 @@ mod many;
 mod pencil;
 mod point_to_point_transpose;
 mod pointwise;
+mod preflight;
+mod spatial_remap;
 mod topology;
 mod transpose;
 mod view;
@@ -337,6 +346,8 @@ pub use pointwise::{
     pointwise2_in_place_views, pointwise2_views, pointwise3, pointwise3_in_place,
     pointwise3_in_place_views, pointwise3_views,
 };
+pub use preflight::all_ranks_succeeded;
+pub use spatial_remap::{SpatialRemapError, SpatialRemapPlan};
 pub use topology::MpiTopology;
 pub use transpose::{
     OverlapError, TransposeError, TransposeTiming, TransposeWorkspace,

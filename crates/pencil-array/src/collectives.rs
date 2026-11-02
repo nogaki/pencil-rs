@@ -2390,19 +2390,20 @@ fn collective_descriptor<C: CommunicatorCollectives>(
     let mut ready = false;
     let mut minimum = None;
     let mut maximum = None;
-    if let (Some(words), Some(length)) = (&descriptor, expected_len) {
-        if words.len() == length && Count::try_from(length).is_ok() {
-            let mut min_words = Vec::new();
-            let mut max_words = Vec::new();
-            let min_ok = min_words.try_reserve_exact(length).is_ok();
-            let max_ok = max_words.try_reserve_exact(length).is_ok();
-            if min_ok && max_ok {
-                min_words.resize(length, 0);
-                max_words.resize(length, 0);
-                minimum = Some(min_words);
-                maximum = Some(max_words);
-                ready = true;
-            }
+    if let (Some(words), Some(length)) = (&descriptor, expected_len)
+        && words.len() == length
+        && Count::try_from(length).is_ok()
+    {
+        let mut min_words = Vec::new();
+        let mut max_words = Vec::new();
+        let min_ok = min_words.try_reserve_exact(length).is_ok();
+        let max_ok = max_words.try_reserve_exact(length).is_ok();
+        if min_ok && max_ok {
+            min_words.resize(length, 0);
+            max_words.resize(length, 0);
+            minimum = Some(min_words);
+            maximum = Some(max_words);
+            ready = true;
         }
     }
     if !collective_valid(communicator, ready) {

@@ -5841,7 +5841,11 @@ where
         } else {
             core.raw_absolute_threshold
         };
-        let plane_count = if core.real_len % 2 == 0 { 2 } else { 1 };
+        let plane_count = if core.real_len.is_multiple_of(2) {
+            2
+        } else {
+            1
+        };
         let batch_count = core.extra_shape.element_count();
         let mut local_maxima = Vec::new();
         local_maxima.try_reserve_exact(batch_count).map_err(|_| {
@@ -6007,7 +6011,11 @@ fn zero_mixed_boundary_data<R: FftReal, const N: usize, const M: usize>(
         .complex_len
         .checked_mul(stride)
         .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-    let plane_count = if core.real_len % 2 == 0 { 2 } else { 1 };
+    let plane_count = if core.real_len.is_multiple_of(2) {
+        2
+    } else {
+        1
+    };
     for batch in 0..core.extra_shape.element_count() {
         let start = batch
             .checked_mul(local_len)
@@ -6330,7 +6338,7 @@ fn mixed_convert_strided_real_forward<R: FftReal, const N: usize, const M: usize
 where
     Complex<R>: Equivalence,
 {
-    if stride <= 1 || rows % stride != 0 {
+    if stride <= 1 || !rows.is_multiple_of(stride) {
         return Err(MixedError::Fft(FftError::PreparationFailed));
     }
     let groups = rows / stride;
@@ -6670,7 +6678,7 @@ fn mixed_convert_strided_complex_reverse<R: FftReal, const N: usize, const M: us
 where
     Complex<R>: Equivalence,
 {
-    if stride <= 1 || rows % stride != 0 {
+    if stride <= 1 || !rows.is_multiple_of(stride) {
         return Err(MixedError::Fft(FftError::PreparationFailed));
     }
     let groups = rows / stride;
@@ -7386,7 +7394,11 @@ mod reverse_overlap_tests {
             zero_complex::<R>(),
         )
         .unwrap();
-        let plane_count = if core.real_len % 2 == 0 { 2 } else { 1 };
+        let plane_count = if core.real_len.is_multiple_of(2) {
+            2
+        } else {
+            1
+        };
         for plane in 0..plane_count {
             let mut position = [0; N];
             position[stage.axis] = if plane == 0 { 0 } else { core.complex_len - 1 };

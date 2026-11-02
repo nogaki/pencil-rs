@@ -1,7 +1,7 @@
 # pencil-fft
 
 Local complex, real, and real-to-real transforms, with optional MPI-distributed
-pencil transforms. Requires Rust 1.85 or newer. The default RustFFT/RealFFT CPU
+pencil transforms. Requires Rust 1.96 or newer. The default RustFFT/RealFFT CPU
 backend is MPI-free and needs neither native FFTW nor Julia.
 
 - Default features: local transforms using RustFFT/RealFFT.
@@ -26,7 +26,22 @@ including componentwise complex transforms, rather than complex FFT embeddings.
 The portable RustFFT algorithms remain unchanged.
 
 Local forward and backward transforms are unnormalized; inverse methods apply
-normalization. Consult the API documentation for buffer sizes and layout rules.
+normalization. `LocalC2cNdPlan` provides MPI-free C2C transforms over selected
+axes of a column-major `Complex` slice (`shape[0]` is fastest). It preserves the
+supplied axes order, treats unselected dimensions as independent batches, and
+owns its FFT plans and line buffers. Its `forward` and `inverse` methods operate
+in place without Rust allocations; inverse normalization is applied once per
+selected axis. An empty axes list is a validated no-op. Consult the API
+documentation for error and shape rules.
+
+`LocalC2cNdPlan::owned_bytes()` reports the capacity-based size of the plan's
+`shape` and `axes` vectors and each axis's line and scratch buffers. The `axes`
+vector count includes its inline axis-plan handles, metadata, and padding; the
+getter excludes the plan's inline storage, backend-internal allocations,
+caller-owned data, and allocator overhead. It is a diagnostic of these direct
+`Vec` allocations, not RSS or total backend memory, and can vary by precision
+and enabled backend features.
+
 Distributed plan construction and execution are collective: all communicator
 ranks must enter compatible calls in the same order. Coordinate local allocation
 failures before the next collective, and drop MPI-owned objects before MPI

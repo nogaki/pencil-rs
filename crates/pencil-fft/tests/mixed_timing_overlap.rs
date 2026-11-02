@@ -136,10 +136,10 @@ fn check_r2c_spectrum<R: Real, const M: usize>(
         for j in 0..lengths[1] {
             for k in 0..lengths[2] {
                 let q = [i, j, k];
-                if q[boundary] <= lengths[boundary] / 2 {
-                    if let Some(x) = a.get_global(&[], q) {
-                        assert_complex(*x, r2c_expected(q, boundary));
-                    }
+                if q[boundary] <= lengths[boundary] / 2
+                    && let Some(x) = a.get_global(&[], q)
+                {
+                    assert_complex(*x, r2c_expected(q, boundary));
                 }
             }
         }

@@ -332,12 +332,11 @@ where
     }
 
     let mut datatype = None;
-    if !layout.empty {
-        if let Ok(raw) =
+    if !layout.empty
+        && let Ok(raw) =
             ffi::type_create_subarray(&layout.global, &layout.local, &layout.starts, comm.as_raw())
-        {
-            datatype = Some(DatatypeGuard { raw });
-        }
+    {
+        datatype = Some(DatatypeGuard { raw });
     }
     let datatype_ok = layout.empty || datatype.is_some();
     let (all_datatypes_ready, mixed_datatypes) = collective_state(comm, datatype_ok);
@@ -751,12 +750,11 @@ where
     };
 
     let mut datatype = None;
-    if !layout.empty {
-        if let Ok(raw) =
+    if !layout.empty
+        && let Ok(raw) =
             ffi::type_create_subarray(&layout.global, &layout.local, &layout.starts, comm.as_raw())
-        {
-            datatype = Some(DatatypeGuard { raw });
-        }
+    {
+        datatype = Some(DatatypeGuard { raw });
     }
     let datatype_ok = layout.empty || datatype.is_some();
     let (all_datatypes_ready, mixed_datatypes) = collective_state(comm, datatype_ok);
@@ -1396,10 +1394,8 @@ impl Header {
                 .map_err(|_| IoError::AllocationFailed {
                     requested: bytes_count,
                 })?;
-            for chunk in bytes[offset..end].chunks_exact(8) {
-                values.push(u64::from_le_bytes(
-                    chunk.try_into().expect("eight-byte chunk"),
-                ));
+            for chunk in bytes[offset..end].as_chunks::<8>().0 {
+                values.push(u64::from_le_bytes(*chunk));
             }
             offset = end;
             Ok(values)

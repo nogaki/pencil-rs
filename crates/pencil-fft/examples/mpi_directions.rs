@@ -316,7 +316,7 @@ mod checks {
             let mut v = values(reduced, e, true, false);
             for (i, x) in v.iter_mut().enumerate() {
                 let k = coord(reduced, i)[1];
-                if k == 0 || (s[1] % 2 == 0 && k == s[1] / 2) {
+                if k == 0 || (s[1].is_multiple_of(2) && k == s[1] / 2) {
                     x.im = 0.;
                 }
             }

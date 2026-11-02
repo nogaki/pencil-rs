@@ -64,8 +64,8 @@ export CARGO_TARGET_DIR=$(mktemp -d /tmp/pencil-reference-target.XXXXXX)
 PENCIL_FFT_BACKEND=rustfft ./tools/fftw-reference/check.sh
 PENCIL_FFT_BACKEND=fftw PENCIL_FFT_THREADS=2 PENCIL_FFT_DIRECTION_ORDER=native-first ./tools/fftw-reference/check.sh
 PENCIL_FFT_BACKEND=fftw PENCIL_FFT_THREADS=2 PENCIL_FFT_DIRECTION_ORDER=directions-first ./tools/fftw-reference/check.sh
-# Exact installed MSRV, isolated target; equivalent to cargo +1.85.0 inside the runner:
-RUSTUP_HOME=/tmp/pencil-rs-rustup-msrv.0vuEDM RUSTUP_TOOLCHAIN=1.85.0 \
+# Exact installed MSRV, isolated target; equivalent to cargo +1.96.0 inside the runner:
+RUSTUP_HOME=/tmp/pencil-rs-rustup-msrv.0vuEDM RUSTUP_TOOLCHAIN=1.96.0 \
 CARGO_TARGET_DIR=$(mktemp -d /tmp/pencil-reference-msrv-target.XXXXXX) \
 PENCIL_FFT_THREADS=2 PENCIL_FFT_BACKEND=fftw PENCIL_FFT_DIRECTION_ORDER=native-first ./tools/fftw-reference/check.sh
 # Pure parser checks (no environment mutation, MPI launch, or runtime loading):
@@ -133,7 +133,7 @@ each one-rank run must fail with status 1 or 101, the executed test's START
 and failed-test markers, and comparison markers with matching kind/operation
 context. Missing Julia, MPI, fixtures, or matrix members is a failure, never a
 skip. The runner uses Cargo's selected toolchain and target directory; it never
-selects an executable by filename or timestamp. Set `RUSTUP_TOOLCHAIN=1.85.0`
+selects an executable by filename or timestamp. Set `RUSTUP_TOOLCHAIN=1.96.0`
 to run the reference matrix with an installed MSRV toolchain.
 
 ## Per-axis Fourier directions
@@ -173,7 +173,7 @@ Each successful run emits exactly one `mpi_directions: PASSED` marker.
 
 ## Isolated MSRV check
 
-Run these commands from the repository root to check exactly Rust 1.85.0
+Run these commands from the repository root to check exactly Rust 1.96.0
 without changing the global Rustup configuration. Setup may download the
 toolchain and Cargo dependencies; MPI development tools are still required.
 
@@ -184,14 +184,14 @@ toolchain and Cargo dependencies; MPI development tools are still required.
   trap 'rm -rf -- "$WORK"' EXIT
   export RUSTUP_HOME="$WORK/rustup" CARGO_HOME="$WORK/cargo"
   export CARGO_TARGET_DIR="$WORK/target"
-  rustup toolchain install 1.85.0 --profile minimal --no-self-update
-  cargo +1.85.0 check --workspace --all-targets --locked
-  cargo +1.85.0 check --workspace --all-targets --all-features --locked
+  rustup toolchain install 1.96.0 --profile minimal --no-self-update
+  cargo +1.96.0 check --workspace --all-targets --locked
+  cargo +1.96.0 check --workspace --all-targets --all-features --locked
 )
 ```
 
 Formatting, Clippy, and numerical tests use the normal project toolchain;
-MSRV checks use the isolated 1.85.0 installation. Reference provenance is
+MSRV checks use the isolated 1.96.0 installation. Reference provenance is
 printed by every generation run and recorded in every fixture.
 
 ## Fixture contract

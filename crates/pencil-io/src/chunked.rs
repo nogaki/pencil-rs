@@ -478,7 +478,8 @@ fn read_inner<T: IoElement, const N: usize, const M: usize>(
             c,
             values.try_reserve_exact(view.len()).map_err(|_| invalid()),
         )?;
-        values.extend(b.chunks_exact(T::WIDTH).map(T::decode_le));
+        let width = T::WIDTH;
+        values.extend(b.chunks_exact(width).map(T::decode_le));
         Ok(values)
     })?;
     view.as_mut_slice().copy_from_slice(&values);

@@ -189,6 +189,7 @@ pub(crate) fn native_contracts(
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap())
             .env("LD_LIBRARY_PATH", std::env::var("LD_LIBRARY_PATH").unwrap_or_default())
+            .env("HOME", &mpi_tmp)
             .env("PENCIL_HDF_NATIVE_CLOSE_CHILD", "1")
             .arg("-c")
             .arg("ulimit -c 0; exec mpiexec --mca orte_base_help_aggregate 0 --mca orte_tmpdir_base \"$2\" --oversubscribe -n 1 \"$1\" --exact tests::post_cleanup_errors_preserve_destination_and_valid_commits --nocapture")

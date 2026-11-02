@@ -316,7 +316,7 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
         }
         for (k, destination) in destination.iter_mut().enumerate() {
             let value = embedding_line[k];
-            let value = if k == 0 || (self.line_len % 2 == 0 && k == self.line_len / 2) {
+            let value = if k == 0 || (self.line_len.is_multiple_of(2) && k == self.line_len / 2) {
                 scaled(value, normalize, self.line_len)
             } else {
                 let mirror = embedding_line[self.line_len - k];
@@ -349,7 +349,7 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
         embedding_len: usize,
         scratch_len: usize,
     ) -> Result<(), LocalR2rError> {
-        if data_len % self.line_len != 0 {
+        if !data_len.is_multiple_of(self.line_len) {
             return Err(LocalR2rError::NonIntegralBatch);
         }
         if embedding_len < self.embedding_len {
