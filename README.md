@@ -572,6 +572,9 @@ writer layout metadata is provenance, not a read-layout requirement. Native
 cleanup failures that can leave an unrecoverable handle are fail-stop paths via
 MPI abort, not recoverable Rust errors.
 
+Open MPI 4.1.6 can lose collective writes; update it or apply the
+[workaround](#open-mpi-416-collective-write-data-loss).
+
 Enable the optional native parallel HDF5 backend with
 `pencil-io/parallel-hdf5`. It stores one versioned dataset at
 `/pencil_io_v1/data` in the same logical order and strict scalar or `{r,i}`
@@ -788,6 +791,56 @@ The default build uses upstream rsmpi and native MPI bindings:
 - libclang and its C development headers, required by bindgen while building
   the MPI bindings
 
+### Open MPI 4.1.6 collective-write data loss
+
+CI covers two stacks:
+
+- The five existing jobs run on Ubuntu 26.04. The MPI jobs (`rust`, `msrv`,
+  `rsmpi-rt`) currently see Open MPI 5.0.10. `local-fft` and `serial-hdf5` have
+  no MPI; `serial-hdf5` uses serial HDF5 only.
+- `mpi-io-openmpi4` runs on Ubuntu 24.04 and requires Open MPI 4.1.x. The
+  current package is 4.1.6. It covers MPI-IO only, with the workaround below.
+
+On Open MPI 4.1.6 the default MPI-IO component (OMPIO) can lose collective
+writes: the write returns `Ok` and the commit marker is present, but parts of
+the payload stay zero. It reproduced at four ranks with a `[4, 1]`
+decomposition under default settings.
+
+Confirmed affected: ordinary MPI-IO writes, named datasets and append, and
+`MpiFileSession`. Other collective-write paths (collections, chunked I/O,
+external views) can be affected as well. Parallel HDF5 on top of OMPIO is
+untested.
+
+The cause is an upstream bug,
+https://github.com/open-mpi/ompi/issues/12718. It was reproduced with Ubuntu's
+`4.1.6-7ubuntu2`; earlier versions were not checked exhaustively. The source
+fix is in 4.1.7 and later (commit 6973c470) and in 5.0.6 and later (commit
+0f1fea8f); 5.0.10 was verified.
+
+Workarounds, in order:
+
+1. Update to Open MPI 4.1.7 or later, or to 5.0.6 or later.
+2. On a local filesystem, keep 4.1.6 and set the lock algorithm for every rank
+   from launch:
+
+   ```bash
+   mpiexec --mca fs_ufs_lock_algorithm 3 ...
+   ```
+
+   ```bash
+   export OMPI_MCA_fs_ufs_lock_algorithm=3
+   ```
+
+3. Alternatively, disable write data sieving or switch the IO component:
+   `OMPI_MCA_fbtl_posix_write_datasieving=0` may slow down non-contiguous I/O,
+   and `OMPI_MCA_io=romio321` needs `ompi_info | grep 'MCA io'` to confirm the
+   component is available.
+
+On NFS, 4.1.6 locks whole files by default and `3` switches that to range
+locks, so prefer updating there. No workaround repairs files that are already
+missing data; rewrite files written in an affected environment. pencil-io does
+not change these settings itself.
+
 ### Experimental runtime MPI (rsmpi-rt)
 
 `pencil-array` and distributed `pencil-fft` can instead use
@@ -907,6 +960,28 @@ for n in 1 4 6; do
   timeout --foreground --kill-after=5s 120s mpiexec --oversubscribe -n "$n" \
     cargo test -p pencil-fft --features distributed --test distributed_mixed \
       --locked -- --nocapture --test-threads=1 || exit 1
+done
+```
+
+`main` is protected by a GitHub ruleset. The ruleset enforces pull requests,
+six required checks (`local-fft`, `rust`, `msrv`, `serial-hdf5`, `rsmpi-rt`,
+and `mpi-io-openmpi4`), and branches up to date with `main` (strict). Required
+approvals are 0.
+
+Merging also requires an independent review and confirmation that every check
+passed on the pull request head. The ruleset does not enforce these; reviewers
+do. When a CI job is renamed or removed, the repository owner updates the
+ruleset's required checks in the same change.
+
+To run MPI-IO locally on Open MPI 4.1.6, apply the workaround and cover one,
+four, and six ranks:
+
+```bash
+export OMPI_MCA_fs_ufs_lock_algorithm=3
+for n in 1 4 6; do
+  mpiexec --oversubscribe -n "$n" \
+    cargo test -p pencil-io --no-default-features --features mpi \
+    --test mpi_io --locked -- --test-threads=1
 done
 ```
 

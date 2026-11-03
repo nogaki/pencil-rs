@@ -97,6 +97,19 @@ for n in 1 4 6; do
 done
 ```
 
+For each SHA you intend to publish, record a CI run in which all six required
+checks passed: `local-fft`, `rust`, `msrv`, `serial-hdf5`, `rsmpi-rt`, and
+`mpi-io-openmpi4`. Record the run URL plus the OS, Rust, MPI, and HDF5 versions
+that each job reports from its "Record toolchain versions" step.
+
+The five pre-existing jobs run on Ubuntu 26.04; the MPI jobs (`rust`, `msrv`,
+`rsmpi-rt`) currently use Open MPI 5.0.10. The `mpi-io-openmpi4` job runs on
+Ubuntu 24.04 and requires Open MPI 4.1.x; the current package is 4.1.6. Record
+the version that job reports and whether it applied the workaround from
+[README.md](README.md#open-mpi-416-collective-write-data-loss). A release
+verified on Open MPI 4.1.7 or later, or on 5.0.6 or later, records that version
+instead.
+
 Native FFTW's ignored tests require both precisions. MPI collectives require all
 ranks to participate in order, and persistent I/O sessions must be closed
 collectively before MPI finalization. Package build verification alone does not
