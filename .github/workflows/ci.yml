@@ -65,6 +65,24 @@ jobs:
       - name: Check native adapter host paths without FFTW installation
         run: cargo test -p pencil-fftw --locked
 
+  reference-source-integrity:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12.6'
+
+      - name: Check reference source integrity guard
+        run: |
+          set -euo pipefail
+          julia --version
+          julia --compiled-modules=no --startup-file=no --history-file=no tools/fftw-reference/check_sources.jl
+
   serial-hdf5:
     runs-on: ubuntu-26.04
     timeout-minutes: 15
@@ -465,6 +483,9 @@ jobs:
             cargo test -p pencil-fft --features distributed --lib --locked \
               distributed::r2r::tests::in_place_error_panic_backend_and_short_workspace_poison_contracts -- \
               --ignored --exact --nocapture --test-threads=1
+
+      - name: Run ordinary local FFT tests with the FFTW feature
+        run: cargo test -p pencil-fft --features fftw --test fftw_local --locked
 
       - name: Verify collection member panic fails stop rather than hangs
         run: |
