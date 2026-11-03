@@ -39,6 +39,9 @@ thread_local! {
     // Fail the Nth zero-displacement reset, after the real native call.
     pub(crate) static FAIL_BYTE_RESET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static FAIL_SESSION_CLEANUP: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    // 0: none, 1: error, 2: short read (read_at only), 3: size + 1 (get_size only).
+    pub(crate) static FAIL_GET_SIZE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    pub(crate) static FAIL_INDEPENDENT_READ: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 #[cfg(test)]
 fn record_file_call(index: usize) {
@@ -397,6 +400,16 @@ pub(crate) fn file_get_size(file: ffi::MPI_File) -> Result<ffi::MPI_Offset, i32>
         let mut size = 0;
         let code = ffi::MPI_File_get_size(file, &mut size);
         if code == ffi::MPI_SUCCESS as c_int {
+            #[cfg(test)]
+            {
+                let fault = FAIL_GET_SIZE.with(std::cell::Cell::get);
+                if fault == 1 {
+                    return Err(ffi::MPI_ERR_OTHER as i32);
+                }
+                if fault == 3 {
+                    return Ok(size.saturating_add(1));
+                }
+            }
             Ok(size)
         } else {
             Err(code)
@@ -549,7 +562,18 @@ pub(crate) fn file_read_at(
             ffi::RSMPI_UINT8_T,
             &mut status,
         );
-        byte_transfer_result(code, &status)
+        let result = byte_transfer_result(code, &status);
+        #[cfg(test)]
+        if !collective {
+            let fault = FAIL_INDEPENDENT_READ.with(std::cell::Cell::get);
+            if fault == 1 {
+                return Err(ffi::MPI_ERR_OTHER as i32);
+            }
+            if fault == 2 {
+                return result.map(|read| read.saturating_sub(1));
+            }
+        }
+        result
     }
 }
 

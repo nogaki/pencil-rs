@@ -349,6 +349,11 @@ pub(crate) fn run() {
     positive_controls(&rig);
     normal_checks(&rig);
     named_checks(&rig);
+    scan_counts_checks(&rig);
+    catalog_chunk_checks(&rig);
+    catalog_fault_checks(&rig);
+    catalog_contract_checks(&rig);
+    catalog_codec_checks();
     raw_checks(&rig);
     chunked_checks(&rig);
     collection_checks(&rig);
@@ -849,6 +854,618 @@ fn named_checks(rig: &Rig<'_>) {
         destination.as_slice() == before.as_slice(),
         "named read allocation destination unchanged",
     );
+}
+
+fn raw_container_header() -> [u8; 32] {
+    let mut header = [0u8; 32];
+    header[..8].copy_from_slice(b"PIONAM02");
+    header[8..16].copy_from_slice(&2u64.to_le_bytes());
+    header[16..24].copy_from_slice(&32u64.to_le_bytes());
+    header
+}
+
+// T1: the scanner's collectives must not grow with the record count. Expected
+// values are derived from the format: one 32-byte container header read, then a
+// 72-byte header plus name, metadata, no payload, and an 8-byte commit marker.
+fn scan_counts_checks(rig: &Rig<'_>) {
+    let size = rig.world.size() as usize;
+    let small = array_for(rig.topology, [size, 1], 500.0);
+    let rank = 2usize;
+    let metadata_len = 16 + 8 * rank;
+    let payload = size * std::mem::size_of::<f64>();
+
+    for count in [1usize, 128] {
+        let path = rig.directory.join(format!("scan-counts-{count}.pio"));
+        reset_file(rig.world, &path);
+        let mut expected = Vec::new();
+        let mut offset = 32usize;
+        for i in 0..count {
+            let name = format!("scan-{i:03}");
+            let total = 72 + name.len() + metadata_len + payload + 8;
+            let payload_offset = offset + 72 + name.len() + metadata_len;
+            expected.push((name, payload_offset));
+            offset = offset.checked_add(total).unwrap();
+            let result = if i == 0 {
+                crate::write_mpi_named(&path, &expected[i].0, small.view())
+            } else {
+                crate::append_mpi_named(&path, &expected[i].0, small.view())
+            };
+            assert!(result.is_ok(), "scan fixture record {i}: {result:?}");
+        }
+        let probe =
+            crate::named_mpi::scan_path_for_test(rig.topology.communicator(), &path, usize::MAX)
+                .expect("direct scan");
+        assert_eq!(probe.allreduces, 7, "scan allreduces: {count} records");
+        assert_eq!(probe.broadcasts, 2, "scan broadcasts: {count} records");
+        assert_eq!(probe.collective_reads, 0, "scan collective reads");
+        let expected_reads = if rig.world.rank() == 0 {
+            3 * count + 1
+        } else {
+            0
+        };
+        assert_eq!(
+            probe.independent_reads, expected_reads,
+            "scan independent reads: {count} records"
+        );
+        let scan = probe.scanned.expect("direct scan success");
+        assert_eq!(scan.tail, offset, "scan tail: {count} records");
+        assert_eq!(scan.size, offset, "scan size: {count} records");
+        assert_eq!(scan.records.len(), count, "scan count");
+        for (record, (name, payload_offset)) in scan.records.iter().zip(&expected) {
+            assert_eq!(record.name, name.as_bytes(), "scan name");
+            assert_eq!(record.typ, crate::ScalarType::F64.code(), "scan type");
+            assert_eq!(record.width, std::mem::size_of::<f64>(), "scan width");
+            assert_eq!(record.global, vec![size, 1], "scan global shape");
+            assert!(record.extra.is_empty(), "scan extra shape");
+            assert_eq!(
+                record.payload_offset, *payload_offset,
+                "scan payload offset"
+            );
+        }
+    }
+
+    let empty_path = rig.directory.join("scan-counts-empty.pio");
+    reset_file(rig.world, &empty_path);
+    support::root_status(rig.world, || {
+        std::fs::write(&empty_path, raw_container_header()).map_err(|error| error.to_string())
+    });
+    rig.world.barrier();
+    let probe =
+        crate::named_mpi::scan_path_for_test(rig.topology.communicator(), &empty_path, usize::MAX)
+            .expect("empty direct scan");
+    assert_eq!(
+        (probe.allreduces, probe.broadcasts),
+        (7, 2),
+        "empty scan collectives"
+    );
+    let expected_reads = usize::from(rig.world.rank() == 0);
+    assert_eq!(
+        probe.independent_reads, expected_reads,
+        "empty scan independent reads"
+    );
+    assert_eq!(probe.collective_reads, 0, "empty scan collective reads");
+    let empty = probe.scanned.expect("empty scan success");
+    assert!(empty.records.is_empty(), "empty scan records");
+    assert_eq!((empty.tail, empty.size), (32, 32), "empty scan tail/size");
+}
+
+const COMMIT_WORD: u64 = 0x434f_4d4d_4954_5445;
+
+fn raw_single_dim_record(name: &[u8], dimension: u64, marker: u64) -> Vec<u8> {
+    let metadata_len = 24usize;
+    let payload = dimension as usize * std::mem::size_of::<f64>();
+    let total = 72 + name.len() + metadata_len + payload + 8;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"PIOREC02");
+    for value in [
+        2u64,
+        name.len() as u64,
+        metadata_len as u64,
+        payload as u64,
+        total as u64,
+        crate::ScalarType::F64.code(),
+        std::mem::size_of::<f64>() as u64,
+        0,
+    ] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(name);
+    out.extend_from_slice(&1u64.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
+    out.extend_from_slice(&dimension.to_le_bytes());
+    out.resize(out.len() + payload, 0);
+    out.extend_from_slice(&marker.to_le_bytes());
+    out
+}
+
+fn raw_named_container(records: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = raw_container_header().to_vec();
+    for record in records {
+        out.extend_from_slice(record);
+    }
+    out
+}
+
+fn write_raw_named(rig: &Rig<'_>, path: &Path, bytes: &[u8]) {
+    reset_file(rig.world, path);
+    support::root_status(rig.world, || {
+        std::fs::write(path, bytes).map_err(|error| error.to_string())
+    });
+    rig.world.barrier();
+}
+
+fn small_1d_array(rig: &Rig<'_>) -> PencilArray<f64, 1, 1> {
+    let pencil = Pencil::<1, 1>::new(rig.topology.clone(), [1], [0]).unwrap();
+    PencilArray::from_elem(pencil, ExtraShape::scalar(), 0.0).unwrap()
+}
+
+fn scan_once(rig: &Rig<'_>, path: &Path) -> crate::named_mpi::TestScan {
+    crate::named_mpi::scan_path_for_test(rig.topology.communicator(), path, usize::MAX)
+        .expect("scan protocol cleanup")
+}
+
+fn named_phase(error: &NamedIoError, phase: &'static str) -> bool {
+    matches!(
+        error,
+        NamedIoError::Io(IoError::CollectivePrecondition { phase: found }) if *found == phase
+    )
+}
+
+fn named_invalid_container(error: &NamedIoError) -> bool {
+    matches!(
+        error,
+        NamedIoError::Io(IoError::InvalidFile {
+            reason: "named container header"
+        })
+    )
+}
+
+// T2: chunked catalog distribution with a test-only 32-byte chunk. One record
+// encodes as 48 fixed bytes + name + one dimension; payload is not encoded.
+fn catalog_chunk_checks(rig: &Rig<'_>) {
+    let array = small_1d_array(rig);
+    crate::named_mpi::set_catalog_chunk_bytes(32);
+    for (label, name, chunks) in [("exact", "abcdefgh", 2usize), ("partial", "abcdefghi", 3)] {
+        let path = rig.directory.join(format!("scan-chunk-{label}.pio"));
+        reset_file(rig.world, &path);
+        let result = crate::write_mpi_named(&path, name, array.view());
+        assert!(result.is_ok(), "chunk fixture write {label}: {result:?}");
+        let probe = scan_once(rig, &path);
+        let expected_allreduces = 6 + chunks;
+        let expected_broadcasts = 1 + chunks;
+        let local_ok = probe.allreduces == expected_allreduces
+            && probe.broadcasts == expected_broadcasts
+            && probe.collective_reads == 0;
+        all_ranks(rig.world, local_ok, &format!("chunk counts {label}"));
+        let scanned = probe.scanned.expect("chunk scan success");
+        let metadata_len = 24usize;
+        let payload_offset = 32 + 72 + name.len() + metadata_len;
+        let tail = payload_offset + 8 + 8;
+        assert_eq!(scanned.records.len(), 1, "chunk records {label}");
+        assert_eq!(scanned.records[0].name, name.as_bytes(), "chunk name");
+        assert_eq!(scanned.records[0].global, vec![1], "chunk shape");
+        assert_eq!(
+            scanned.records[0].payload_offset, payload_offset,
+            "chunk payload offset"
+        );
+        assert_eq!(
+            (scanned.tail, scanned.size),
+            (tail, tail),
+            "chunk tail/size"
+        );
+    }
+
+    // A chunk boundary inside each record: 128 encoded bytes in 32-byte chunks.
+    let path = rig.directory.join("scan-chunk-mid-record.pio");
+    reset_file(rig.world, &path);
+    assert!(
+        crate::write_mpi_named(&path, "abcdefgh", array.view()).is_ok(),
+        "mid-record fixture create"
+    );
+    assert!(
+        crate::append_mpi_named(&path, "ijklmnop", array.view()).is_ok(),
+        "mid-record fixture append"
+    );
+    let probe = scan_once(rig, &path);
+    all_ranks(
+        rig.world,
+        probe.allreduces == 10 && probe.broadcasts == 5,
+        "mid-record chunk counts",
+    );
+    let scanned = probe.scanned.expect("mid-record scan success");
+    assert_eq!(scanned.records.len(), 2, "mid-record records");
+    assert_eq!(
+        scanned.records[0].name, b"abcdefgh",
+        "mid-record first name"
+    );
+    assert_eq!(
+        scanned.records[1].name, b"ijklmnop",
+        "mid-record second name"
+    );
+    assert_eq!(
+        scanned.records[1].payload_offset,
+        scanned.records[0].payload_offset + 72 + 8 + 24 + 8 + 8,
+        "mid-record second offset"
+    );
+    crate::named_mpi::set_catalog_chunk_bytes(1 << 30);
+}
+
+fn expect_scan_error(
+    rig: &Rig<'_>,
+    path: &Path,
+    label: &str,
+    expected: impl Fn(&NamedIoError) -> bool,
+    allreduces: usize,
+    broadcasts: usize,
+) {
+    let probe = scan_once(rig, path);
+    let local_ok = probe.scanned.as_ref().err().is_some_and(&expected)
+        && probe.allreduces == allreduces
+        && probe.broadcasts == broadcasts;
+    if !local_ok {
+        eprintln!(
+            "{label}: rank={} error={:?} allreduces={} broadcasts={}",
+            rig.world.rank(),
+            probe.scanned.as_ref().err(),
+            probe.allreduces,
+            probe.broadcasts
+        );
+    }
+    all_ranks(rig.world, local_ok, label);
+}
+
+// T3a: every preparation and recovery step fails on all ranks with the phase
+// documented for the fixed report.
+fn catalog_fault_checks(rig: &Rig<'_>) {
+    let array = small_1d_array(rig);
+    let path = rig.directory.join("scan-fault.pio");
+    reset_file(rig.world, &path);
+    assert!(
+        crate::write_mpi_named(&path, "abcdefgh", array.view()).is_ok(),
+        "fault fixture write"
+    );
+    let before = support::root_read(rig.world, &path);
+    let rank = rig.world.rank();
+    let last = rig.world.size() - 1;
+
+    crate::ffi::FAIL_GET_SIZE.with(|fault| fault.set(0));
+    if rank == 0 {
+        crate::ffi::FAIL_GET_SIZE.with(|fault| fault.set(1));
+    }
+    expect_scan_error(
+        rig,
+        &path,
+        "scan get-size error",
+        |error| named_phase(error, "MPI_File_get_size"),
+        1,
+        0,
+    );
+    crate::ffi::FAIL_GET_SIZE.with(|fault| fault.set(0));
+
+    if rig.world.size() > 1 {
+        if rank == last {
+            crate::ffi::FAIL_GET_SIZE.with(|fault| fault.set(3));
+        }
+        expect_scan_error(
+            rig,
+            &path,
+            "scan size mismatch",
+            |error| {
+                matches!(
+                    error,
+                    NamedIoError::Io(IoError::CollectiveDescriptorMismatch)
+                )
+            },
+            3,
+            0,
+        );
+        crate::ffi::FAIL_GET_SIZE.with(|fault| fault.set(0));
+    }
+
+    for (label, fault) in [("error", 1u8), ("short", 2)] {
+        if rank == 0 {
+            crate::ffi::FAIL_INDEPENDENT_READ.with(|current| current.set(fault));
+        }
+        expect_scan_error(
+            rig,
+            &path,
+            &format!("scan metadata read {label}"),
+            |error| named_phase(error, "named metadata read"),
+            4,
+            1,
+        );
+        crate::ffi::FAIL_INDEPENDENT_READ.with(|current| current.set(0));
+    }
+
+    for (fault, phase) in [
+        (
+            crate::named_mpi::ScanFault::BodyAllocation,
+            "named allocation",
+        ),
+        (
+            crate::named_mpi::ScanFault::DimensionsAllocation,
+            "named dimensions allocation",
+        ),
+        (
+            crate::named_mpi::ScanFault::IndexAllocation,
+            "named record index allocation",
+        ),
+        (
+            crate::named_mpi::ScanFault::EncodeAllocation,
+            "named catalog encoding",
+        ),
+    ] {
+        if rank == 0 {
+            crate::named_mpi::set_scan_fault(fault);
+        }
+        expect_scan_error(
+            rig,
+            &path,
+            &format!("scan root allocation {phase}"),
+            |error| named_phase(error, phase),
+            4,
+            1,
+        );
+        crate::named_mpi::set_scan_fault(crate::named_mpi::ScanFault::None);
+    }
+
+    if rank == 0 {
+        crate::named_mpi::set_scan_fault(crate::named_mpi::ScanFault::ReportBroadcast);
+    }
+    expect_scan_error(
+        rig,
+        &path,
+        "scan report broadcast failure",
+        |error| named_phase(error, "named catalog report broadcast"),
+        4,
+        1,
+    );
+    crate::named_mpi::set_scan_fault(crate::named_mpi::ScanFault::None);
+
+    let report_rank = if rig.world.size() > 1 { last } else { 0 };
+    if rank == report_rank {
+        crate::named_mpi::set_scan_fault(crate::named_mpi::ScanFault::ReportValidation);
+    }
+    expect_scan_error(
+        rig,
+        &path,
+        "scan report validation failure",
+        |error| named_phase(error, "named catalog preparation"),
+        5,
+        1,
+    );
+    crate::named_mpi::set_scan_fault(crate::named_mpi::ScanFault::None);
+
+    if rig.world.size() > 1 {
+        if rank == last {
+            crate::named_mpi::set_scan_fault(crate::named_mpi::ScanFault::ReceiveAllocation);
+        }
+        expect_scan_error(
+            rig,
+            &path,
+            "scan receive allocation failure",
+            |error| named_phase(error, "named catalog preparation"),
+            5,
+            1,
+        );
+        crate::named_mpi::set_scan_fault(crate::named_mpi::ScanFault::None);
+
+        if rank == last {
+            crate::named_mpi::set_scan_fault(crate::named_mpi::ScanFault::Decode);
+        }
+        expect_scan_error(
+            rig,
+            &path,
+            "scan decode failure",
+            |error| named_phase(error, "named catalog decode"),
+            7,
+            2,
+        );
+        crate::named_mpi::set_scan_fault(crate::named_mpi::ScanFault::None);
+    }
+
+    let short = rig.directory.join("scan-short-container.pio");
+    write_raw_named(rig, &short, &raw_container_header()[..8]);
+    expect_scan_error(
+        rig,
+        &short,
+        "scan short container",
+        named_invalid_container,
+        4,
+        1,
+    );
+
+    let bad_header = rig.directory.join("scan-bad-container.pio");
+    write_raw_named(rig, &bad_header, &[0u8; 32]);
+    expect_scan_error(
+        rig,
+        &bad_header,
+        "scan bad container",
+        named_invalid_container,
+        4,
+        1,
+    );
+
+    all_ranks(
+        rig.world,
+        support::root_read(rig.world, &path) == before,
+        "scan faults leave file unchanged",
+    );
+
+    // T3b: fail one rank after the second chunk broadcast completes. The scan
+    // must stop at that agreement (10 collectives for a three-chunk catalog).
+    let array = small_1d_array(rig);
+    let chunks = rig.directory.join("scan-chunk-failure.pio");
+    reset_file(rig.world, &chunks);
+    assert!(
+        crate::write_mpi_named(&chunks, "abcdefghi", array.view()).is_ok(),
+        "chunk failure fixture write"
+    );
+    crate::named_mpi::set_catalog_chunk_bytes(32);
+    if rank == last {
+        crate::named_mpi::set_scan_fault(crate::named_mpi::ScanFault::ChunkBroadcast(2));
+    }
+    expect_scan_error(
+        rig,
+        &chunks,
+        "scan mid-chunk failure",
+        |error| named_phase(error, "named catalog broadcast"),
+        7,
+        3,
+    );
+    crate::named_mpi::set_scan_fault(crate::named_mpi::ScanFault::None);
+
+    // A scanner error must not poison a session or prevent a retry.
+    let options = MpiIoOptions::default().mode(MpiIoMode::Collective);
+    match MpiFileSession::open_read(rig.topology.communicator(), &chunks, &options) {
+        Ok(mut session) => {
+            if rank == last {
+                crate::named_mpi::set_scan_fault(crate::named_mpi::ScanFault::ChunkBroadcast(2));
+            }
+            let failed = session.catalog();
+            let local_ok = matches!(
+                &failed,
+                Err(MpiSessionError::Named(NamedIoError::Io(
+                    IoError::CollectivePrecondition {
+                        phase: "named catalog broadcast"
+                    }
+                )))
+            );
+            all_ranks(rig.world, local_ok, "session catalog sees chunk failure");
+            crate::named_mpi::set_scan_fault(crate::named_mpi::ScanFault::None);
+            let retried = session.catalog().map_err(|error| format!("{error:?}"));
+            let retried_ok = retried
+                .as_ref()
+                .is_ok_and(|catalog| catalog.len() == 1 && catalog[0].name() == Some("abcdefghi"));
+            all_ranks(rig.world, retried_ok, "session catalog retries after fault");
+            all_ranks(
+                rig.world,
+                session.close().is_ok(),
+                "session catalog fault close",
+            );
+        }
+        Err(error) => {
+            all_ranks(
+                rig.world,
+                false,
+                &format!("session catalog fault open: {error:?}"),
+            );
+        }
+    }
+    crate::named_mpi::set_catalog_chunk_bytes(1 << 30);
+}
+
+// T5: scanner-level recovery contract for duplicate names, uncommitted
+// records, and the record-count limit before a short tail.
+fn catalog_contract_checks(rig: &Rig<'_>) {
+    let first = raw_single_dim_record(b"dup", 0, COMMIT_WORD);
+    let duplicate = rig.directory.join("scan-duplicate.pio");
+    write_raw_named(
+        rig,
+        &duplicate,
+        &raw_named_container(&[first.clone(), first.clone()]),
+    );
+    let probe = scan_once(rig, &duplicate);
+    let scanned = probe.scanned.expect("duplicate prefix scan");
+    assert_eq!(scanned.records.len(), 1, "duplicate keeps committed prefix");
+    assert_eq!(scanned.tail, 32 + first.len(), "duplicate stops at tail");
+    assert_eq!(scanned.size, 32 + 2 * first.len(), "duplicate file size");
+
+    let uncommitted = rig.directory.join("scan-uncommitted.pio");
+    let bad_marker = raw_single_dim_record(b"bad", 0, 0);
+    write_raw_named(rig, &uncommitted, &raw_named_container(&[bad_marker]));
+    let probe = scan_once(rig, &uncommitted);
+    let scanned = probe.scanned.expect("uncommitted prefix scan");
+    assert!(scanned.records.is_empty(), "uncommitted record dropped");
+    assert_eq!(scanned.tail, 32, "uncommitted tail");
+
+    let mut limited = raw_named_container(&[
+        raw_single_dim_record(b"one", 0, COMMIT_WORD),
+        raw_single_dim_record(b"two", 0, COMMIT_WORD),
+    ]);
+    limited.push(0);
+    let limited_path = rig.directory.join("scan-record-limit.pio");
+    write_raw_named(rig, &limited_path, &limited);
+    let probe = crate::named_mpi::scan_path_for_test(rig.topology.communicator(), &limited_path, 2)
+        .expect("limit scan protocol");
+    let local_ok = matches!(
+        &probe.scanned,
+        Err(NamedIoError::Io(IoError::SizeLimit {
+            what: "catalog dataset count"
+        }))
+    );
+    all_ranks(rig.world, local_ok, "record limit precedes short tail");
+    let probe = scan_once(rig, &limited_path);
+    let scanned = probe.scanned.expect("unbounded short-tail scan");
+    assert_eq!(
+        scanned.records.len(),
+        2,
+        "unbounded scan keeps both records"
+    );
+    assert_eq!(
+        scanned.size - scanned.tail,
+        1,
+        "unbounded scan reports short tail"
+    );
+}
+
+// Codec-level checks: a round trip and every rejected structural field. These
+// do not need MPI; they run inside the single MPI test entry point.
+fn catalog_codec_checks() {
+    use crate::named_mpi::{Rec, decode_catalog_for_test, encode_catalog_for_test};
+    let record = Rec {
+        name: b"x".to_vec(),
+        typ: crate::ScalarType::F64.code(),
+        width: 8,
+        global: vec![2, 3],
+        extra: vec![4],
+        payload_offset: 32 + 72 + 1 + 40,
+    };
+    let payload = 2 * 3 * 4 * 8;
+    let tail = record.payload_offset + payload + 8;
+    let size = tail;
+    let encoded = encode_catalog_for_test(std::slice::from_ref(&record)).unwrap();
+    assert_eq!(encoded.len(), 48 + 1 + 3 * 8, "codec encoded length");
+    let decoded = decode_catalog_for_test(&encoded, 1, tail, size).expect("codec round trip");
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0].name, record.name);
+    assert_eq!(decoded[0].typ, record.typ);
+    assert_eq!(decoded[0].width, record.width);
+    assert_eq!(decoded[0].global, record.global);
+    assert_eq!(decoded[0].extra, record.extra);
+    assert_eq!(decoded[0].payload_offset, record.payload_offset);
+
+    assert!(encode_catalog_for_test(&[]).unwrap().is_empty());
+    assert_eq!(
+        decode_catalog_for_test(&[], 0, 32, 32)
+            .expect("empty catalog")
+            .len(),
+        0
+    );
+    assert!(decode_catalog_for_test(&[], 0, 33, 33).is_none());
+    assert!(decode_catalog_for_test(&encoded, 2, tail, size).is_none());
+    assert!(decode_catalog_for_test(&encoded, 0, tail, size).is_none());
+    assert!(decode_catalog_for_test(&encoded, 1, tail + 1, size).is_none());
+    assert!(decode_catalog_for_test(&encoded, 1, tail, size - 1).is_none());
+    assert!(decode_catalog_for_test(&encoded[..encoded.len() - 1], 1, tail, size).is_none());
+    let mut extra = encoded.clone();
+    extra.push(0);
+    assert!(decode_catalog_for_test(&extra, 1, tail, size).is_none());
+    for (index, value) in [
+        (0usize, 0u64),
+        (0, u64::MAX),
+        (2, 16),
+        (3, 0),
+        (3, 64),
+        (5, record.payload_offset as u64 + 1),
+    ] {
+        let mut broken = encoded.clone();
+        broken[index * 8..index * 8 + 8].copy_from_slice(&value.to_le_bytes());
+        assert!(
+            decode_catalog_for_test(&broken, 1, tail, size).is_none(),
+            "codec accepted broken field {index} = {value}"
+        );
+    }
 }
 
 fn raw_checks(rig: &Rig<'_>) {

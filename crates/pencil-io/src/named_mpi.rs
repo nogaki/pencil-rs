@@ -158,94 +158,211 @@ pub(crate) struct Rec {
     pub(crate) width: usize,
     pub(crate) global: Vec<usize>,
     pub(crate) extra: Vec<usize>,
-    payload_offset: usize,
-}
-fn read_segment<C: CommunicatorCollectives>(
-    comm: &C,
-    file: ffi::MPI_File,
-    offset: usize,
-    len: usize,
-) -> Result<Vec<u8>, NamedIoError> {
-    let mut out = allocate(comm, len)?;
-    let result = if comm.rank() == 0 {
-        ffi::file_read_at_all(file, offset as i64, &mut out)
-    } else {
-        ffi::file_read_at_all(file, 0, &mut [])
-    };
-    let ok = if comm.rank() == 0 {
-        matches!(result, Ok(n) if n == len)
-    } else {
-        matches!(result, Ok(0))
-    };
-    agree_phase(comm, ok, "named metadata read").map_err(NamedIoError::Io)?;
-    comm.process_at_rank(0).broadcast_into(&mut out[..]);
-    Ok(out)
+    pub(crate) payload_offset: usize,
 }
 
-/// Scan only fixed headers, names, metadata, and commit markers. Payload bytes
-/// never enter the root's buffer.
-fn scan_file<C: CommunicatorCollectives>(
-    comm: &C,
-    file: ffi::MPI_File,
-) -> Result<(Vec<Rec>, usize, usize), NamedIoError> {
-    scan_file_bounded(comm, file, usize::MAX)
+#[cfg(test)]
+thread_local! {
+    static SCAN_ALLREDUCES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCAN_BROADCASTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-pub(crate) fn scan_file_bounded<C: CommunicatorCollectives>(
-    comm: &C,
-    file: ffi::MPI_File,
+#[cfg(test)]
+fn count_scan_allreduce() {
+    SCAN_ALLREDUCES.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+fn count_scan_broadcast() {
+    SCAN_BROADCASTS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn test_scan_collectives() -> (usize, usize) {
+    (
+        SCAN_ALLREDUCES.with(std::cell::Cell::get),
+        SCAN_BROADCASTS.with(std::cell::Cell::get),
+    )
+}
+
+/// Test-only direct scan of a named container, excluding descriptor, open, and
+/// cleanup collectives from the reported counts.
+#[cfg(test)]
+pub(crate) struct TestScanned {
+    pub(crate) records: Vec<Rec>,
+    pub(crate) tail: usize,
+    pub(crate) size: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct TestScan {
+    pub(crate) scanned: Result<TestScanned, NamedIoError>,
+    pub(crate) allreduces: usize,
+    pub(crate) broadcasts: usize,
+    pub(crate) independent_reads: usize,
+    pub(crate) collective_reads: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn scan_path_for_test(
+    comm: &mpi::topology::CartesianCommunicator,
+    path: &Path,
     max_records: usize,
-) -> Result<(Vec<Rec>, usize, usize), NamedIoError> {
-    let native_size = ffi::file_get_size(file);
-    agree_phase(comm, native_size.is_ok(), "MPI_File_get_size").map_err(NamedIoError::Io)?;
-    let local_size = native_size.map_err(|code| {
-        NamedIoError::Io(IoError::Mpi {
-            operation: "MPI_File_get_size",
-            code,
+) -> Result<TestScan, NamedIoError> {
+    let pc = path_c(path)?;
+    let duplicate = duplicate_comm(comm)?;
+    let file = match open(comm, duplicate.raw, &pc, 1, None) {
+        Ok(file) => file,
+        Err(error) => {
+            crate::mpi_io::finish_comm(comm, duplicate);
+            return Err(error);
+        }
+    };
+    let result: Result<TestScan, NamedIoError> = (|| {
+        agree_phase(
+            comm,
+            ffi::file_set_errors_return(file) == ffi::MPI_SUCCESS as i32,
+            "named file error-handler setup",
+        )?;
+        let (allreduces, broadcasts) = test_scan_collectives();
+        let at_calls = ffi::test_at_calls();
+        let scanned = scan_file_bounded(comm, file, max_records);
+        let (allreduces_after, broadcasts_after) = test_scan_collectives();
+        let at_calls_after = ffi::test_at_calls();
+        Ok(TestScan {
+            scanned: scanned.map(|(records, tail, size)| TestScanned {
+                records,
+                tail,
+                size,
+            }),
+            allreduces: allreduces_after - allreduces,
+            broadcasts: broadcasts_after - broadcasts,
+            independent_reads: at_calls_after[3] - at_calls[3],
+            collective_reads: at_calls_after[2] - at_calls[2],
         })
-    })?;
-    let mut min_size = local_size;
-    let mut max_size = local_size;
-    comm.all_reduce_into(&local_size, &mut min_size, SystemOperation::min());
-    comm.all_reduce_into(&local_size, &mut max_size, SystemOperation::max());
-    if min_size != max_size {
-        return Err(NamedIoError::Io(IoError::CollectiveDescriptorMismatch));
+    })();
+    let cleanup = finish_resources(
+        comm,
+        duplicate,
+        crate::mpi_io::FileGuard { raw: file },
+        None,
+    );
+    let scan = result?;
+    if let Some(error) = cleanup {
+        return Err(error.into());
     }
-    let size = usize::try_from(local_size).map_err(|_| {
-        NamedIoError::Io(IoError::SizeLimit {
-            what: "container size",
-        })
-    })?;
-    // File size itself does not allocate memory. An oversized damaged tail
-    // must not hide an earlier bounded, committed record.
-    if size < CONTAINER_BYTES {
-        return Err(NamedIoError::Io(IoError::InvalidFile {
-            reason: "named container header",
-        }));
-    }
-    let h = read_segment(comm, file, 0, CONTAINER_BYTES)?;
-    if &h[..8] != MAGIC
-        || u64at(&h, 8) != Some(VERSION)
-        || u64at(&h, 16) != Some(CONTAINER_BYTES as u64)
-        || u64at(&h, 24) != Some(0)
+    Ok(scan)
+}
+const CATALOG_CHUNK_BYTES: usize = 1 << 30;
+const REPORT_BYTES: usize = 40;
+
+const STATUS_CONTAINER_HEADER: u64 = 1;
+const STATUS_CONTAINER_SIZE: u64 = 2;
+const STATUS_RECORD_LIMIT: u64 = 3;
+const STATUS_METADATA_READ: u64 = 4;
+const STATUS_ALLOCATION: u64 = 5;
+const STATUS_DIMENSIONS_ALLOCATION: u64 = 6;
+const STATUS_INDEX_ALLOCATION: u64 = 7;
+const STATUS_CATALOG_BYTES: u64 = 8;
+const STATUS_CATALOG_ENCODING: u64 = 9;
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanFault {
+    None,
+    BodyAllocation,
+    DimensionsAllocation,
+    IndexAllocation,
+    EncodeAllocation,
+    ReportBroadcast,
+    ReportValidation,
+    ReceiveAllocation,
+    Decode,
+    ChunkBroadcast(usize),
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCAN_FAULT: std::cell::Cell<ScanFault> = const { std::cell::Cell::new(ScanFault::None) };
+    static SCAN_CHUNK_BYTES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(CATALOG_CHUNK_BYTES) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_scan_fault(fault: ScanFault) {
+    SCAN_FAULT.with(|current| current.set(fault));
+}
+
+#[cfg(test)]
+pub(crate) fn set_catalog_chunk_bytes(bytes: usize) {
+    SCAN_CHUNK_BYTES.with(|current| current.set(bytes));
+}
+
+#[cfg(test)]
+fn scan_fault(fault: ScanFault) -> bool {
+    SCAN_FAULT.with(|current| current.get() == fault)
+}
+
+fn catalog_chunk_bytes() -> usize {
+    #[cfg(test)]
     {
-        return Err(NamedIoError::Io(IoError::InvalidFile {
-            reason: "named container header",
-        }));
+        SCAN_CHUNK_BYTES.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        CATALOG_CHUNK_BYTES
+    }
+}
+
+fn scan_agree<C: CommunicatorCollectives>(
+    comm: &C,
+    local_ok: bool,
+    phase: &'static str,
+) -> Result<(), NamedIoError> {
+    #[cfg(test)]
+    count_scan_allreduce();
+    agree_phase(comm, local_ok, phase).map_err(NamedIoError::Io)
+}
+
+fn root_read(file: ffi::MPI_File, offset: usize, bytes: &mut [u8]) -> Result<(), u64> {
+    let offset = i64::try_from(offset).map_err(|_| STATUS_METADATA_READ)?;
+    match ffi::file_read_at(file, offset, bytes, false) {
+        Ok(read) if read == bytes.len() => Ok(()),
+        _ => Err(STATUS_METADATA_READ),
+    }
+}
+
+/// Rank zero scans metadata with independent reads. Payload bytes never enter
+/// its buffers.
+fn scan_root(
+    file: ffi::MPI_File,
+    size: usize,
+    max_records: usize,
+) -> Result<(Vec<Rec>, usize), u64> {
+    if size < CONTAINER_BYTES {
+        return Err(STATUS_CONTAINER_HEADER);
+    }
+    let mut header = [0u8; CONTAINER_BYTES];
+    root_read(file, 0, &mut header)?;
+    if &header[..8] != MAGIC
+        || u64at(&header, 8) != Some(VERSION)
+        || u64at(&header, 16) != Some(CONTAINER_BYTES as u64)
+        || u64at(&header, 24) != Some(0)
+    {
+        return Err(STATUS_CONTAINER_HEADER);
     }
     let mut p = CONTAINER_BYTES;
-    let mut out = Vec::new();
+    let mut out: Vec<Rec> = Vec::new();
+    let mut names: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     while p < size {
         if out.len() == max_records {
-            return Err(IoError::SizeLimit {
-                what: "catalog dataset count",
-            }
-            .into());
+            return Err(STATUS_RECORD_LIMIT);
         }
         if size - p < RECORD_HEADER_BYTES {
             break;
         }
-        let rh = read_segment(comm, file, p, RECORD_HEADER_BYTES)?;
+        let mut rh = [0u8; RECORD_HEADER_BYTES];
+        root_read(file, p, &mut rh)?;
         if &rh[..8] != RECORD_MAGIC || u64at(&rh, 8) != Some(VERSION) || u64at(&rh, 64) != Some(0) {
             break;
         }
@@ -281,12 +398,17 @@ pub(crate) fn scan_file_bounded<C: CommunicatorCollectives>(
             Some(x) => x,
             None => break,
         };
-        let body = read_segment(comm, file, p + RECORD_HEADER_BYTES, body_len)?;
+        let mut body = Vec::new();
+        let body_allocated = body.try_reserve_exact(body_len).is_ok();
+        #[cfg(test)]
+        let body_allocated = body_allocated && !scan_fault(ScanFault::BodyAllocation);
+        if !body_allocated {
+            return Err(STATUS_ALLOCATION);
+        }
+        body.resize(body_len, 0);
+        root_read(file, p + RECORD_HEADER_BYTES, &mut body)?;
         let name = &body[..nl];
-        if std::str::from_utf8(name).is_err()
-            || name.contains(&0)
-            || out.iter().any(|r: &Rec| r.name == name)
-        {
+        if std::str::from_utf8(name).is_err() || name.contains(&0) || names.contains(name) {
             break;
         }
         let meta = &body[nl..];
@@ -310,11 +432,12 @@ pub(crate) fn scan_file_bounded<C: CommunicatorCollectives>(
             break;
         }
         let mut dims = Vec::new();
-        agree_phase(
-            comm,
-            dims.try_reserve_exact(rank).is_ok(),
-            "named dimensions allocation",
-        )?;
+        let dims_allocated = dims.try_reserve_exact(rank).is_ok();
+        #[cfg(test)]
+        let dims_allocated = dims_allocated && !scan_fault(ScanFault::DimensionsAllocation);
+        if !dims_allocated {
+            return Err(STATUS_DIMENSIONS_ALLOCATION);
+        }
         let mut elements = 1usize;
         for i in 0..rank {
             let d = match u64at(meta, 16 + i * 8).and_then(|x| usize::try_from(x).ok()) {
@@ -349,19 +472,29 @@ pub(crate) fn scan_file_bounded<C: CommunicatorCollectives>(
         {
             break;
         }
-        let marker = read_segment(comm, file, end - 8, 8)?;
-        if u64::from_le_bytes(marker.try_into().unwrap()) != COMMIT_MARKER {
+        let mut marker = [0u8; 8];
+        root_read(file, end - 8, &mut marker)?;
+        if u64::from_le_bytes(marker) != COMMIT_MARKER {
             break;
         }
         let mut extra = Vec::new();
         let mut key = Vec::new();
+        let mut set_key = Vec::new();
         let allocated = extra.try_reserve_exact(er).is_ok()
             && key.try_reserve_exact(nl).is_ok()
-            && out.try_reserve(1).is_ok();
-        agree_phase(comm, allocated, "named record index allocation")?;
+            && set_key.try_reserve_exact(nl).is_ok()
+            && out.try_reserve(1).is_ok()
+            && names.try_reserve(1).is_ok();
+        #[cfg(test)]
+        let allocated = allocated && !scan_fault(ScanFault::IndexAllocation);
+        if !allocated {
+            return Err(STATUS_INDEX_ALLOCATION);
+        }
         extra.extend_from_slice(&dims[nr..]);
+        set_key.extend_from_slice(name);
         dims.truncate(nr);
         key.extend_from_slice(name);
+        names.insert(set_key);
         out.push(Rec {
             name: key,
             typ,
@@ -372,7 +505,387 @@ pub(crate) fn scan_file_bounded<C: CommunicatorCollectives>(
         });
         p = end;
     }
-    Ok((out, p, size))
+    Ok((out, p))
+}
+
+fn encode_catalog(records: &[Rec]) -> Result<Vec<u8>, u64> {
+    let mut catalog_len = 0u64;
+    for record in records {
+        let rank = record
+            .global
+            .len()
+            .checked_add(record.extra.len())
+            .ok_or(STATUS_CATALOG_BYTES)?;
+        let fields = 48u64
+            .checked_add(record.name.len() as u64)
+            .and_then(|x| x.checked_add((rank as u64).checked_mul(8)?))
+            .ok_or(STATUS_CATALOG_BYTES)?;
+        catalog_len = catalog_len
+            .checked_add(fields)
+            .ok_or(STATUS_CATALOG_BYTES)?;
+    }
+    let catalog_len = usize::try_from(catalog_len).map_err(|_| STATUS_CATALOG_BYTES)?;
+    let mut out = Vec::new();
+    let prepared = out.try_reserve_exact(catalog_len).is_ok();
+    #[cfg(test)]
+    let prepared = prepared && !scan_fault(ScanFault::EncodeAllocation);
+    if !prepared {
+        return Err(STATUS_CATALOG_ENCODING);
+    }
+    for record in records {
+        put(&mut out, record.name.len() as u64);
+        put(&mut out, record.typ);
+        put(&mut out, record.width as u64);
+        put(&mut out, record.global.len() as u64);
+        put(&mut out, record.extra.len() as u64);
+        put(&mut out, record.payload_offset as u64);
+        out.extend_from_slice(&record.name);
+        for &dim in record.global.iter().chain(record.extra.iter()) {
+            put(&mut out, dim as u64);
+        }
+    }
+    debug_assert_eq!(out.len(), catalog_len);
+    Ok(out)
+}
+
+fn catalog_word(bytes: &[u8], at: &mut usize) -> Option<u64> {
+    let word = u64at(bytes, *at)?;
+    *at = at.checked_add(8)?;
+    Some(word)
+}
+
+fn catalog_slice<'a>(bytes: &'a [u8], at: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let end = at.checked_add(len)?;
+    let slice = bytes.get(*at..end)?;
+    *at = end;
+    Some(slice)
+}
+
+fn decode_catalog(bytes: &[u8], count: usize, tail: usize, size: usize) -> Option<Vec<Rec>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(count).ok()?;
+    let mut at = 0usize;
+    let mut start = CONTAINER_BYTES;
+    for _ in 0..count {
+        let name_len = usize::try_from(catalog_word(bytes, &mut at)?).ok()?;
+        if name_len == 0 || name_len > MAX_NAME {
+            return None;
+        }
+        let typ = catalog_word(bytes, &mut at)?;
+        let width = usize::try_from(catalog_word(bytes, &mut at)?).ok()?;
+        let spatial = usize::try_from(catalog_word(bytes, &mut at)?).ok()?;
+        let extra_rank = usize::try_from(catalog_word(bytes, &mut at)?).ok()?;
+        let payload_offset = usize::try_from(catalog_word(bytes, &mut at)?).ok()?;
+        if spatial == 0 || spatial > MAX_PROTOCOL_RANK || extra_rank > MAX_PROTOCOL_RANK {
+            return None;
+        }
+        let rank = spatial.checked_add(extra_rank)?;
+        if rank > MAX_PROTOCOL_RANK {
+            return None;
+        }
+        let name = catalog_slice(bytes, &mut at, name_len)?;
+        if std::str::from_utf8(name).is_err() || name.contains(&0) {
+            return None;
+        }
+        let metadata_len = 16usize.checked_add(rank.checked_mul(8)?)?;
+        let header_len = RECORD_HEADER_BYTES
+            .checked_add(name_len)?
+            .checked_add(metadata_len)?;
+        if payload_offset.checked_sub(header_len)? != start {
+            return None;
+        }
+        let mut global = Vec::new();
+        global.try_reserve_exact(spatial).ok()?;
+        let mut extra = Vec::new();
+        extra.try_reserve_exact(extra_rank).ok()?;
+        let mut elements = 1usize;
+        for i in 0..rank {
+            let dim = usize::try_from(catalog_word(bytes, &mut at)?).ok()?;
+            elements = elements.checked_mul(dim)?;
+            if i < spatial {
+                global.push(dim);
+            } else {
+                extra.push(dim);
+            }
+        }
+        let payload = elements.checked_mul(width)?;
+        let end = payload_offset.checked_add(payload)?.checked_add(8)?;
+        if end > size || i64::try_from(end).is_err() {
+            return None;
+        }
+        ScalarType::decode(typ, width as u64)?;
+        let mut owned = Vec::new();
+        owned.try_reserve_exact(name_len).ok()?;
+        owned.extend_from_slice(name);
+        out.push(Rec {
+            name: owned,
+            typ,
+            width,
+            global,
+            extra,
+            payload_offset,
+        });
+        start = end;
+    }
+    if at != bytes.len() || start != tail {
+        return None;
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+pub(crate) fn encode_catalog_for_test(records: &[Rec]) -> Result<Vec<u8>, u64> {
+    encode_catalog(records)
+}
+
+#[cfg(test)]
+pub(crate) fn decode_catalog_for_test(
+    bytes: &[u8],
+    count: usize,
+    tail: usize,
+    size: usize,
+) -> Option<Vec<Rec>> {
+    decode_catalog(bytes, count, tail, size)
+}
+
+fn encode_report(
+    status: u64,
+    catalog_len: u64,
+    count: u64,
+    tail: u64,
+    size: u64,
+) -> [u8; REPORT_BYTES] {
+    let mut report = [0u8; REPORT_BYTES];
+    for (index, value) in [status, catalog_len, count, tail, size]
+        .into_iter()
+        .enumerate()
+    {
+        report[index * 8..index * 8 + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    report
+}
+
+fn report_fields(report: &[u8; REPORT_BYTES]) -> [u64; 5] {
+    std::array::from_fn(|index| {
+        u64::from_le_bytes(report[index * 8..index * 8 + 8].try_into().unwrap())
+    })
+}
+
+fn failure_status(status: u64) -> Option<NamedIoError> {
+    Some(match status {
+        STATUS_CONTAINER_HEADER => NamedIoError::Io(IoError::InvalidFile {
+            reason: "named container header",
+        }),
+        STATUS_CONTAINER_SIZE => NamedIoError::Io(IoError::SizeLimit {
+            what: "container size",
+        }),
+        STATUS_RECORD_LIMIT => NamedIoError::Io(IoError::SizeLimit {
+            what: "catalog dataset count",
+        }),
+        STATUS_METADATA_READ => NamedIoError::Io(IoError::CollectivePrecondition {
+            phase: "named metadata read",
+        }),
+        STATUS_ALLOCATION => NamedIoError::Io(IoError::CollectivePrecondition {
+            phase: "named allocation",
+        }),
+        STATUS_DIMENSIONS_ALLOCATION => NamedIoError::Io(IoError::CollectivePrecondition {
+            phase: "named dimensions allocation",
+        }),
+        STATUS_INDEX_ALLOCATION => NamedIoError::Io(IoError::CollectivePrecondition {
+            phase: "named record index allocation",
+        }),
+        STATUS_CATALOG_BYTES => NamedIoError::Io(IoError::SizeLimit {
+            what: "named catalog bytes",
+        }),
+        STATUS_CATALOG_ENCODING => NamedIoError::Io(IoError::CollectivePrecondition {
+            phase: "named catalog encoding",
+        }),
+        _ => return None,
+    })
+}
+
+/// Scan only fixed headers, names, metadata, and commit markers. Rank zero
+/// reads them independently; the parsed catalog is broadcast once for catalogs
+/// up to 1 GiB and once per additional 1 GiB chunk.
+fn scan_file<C: CommunicatorCollectives>(
+    comm: &C,
+    file: ffi::MPI_File,
+) -> Result<(Vec<Rec>, usize, usize), NamedIoError> {
+    scan_file_bounded(comm, file, usize::MAX)
+}
+
+/// Scan metadata with collectives independent of the record count. Rank zero
+/// scans metadata with independent reads; payload bytes are skipped. The
+/// encoded catalog is broadcast in chunks of at most 1 GiB, with an agreement
+/// after every chunk. An empty catalog uses one zero-count broadcast. The scan
+/// performs nine collectives for catalogs up to 1 GiB, then two more for each
+/// additional chunk. This excludes caller-side collectives such as opening,
+/// closing, resetting views, and transferring payloads.
+pub(crate) fn scan_file_bounded<C: CommunicatorCollectives>(
+    comm: &C,
+    file: ffi::MPI_File,
+    max_records: usize,
+) -> Result<(Vec<Rec>, usize, usize), NamedIoError> {
+    let native_size = ffi::file_get_size(file);
+    scan_agree(comm, native_size.is_ok(), "MPI_File_get_size")?;
+    let local_size = native_size.map_err(|code| {
+        NamedIoError::Io(IoError::Mpi {
+            operation: "MPI_File_get_size",
+            code,
+        })
+    })?;
+    let mut min_size = local_size;
+    let mut max_size = local_size;
+    comm.all_reduce_into(&local_size, &mut min_size, SystemOperation::min());
+    comm.all_reduce_into(&local_size, &mut max_size, SystemOperation::max());
+    #[cfg(test)]
+    {
+        count_scan_allreduce();
+        count_scan_allreduce();
+    }
+    if min_size != max_size {
+        return Err(NamedIoError::Io(IoError::CollectiveDescriptorMismatch));
+    }
+    let size = usize::try_from(local_size).ok();
+
+    let mut report = encode_report(0, 0, 0, 0, 0);
+    let mut root_catalog: Option<Vec<u8>> = None;
+    let mut root_records: Option<Vec<Rec>> = None;
+    if comm.rank() == 0 {
+        let outcome = match size {
+            Some(size) => scan_root(file, size, max_records).and_then(|(records, tail)| {
+                encode_catalog(&records).map(|catalog| (records, tail, catalog))
+            }),
+            None => Err(STATUS_CONTAINER_SIZE),
+        };
+        match outcome {
+            Ok((records, tail, catalog)) => {
+                report = encode_report(
+                    0,
+                    catalog.len() as u64,
+                    records.len() as u64,
+                    tail as u64,
+                    size.unwrap() as u64,
+                );
+                root_catalog = Some(catalog);
+                root_records = Some(records);
+            }
+            Err(status) => report = encode_report(status, 0, 0, 0, 0),
+        }
+    }
+    let report_code = ffi::bcast_bytes(comm.as_raw(), 0, &mut report);
+    #[cfg(test)]
+    let report_code = if scan_fault(ScanFault::ReportBroadcast) {
+        mpi::ffi::MPI_ERR_OTHER as i32
+    } else {
+        report_code
+    };
+    #[cfg(test)]
+    count_scan_broadcast();
+    scan_agree(
+        comm,
+        report_code == ffi::MPI_SUCCESS as i32,
+        "named catalog report broadcast",
+    )?;
+
+    let fields = report_fields(&report);
+    let status = fields[0];
+    if status != 0 {
+        if let Some(error) = failure_status(status) {
+            return Err(error);
+        }
+        scan_agree(comm, false, "named catalog preparation")?;
+        unreachable!("failed preparation agreement returned success");
+    }
+
+    let catalog_len = usize::try_from(fields[1]).ok();
+    let count = usize::try_from(fields[2]).ok();
+    let tail = usize::try_from(fields[3]).ok();
+    let file_size = usize::try_from(fields[4]).ok();
+    let report_valid = matches!(
+        (size, catalog_len, count, tail, file_size),
+        (Some(size), Some(catalog_len), Some(count), Some(tail), Some(file_size))
+            if file_size == size
+                && (CONTAINER_BYTES..=size).contains(&tail)
+                && count <= max_records
+                && if count == 0 {
+                    catalog_len == 0 && tail == CONTAINER_BYTES
+                } else {
+                    count
+                        .checked_mul(48)
+                        .is_some_and(|minimum| catalog_len >= minimum)
+                }
+    );
+    #[cfg(test)]
+    let report_valid = report_valid && !scan_fault(ScanFault::ReportValidation);
+    let catalog_len = catalog_len.unwrap_or(0);
+    let mut receive = Vec::new();
+    let receive_prepared = if comm.rank() == 0 {
+        true
+    } else {
+        receive.try_reserve_exact(catalog_len).is_ok()
+    };
+    #[cfg(test)]
+    let receive_prepared =
+        receive_prepared && (comm.rank() == 0 || !scan_fault(ScanFault::ReceiveAllocation));
+    scan_agree(
+        comm,
+        report_valid && receive_prepared,
+        "named catalog preparation",
+    )?;
+    if comm.rank() != 0 {
+        receive.resize(catalog_len, 0);
+    }
+
+    let count = count.expect("validated catalog count");
+    let tail = tail.expect("validated catalog tail");
+    let chunk = catalog_chunk_bytes();
+    let chunks = if catalog_len == 0 {
+        1
+    } else {
+        (catalog_len - 1) / chunk + 1
+    };
+    for index in 1..=chunks {
+        let start = (index - 1) * chunk;
+        let end = start.saturating_add(chunk).min(catalog_len);
+        let code = if comm.rank() == 0 {
+            let catalog = root_catalog.as_mut().expect("root catalog");
+            ffi::bcast_bytes(comm.as_raw(), 0, &mut catalog[start..end])
+        } else {
+            ffi::bcast_bytes(comm.as_raw(), 0, &mut receive[start..end])
+        };
+        #[cfg(test)]
+        let code = if scan_fault(ScanFault::ChunkBroadcast(index)) {
+            mpi::ffi::MPI_ERR_OTHER as i32
+        } else {
+            code
+        };
+        #[cfg(test)]
+        count_scan_broadcast();
+        scan_agree(
+            comm,
+            code == ffi::MPI_SUCCESS as i32,
+            "named catalog broadcast",
+        )?;
+    }
+    drop(root_catalog);
+
+    let decoded = if comm.rank() == 0 {
+        None
+    } else {
+        Some(decode_catalog(&receive, count, tail, size.unwrap_or(0)))
+    };
+    let decode_ok = decoded.as_ref().is_none_or(|catalog| catalog.is_some());
+    #[cfg(test)]
+    let decode_ok = decode_ok && (comm.rank() == 0 || !scan_fault(ScanFault::Decode));
+    scan_agree(comm, decode_ok, "named catalog decode")?;
+    drop(receive);
+    let records = match decoded {
+        Some(Some(records)) => records,
+        Some(None) => unreachable!("failed decode agreement returned success"),
+        None => root_records.expect("root scan records"),
+    };
+    Ok((records, tail, size.unwrap_or(0)))
 }
 
 fn record<T: IoElement, const N: usize, const M: usize>(

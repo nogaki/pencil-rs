@@ -4,7 +4,10 @@ use mpi::collective::CommunicatorCollectives;
 use mpi::traits::Communicator;
 use num_complex::{Complex32, Complex64};
 use pencil_array::{ExtraShape, MpiTopology, Pencil, PencilArray};
-use pencil_io::{ScalarType, append_mpi_named, write_mpi, write_mpi_collection, write_mpi_named};
+use pencil_io::{
+    MpiFileSession, MpiIoOptions, ScalarType, append_mpi_named, write_mpi, write_mpi_collection,
+    write_mpi_named,
+};
 use pencil_io::{read_mpi_catalog, read_mpi_named, read_mpi_named_catalog};
 
 mod support;
@@ -116,6 +119,70 @@ fn named_fixture(code: u64, width: usize) -> Vec<u8> {
     out.extend_from_slice(&meta);
     out.extend(vec![0; payload]);
     out.extend_from_slice(&0x434f_4d4d_4954_5445u64.to_le_bytes());
+    out
+}
+
+const NAMED_KEY_BYTES: usize = 1_018;
+const COMMIT_WORD: u64 = 0x434f_4d4d_4954_5445;
+
+// Raw named-v2 fixture: 1-D global extent 1 (8-byte payload), keys are a
+// 1,018-byte common prefix plus six digits. Independent of the production
+// writers, as in `named_fixture`.
+fn raw_named_record(index: usize) -> Vec<u8> {
+    let mut name = vec![b'p'; NAMED_KEY_BYTES];
+    name.extend_from_slice(format!("{index:06}").as_bytes());
+    assert_eq!(name.len(), 1_024);
+    let metadata_len = 16 + 8;
+    let payload = 8usize;
+    let total = 72 + name.len() + metadata_len + payload + 8;
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"PIOREC02");
+    for value in [
+        2u64,
+        name.len() as u64,
+        metadata_len as u64,
+        payload as u64,
+        total as u64,
+        ScalarType::F64.code(),
+        8,
+        0,
+    ] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(&name);
+    out.extend_from_slice(&1u64.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
+    out.extend_from_slice(&1u64.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
+    out.extend_from_slice(&COMMIT_WORD.to_le_bytes());
+    out
+}
+
+fn raw_named_key(index: usize) -> String {
+    let mut key = String::from_utf8(vec![b'p'; NAMED_KEY_BYTES]).unwrap();
+    key.push_str(&format!("{index:06}"));
+    key
+}
+
+fn raw_named_records(count: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"PIONAM02");
+    for value in [2u64, 32, 0] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.reserve(count * 1_136);
+    for index in 0..count {
+        out.extend_from_slice(&raw_named_record(index));
+    }
+    out
+}
+
+fn raw_empty_named_container() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"PIONAM02");
+    for value in [2u64, 32, 0] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
     out
 }
 
@@ -401,6 +468,52 @@ fn catalog_integration() {
         read_mpi_catalog(&sparse, comm).unwrap()[0].global_shape(),
         &[4, 5]
     );
+
+    // An empty named container is rejected by the strict path catalog but is a
+    // valid empty session catalog.
+    let empty_named = dir.join("named-empty.pio");
+    barrier_file(comm, &empty_named, &raw_empty_named_container());
+    assert!(read_mpi_named_catalog(&empty_named, comm).is_err());
+    {
+        let options = MpiIoOptions::default();
+        let mut session = MpiFileSession::open_read(comm, &empty_named, &options).unwrap();
+        assert!(session.catalog().unwrap().is_empty());
+        session.close().unwrap();
+    }
+
+    // The 65,536-record catalog limit and the unbounded path read bound. Build
+    // the raw fixture once on root; every other rank passes an empty slice.
+    let include_max = |count: usize| -> Vec<u8> {
+        if world.rank() == 0 {
+            raw_named_records(count)
+        } else {
+            Vec::new()
+        }
+    };
+    let max_records = dir.join("named-max-records.pio");
+    barrier_file(comm, &max_records, &include_max(65_536));
+    let catalog = read_mpi_named_catalog(&max_records, comm).unwrap();
+    assert_eq!(catalog.len(), 65_536);
+    assert_eq!(catalog[0].name(), Some(raw_named_key(0).as_str()));
+    assert_eq!(catalog[65_535].name(), Some(raw_named_key(65_535).as_str()));
+    assert_eq!(catalog[0].global_shape(), &[1]);
+    assert_eq!(catalog[0].scalar_type(), ScalarType::F64);
+    assert!(catalog.iter().enumerate().all(|(index, info)| {
+        info.name()
+            .is_some_and(|name| name.ends_with(&format!("{index:06}")))
+    }));
+
+    let over_records = dir.join("named-over-records.pio");
+    barrier_file(comm, &over_records, &include_max(65_537));
+    assert!(read_mpi_named_catalog(&over_records, comm).is_err());
+    let read_pencil = Pencil::<1, 1>::new(
+        MpiTopology::new(&world, [world.size() as usize]).unwrap(),
+        [1],
+        [0],
+    )
+    .unwrap();
+    let mut destination = PencilArray::from_elem(read_pencil, ExtraShape::scalar(), -1.0).unwrap();
+    assert!(read_mpi_named(&over_records, raw_named_key(65_536), destination.view_mut()).is_ok());
 
     #[cfg(feature = "parallel-hdf5")]
     hdf_cases(&world, comm, &dir, &a);

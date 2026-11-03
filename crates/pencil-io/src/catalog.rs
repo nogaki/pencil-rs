@@ -444,6 +444,13 @@ pub fn read_hdf5_catalog<P: AsRef<Path>>(
 /// [`DatasetInfo::provenance`] is empty. Writers from different jobs or
 /// communicators must serialize access externally; this reader does not roll
 /// back, overwrite, or resize a file.
+///
+/// The scan itself uses collectives that do not grow with the record count:
+/// rank zero reads metadata independently, and the encoded catalog is
+/// broadcast in chunks of at most 1 GiB with an agreement after every chunk.
+/// A scan of a catalog up to 1 GiB uses nine collectives, then two more for
+/// each additional chunk; this excludes this reader's descriptor, path, open,
+/// and close agreements.
 pub fn read_mpi_named_catalog<P: AsRef<Path>>(
     p: P,
     c: &CartesianCommunicator,
