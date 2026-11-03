@@ -21,8 +21,8 @@ use pencil_array::{AxisPermutation, ExtraShape, MpiTopology, Pencil, PencilArray
 #[cfg(feature = "parallel-hdf5")]
 use pencil_io::{Hdf5FileSession, Hdf5ReadOptions, Hdf5WriteOptions, read_hdf5, write_hdf5};
 use pencil_io::{
-    MpiFileSession, MpiIoOptions, RawByteOrder, RawReadOptions, read_mpi, read_mpi_named,
-    read_mpi_raw, write_mpi, write_mpi_named,
+    MpiFileSession, MpiIoOptions, RawByteOrder, RawReadOptions, read_mpi, read_mpi_chunked,
+    read_mpi_named, read_mpi_raw, write_mpi, write_mpi_chunked, write_mpi_named,
 };
 
 mod support;
@@ -295,14 +295,31 @@ fn physical_offset(e: usize, x: usize, y: usize) -> usize {
     (e * SPATIAL[1] + y) * SPATIAL[0] + x
 }
 
+/// Reader storage offset for the identity `[0, 1]` permutation.
+fn identity_offset(e: usize, x: usize, y: usize) -> usize {
+    (e * SPATIAL[0] + x) * SPATIAL[1] + y
+}
+
 fn verify_values(label: &str, array: &PencilArray<Complex<f64>, 2, 2>) {
+    verify_at(label, array, physical_offset);
+}
+
+fn verify_identity_values(label: &str, array: &PencilArray<Complex<f64>, 2, 2>) {
+    verify_at(label, array, identity_offset);
+}
+
+fn verify_at(
+    label: &str,
+    array: &PencilArray<Complex<f64>, 2, 2>,
+    offset: fn(usize, usize, usize) -> usize,
+) {
     let storage = array.as_slice();
     assert_eq!(storage.len(), ELEMENTS, "{label}: local element count");
     for e in 0..EXTRA {
         for x in 0..SPATIAL[0] {
             for y in 0..SPATIAL[1] {
                 let expected = value_at(e, x, y);
-                let actual = storage[physical_offset(e, x, y)];
+                let actual = storage[offset(e, x, y)];
                 assert_eq!(
                     actual.re.to_bits(),
                     expected.re.to_bits(),
@@ -449,6 +466,17 @@ fn staging_peak_is_one_payload() {
         }
     }
 
+    // The chunked format stores each rank's physical slice order and the reader
+    // must use the identical layout, so this destination keeps `[0, 1]` while
+    // the permuted one below is what the other decoders have to undo.
+    let mut chunked_destination = PencilArray::from_elem(
+        Pencil::<2, 2>::new(topology.clone(), SPATIAL, [0, 1]).expect("chunked reader pencil"),
+        extra.clone(),
+        Complex::new(-1.0, -1.0),
+    )
+    .expect("chunked destination");
+    assert_eq!(chunked_destination.as_slice().len(), ELEMENTS);
+
     // Destination: the spatial axes are swapped in memory, so `[1, 0]` is what
     // the decoder has to undo.
     let reader_pencil = Pencil::<2, 2>::new_permuted(
@@ -474,6 +502,9 @@ fn staging_peak_is_one_payload() {
     write_mpi_named(&named_path, "large", source.view()).expect("named MPI fixture");
 
     let options = MpiIoOptions::default();
+    let chunked_path = directory.join("staging-chunked.pio");
+    write_mpi_chunked(&chunked_path, source.view(), &options).expect("chunked MPI fixture");
+
     let session_path = directory.join("staging-session.pio");
     let mut mpi_session =
         MpiFileSession::create(comm, &session_path, &options).expect("MPI session");
@@ -535,6 +566,14 @@ fn staging_peak_is_one_payload() {
     samples.push(sample);
     verify_values("MpiFileSession::read_named", &destination);
 
+    reset_destination(&mut chunked_destination);
+    let (result, sample) = measure("mpi_chunked", || {
+        read_mpi_chunked(&chunked_path, chunked_destination.view_mut(), &options)
+    });
+    assert!(result.is_ok(), "read_mpi_chunked failed: {result:?}");
+    samples.push(sample);
+    verify_identity_values("read_mpi_chunked", &chunked_destination);
+
     #[cfg(feature = "parallel-hdf5")]
     {
         reset_destination(&mut destination);
@@ -575,7 +614,13 @@ fn staging_peak_is_one_payload() {
 
     let mut measured: Vec<&str> = samples.iter().map(|sample| sample.path).collect();
     measured.sort_unstable();
-    let mut expected = vec!["mpi_io", "mpi_named", "mpi_raw", "mpi_session"];
+    let mut expected = vec![
+        "mpi_chunked",
+        "mpi_io",
+        "mpi_named",
+        "mpi_raw",
+        "mpi_session",
+    ];
     #[cfg(feature = "parallel-hdf5")]
     expected.extend(["hdf5", "hdf5_session"]);
     expected.sort_unstable();

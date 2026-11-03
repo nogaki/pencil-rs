@@ -477,7 +477,7 @@ fn read_inner<T: IoElement, const N: usize, const M: usize>(
         view.len(),
     )?;
     let rank = c.rank() as usize;
-    let values = with_file(c, path, options, false, inject, |f| {
+    let packed = with_file(c, path, options, false, inject, |f| {
         let found = scan(c, f)?;
         agree_phase(c, found.bytes == h.bytes, "chunked writer layout")?;
         let mut b = prepared(c, buffer(n))?;
@@ -486,16 +486,18 @@ fn read_inner<T: IoElement, const N: usize, const M: usize>(
             matches!(ffi::file_read_at(f,h.offsets[rank] as i64,&mut b,options.mode==MpiIoMode::Collective),Ok(n) if n==b.len()),
             "chunked payload read",
         )?;
-        let mut values = Vec::new();
-        prepared(
-            c,
-            values.try_reserve_exact(view.len()).map_err(|_| invalid()),
-        )?;
-        let width = T::WIDTH;
-        values.extend(b.chunks_exact(width).map(T::decode_le));
-        Ok(values)
+        Ok(b)
     })?;
-    view.as_mut_slice().copy_from_slice(&values);
+    // The writer stored each rank's physical slice order, so the packed bytes are
+    // decoded in place: no typed staging buffer and no final copy.
+    let width = T::WIDTH;
+    for (slot, encoded) in view
+        .as_mut_slice()
+        .iter_mut()
+        .zip(packed.chunks_exact(width))
+    {
+        *slot = T::decode_le(encoded);
+    }
     Ok(())
 }
 /// Metadata only: no payload is read. API identity denotes the chunked format.
