@@ -398,12 +398,15 @@ fn named_mpi_matrix() {
     assert_i32(&ar, 2);
     let before = raw.clone();
     let duplicate = append_mpi_named(&path, "A", a.view());
+    // Every rank must call root_bytes unconditionally: its broadcasts and the
+    // check() reduction must reach all ranks in the same order even when the
+    // rank-local outcome differs.
+    let after = root_bytes(&world, &path);
     check(
         &world,
         &mut failures,
         "duplicate rejected",
-        matches!(duplicate, Err(NamedIoError::DuplicateName))
-            && root_bytes(&world, &path) == before,
+        matches!(duplicate, Err(NamedIoError::DuplicateName)) && after == before,
     );
 
     let missing = dir.join("missing.pio");
@@ -424,11 +427,12 @@ fn named_mpi_matrix() {
     } else {
         append_mpi_named(&path, "X", a.view())
     };
+    let after_op = root_bytes(&world, &path);
     check(
         &world,
         &mut failures,
         "old/new operation rank mismatch",
-        op.is_err() && root_bytes(&world, &path) == mismatch_before,
+        op.is_err() && after_op == mismatch_before,
     );
     world.barrier();
     let name = if world.rank() == 0 {
@@ -441,11 +445,12 @@ fn named_mpi_matrix() {
     } else {
         Some(append_mpi_named(&path, name, a.view()))
     };
+    let after_mismatch = root_bytes(&world, &path);
     check(
         &world,
         &mut failures,
         "name mismatch recovery",
-        size == 1 || (mismatch.unwrap().is_err() && root_bytes(&world, &path) == mismatch_before),
+        size == 1 || (mismatch.unwrap().is_err() && after_mismatch == mismatch_before),
     );
     world.barrier();
     let type_array =
@@ -527,11 +532,12 @@ fn named_mpi_matrix() {
     world.barrier();
     let malformed = root_bytes(&world, &path);
     let tail = append_mpi_named(&path, "tail", a.view());
+    let after_tail = root_bytes(&world, &path);
     check(
         &world,
         &mut failures,
         "malformed tail append rejected unchanged",
-        tail.is_err() && root_bytes(&world, &path) == malformed,
+        tail.is_err() && after_tail == malformed,
     );
     let mut again = PencilArray::from_elem(
         Pencil::<2, 2>::new(MpiTopology::new(&world, [1, size]).unwrap(), [4, 5], [1, 0]).unwrap(),
