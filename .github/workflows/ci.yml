@@ -422,6 +422,17 @@ jobs:
               cargo test -p pencil-io --features parallel-hdf5 --test "$suite" --locked -- \
                 --nocapture --test-threads=1
           done
+          # Whole-process Rust live-byte peak for the read paths; one rank only.
+          run_one timeout --kill-after=5s 240s \
+            mpiexec --oversubscribe -n 1 \
+            cargo test -p pencil-io --no-default-features --features mpi \
+              --test staging_memory --locked staging_peak_is_one_payload -- \
+              --exact --nocapture --test-threads=1
+          run_one timeout --kill-after=5s 240s \
+            mpiexec --oversubscribe -n 1 \
+            cargo test -p pencil-io --all-features \
+              --test staging_memory --locked staging_peak_is_one_payload -- \
+              --exact --nocapture --test-threads=1
           run_one timeout --kill-after=5s 240s \
             cargo test -p pencil-io --features parallel-hdf5 --lib --locked \
               named_mpi::session::native_cleanup_failstop_children -- --exact --ignored --nocapture --test-threads=1
@@ -637,7 +648,7 @@ jobs:
           cargo test -p pencil-io --no-default-features --features mpi --locked --no-run --lib \
             --test named_mpi --test mpi_io --test mpi_session --test new_options \
             --test collections --test named_collections --test catalog --test chunked \
-            --test external_views_io
+            --test external_views_io --test staging_memory
 
       - name: Run pencil-io MPI-IO matrix on Open MPI 4.1
         run: |
@@ -697,6 +708,12 @@ jobs:
               done
             fi
           done
+          # Whole-process Rust live-byte peak for the read paths; one rank only.
+          run_one timeout --kill-after=5s 240s \
+            mpiexec --oversubscribe -n 1 \
+            cargo test -p pencil-io --no-default-features --features mpi \
+              --test staging_memory --locked staging_peak_is_one_payload -- \
+              --exact --nocapture --test-threads=1
 
       - name: Run pencil-io fail-stop contracts outside mpiexec
         run: |

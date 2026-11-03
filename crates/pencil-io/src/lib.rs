@@ -434,6 +434,35 @@ mod tests {
         if std::env::var_os("PENCIL_MPI_SESSION_CLEANUP_CHILD").is_some() {
             crate::named_mpi::session::test_native_cleanup_child(&directory, &source);
         }
+
+        {
+            let mut empty = PencilArray::from_elem(
+                std::sync::Arc::clone(source.pencil()),
+                ExtraShape::new([usize::MAX, 2, 0]).unwrap(),
+                0i32,
+            )
+            .unwrap();
+            let view = empty.view_mut();
+            assert!(matches!(
+                crate::format::prepare_physical_decode(&view, &[]),
+                Err(IoError::SizeLimit {
+                    what: "element count"
+                })
+            ));
+        }
+
+        {
+            let mut empty = PencilArray::from_elem(
+                std::sync::Arc::clone(source.pencil()),
+                ExtraShape::new([0, usize::MAX, 2]).unwrap(),
+                0i32,
+            )
+            .unwrap();
+            let mut view = empty.view_mut();
+            let plan = crate::format::prepare_physical_decode(&view, &[]).unwrap();
+            plan.decode_into(&[], view.as_mut_slice());
+            assert!(view.is_empty());
+        }
         crate::chunked::tests::cleanup_and_native_contracts(&world);
         let valid_path = directory.join("valid.pio");
         root_status(&world, || reset(&valid_path));

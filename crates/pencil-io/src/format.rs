@@ -198,15 +198,32 @@ pub(crate) fn pack_view<T: IoElement, const N: usize, const M: usize>(
     Ok(packed)
 }
 
-/// Decodes a local logical-order payload into the view's physical row-major
-/// order.  All allocation and index validation happens before callers close
-/// their native resources; the returned vector can therefore be committed with
-/// one infallible slice copy.
+/// Validated layout metadata and scratch for one physical-order decode.
+///
+/// Retains neither the destination view nor the byte payload.
 #[cfg(feature = "mpi")]
-pub(crate) fn prepare_physical_values<T: IoElement, const N: usize, const M: usize>(
+pub(crate) struct PhysicalDecodePlan<T: IoElement, const N: usize> {
+    logical_dims: Vec<usize>,
+    physical_dims: Vec<usize>,
+    physical_indices: Vec<usize>,
+    logical_spatial: [usize; N],
+    memory_to_logical: [usize; N],
+    extra_rank: usize,
+    elements: usize,
+    bytes: usize,
+    _element: std::marker::PhantomData<T>,
+}
+
+/// Validates a logical-order payload and allocates O(rank) decode scratch.
+///
+/// Leaves the destination unchanged and retains neither argument. Decode with
+/// this payload and the original view's storage only after native cleanup and
+/// the final collective gate have succeeded.
+#[cfg(feature = "mpi")]
+pub(crate) fn prepare_physical_decode<T: IoElement, const N: usize, const M: usize>(
     view: &PencilArrayViewMut<'_, T, N, M>,
     packed: &[u8],
-) -> Result<Vec<T>, IoError> {
+) -> Result<PhysicalDecodePlan<T, N>, IoError> {
     let logical_dims = canonical_dims(view.extra_shape().dimensions(), view.pencil())?;
     let elements = element_count(&logical_dims)?;
     let bytes = elements.checked_mul(T::WIDTH).ok_or(IoError::SizeLimit {
@@ -229,12 +246,6 @@ pub(crate) fn prepare_physical_values<T: IoElement, const N: usize, const M: usi
     physical_dims.extend_from_slice(extra);
     physical_dims.extend_from_slice(&view.local_spatial_memory_shape());
 
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(elements)
-        .map_err(|_| IoError::AllocationFailed {
-            requested: elements.saturating_mul(std::mem::size_of::<T>()),
-        })?;
     let mut physical_indices = Vec::new();
     physical_indices
         .try_reserve_exact(physical_dims.len())
@@ -243,39 +254,105 @@ pub(crate) fn prepare_physical_values<T: IoElement, const N: usize, const M: usi
         })?;
     physical_indices.resize(physical_dims.len(), 0);
 
-    for physical_flat in 0..elements {
-        set_indices(physical_flat, &physical_dims, &mut physical_indices);
-        let mut logical_spatial = [0usize; N];
-        for (memory_axis, &axis) in view.pencil().permutation().axes().iter().enumerate() {
-            logical_spatial[axis.index()] = physical_indices[extra_rank + memory_axis];
-        }
+    let memory_to_logical =
+        std::array::from_fn(|axis| view.pencil().permutation().axes()[axis].index());
 
-        let mut logical_flat = 0usize;
-        for axis in 0..logical_dims.len() {
-            let index = if axis < extra_rank {
-                physical_indices[axis]
-            } else {
-                logical_spatial[axis - extra_rank]
-            };
-            logical_flat = logical_flat
-                .checked_mul(logical_dims[axis])
-                .and_then(|flat| flat.checked_add(index))
-                .ok_or(IoError::InvalidFile {
-                    reason: "decoded index",
-                })?;
+    Ok(PhysicalDecodePlan {
+        logical_dims,
+        physical_dims,
+        physical_indices,
+        logical_spatial: [0usize; N],
+        memory_to_logical,
+        extra_rank,
+        elements,
+        bytes,
+        _element: std::marker::PhantomData,
+    })
+}
+
+#[cfg(feature = "mpi")]
+impl<T: IoElement, const N: usize> PhysicalDecodePlan<T, N> {
+    /// Consumes this plan and decodes directly into physical-order storage.
+    ///
+    /// The caller must supply the original payload and the original view's
+    /// storage. Correct use performs no allocation or collective and returns
+    /// no error.
+    ///
+    /// # Panics
+    ///
+    /// Panics before any destination write if either length differs from the
+    /// length validated during preparation.
+    pub(crate) fn decode_into(mut self, packed: &[u8], destination: &mut [T]) {
+        // shortcut: equal-length substitutions are undetected; revisit if prepare/decode move to separate operations.
+        assert_eq!(packed.len(), self.bytes, "validated staging length changed");
+        assert_eq!(
+            destination.len(),
+            self.elements,
+            "validated destination length changed"
+        );
+
+        // Validated products and lengths bound all indices and byte ranges.
+        for (physical_flat, slot) in destination.iter_mut().enumerate() {
+            set_indices(
+                physical_flat,
+                &self.physical_dims,
+                &mut self.physical_indices,
+            );
+
+            for (memory_axis, &logical_axis) in self.memory_to_logical.iter().enumerate() {
+                self.logical_spatial[logical_axis] =
+                    self.physical_indices[self.extra_rank + memory_axis];
+            }
+
+            let mut logical_flat = 0usize;
+            for (axis, &extent) in self.logical_dims.iter().enumerate() {
+                let index = if axis < self.extra_rank {
+                    self.physical_indices[axis]
+                } else {
+                    self.logical_spatial[axis - self.extra_rank]
+                };
+                logical_flat = logical_flat * extent + index;
+            }
+
+            let start = logical_flat * T::WIDTH;
+            let end = start + T::WIDTH;
+            *slot = T::decode_le(&packed[start..end]);
         }
-        let start = logical_flat
-            .checked_mul(T::WIDTH)
-            .ok_or(IoError::InvalidFile {
-                reason: "decoded byte offset",
-            })?;
-        let end = start.checked_add(T::WIDTH).ok_or(IoError::InvalidFile {
-            reason: "decoded byte range",
-        })?;
-        values.push(T::decode_le(&packed[start..end]));
     }
-    debug_assert_eq!(values.len(), view.len());
-    Ok(values)
+}
+
+#[cfg(all(test, feature = "mpi"))]
+#[test]
+fn physical_decode_length_mismatch_preserves_destination() {
+    // Logical and physical shape [2] with the identity axis map.
+    let plan = || PhysicalDecodePlan::<i32, 1> {
+        logical_dims: vec![2],
+        physical_dims: vec![2],
+        physical_indices: vec![0],
+        logical_spatial: [0],
+        memory_to_logical: [0],
+        extra_rank: 0,
+        elements: 2,
+        bytes: 8,
+        _element: std::marker::PhantomData,
+    };
+
+    for (bytes, destination_len) in [(7usize, 2usize), (9, 2), (8, 1), (8, 3)] {
+        let packed = vec![0u8; bytes];
+        let mut destination = vec![-999i32; destination_len];
+        let before = destination.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            plan().decode_into(&packed, &mut destination);
+        }));
+        assert!(
+            outcome.is_err(),
+            "mismatched {bytes}-byte staging and {destination_len}-element destination must panic"
+        );
+        assert_eq!(
+            destination, before,
+            "mismatched {bytes}-byte staging and {destination_len}-element destination wrote"
+        );
+    }
 }
 
 #[cfg(feature = "mpi")]

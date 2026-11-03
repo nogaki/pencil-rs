@@ -58,9 +58,10 @@ pub enum MpiSessionError {
 /// IoError::SizeLimit { what: "MPI local byte count" }))` before packing or
 /// staging, and the session remains usable for a later operation.
 ///
-/// Reads commit staged values after operation datatype/view cleanup and collective
-/// agreement, **before** the eventual file close. Legacy path reads still close
-/// their file before committing. Read-only opens expose the committed prefix;
+/// Reads decode staged bytes into the destination after operation datatype/view
+/// cleanup and collective agreement, **before** the eventual file close.
+/// Legacy path reads still close their file before committing. Read-only opens
+/// expose the committed prefix;
 /// append opens and catalogs require a complete committed tail.
 ///
 /// Call [`Self::close`] collectively before MPI finalization. Dropping an open
@@ -479,7 +480,7 @@ impl<'c> MpiFileSession<'c> {
         )?;
         let file = self.file();
         let mut datatype = None;
-        let result = (|| -> Result<Vec<T>, MpiSessionError> {
+        let result = (|| -> Result<_, MpiSessionError> {
             let native = if layout.empty {
                 Ok(None)
             } else {
@@ -517,15 +518,15 @@ impl<'c> MpiFileSession<'c> {
             )?;
             Ok(prepared(
                 comm,
-                prepare_physical_values(&view, &packed),
+                prepare_physical_decode(&view, &packed),
                 "session physical staging",
             )?)
         })();
         let cleanup = self.finish_operation(datatype);
-        let physical = result?;
+        let plan = result?;
         cleanup?;
         agree_phase(comm, true, "session read commit")?;
-        view.as_mut_slice().copy_from_slice(&physical);
+        plan.decode_into(&packed, view.as_mut_slice());
         Ok(())
     }
     /// Strict metadata-only inspection on the retained native file handle.

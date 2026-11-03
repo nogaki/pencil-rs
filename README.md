@@ -757,7 +757,7 @@ path are distinct. Do not overlap calls on that communicator. Read-only and
 ordinary preflight errors leave the session usable; uncertain mutations poison
 it until close. Session reads publish after per-operation cleanup agreement;
 a later close failure cannot undo earlier successful operations. Old path reads
-retain their close-before-destination-copy guarantee. External serialization
+retain their close-before-destination-update guarantee. External serialization
 of same-file writers is still the caller's responsibility.
 
 Run the MPI-IO integration test at the required 1/4/6 rank matrix:

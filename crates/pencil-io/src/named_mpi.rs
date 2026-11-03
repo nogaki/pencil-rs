@@ -17,7 +17,7 @@ use mpi::traits::AsRaw;
 use pencil_array::{PencilArrayView, PencilArrayViewMut};
 
 use crate::ffi;
-use crate::format::{IoElement, element_count, pack_view, prepare_physical_values};
+use crate::format::{IoElement, element_count, pack_view, prepare_physical_decode};
 use crate::mpi_io::agree_phase;
 use crate::mpi_io::{
     DatatypeGuard, agree_mpi_preparation, build_layout, duplicate_comm, finish_resources,
@@ -936,7 +936,7 @@ fn read_named<T: IoElement, const N: usize, const M: usize>(
         )?;
         prepared(
             comm,
-            prepare_physical_values(&view, &packed),
+            prepare_physical_decode(&view, &packed),
             "named physical staging",
         )
     })();
@@ -956,11 +956,11 @@ fn read_named<T: IoElement, const N: usize, const M: usize>(
     };
     drop(info);
     let cleanup = crate::mpi_io::aggregate_cleanup_result(comm, cleanup);
-    let physical = result?;
+    let plan = result?;
     if let Some(error) = cleanup {
         return Err(error.into());
     }
-    view.as_mut_slice().copy_from_slice(&physical);
+    plan.decode_into(&packed, view.as_mut_slice());
     Ok(())
 }
 

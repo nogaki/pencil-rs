@@ -10,7 +10,7 @@ use mpi::traits::AsRaw;
 use crate::ffi;
 use pencil_array::{PencilArrayView, PencilArrayViewMut, SpatialAxis};
 
-use crate::format::{IoElement, element_count, pack_view, prepare_physical_values};
+use crate::format::{IoElement, element_count, pack_view, prepare_physical_decode};
 use crate::options::{InfoGuard, MpiIoMode, MpiIoOptions, agree_options};
 use crate::{
     COMMIT_MARKER, FORMAT_VERSION, INCOMPLETE_MARKER, IO_NAMESPACE, IoError, MAX_DESCRIPTOR_BYTES,
@@ -795,16 +795,13 @@ where
         return Err(cleanup.unwrap_or(agreement));
     }
 
-    // Decode, map, and allocate the final physical-order buffer while every
-    // native resource is still owned.  No rank can reach cleanup or commit
-    // alone after this agreement.
-    let values_result = prepare_physical_values(&view, &staging);
-    if let Err(agreement) = agree_phase(comm, values_result.is_ok(), "MPI-IO read physical staging")
-    {
+    // Validate layout and allocate decode scratch before native cleanup.
+    let plan_result = prepare_physical_decode(&view, &staging);
+    if let Err(agreement) = agree_phase(comm, plan_result.is_ok(), "MPI-IO read physical staging") {
         let cleanup = finish_resources(comm, duplicate, file, datatype);
-        return Err(cleanup.unwrap_or(values_result.err().unwrap_or(agreement)));
+        return Err(cleanup.unwrap_or(plan_result.err().unwrap_or(agreement)));
     }
-    let values = values_result.expect("read physical staging agreement established");
+    let plan = plan_result.expect("read physical staging agreement established");
     let cleanup = finish_resources(comm, duplicate, file, datatype);
     drop(info);
     let injected = if inject_post_cleanup_failure && comm.rank() == ROOT_RANK {
@@ -818,7 +815,7 @@ where
     if let Some(error) = aggregate_cleanup_result(comm, cleanup.or(injected)) {
         return Err(error);
     }
-    view.as_mut_slice().copy_from_slice(&values);
+    plan.decode_into(&staging, view.as_mut_slice());
     Ok(())
 }
 

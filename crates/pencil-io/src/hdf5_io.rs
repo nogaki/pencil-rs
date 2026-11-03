@@ -10,7 +10,7 @@ use pencil_array::{PencilArrayView, PencilArrayViewMut};
 
 use crate::ffi;
 use crate::ffi::hdf5 as native;
-use crate::format::{IoElement, pack_view, prepare_physical_values};
+use crate::format::{IoElement, pack_view, prepare_physical_decode};
 use crate::mpi_io::{
     CommGuard, abort_unrecoverable, aggregate_cleanup_result, agree_phase, cleanup_result,
     collective_state, descriptor_agreement, duplicate_comm, first_error2, is_permutation,
@@ -1209,20 +1209,18 @@ where
         return Err(cleanup_ready(comm, duplicate, opened, resources, primary));
     }
 
-    // Decode and map before any close.  After the collective prepare agreement
-    // and successful cleanup, the destination is changed by one infallible
-    // physical-order copy only.
-    let values_result = prepare_physical_values(&view, &staging);
-    if let Err(agreement) = agree_phase(comm, values_result.is_ok(), "HDF5 read physical staging") {
+    // Validate layout and allocate decode scratch before native cleanup.
+    let plan_result = prepare_physical_decode(&view, &staging);
+    if let Err(agreement) = agree_phase(comm, plan_result.is_ok(), "HDF5 read physical staging") {
         return Err(cleanup_ready(
             comm,
             duplicate,
             opened,
             resources,
-            values_result.err().unwrap_or(agreement),
+            plan_result.err().unwrap_or(agreement),
         ));
     }
-    let values = values_result.expect("HDF5 read physical staging agreement");
+    let plan = plan_result.expect("HDF5 read physical staging agreement");
     let cleanup = finish_hdf5(comm, duplicate, opened, resources);
     let injected = if inject_post_cleanup_failure && comm.rank() == 0 {
         Some(IoError::Native {
@@ -1235,7 +1233,7 @@ where
     if let Some(error) = aggregate_cleanup_result(comm, cleanup.or(injected)) {
         return Err(error);
     }
-    view.as_mut_slice().copy_from_slice(&values);
+    plan.decode_into(&staging, view.as_mut_slice());
     Ok(())
 }
 

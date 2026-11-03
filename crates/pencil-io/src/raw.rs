@@ -1,4 +1,4 @@
-use crate::format::{IoElement, element_count, prepare_physical_values};
+use crate::format::{IoElement, element_count, prepare_physical_decode};
 use crate::mpi_io::{
     DatatypeGuard, FileGuard, abort_unrecoverable, aggregate_cleanup_result, agree_mpi_preparation,
     agree_phase, build_layout, checked_local_byte_count, collective_state, descriptor_agreement,
@@ -213,11 +213,11 @@ fn read_raw_inner<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
                 component.reverse();
             }
         }
-        let values = prepare_physical_values(&view, &staging);
-        if let Err(e) = agree_phase(comm, values.is_ok(), "raw physical values") {
-            return Err(values.err().unwrap_or(e));
+        let plan_result = prepare_physical_decode(&view, &staging);
+        if let Err(e) = agree_phase(comm, plan_result.is_ok(), "raw physical values") {
+            return Err(plan_result.err().unwrap_or(e));
         }
-        values
+        plan_result.map(|plan| (plan, staging))
     })();
     let cleanup = finish_resources(comm, duplicate, file, datatype);
     drop(info);
@@ -238,7 +238,7 @@ fn read_raw_inner<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
     if let Some(e) = error {
         return Err(e);
     }
-    view.as_mut_slice()
-        .copy_from_slice(&result.expect("read and cleanup agreement"));
+    let (plan, staging) = result.expect("read and cleanup agreement");
+    plan.decode_into(&staging, view.as_mut_slice());
     Ok(())
 }
