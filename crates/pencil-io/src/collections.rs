@@ -1,3 +1,4 @@
+use crate::format::ReadTarget;
 use crate::mpi_io::{
     MPI_LOCAL_BYTE_LIMIT_WHAT, agree_mpi_preparation, agree_phase, build_layout,
     checked_local_byte_count, descriptor_agreement, mpi_preparation_error,
@@ -16,6 +17,8 @@ use std::path::Path;
 #[cfg(test)]
 thread_local! {
     pub(crate) static STAGING_FAILURE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Test-only injection of the first combined byte-staging reservation.
+    pub(crate) static STAGING_ALLOCATION_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static STAGING_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -80,13 +83,13 @@ fn header(
     Ok(())
 }
 
-fn prepare<'a, T: IoElement + 'a, const N: usize, const M: usize>(
+fn prepare_metadata<'a, T: IoElement + 'a, const N: usize, const M: usize>(
     comm: &CartesianCommunicator,
     path: &Path,
     operation: u64,
     count: usize,
     mut members: impl Iterator<Item = (&'a Pencil<N, M>, &'a ExtraShape, &'a [T])> + Clone,
-) -> Result<PencilArray<T, N, M>, CollectionIoError> {
+) -> Result<Vec<usize>, CollectionIoError> {
     let all = members.clone();
     let (first, extra, data) = members.next().expect("nonempty collection");
     let bad = all
@@ -188,6 +191,19 @@ fn prepare<'a, T: IoElement + 'a, const N: usize, const M: usize>(
         T::WIDTH,
     )?;
     crate::options::agree_decomposition(first)?;
+    Ok(dims)
+}
+
+fn prepare<'a, T: IoElement + 'a, const N: usize, const M: usize>(
+    comm: &CartesianCommunicator,
+    path: &Path,
+    operation: u64,
+    count: usize,
+    members: impl Iterator<Item = (&'a Pencil<N, M>, &'a ExtraShape, &'a [T])> + Clone,
+) -> Result<PencilArray<T, N, M>, CollectionIoError> {
+    let all = members.clone();
+    let (first, _, data) = members.clone().next().expect("nonempty collection");
+    let dims = prepare_metadata(comm, path, operation, count, members)?;
     #[cfg(test)]
     STAGING_CALLS.with(|calls| calls.set(calls.get() + 1));
     let staged = (|| {
@@ -226,6 +242,60 @@ fn prepare<'a, T: IoElement + 'a, const N: usize, const M: usize>(
         return Err(staged.err().unwrap_or(e).into());
     }
     Ok(staged?)
+}
+
+/// Prepares collection read metadata and reserves one combined byte-staging
+/// buffer before any destination is touched.
+///
+/// Returns the combined `[count, extra...]` shape, the combined local element
+/// count, and the reserved (empty, `capacity >= bytes`) staging buffer.
+fn prepare_read<T: IoElement, const N: usize, const M: usize>(
+    comm: &CartesianCommunicator,
+    path: &Path,
+    operation: u64,
+    views: &[PencilArrayViewMut<'_, T, N, M>],
+) -> Result<(Vec<usize>, usize, Vec<u8>), CollectionIoError> {
+    let dims = prepare_metadata(
+        comm,
+        path,
+        operation,
+        views.len(),
+        views
+            .iter()
+            .map(|v| (v.pencil(), v.extra_shape(), v.as_slice())),
+    )?;
+    let first = views.first().expect("nonempty collection");
+    #[cfg(test)]
+    STAGING_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let staged = (|| {
+        let len = first
+            .len()
+            .checked_mul(views.len())
+            .ok_or(IoError::SizeLimit {
+                what: "collection storage",
+            })?;
+        let bytes = len.checked_mul(T::WIDTH).ok_or(IoError::SizeLimit {
+            what: "collection storage",
+        })?;
+        #[cfg(test)]
+        if STAGING_ALLOCATION_FAILURE.with(std::cell::Cell::get) {
+            return Err(IoError::AllocationFailed { requested: bytes });
+        }
+        #[cfg(test)]
+        if STAGING_FAILURE.with(|failure| failure.get().is_some()) {
+            return Err(IoError::AllocationFailed { requested: bytes });
+        }
+        let mut staging = Vec::new();
+        staging
+            .try_reserve_exact(bytes)
+            .map_err(|_| IoError::AllocationFailed { requested: bytes })?;
+        Ok::<_, IoError>((len, staging))
+    })();
+    if let Err(e) = agree_phase(comm, staged.is_ok(), "collection staging allocation") {
+        return Err(staged.err().unwrap_or(e).into());
+    }
+    let (len, staging) = staged?;
+    Ok((dims, len, staging))
 }
 
 fn mpi_write<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
@@ -306,31 +376,17 @@ fn mpi_read<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
     if let Some(o) = options {
         agree_options(comm, o, &[])?;
     }
-    let mut array = prepare(
-        comm,
-        path.as_ref(),
-        operation,
-        views.len(),
-        views
-            .iter()
-            .map(|v| (v.pencil(), v.extra_shape(), v.as_slice())),
-    )?;
-    if let Some(o) = options {
-        crate::read_mpi_with_options(path, array.view_mut(), o)?;
-    } else {
-        crate::read_mpi(path, array.view_mut())?;
-    }
-    let len = views[0].len();
-    for (i, v) in views.iter_mut().enumerate() {
-        v.as_mut_slice()
-            .copy_from_slice(&array.as_slice()[i * len..(i + 1) * len]);
-    }
+    let (dims, len, staging) = prepare_read(comm, path.as_ref(), operation, views)?;
+    let target = ReadTarget::collection(views, dims, len, staging);
+    crate::mpi_io::read_mpi_target(path, target, options)?;
     Ok(())
 }
-/// Read a combined MPI collection; destinations change only after staging succeeds.
-/// The same combined-payload 2147483647 bytes/rank limit as
-/// [`write_mpi_collection`] applies before staging; a rejected read leaves every
-/// destination unchanged.
+/// Read a combined MPI collection into its member destinations.
+/// One combined byte-staging payload is reserved and read once; members are
+/// decoded directly from it only after native cleanup and collective success,
+/// so a returned error leaves every destination unchanged. The same
+/// combined-payload 2147483647 bytes/rank limit as [`write_mpi_collection`]
+/// applies before staging.
 ///
 /// All ranks in `comm` participate; the file is not overwritten or resized.
 pub fn read_mpi_collection<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
@@ -341,7 +397,8 @@ pub fn read_mpi_collection<P: AsRef<Path>, T: IoElement, const N: usize, const M
     mpi_read(path, comm, views, None, MPI_READ)
 }
 /// Read a collection with explicit MPI-IO controls. Applies the same
-/// combined-payload MPI local byte limit as [`read_mpi_collection`].
+/// combined-payload MPI local byte limit and one-payload direct decode as
+/// [`read_mpi_collection`].
 ///
 /// All ranks in `comm` participate; the file is not overwritten or resized.
 pub fn read_mpi_collection_with_options<
@@ -428,8 +485,9 @@ pub fn append_mpi_named_collection<
     Ok(())
 }
 /// Read a named combined MPI collection atomically into member destinations.
-/// Applies the same combined-payload MPI local byte limit as
-/// [`read_mpi_collection`]; a rejected read leaves all destinations unchanged.
+/// Applies the same combined-payload MPI local byte limit and direct decode
+/// after cleanup as [`read_mpi_collection`]; a rejected read leaves all
+/// destinations unchanged.
 ///
 /// The file is not overwritten or resized.
 pub fn read_mpi_named_collection<
@@ -448,21 +506,9 @@ pub fn read_mpi_named_collection<
     header(comm, MPI_NAMED_READ_OPTIONS, views.len())?;
     agree_name(comm, name.as_ref())?;
     agree_options(comm, o, &[])?;
-    let mut a = prepare(
-        comm,
-        path.as_ref(),
-        MPI_NAMED_READ_OPTIONS,
-        views.len(),
-        views
-            .iter()
-            .map(|v| (v.pencil(), v.extra_shape(), v.as_slice())),
-    )?;
-    crate::read_mpi_named_with_options(path, name, a.view_mut(), o)?;
-    let len = views[0].len();
-    for (i, v) in views.iter_mut().enumerate() {
-        v.as_mut_slice()
-            .copy_from_slice(&a.as_slice()[i * len..(i + 1) * len]);
-    }
+    let (dims, len, staging) = prepare_read(comm, path.as_ref(), MPI_NAMED_READ_OPTIONS, views)?;
+    let target = ReadTarget::collection(views, dims, len, staging);
+    crate::named_mpi::read_named_target(path.as_ref(), name.as_ref(), target, Some(o))?;
     Ok(())
 }
 
@@ -528,34 +574,26 @@ pub fn write_hdf5_collection_with_options<
     Ok(())
 }
 #[cfg(feature = "parallel-hdf5")]
-/// Read one combined parallel HDF5 collection; destinations change only after staging succeeds.
-///
-/// The file is not overwritten or resized.
+/// Read one combined parallel HDF5 collection into its member destinations.
+/// One combined byte-staging payload is reserved and read once; members are
+/// decoded directly from it only after native cleanup and collective success,
+/// so a returned error leaves every destination unchanged. The file is not
+/// overwritten or resized.
 pub fn read_hdf5_collection<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
     path: P,
     comm: &CartesianCommunicator,
     views: &mut [PencilArrayViewMut<'_, T, N, M>],
 ) -> Result<(), CollectionIoError> {
     header(comm, HDF5_READ, views.len())?;
-    let mut a = prepare(
-        comm,
-        path.as_ref(),
-        HDF5_READ,
-        views.len(),
-        views
-            .iter()
-            .map(|v| (v.pencil(), v.extra_shape(), v.as_slice())),
-    )?;
-    crate::read_hdf5(path, a.view_mut())?;
-    let len = views[0].len();
-    for (i, v) in views.iter_mut().enumerate() {
-        v.as_mut_slice()
-            .copy_from_slice(&a.as_slice()[i * len..(i + 1) * len]);
-    }
+    let (dims, len, staging) = prepare_read(comm, path.as_ref(), HDF5_READ, views)?;
+    let target = ReadTarget::collection(views, dims, len, staging);
+    crate::hdf5_io::read_hdf5_target(path, target)?;
     Ok(())
 }
 #[cfg(feature = "parallel-hdf5")]
-/// Read a combined HDF5 collection with explicit controls; destinations change only after staging succeeds.
+/// Read a combined HDF5 collection with explicit controls; members are decoded
+/// directly from one byte-staging payload after native cleanup, so a returned
+/// error leaves every destination unchanged.
 ///
 /// The file is not overwritten or resized.
 pub fn read_hdf5_collection_with_options<
@@ -577,21 +615,9 @@ pub fn read_hdf5_collection_with_options<
         N + first.extra_shape().dimensions().len() + 1,
         T::WIDTH,
     )?;
-    let mut a = prepare(
-        comm,
-        path.as_ref(),
-        HDF5_READ_OPTIONS,
-        views.len(),
-        views
-            .iter()
-            .map(|v| (v.pencil(), v.extra_shape(), v.as_slice())),
-    )?;
-    crate::read_hdf5_with_options(path, a.view_mut(), o)?;
-    let len = views[0].len();
-    for (i, v) in views.iter_mut().enumerate() {
-        v.as_mut_slice()
-            .copy_from_slice(&a.as_slice()[i * len..(i + 1) * len]);
-    }
+    let (dims, len, staging) = prepare_read(comm, path.as_ref(), HDF5_READ_OPTIONS, views)?;
+    let target = ReadTarget::collection(views, dims, len, staging);
+    crate::hdf5_io::read_hdf5_target_options(path, target, o.settings())?;
     Ok(())
 }
 #[cfg(feature = "parallel-hdf5")]
@@ -659,7 +685,8 @@ pub fn append_hdf5_named_collection<
     Ok(())
 }
 #[cfg(feature = "parallel-hdf5")]
-/// Read a named combined HDF5 collection atomically into member destinations.
+/// Read a named combined HDF5 collection atomically into member destinations,
+/// decoding directly from one byte-staging payload after native cleanup.
 ///
 /// The file is not overwritten or resized.
 pub fn read_hdf5_named_collection<
@@ -684,20 +711,13 @@ pub fn read_hdf5_named_collection<
         N + first.extra_shape().dimensions().len() + 1,
         T::WIDTH,
     )?;
-    let mut a = prepare(
-        comm,
+    let (dims, len, staging) = prepare_read(comm, path.as_ref(), HDF5_NAMED_READ_OPTIONS, views)?;
+    let target = ReadTarget::collection(views, dims, len, staging);
+    crate::hdf5_io::read_named_collection_with_options(
         path.as_ref(),
-        HDF5_NAMED_READ_OPTIONS,
-        views.len(),
-        views
-            .iter()
-            .map(|v| (v.pencil(), v.extra_shape(), v.as_slice())),
+        name.as_ref(),
+        target,
+        o.settings(),
     )?;
-    crate::read_hdf5_named_with_options(path, name, a.view_mut(), o)?;
-    let len = views[0].len();
-    for (i, v) in views.iter_mut().enumerate() {
-        v.as_mut_slice()
-            .copy_from_slice(&a.as_slice()[i * len..(i + 1) * len]);
-    }
     Ok(())
 }

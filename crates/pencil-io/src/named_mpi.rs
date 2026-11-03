@@ -17,7 +17,7 @@ use mpi::traits::AsRaw;
 use pencil_array::{PencilArrayView, PencilArrayViewMut};
 
 use crate::ffi;
-use crate::format::{IoElement, element_count, pack_view, prepare_physical_decode};
+use crate::format::{IoElement, ReadTarget, element_count, pack_view};
 use crate::mpi_io::agree_phase;
 use crate::mpi_io::{
     DatatypeGuard, agree_mpi_preparation, build_layout, duplicate_comm, finish_resources,
@@ -818,14 +818,43 @@ pub fn read_mpi_named_with_options<
     read_named(path.as_ref(), name.as_ref(), view, false, Some(options))
 }
 
+/// Reads into a single view or a collection of member views using one byte
+/// payload. Collection callers prepare the target and its staging first.
+pub(crate) fn read_named_target<T: IoElement, const N: usize, const M: usize>(
+    path: &Path,
+    name: &str,
+    target: ReadTarget<'_, '_, T, N, M>,
+    options: Option<&MpiIoOptions>,
+) -> Result<(), NamedIoError> {
+    read_named_inner(path, name, target, false, options)
+}
+
 fn read_named<T: IoElement, const N: usize, const M: usize>(
     path: &Path,
     name: &str,
-    mut view: PencilArrayViewMut<'_, T, N, M>,
+    view: PencilArrayViewMut<'_, T, N, M>,
     inject_post_cleanup_failure: bool,
     options: Option<&MpiIoOptions>,
 ) -> Result<(), NamedIoError> {
-    let comm = view.pencil().topology().communicator();
+    read_named_inner(
+        path,
+        name,
+        ReadTarget::Single(view),
+        inject_post_cleanup_failure,
+        options,
+    )
+}
+
+fn read_named_inner<T: IoElement, const N: usize, const M: usize>(
+    path: &Path,
+    name: &str,
+    mut target: ReadTarget<'_, '_, T, N, M>,
+    inject_post_cleanup_failure: bool,
+    options: Option<&MpiIoOptions>,
+) -> Result<(), NamedIoError> {
+    // Take the reserved staging out before borrowing the target's metadata.
+    let mut packed = target.take_staging();
+    let comm = target.pencil().topology().communicator();
     crate::mpi_io::descriptor_agreement(
         comm,
         path,
@@ -834,11 +863,11 @@ fn read_named<T: IoElement, const N: usize, const M: usize>(
         } else {
             OP_READ
         },
-        view.pencil().global_shape(),
-        view.extra_shape().dimensions(),
-        view.pencil().topology().process_grid(),
-        view.pencil().decomposition(),
-        view.pencil().permutation().axes(),
+        target.pencil().global_shape(),
+        target.extra(),
+        target.pencil().topology().process_grid(),
+        target.pencil().decomposition(),
+        target.pencil().permutation().axes(),
         T::CODE,
         T::WIDTH,
     )?;
@@ -848,11 +877,11 @@ fn read_named<T: IoElement, const N: usize, const M: usize>(
     }
     let pc = prepared(comm, path_c(path), "named path preparation")?;
     let layout_result = build_layout(
-        view.pencil().global_shape(),
-        view.extra_shape().dimensions(),
-        &view.local_spatial_shape(),
-        view.pencil().local_ranges(),
-        view.len(),
+        target.pencil().global_shape(),
+        target.extra(),
+        &target.local_spatial_shape(),
+        target.pencil().local_ranges(),
+        target.len(),
         T::WIDTH,
     );
     if let Err(agreement) =
@@ -861,13 +890,18 @@ fn read_named<T: IoElement, const N: usize, const M: usize>(
         return Err(NamedIoError::Io(agreement));
     }
     let layout = layout_result.map_err(NamedIoError::Io)?;
-    let size = view.len().checked_mul(T::WIDTH).ok_or(IoError::SizeLimit {
-        what: "named read buffer",
-    });
+    let size = target
+        .len()
+        .checked_mul(T::WIDTH)
+        .ok_or(IoError::SizeLimit {
+            what: "named read buffer",
+        });
     let size = prepared(comm, size, "named read size")?;
-    let mut packed = allocate(comm, size)?;
+    let allocation = packed.try_reserve_exact(size);
+    agree_phase(comm, allocation.is_ok(), "named allocation")?;
+    packed.resize(size, 0);
     if options.is_some() {
-        crate::options::agree_decomposition(view.pencil())?;
+        crate::options::agree_decomposition(target.pencil())?;
     }
     let info = options
         .map(|options| InfoGuard::new(comm, options))
@@ -894,8 +928,8 @@ fn read_named<T: IoElement, const N: usize, const M: usize>(
             .ok_or(NamedIoError::NotFound)?;
         if record.typ != T::CODE
             || record.width != T::WIDTH
-            || record.global != view.pencil().global_shape()
-            || record.extra != view.extra_shape().dimensions()
+            || record.global != target.pencil().global_shape()
+            || record.extra != target.extra()
         {
             return Err(IoError::MetadataMismatch {
                 field: "named record",
@@ -934,11 +968,7 @@ fn read_named<T: IoElement, const N: usize, const M: usize>(
             matches!(read, Ok(n) if n == packed.len()),
             "named payload read",
         )?;
-        prepared(
-            comm,
-            prepare_physical_decode(&view, &packed),
-            "named physical staging",
-        )
+        prepared(comm, target.prepare(&packed), "named physical staging")
     })();
     let cleanup = finish_resources(
         comm,
@@ -946,7 +976,9 @@ fn read_named<T: IoElement, const N: usize, const M: usize>(
         crate::mpi_io::FileGuard { raw: file },
         datatype,
     );
-    let cleanup = if inject_post_cleanup_failure && comm.rank() == 0 {
+    let cleanup = if crate::mpi_io::post_cleanup_failure_injected(inject_post_cleanup_failure)
+        && comm.rank() == 0
+    {
         Some(IoError::Native {
             operation: "named post-cleanup result",
             code: -1,
@@ -960,7 +992,7 @@ fn read_named<T: IoElement, const N: usize, const M: usize>(
     if let Some(error) = cleanup {
         return Err(error.into());
     }
-    plan.decode_into(&packed, view.as_mut_slice());
+    target.commit(plan, &packed);
     Ok(())
 }
 

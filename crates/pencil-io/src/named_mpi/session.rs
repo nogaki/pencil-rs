@@ -1,5 +1,6 @@
 //! Retained native handles for the existing named-v2 format.
 use super::*;
+use crate::format::prepare_physical_decode;
 use crate::mpi_io::{CommGuard, FileGuard, abort_unrecoverable, collective_state};
 use crate::{CatalogError, DatasetInfo, ScalarType};
 use mpi::topology::CartesianCommunicator;

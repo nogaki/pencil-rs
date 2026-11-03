@@ -491,7 +491,13 @@ where
         };
     resources.dataset = Some(dataset);
 
-    if let Err(error) = validate_read_metadata(comm, duplicate, dataset, &view) {
+    if let Err(error) = validate_read_metadata::<T, N, M>(
+        comm,
+        duplicate,
+        dataset,
+        view.pencil(),
+        view.extra_shape().dimensions(),
+    ) {
         return Err(cleanup_session(comm, resources, error));
     }
 

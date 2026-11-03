@@ -178,12 +178,13 @@ combined payload is limited to 2147483647 bytes/rank
 (`combined_local_elements * scalar_width`; for `f64`, up to 268435455 elements),
 not each member separately. If any rank exceeds it, every rank returns
 `CollectionIoError::Io(IoError::SizeLimit { what: "MPI local byte count" })`
-before combined typed storage is allocated; this is not a whole-file cap. The
-same combined limit applies to named MPI collection records; the HDF5 collection
-paths are not subject to this MPI local byte limit. Every read destination is
-staged until native
-cleanup and agreement succeed. Option-bearing collection forms preserve the
-same staging guarantees. `write_mpi_named_collection`, `append_mpi_named_collection`,
+before payload staging or combined typed storage is allocated; this is not a
+whole-file cap. The same combined limit applies to named MPI collection records;
+the HDF5 collection paths are not subject to this MPI local byte limit. A
+collection read reserves one combined byte-staging payload and decodes every
+member directly from it only after native cleanup and agreement succeed, so no
+combined typed storage is retained; option-bearing and named collection forms
+preserve the same guarantee. `write_mpi_named_collection`, `append_mpi_named_collection`,
 `read_mpi_named_collection` and their HDF5 counterparts store one combined named
 dataset and accept explicit options. Names, options and all members agree before
 payload staging or mutation. These APIs do not pretend several independent

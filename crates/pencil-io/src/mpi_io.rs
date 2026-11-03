@@ -10,7 +10,7 @@ use mpi::traits::AsRaw;
 use crate::ffi;
 use pencil_array::{PencilArrayView, PencilArrayViewMut, SpatialAxis};
 
-use crate::format::{IoElement, element_count, pack_view, prepare_physical_decode};
+use crate::format::{IoElement, ReadTarget, element_count, pack_view};
 use crate::options::{InfoGuard, MpiIoMode, MpiIoOptions, agree_options};
 use crate::{
     COMMIT_MARKER, FORMAT_VERSION, INCOMPLETE_MARKER, IO_NAMESPACE, IoError, MAX_DESCRIPTOR_BYTES,
@@ -485,7 +485,7 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_mpi_inner(path, view, false, None)
+    read_mpi_inner(path, ReadTarget::Single(view), false, None)
 }
 
 /// Option-bearing additive form of [`read_mpi`]. Applies the same MPI local
@@ -499,12 +499,27 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_mpi_inner(path, view, false, Some(options))
+    read_mpi_inner(path, ReadTarget::Single(view), false, Some(options))
+}
+
+/// Reads directly into a single view or a collection of member views using one
+/// byte-staging payload. Collection callers must prepare the target and its
+/// staging reservation first.
+pub(crate) fn read_mpi_target<P, T, const N: usize, const M: usize>(
+    path: P,
+    target: ReadTarget<'_, '_, T, N, M>,
+    options: Option<&MpiIoOptions>,
+) -> Result<(), IoError>
+where
+    P: AsRef<Path>,
+    T: IoElement,
+{
+    read_mpi_inner(path, target, false, options)
 }
 
 fn read_mpi_inner<P, T, const N: usize, const M: usize>(
     path: P,
-    mut view: PencilArrayViewMut<'_, T, N, M>,
+    mut target: ReadTarget<'_, '_, T, N, M>,
     inject_post_cleanup_failure: bool,
     options: Option<&MpiIoOptions>,
 ) -> Result<(), IoError>
@@ -512,11 +527,13 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    let comm = view.pencil().topology().communicator();
-    let global = view.pencil().global_shape();
-    let extra = view.extra_shape().dimensions();
-    let grid = view.pencil().topology().process_grid();
-    let permutation = view.pencil().permutation().axes();
+    // Take the reserved staging out before borrowing the target's metadata.
+    let mut staging = target.take_staging();
+    let comm = target.pencil().topology().communicator();
+    let global = target.pencil().global_shape();
+    let extra = target.extra();
+    let grid = target.pencil().topology().process_grid();
+    let permutation = target.pencil().permutation().axes();
     descriptor_agreement(
         comm,
         path.as_ref(),
@@ -524,7 +541,7 @@ where
         global,
         extra,
         grid,
-        view.pencil().decomposition(),
+        target.pencil().decomposition(),
         permutation,
         T::CODE,
         T::WIDTH,
@@ -532,17 +549,17 @@ where
 
     let path_result = path_bytes(path.as_ref())
         .and_then(|bytes| CString::new(bytes).map_err(|_| IoError::InvalidPath));
-    let global_shape = view.pencil().global_shape();
-    let local_shape = view.local_spatial_shape();
+    let global_shape = target.pencil().global_shape();
+    let local_shape = target.local_spatial_shape();
     let layout_result = build_layout(
         global_shape,
         extra,
         &local_shape,
-        view.pencil().local_ranges(),
-        view.len(),
+        target.pencil().local_ranges(),
+        target.len(),
         T::WIDTH,
     );
-    let staged_bytes = checked_local_byte_count(view.len(), T::WIDTH);
+    let staged_bytes = checked_local_byte_count(target.len(), T::WIDTH);
     let prep_error = first_error3(&staged_bytes, &layout_result, &path_result);
     if let Err(agreement) = agree_mpi_preparation(comm, prep_error.as_ref(), "path preparation") {
         return Err(mpi_preparation_error(prep_error, agreement));
@@ -558,12 +575,11 @@ where
     }
     let info = options
         .map(|_| {
-            crate::options::agree_decomposition(view.pencil())?;
+            crate::options::agree_decomposition(target.pencil())?;
             InfoGuard::new(comm, controls)
         })
         .transpose()?;
     let native_info = info.as_ref().map_or_else(ffi::info_null, |i| i.raw);
-    let mut staging = Vec::new();
     let staging_result = staging
         .try_reserve_exact(staging_len)
         .map(|_| staging_len)
@@ -796,7 +812,7 @@ where
     }
 
     // Validate layout and allocate decode scratch before native cleanup.
-    let plan_result = prepare_physical_decode(&view, &staging);
+    let plan_result = target.prepare(&staging);
     if let Err(agreement) = agree_phase(comm, plan_result.is_ok(), "MPI-IO read physical staging") {
         let cleanup = finish_resources(comm, duplicate, file, datatype);
         return Err(cleanup.unwrap_or(plan_result.err().unwrap_or(agreement)));
@@ -804,18 +820,19 @@ where
     let plan = plan_result.expect("read physical staging agreement established");
     let cleanup = finish_resources(comm, duplicate, file, datatype);
     drop(info);
-    let injected = if inject_post_cleanup_failure && comm.rank() == ROOT_RANK {
-        Some(IoError::Native {
-            operation: "test post-cleanup result",
-            code: -1,
-        })
-    } else {
-        None
-    };
+    let injected =
+        if post_cleanup_failure_injected(inject_post_cleanup_failure) && comm.rank() == ROOT_RANK {
+            Some(IoError::Native {
+                operation: "test post-cleanup result",
+                code: -1,
+            })
+        } else {
+            None
+        };
     if let Some(error) = aggregate_cleanup_result(comm, cleanup.or(injected)) {
         return Err(error);
     }
-    plan.decode_into(&staging, view.as_mut_slice());
+    target.commit(plan, &staging);
     Ok(())
 }
 
@@ -828,7 +845,7 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_mpi_inner(path, view, true, None)
+    read_mpi_inner(path, ReadTarget::Single(view), true, None)
 }
 
 #[derive(Debug)]
@@ -889,6 +906,25 @@ pub(crate) fn cleanup_result(cleanup: Option<IoError>, primary: IoError) -> IoEr
         primary
     } else {
         cleanup.unwrap_or(primary)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only injection of a post-cleanup failure on the calling rank,
+    /// applied by every single-call, named, and collection read.
+    pub(crate) static POST_CLEANUP_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Combines the per-entry injection flag with the thread-local test hook.
+pub(crate) fn post_cleanup_failure_injected(local: bool) -> bool {
+    #[cfg(test)]
+    {
+        local || POST_CLEANUP_FAILURE.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        local
     }
 }
 

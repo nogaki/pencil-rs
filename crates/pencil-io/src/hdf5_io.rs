@@ -10,7 +10,7 @@ use pencil_array::{PencilArrayView, PencilArrayViewMut};
 
 use crate::ffi;
 use crate::ffi::hdf5 as native;
-use crate::format::{IoElement, pack_view, prepare_physical_decode};
+use crate::format::{IoElement, ReadTarget, pack_view};
 use crate::mpi_io::{
     CommGuard, abort_unrecoverable, aggregate_cleanup_result, agree_phase, cleanup_result,
     collective_state, descriptor_agreement, duplicate_comm, first_error2, is_permutation,
@@ -817,16 +817,32 @@ pub(crate) fn read_named<T: IoElement, const N: usize, const M: usize>(
     view: PencilArrayViewMut<'_, T, N, M>,
     inject: bool,
 ) -> Result<(), NamedIoError> {
-    let comm = view.pencil().topology().communicator();
+    read_named_inner(
+        path,
+        name,
+        ReadTarget::Single(view),
+        inject,
+        Hdf5Settings::default(),
+    )
+}
+
+fn read_named_inner<T: IoElement, const N: usize, const M: usize>(
+    path: &Path,
+    name: &str,
+    target: ReadTarget<'_, '_, T, N, M>,
+    inject: bool,
+    settings: Hdf5Settings<'_>,
+) -> Result<(), NamedIoError> {
+    let comm = target.pencil().topology().communicator();
     descriptor_agreement(
         comm,
         path,
         OP_READ_HDF5_NAMED,
-        view.pencil().global_shape(),
-        view.extra_shape().dimensions(),
-        view.pencil().topology().process_grid(),
-        view.pencil().decomposition(),
-        view.pencil().permutation().axes(),
+        target.pencil().global_shape(),
+        target.extra(),
+        target.pencil().topology().process_grid(),
+        target.pencil().decomposition(),
+        target.pencil().permutation().axes(),
         T::CODE,
         T::WIDTH,
     )
@@ -834,13 +850,13 @@ pub(crate) fn read_named<T: IoElement, const N: usize, const M: usize>(
     let link = named_link(comm, name)?;
     read_hdf5_inner(
         path,
-        view,
+        target,
         inject,
         cstr(NAMED_GROUP),
         &link,
         Some(name.as_bytes()),
         OP_READ_HDF5_NAMED,
-        Hdf5Settings::default(),
+        settings,
     )
     .map_err(|error| match error {
         IoError::MetadataMismatch {
@@ -862,38 +878,59 @@ where
     S: AsRef<str>,
     T: IoElement,
 {
-    let comm = view.pencil().topology().communicator();
+    read_named_with_options(
+        path.as_ref(),
+        name.as_ref(),
+        ReadTarget::Single(view),
+        options.settings(),
+        73,
+    )
+}
+
+/// Reads a collection of named members with explicit controls.
+pub(crate) fn read_named_collection_with_options<T: IoElement, const N: usize, const M: usize>(
+    path: &Path,
+    name: &str,
+    target: ReadTarget<'_, '_, T, N, M>,
+    settings: Hdf5Settings<'_>,
+) -> Result<(), NamedIoError> {
+    read_named_with_options(path, name, target, settings, 73)
+}
+
+fn read_named_with_options<T: IoElement, const N: usize, const M: usize>(
+    path: &Path,
+    name: &str,
+    target: ReadTarget<'_, '_, T, N, M>,
+    settings: Hdf5Settings<'_>,
+    operation: u64,
+) -> Result<(), NamedIoError> {
+    let comm = target.pencil().topology().communicator();
     descriptor_agreement(
         comm,
-        path.as_ref(),
-        73,
-        view.pencil().global_shape(),
-        view.extra_shape().dimensions(),
-        view.pencil().topology().process_grid(),
-        view.pencil().decomposition(),
-        view.pencil().permutation().axes(),
+        path,
+        operation,
+        target.pencil().global_shape(),
+        target.extra(),
+        target.pencil().topology().process_grid(),
+        target.pencil().decomposition(),
+        target.pencil().permutation().axes(),
         T::CODE,
         T::WIDTH,
     )
     .map_err(NamedIoError::Io)?;
-    crate::options::agree_decomposition(view.pencil()).map_err(NamedIoError::Io)?;
-    validate_options(
-        comm,
-        options.settings(),
-        N + view.extra_shape().dimensions().len(),
-        T::WIDTH,
-    )
-    .map_err(NamedIoError::Io)?;
-    let link = named_link(comm, name.as_ref())?;
+    crate::options::agree_decomposition(target.pencil()).map_err(NamedIoError::Io)?;
+    validate_options(comm, settings, N + target.extra().len(), T::WIDTH)
+        .map_err(NamedIoError::Io)?;
+    let link = named_link(comm, name)?;
     read_hdf5_inner(
         path,
-        view,
+        target,
         false,
         cstr(NAMED_GROUP),
         &link,
-        Some(name.as_ref().as_bytes()),
-        73,
-        options.settings(),
+        Some(name.as_bytes()),
+        operation,
+        settings,
     )
     .map_err(|error| match error {
         IoError::MetadataMismatch {
@@ -912,15 +949,47 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
+    read_hdf5_target(path, ReadTarget::Single(view))
+}
+
+pub(crate) fn read_hdf5_target<P, T, const N: usize, const M: usize>(
+    path: P,
+    target: ReadTarget<'_, '_, T, N, M>,
+) -> Result<(), IoError>
+where
+    P: AsRef<Path>,
+    T: IoElement,
+{
     read_hdf5_inner(
         path,
-        view,
+        target,
         false,
         cstr(GROUP_NAME),
         cstr(DATASET_NAME),
         None,
         OP_READ_HDF5,
         Hdf5Settings::default(),
+    )
+}
+
+pub(crate) fn read_hdf5_target_options<P, T, const N: usize, const M: usize>(
+    path: P,
+    target: ReadTarget<'_, '_, T, N, M>,
+    settings: Hdf5Settings<'_>,
+) -> Result<(), IoError>
+where
+    P: AsRef<Path>,
+    T: IoElement,
+{
+    read_hdf5_inner(
+        path,
+        target,
+        false,
+        cstr(GROUP_NAME),
+        cstr(DATASET_NAME),
+        None,
+        OP_OPTIONS_READ_HDF5,
+        settings,
     )
 }
 
@@ -933,22 +1002,13 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_hdf5_inner(
-        path,
-        view,
-        false,
-        cstr(GROUP_NAME),
-        cstr(DATASET_NAME),
-        None,
-        OP_OPTIONS_READ_HDF5,
-        settings,
-    )
+    read_hdf5_target_options(path, ReadTarget::Single(view), settings)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn read_hdf5_inner<P, T, const N: usize, const M: usize>(
     path: P,
-    mut view: PencilArrayViewMut<'_, T, N, M>,
+    mut target: ReadTarget<'_, '_, T, N, M>,
     inject_post_cleanup_failure: bool,
     group_name: &CStr,
     dataset_name: &CStr,
@@ -960,31 +1020,35 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    let comm = view.pencil().topology().communicator();
+    // Take the reserved staging out before borrowing the target's metadata.
+    let mut staging = target.take_staging();
+    let comm = target.pencil().topology().communicator();
     descriptor_agreement(
         comm,
         path.as_ref(),
         operation,
-        view.pencil().global_shape(),
-        view.extra_shape().dimensions(),
-        view.pencil().topology().process_grid(),
-        view.pencil().decomposition(),
-        view.pencil().permutation().axes(),
+        target.pencil().global_shape(),
+        target.extra(),
+        target.pencil().topology().process_grid(),
+        target.pencil().decomposition(),
+        target.pencil().permutation().axes(),
         T::CODE,
         T::WIDTH,
     )?;
     let path = path_cstring(path.as_ref(), comm)?;
     let layout_result = build_layout(
-        view.pencil().global_shape(),
-        view.extra_shape().dimensions(),
-        &view.local_spatial_shape(),
-        view.pencil().local_ranges(),
-        view.len(),
+        target.pencil().global_shape(),
+        target.extra(),
+        &target.local_spatial_shape(),
+        target.pencil().local_ranges(),
+        target.len(),
     );
-    let bytes = view.len().checked_mul(T::WIDTH).ok_or(IoError::SizeLimit {
-        what: "HDF5 staging bytes",
-    });
-    let mut staging = Vec::new();
+    let bytes = target
+        .len()
+        .checked_mul(T::WIDTH)
+        .ok_or(IoError::SizeLimit {
+            what: "HDF5 staging bytes",
+        });
     let staging_result = match bytes {
         Ok(bytes) => staging
             .try_reserve_exact(bytes)
@@ -1002,7 +1066,7 @@ where
         0,
     );
     if settings.explicit {
-        crate::options::agree_decomposition(view.pencil())?;
+        crate::options::agree_decomposition(target.pencil())?;
     }
     validate_options(comm, settings, layout.global.len(), T::WIDTH)?;
 
@@ -1076,7 +1140,13 @@ where
         }
     }
 
-    if let Err(error) = validate_read_metadata(comm, duplicate.raw, dataset, &view) {
+    if let Err(error) = validate_read_metadata::<T, N, M>(
+        comm,
+        duplicate.raw,
+        dataset,
+        target.pencil(),
+        target.extra(),
+    ) {
         return Err(cleanup_ready(comm, duplicate, opened, resources, error));
     }
 
@@ -1210,7 +1280,7 @@ where
     }
 
     // Validate layout and allocate decode scratch before native cleanup.
-    let plan_result = prepare_physical_decode(&view, &staging);
+    let plan_result = target.prepare(&staging);
     if let Err(agreement) = agree_phase(comm, plan_result.is_ok(), "HDF5 read physical staging") {
         return Err(cleanup_ready(
             comm,
@@ -1222,7 +1292,9 @@ where
     }
     let plan = plan_result.expect("HDF5 read physical staging agreement");
     let cleanup = finish_hdf5(comm, duplicate, opened, resources);
-    let injected = if inject_post_cleanup_failure && comm.rank() == 0 {
+    let injected = if crate::mpi_io::post_cleanup_failure_injected(inject_post_cleanup_failure)
+        && comm.rank() == 0
+    {
         Some(IoError::Native {
             operation: "test post-cleanup result",
             code: -1,
@@ -1233,7 +1305,7 @@ where
     if let Some(error) = aggregate_cleanup_result(comm, cleanup.or(injected)) {
         return Err(error);
     }
-    plan.decode_into(&staging, view.as_mut_slice());
+    target.commit(plan, &staging);
     Ok(())
 }
 
@@ -1248,7 +1320,7 @@ where
 {
     read_hdf5_inner(
         path,
-        view,
+        ReadTarget::Single(view),
         true,
         cstr(GROUP_NAME),
         cstr(DATASET_NAME),
@@ -1967,7 +2039,8 @@ fn validate_read_metadata<T: IoElement, const N: usize, const M: usize>(
     comm: &mpi::topology::CartesianCommunicator,
     duplicate: ffi::MPI_Comm,
     dataset: native::Hid,
-    view: &PencilArrayViewMut<'_, T, N, M>,
+    pencil: &pencil_array::Pencil<N, M>,
+    extra_dims: &[usize],
 ) -> Result<(), IoError> {
     let read_attr = |name, expected, max, phase| {
         read_attr_phase(comm, duplicate, dataset, name, expected, max, phase)
@@ -1982,7 +2055,7 @@ fn validate_read_metadata<T: IoElement, const N: usize, const M: usize>(
         && n == [N as u64]
         && type_code == [T::CODE]
         && width == [T::WIDTH as u64]
-        && usize::try_from(extra_rank[0]).ok() == Some(view.extra_shape().dimensions().len())
+        && usize::try_from(extra_rank[0]).ok() == Some(extra_dims.len())
         && extra_rank[0] <= MAX_PROTOCOL_RANK as u64;
     let commit_state = if commit == [COMMIT_MARKER] {
         Ok(())
@@ -2031,11 +2104,11 @@ fn validate_read_metadata<T: IoElement, const N: usize, const M: usize>(
         && global
             .iter()
             .copied()
-            .eq(view.pencil().global_shape().iter().map(|&v| v as u64))
+            .eq(pencil.global_shape().iter().map(|&v| v as u64))
         && extra
             .iter()
             .copied()
-            .eq(view.extra_shape().dimensions().iter().map(|&v| v as u64))
+            .eq(extra_dims.iter().map(|&v| v as u64))
         && valid_extents(&writer_grid)
         && writer_grid.len() <= N
         && is_permutation(&writer_perm, N);

@@ -13,16 +13,25 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mpi::traits::*;
 use num_complex::Complex;
-use pencil_array::{AxisPermutation, ExtraShape, MpiTopology, Pencil, PencilArray};
+use pencil_array::{
+    AxisPermutation, ExtraShape, MpiTopology, Pencil, PencilArray, PencilArrayViewMut,
+};
 #[cfg(feature = "parallel-hdf5")]
-use pencil_io::{Hdf5FileSession, Hdf5ReadOptions, Hdf5WriteOptions, read_hdf5, write_hdf5};
+use pencil_io::{
+    Hdf5FileSession, Hdf5ReadOptions, Hdf5WriteOptions, read_hdf5, read_hdf5_collection,
+    read_hdf5_collection_with_options, read_hdf5_named_collection, write_hdf5,
+    write_hdf5_collection, write_hdf5_collection_with_options, write_hdf5_named_collection,
+};
 use pencil_io::{
     MpiFileSession, MpiIoOptions, RawByteOrder, RawReadOptions, read_mpi, read_mpi_chunked,
-    read_mpi_named, read_mpi_raw, write_mpi, write_mpi_chunked, write_mpi_named,
+    read_mpi_collection, read_mpi_collection_with_options, read_mpi_named,
+    read_mpi_named_collection, read_mpi_raw, write_mpi, write_mpi_chunked, write_mpi_collection,
+    write_mpi_collection_with_options, write_mpi_named, write_mpi_named_collection,
 };
 
 mod support;
@@ -34,6 +43,13 @@ const ELEMENTS: usize = EXTRA * SPATIAL[0] * SPATIAL[1];
 const WIDTH: usize = 16;
 const PAYLOAD_BYTES: usize = ELEMENTS * WIDTH;
 const LIMIT_BYTES: usize = PAYLOAD_BYTES + 1024 * 1024;
+
+// Collection fixture: two members of `ExtraShape([1])` whose combined payload
+// is exactly `PAYLOAD_BYTES`.
+const MEMBERS: usize = 2;
+const MEMBER_ELEMENTS: usize = ELEMENTS / MEMBERS;
+type Array = PencilArray<Complex<f64>, 2, 2>;
+type ViewMut<'a> = PencilArrayViewMut<'a, Complex<f64>, 2, 2>;
 
 // ---------------------------------------------------------------------------
 // Allocator accounting
@@ -335,6 +351,46 @@ fn verify_at(
     }
 }
 
+/// Values of the two-member collection: the extra axis of each member is the
+/// member index, so both members hold different bit patterns.
+fn verify_collection_values(label: &str, arrays: &[Array; MEMBERS]) {
+    for (member, array) in arrays.iter().enumerate() {
+        let storage = array.as_slice();
+        assert_eq!(
+            storage.len(),
+            MEMBER_ELEMENTS,
+            "{label}: member {member} element count"
+        );
+        for x in 0..SPATIAL[0] {
+            for y in 0..SPATIAL[1] {
+                let expected = value_at(member, x, y);
+                let actual = storage[physical_offset(0, x, y)];
+                assert_eq!(
+                    actual.re.to_bits(),
+                    expected.re.to_bits(),
+                    "{label}: member {member} real bits at x={x} y={y}"
+                );
+                assert_eq!(
+                    actual.im.to_bits(),
+                    expected.im.to_bits(),
+                    "{label}: member {member} imaginary bits at x={x} y={y}"
+                );
+            }
+        }
+    }
+}
+
+fn member_views(arrays: &mut [Array; MEMBERS]) -> [ViewMut<'_>; MEMBERS] {
+    let [first, second] = arrays;
+    [first.view_mut(), second.view_mut()]
+}
+
+fn reset_collection(arrays: &mut [Array; MEMBERS]) {
+    for array in arrays {
+        reset_destination(array);
+    }
+}
+
 fn reset_destination(destination: &mut PencilArray<Complex<f64>, 2, 2>) {
     let sentinel = Complex::new(
         f64::from_bits(0x7ff8_1234_5678_9abc),
@@ -530,6 +586,96 @@ fn staging_peak_is_one_payload() {
         .write("large", source.view(), &Hdf5WriteOptions::default())
         .expect("session HDF5 fixture");
 
+    // Collection fixtures: two members whose combined payload is one P, read
+    // through a permuted destination.
+    let member_extra = ExtraShape::new([1]).expect("member extra shape");
+    // Reuse the fixture pencils: the writer keeps `[0, 1]` and the single-view
+    // destination already uses the `[1, 0]` reader permutation.
+    let mut collection_sources: [Array; MEMBERS] = std::array::from_fn(|_| {
+        Array::from_elem(
+            Arc::clone(source.pencil()),
+            member_extra.clone(),
+            Complex::new(-1.0, -1.0),
+        )
+        .expect("collection source")
+    });
+    let mut collection_destinations: [Array; MEMBERS] = std::array::from_fn(|_| {
+        Array::from_elem(
+            Arc::clone(destination.pencil()),
+            member_extra.clone(),
+            Complex::new(-1.0, -1.0),
+        )
+        .expect("collection destination")
+    });
+    for (member, array) in collection_sources.iter_mut().enumerate() {
+        for x in 0..SPATIAL[0] {
+            for y in 0..SPATIAL[1] {
+                array.as_mut_slice()[identity_offset(0, x, y)] = value_at(member, x, y);
+            }
+        }
+    }
+    assert_eq!(collection_sources[0].as_slice().len(), MEMBER_ELEMENTS);
+
+    let collection_path = directory.join("staging-collection.pio");
+    write_mpi_collection(
+        &collection_path,
+        comm,
+        &[collection_sources[0].view(), collection_sources[1].view()],
+    )
+    .expect("MPI collection fixture");
+
+    let collection_options_path = directory.join("staging-collection-options.pio");
+    write_mpi_collection_with_options(
+        &collection_options_path,
+        comm,
+        &[collection_sources[0].view(), collection_sources[1].view()],
+        &options,
+    )
+    .expect("option MPI collection fixture");
+
+    let collection_named_path = directory.join("staging-collection-named.pio");
+    write_mpi_named_collection(
+        &collection_named_path,
+        "members",
+        comm,
+        &[collection_sources[0].view(), collection_sources[1].view()],
+        &options,
+    )
+    .expect("named MPI collection fixture");
+
+    #[cfg(feature = "parallel-hdf5")]
+    let hdf5_write_options = Hdf5WriteOptions::default();
+    #[cfg(feature = "parallel-hdf5")]
+    let hdf5_collection_path = directory.join("staging-collection.h5");
+    #[cfg(feature = "parallel-hdf5")]
+    write_hdf5_collection(
+        &hdf5_collection_path,
+        comm,
+        &[collection_sources[0].view(), collection_sources[1].view()],
+    )
+    .expect("HDF5 collection fixture");
+    #[cfg(feature = "parallel-hdf5")]
+    let hdf5_collection_options_path = directory.join("staging-collection-options.h5");
+    #[cfg(feature = "parallel-hdf5")]
+    write_hdf5_collection_with_options(
+        &hdf5_collection_options_path,
+        comm,
+        &[collection_sources[0].view(), collection_sources[1].view()],
+        &hdf5_write_options,
+    )
+    .expect("option HDF5 collection fixture");
+    #[cfg(feature = "parallel-hdf5")]
+    let hdf5_collection_named_path = directory.join("staging-collection-named.h5");
+    #[cfg(feature = "parallel-hdf5")]
+    write_hdf5_named_collection(
+        &hdf5_collection_named_path,
+        "members",
+        comm,
+        &[collection_sources[0].view(), collection_sources[1].view()],
+        &hdf5_write_options,
+    )
+    .expect("named HDF5 collection fixture");
+
     let mut samples: Vec<Sample> = Vec::new();
 
     reset_destination(&mut destination);
@@ -574,6 +720,45 @@ fn staging_peak_is_one_payload() {
     samples.push(sample);
     verify_identity_values("read_mpi_chunked", &chunked_destination);
 
+    reset_collection(&mut collection_destinations);
+    let (result, sample) = measure("mpi_collection", || {
+        let mut views = member_views(&mut collection_destinations);
+        read_mpi_collection(&collection_path, comm, &mut views)
+    });
+    assert!(result.is_ok(), "read_mpi_collection failed: {result:?}");
+    samples.push(sample);
+    verify_collection_values("read_mpi_collection", &collection_destinations);
+
+    reset_collection(&mut collection_destinations);
+    let (result, sample) = measure("mpi_collection_options", || {
+        let mut views = member_views(&mut collection_destinations);
+        read_mpi_collection_with_options(&collection_options_path, comm, &mut views, &options)
+    });
+    assert!(
+        result.is_ok(),
+        "read_mpi_collection_with_options failed: {result:?}"
+    );
+    samples.push(sample);
+    verify_collection_values("read_mpi_collection_with_options", &collection_destinations);
+
+    reset_collection(&mut collection_destinations);
+    let (result, sample) = measure("mpi_named_collection", || {
+        let mut views = member_views(&mut collection_destinations);
+        read_mpi_named_collection(
+            &collection_named_path,
+            "members",
+            comm,
+            &mut views,
+            &options,
+        )
+    });
+    assert!(
+        result.is_ok(),
+        "read_mpi_named_collection failed: {result:?}"
+    );
+    samples.push(sample);
+    verify_collection_values("read_mpi_named_collection", &collection_destinations);
+
     #[cfg(feature = "parallel-hdf5")]
     {
         reset_destination(&mut destination);
@@ -589,6 +774,53 @@ fn staging_peak_is_one_payload() {
         assert!(result.is_ok(), "Hdf5FileSession::read failed: {result:?}");
         samples.push(sample);
         verify_values("Hdf5FileSession::read", &destination);
+
+        reset_collection(&mut collection_destinations);
+        let (result, sample) = measure("hdf5_collection", || {
+            let mut views = member_views(&mut collection_destinations);
+            read_hdf5_collection(&hdf5_collection_path, comm, &mut views)
+        });
+        assert!(result.is_ok(), "read_hdf5_collection failed: {result:?}");
+        samples.push(sample);
+        verify_collection_values("read_hdf5_collection", &collection_destinations);
+
+        reset_collection(&mut collection_destinations);
+        let (result, sample) = measure("hdf5_collection_options", || {
+            let mut views = member_views(&mut collection_destinations);
+            read_hdf5_collection_with_options(
+                &hdf5_collection_options_path,
+                comm,
+                &mut views,
+                &hdf5_read_options,
+            )
+        });
+        assert!(
+            result.is_ok(),
+            "read_hdf5_collection_with_options failed: {result:?}"
+        );
+        samples.push(sample);
+        verify_collection_values(
+            "read_hdf5_collection_with_options",
+            &collection_destinations,
+        );
+
+        reset_collection(&mut collection_destinations);
+        let (result, sample) = measure("hdf5_named_collection", || {
+            let mut views = member_views(&mut collection_destinations);
+            read_hdf5_named_collection(
+                &hdf5_collection_named_path,
+                "members",
+                comm,
+                &mut views,
+                &hdf5_read_options,
+            )
+        });
+        assert!(
+            result.is_ok(),
+            "read_hdf5_named_collection failed: {result:?}"
+        );
+        samples.push(sample);
+        verify_collection_values("read_hdf5_named_collection", &collection_destinations);
     }
 
     // Sessions close only after every measured read has returned.
@@ -616,13 +848,22 @@ fn staging_peak_is_one_payload() {
     measured.sort_unstable();
     let mut expected = vec![
         "mpi_chunked",
+        "mpi_collection",
+        "mpi_collection_options",
         "mpi_io",
         "mpi_named",
+        "mpi_named_collection",
         "mpi_raw",
         "mpi_session",
     ];
     #[cfg(feature = "parallel-hdf5")]
-    expected.extend(["hdf5", "hdf5_session"]);
+    expected.extend([
+        "hdf5",
+        "hdf5_collection",
+        "hdf5_collection_options",
+        "hdf5_named_collection",
+        "hdf5_session",
+    ]);
     expected.sort_unstable();
     assert_eq!(
         measured, expected,
