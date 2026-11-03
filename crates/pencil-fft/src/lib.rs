@@ -86,6 +86,14 @@
 //! Fourier signs, or normalization. Spectrum endpoint validation, where
 //! applicable, is an additional acceptance check, not a provenance guarantee.
 //!
+//! For `R2cPlan` and `MixedR2cPlan` reverse execution and `C2rPlan` forward
+//! execution, spectrum endpoint validation checks each extra-shape batch
+//! and constrained plane independently using the documented finiteness
+//! checks, thresholds, and acceptance formula. Fusing SUM reductions across
+//! batches can change MPI's floating-point reduction order. Acceptance near
+//! a threshold can therefore differ from the former per-batch reductions;
+//! exact agreement with the former implementation is not guaranteed there.
+//!
 //! ## Failure boundaries
 //!
 //! These are guarantees for checked, returned errors in supported execution

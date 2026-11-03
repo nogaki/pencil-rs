@@ -116,6 +116,50 @@ fn consume_r2c_callback_injection() -> Result<(), FftError> {
     }
 }
 
+/// One observed step of the endpoint statistics protocol.
+///
+/// Only the statistics reductions of `validate_boundary` and
+/// `validate_mixed_boundary_data` are recorded; constructor agreements and
+/// point-to-point status reductions are not part of this log.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndpointReductionEvent {
+    PreparationAgreement,
+    Allocation { slot: usize, length: usize },
+    MaxReduction { elements: usize },
+    SumReduction { elements: usize },
+    FinalAgreement,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ENDPOINT_REDUCTION_LOG: std::cell::RefCell<Vec<EndpointReductionEvent>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static ENDPOINT_ALLOCATION_FAILURE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn record_endpoint_reduction(event: EndpointReductionEvent) {
+    ENDPOINT_REDUCTION_LOG.with(|log| log.borrow_mut().push(event));
+}
+
+#[cfg(test)]
+fn endpoint_reduction_log() -> Vec<EndpointReductionEvent> {
+    ENDPOINT_REDUCTION_LOG.with(|log| log.borrow().clone())
+}
+
+#[cfg(test)]
+fn reset_endpoint_reduction_log() {
+    ENDPOINT_REDUCTION_LOG.with(|log| log.borrow_mut().clear());
+    ENDPOINT_ALLOCATION_FAILURE.with(|failure| failure.set(None));
+}
+
+#[cfg(test)]
+fn force_endpoint_allocation_failure(slot: usize) {
+    ENDPOINT_ALLOCATION_FAILURE.with(|failure| failure.set(Some(slot)));
+}
+
 use crate::{
     Complex, FftReal, LocalC2cError, LocalC2cPlan, LocalR2cError, LocalR2cPlan, LocalR2rError,
 };
@@ -165,6 +209,14 @@ impl BackendChoice {
 }
 
 const BACKEND_DESCRIPTOR_WORDS: usize = 8;
+
+/// Extra-shape batches fused into one endpoint statistics reduction.
+///
+/// Each statistics buffer holds at most this many batches per rank, and
+/// endpoint validation runs one MAX and one SUM reduction per chunk. For `B`
+/// batches that is `2 * B.div_ceil(ENDPOINT_BATCH_CHUNK)` all-reduces instead
+/// of two per batch.
+const ENDPOINT_BATCH_CHUNK: usize = 1024;
 const DESCRIPTOR_SCHEMA: u64 = 5;
 const OPERATION_PLAN: u64 = 7;
 const OPERATION_FORWARD: u64 = 8;
@@ -3782,6 +3834,55 @@ fn initialized_vec<T: Clone>(length: usize, value: T) -> Result<Vec<T>, FftError
     Ok(values)
 }
 
+fn endpoint_chunk_count(batch_count: usize) -> usize {
+    batch_count.div_ceil(ENDPOINT_BATCH_CHUNK)
+}
+
+fn endpoint_chunk_len(batch_count: usize, chunk_start: usize) -> usize {
+    (batch_count - chunk_start).min(ENDPOINT_BATCH_CHUNK)
+}
+
+/// The ULP neighbors of `threshold` in `R`, with the exact value in the middle.
+///
+/// Threshold fixtures use exactly representable values so that the middle
+/// neighbor pins the analytic threshold and MPI's reduction order cannot
+/// change its decision.
+#[cfg(test)]
+fn endpoint_ulp_neighbors<R: FftReal>(threshold: f64) -> [f64; 3] {
+    let neighbors = if size_of::<R>() == size_of::<f32>() {
+        let bits = (threshold as f32).to_bits();
+        [bits - 1, bits, bits + 1].map(|bits| f32::from_bits(bits) as f64)
+    } else {
+        let bits = threshold.to_bits();
+        [bits - 1, bits, bits + 1].map(f64::from_bits)
+    };
+    assert_eq!(neighbors[1], threshold, "fixture threshold must be exact");
+    neighbors
+}
+
+/// Allocates the three chunk statistics buffers before any collective call.
+///
+/// The slot order is local statistics, global maxima, and global sums. A
+/// failure here must be agreed before the first statistics reduction, so the
+/// caller allocates all three inside its preparation result.
+fn endpoint_chunk_buffers(length: usize) -> Result<[Vec<[f64; 4]>; 3], FftError> {
+    let mut buffers: [Vec<[f64; 4]>; 3] = std::array::from_fn(|_| Vec::new());
+    for (slot, buffer) in buffers.iter_mut().enumerate() {
+        #[cfg(test)]
+        {
+            record_endpoint_reduction(EndpointReductionEvent::Allocation { slot, length });
+            let failure = ENDPOINT_ALLOCATION_FAILURE.with(std::cell::Cell::get);
+            if failure == Some(slot) {
+                return Err(FftError::AllocationFailed { required: length });
+            }
+        }
+        #[cfg(not(test))]
+        let _ = slot;
+        *buffer = initialized_vec(length, [0.0_f64; 4])?;
+    }
+    Ok(buffers)
+}
+
 fn map_array_allocation(error: ArrayError) -> FftError {
     match error {
         ArrayError::AllocationFailed { required } => FftError::AllocationFailed { required },
@@ -3799,18 +3900,19 @@ mod tests {
 
     use super::{
         C2C_CALLBACK_INJECTION, C2cCallbackInjection, C2cInPlaceArray, C2cInPlaceWorkspace,
-        C2cPlan, C2cState, C2cTransition, Complex, Direction, DistributedLayout, ExtraShape,
-        FftError, FftOverlapError, LocalC2cError, LocalC2cPlan, OPERATION_BACKWARD,
-        OPERATION_BACKWARD_IN_PLACE, OPERATION_DHT_BACKWARD, OPERATION_DHT_BACKWARD_IN_PLACE,
-        OPERATION_DHT_FORWARD, OPERATION_DHT_FORWARD_IN_PLACE, OPERATION_DHT_INVERSE,
-        OPERATION_DHT_INVERSE_IN_PLACE, OPERATION_DHT_PLAN, OPERATION_FORWARD,
-        OPERATION_FORWARD_IN_PLACE, OPERATION_INVERSE, OPERATION_INVERSE_IN_PLACE, OPERATION_PLAN,
-        OPERATION_R2C_BACKWARD, OPERATION_R2C_BACKWARD_IN_PLACE, OPERATION_R2C_FORWARD,
-        OPERATION_R2C_FORWARD_IN_PLACE, OPERATION_R2C_INVERSE, OPERATION_R2C_INVERSE_IN_PLACE,
-        OPERATION_R2C_PLAN, OPERATION_R2R_BACKWARD, OPERATION_R2R_BACKWARD_IN_PLACE,
-        OPERATION_R2R_FORWARD, OPERATION_R2R_FORWARD_IN_PLACE, OPERATION_R2R_INVERSE,
-        OPERATION_R2R_INVERSE_IN_PLACE, OPERATION_R2R_PLAN, OverlapError, R2C_CALLBACK_INJECTION,
-        R2cCallbackInjection, R2cError, R2cPlan, TransposeMethod, descriptor_len,
+        C2cPlan, C2cState, C2cTransition, Complex, Direction, DistributedLayout,
+        ENDPOINT_BATCH_CHUNK, ExtraShape, FftError, FftOverlapError, LocalC2cError, LocalC2cPlan,
+        OPERATION_BACKWARD, OPERATION_BACKWARD_IN_PLACE, OPERATION_DHT_BACKWARD,
+        OPERATION_DHT_BACKWARD_IN_PLACE, OPERATION_DHT_FORWARD, OPERATION_DHT_FORWARD_IN_PLACE,
+        OPERATION_DHT_INVERSE, OPERATION_DHT_INVERSE_IN_PLACE, OPERATION_DHT_PLAN,
+        OPERATION_FORWARD, OPERATION_FORWARD_IN_PLACE, OPERATION_INVERSE,
+        OPERATION_INVERSE_IN_PLACE, OPERATION_PLAN, OPERATION_R2C_BACKWARD,
+        OPERATION_R2C_BACKWARD_IN_PLACE, OPERATION_R2C_FORWARD, OPERATION_R2C_FORWARD_IN_PLACE,
+        OPERATION_R2C_INVERSE, OPERATION_R2C_INVERSE_IN_PLACE, OPERATION_R2C_PLAN,
+        OPERATION_R2R_BACKWARD, OPERATION_R2R_BACKWARD_IN_PLACE, OPERATION_R2R_FORWARD,
+        OPERATION_R2R_FORWARD_IN_PLACE, OPERATION_R2R_INVERSE, OPERATION_R2R_INVERSE_IN_PLACE,
+        OPERATION_R2R_PLAN, OverlapError, R2C_CALLBACK_INJECTION, R2cCallbackInjection, R2cError,
+        R2cPlan, TransposeMethod, descriptor_len, endpoint_chunk_count, endpoint_chunk_len,
         run_in_place_transaction,
     };
     use crate::{
@@ -3818,6 +3920,26 @@ mod tests {
     };
     use mpi::{collective::CommunicatorCollectives, topology::Communicator};
     use pencil_array::{ArrayError, MpiTopology, TransposeWorkspace};
+
+    #[test]
+    fn endpoint_chunks_bound_batch_statistics() {
+        let chunk = ENDPOINT_BATCH_CHUNK;
+        assert_eq!(chunk, 1024);
+        for (batch_count, chunks, last) in [
+            (0, 0, 0),
+            (1, 1, 1),
+            (chunk - 1, 1, chunk - 1),
+            (chunk, 1, chunk),
+            (chunk + 1, 2, 1),
+            (2 * chunk + 1, 3, 1),
+        ] {
+            assert_eq!(endpoint_chunk_count(batch_count), chunks);
+            if chunks > 0 {
+                assert_eq!(endpoint_chunk_len(batch_count, 0), chunk.min(batch_count));
+                assert_eq!(endpoint_chunk_len(batch_count, (chunks - 1) * chunk), last);
+            }
+        }
+    }
 
     #[test]
     fn axis_selection_validates_and_ignores_input_order() {

@@ -335,6 +335,50 @@ pub(crate) enum Kind {
     Forward,
     Inverse,
 }
+/// Planner scratch for one transform kind: only the arrays that transform reads
+/// and writes are allocated, each at the length FFTW requires. Initialized and
+/// private, so destructive planning never sees caller data.
+struct PlanningBuffers<R: Real> {
+    complex_in: Vec<Complex<R>>,
+    complex_out: Vec<Complex<R>>,
+    real_in: Vec<R>,
+    real_out: Vec<R>,
+}
+impl<R: Real> PlanningBuffers<R> {
+    fn new(n: usize, kind: Kind) -> Result<Self, FftwError> {
+        let mut buffers = Self {
+            complex_in: Vec::new(),
+            complex_out: Vec::new(),
+            real_in: Vec::new(),
+            real_out: Vec::new(),
+        };
+        match kind {
+            // C2C: one complex array in place, two out of place.
+            Kind::Complex(_, true) => buffers.complex_in = zeros(n)?,
+            Kind::Complex(_, false) => {
+                buffers.complex_in = zeros(n)?;
+                buffers.complex_out = zeros(n)?;
+            }
+            // R2R: one real array in place, two out of place.
+            Kind::R2r(_, true) => buffers.real_in = zeros(n)?,
+            Kind::R2r(_, false) => {
+                buffers.real_in = zeros(n)?;
+                buffers.real_out = zeros(n)?;
+            }
+            // R2C reads n reals, writes the n/2+1 half spectrum.
+            Kind::Forward => {
+                buffers.real_in = zeros(n)?;
+                buffers.complex_out = zeros(n / 2 + 1)?;
+            }
+            // C2R reads the n/2+1 half spectrum, writes n reals.
+            Kind::Inverse => {
+                buffers.complex_in = zeros(n / 2 + 1)?;
+                buffers.real_in = zeros(n)?;
+            }
+        }
+        Ok(buffers)
+    }
+}
 pub(crate) struct Plan<R: Real> {
     handle: NonNull<c_void>,
     table: Table<R>,
@@ -372,17 +416,17 @@ impl<R: Real> Plan<R> {
             ));
         }
         let table = Table::load()?;
-        // Initialized, private buffers: destructive planning never sees caller data.
-        let mut a = zeros::<Complex<R>>(n)?;
-        let mut b = zeros::<Complex<R>>(n)?;
-        let mut r = zeros::<R>(n)?;
+        let mut buffers = PlanningBuffers::<R>::new(n, kind)?;
         let _guard = lock::<R>();
         let _threads = set_threads(&table, options.threads)?;
         #[cfg(test)]
         trace("limit/plan");
         let _reset = Reset(&table.limit);
-        // SAFETY: dimensions fit c_int and all arrays hold at least n initialized
-        // elements. Complex<T> has repr(C), two consecutive T fields (num-complex).
+        // SAFETY: dimensions fit c_int, and every pointer below refers to an
+        // initialized buffer of exactly the length its transform needs: n complex
+        // values per C2C array, n reals in and n/2+1 complex out for R2C, n/2+1
+        // complex in and n reals out for C2R, and n reals per R2R array.
+        // Complex<T> has repr(C), two consecutive T fields (num-complex).
         // UNALIGNED removes SIMD alignment constraints, NOT alias constraints.
         let handle = unsafe {
             (table.limit)(options.time_limit.map_or(-1.0, |t| t.as_secs_f64()));
@@ -404,8 +448,12 @@ impl<R: Real> Plan<R> {
                     trace_flags(flags | FFTW_PRESERVE_INPUT);
                     (table.pc)(
                         native,
-                        a.as_mut_ptr(),
-                        if ip { a.as_mut_ptr() } else { b.as_mut_ptr() },
+                        buffers.complex_in.as_mut_ptr(),
+                        if ip {
+                            buffers.complex_in.as_mut_ptr()
+                        } else {
+                            buffers.complex_out.as_mut_ptr()
+                        },
                         if d == FftDirection::Forward { -1 } else { 1 },
                         flags | FFTW_PRESERVE_INPUT,
                     )
@@ -415,12 +463,11 @@ impl<R: Real> Plan<R> {
                     trace_flags(flags | FFTW_PRESERVE_INPUT);
                     (table.pr)(
                         native,
-                        r.as_mut_ptr(),
-                        // a holds 2*n initialized reals; use only its first n.
+                        buffers.real_in.as_mut_ptr(),
                         if ip {
-                            r.as_mut_ptr()
+                            buffers.real_in.as_mut_ptr()
                         } else {
-                            a.as_mut_ptr().cast()
+                            buffers.real_out.as_mut_ptr()
                         },
                         kind as c_int,
                         flags | FFTW_PRESERVE_INPUT,
@@ -429,12 +476,22 @@ impl<R: Real> Plan<R> {
                 Kind::Forward => {
                     #[cfg(test)]
                     trace_flags(flags);
-                    (table.pf)(native, r.as_mut_ptr(), b.as_mut_ptr(), flags)
+                    (table.pf)(
+                        native,
+                        buffers.real_in.as_mut_ptr(),
+                        buffers.complex_out.as_mut_ptr(),
+                        flags,
+                    )
                 }
                 Kind::Inverse => {
                     #[cfg(test)]
                     trace_flags(flags);
-                    (table.pi)(native, a.as_mut_ptr(), r.as_mut_ptr(), flags)
+                    (table.pi)(
+                        native,
+                        buffers.complex_in.as_mut_ptr(),
+                        buffers.real_in.as_mut_ptr(),
+                        flags,
+                    )
                 }
             }
         };
@@ -1044,6 +1101,52 @@ mod tests {
                 assert!(command.status().unwrap().success(), "{precision}: {mode}");
             }
         }
+    }
+    // Allocation sizes and lengths handed to FFTW; needs no FFTW runtime.
+    // Guards the pre-#48 shape, which was n complex twice plus n reals for every
+    // kind, so C2C in place reported [n, n, n, 0] instead of [n, 0, 0, 0].
+    #[test]
+    fn planning_buffers_match_kind_shapes() {
+        fn check<R: Real>() {
+            for n in [7, 8] {
+                let half = n / 2 + 1;
+                let check = |kind: Kind, lens: [usize; 4]| {
+                    let b = PlanningBuffers::<R>::new(n, kind).unwrap();
+                    assert_eq!(
+                        [
+                            b.complex_in.len(),
+                            b.complex_out.len(),
+                            b.real_in.len(),
+                            b.real_out.len(),
+                        ],
+                        lens,
+                        "n={n}, {kind:?}"
+                    );
+                };
+                for d in [FftDirection::Forward, FftDirection::Inverse] {
+                    check(Kind::Complex(d, false), [n, n, 0, 0]);
+                    check(Kind::Complex(d, true), [n, 0, 0, 0]);
+                }
+                for kind in [
+                    R2rKind::Dht,
+                    R2rKind::DctI,
+                    R2rKind::DctII,
+                    R2rKind::DctIII,
+                    R2rKind::DctIV,
+                    R2rKind::DstI,
+                    R2rKind::DstII,
+                    R2rKind::DstIII,
+                    R2rKind::DstIV,
+                ] {
+                    check(Kind::R2r(kind, false), [0, 0, n, n]);
+                    check(Kind::R2r(kind, true), [0, 0, n, 0]);
+                }
+                check(Kind::Forward, [0, half, n, 0]);
+                check(Kind::Inverse, [half, 0, n, 0]);
+            }
+        }
+        check::<f32>();
+        check::<f64>();
     }
     #[test]
     fn missing_library_and_symbol() {

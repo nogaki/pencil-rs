@@ -4,10 +4,15 @@ use std::path::Path;
 use mpi::collective::SystemOperation;
 use mpi::traits::*;
 use pencil_array::{AxisPermutation, ExtraShape, MpiTopology, Pencil, PencilArray};
-use pencil_io::{NamedIoError, append_mpi_named, read_mpi_named, write_mpi, write_mpi_named};
+use pencil_io::{
+    IoError, NamedIoError, append_mpi_named, read_mpi_named, write_mpi, write_mpi_named,
+};
 
 mod support;
-use support::{cleanup_owned_temp_dir, owned_temp_dir};
+use support::{
+    cleanup_owned_temp_dir, decomposition_array, decomposition_values_match,
+    mismatched_decomposition, owned_temp_dir, record_case, root_read,
+};
 
 fn root_bytes<C: CommunicatorCollectives>(world: &C, path: &Path) -> Vec<u8> {
     let mut n = if world.rank() == 0 {
@@ -188,6 +193,129 @@ fn sparse_snapshot(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+// Issue #38: the named MPI paths must reject a decomposition that differs
+// between ranks, before they touch the container.
+fn issue38_named_mpi_cases<C>(world: &C, dir: &Path, failures: &mut Vec<String>)
+where
+    C: Communicator + CommunicatorCollectives,
+{
+    let size = usize::try_from(world.size()).unwrap();
+    if size == 1 {
+        if world.rank() == 0 {
+            eprintln!("issue38 skipped: 1 rank");
+        }
+        return;
+    }
+
+    let read_path = dir.join("issue38-named-read.pio");
+    reset(world, &read_path);
+    let source = decomposition_array(world, [0, 1], None);
+    write_mpi_named(&read_path, "field", source.view()).unwrap();
+    world.barrier();
+
+    let mut destination = decomposition_array(world, mismatched_decomposition(world), Some(-888));
+    let before = destination.as_slice().to_vec();
+    let result = read_mpi_named(&read_path, "field", destination.view_mut());
+    let ok = matches!(
+        result,
+        Err(NamedIoError::Io(IoError::CollectiveDescriptorMismatch))
+    ) && destination.as_slice() == before.as_slice();
+    record_case(
+        world,
+        failures,
+        "default_named_mpi_read_decomposition_mismatch",
+        ok,
+        &format!("{result:?}"),
+    );
+
+    let mut recovered = decomposition_array(world, [1, 0], Some(-888));
+    let result = read_mpi_named(&read_path, "field", recovered.view_mut());
+    let ok = result.is_ok() && decomposition_values_match(&recovered);
+    record_case(
+        world,
+        failures,
+        "default_named_mpi_read_decomposition_mismatch/recovery",
+        ok,
+        &format!("{result:?}"),
+    );
+
+    let before_append = root_read(world, &read_path);
+    let source = decomposition_array(world, mismatched_decomposition(world), None);
+    let result = append_mpi_named(&read_path, "other", source.view());
+    world.barrier();
+    let after_append = root_read(world, &read_path);
+    let unchanged = world.rank() != 0 || after_append == before_append;
+    let ok = matches!(
+        result,
+        Err(NamedIoError::Io(IoError::CollectiveDescriptorMismatch))
+    ) && unchanged;
+    record_case(
+        world,
+        failures,
+        "default_named_mpi_append_decomposition_mismatch",
+        ok,
+        &format!("{result:?} unchanged={unchanged}"),
+    );
+
+    let source = decomposition_array(world, [0, 1], None);
+    let result = append_mpi_named(&read_path, "other_ok", source.view());
+    record_case(
+        world,
+        failures,
+        "default_named_mpi_append_decomposition_mismatch/recovery",
+        result.is_ok(),
+        &format!("{result:?}"),
+    );
+
+    let mut recovered = decomposition_array(world, [0, 1], Some(0));
+    let result = read_mpi_named(&read_path, "field", recovered.view_mut());
+    let ok = result.is_ok() && decomposition_values_match(&recovered);
+    record_case(
+        world,
+        failures,
+        "default_named_mpi_append_decomposition_mismatch/recovery_field",
+        ok,
+        &format!("{result:?}"),
+    );
+
+    let write_path = dir.join("issue38-named-write.pio");
+    reset(world, &write_path);
+    let source = decomposition_array(world, mismatched_decomposition(world), None);
+    let result = write_mpi_named(&write_path, "field", source.view());
+    world.barrier();
+    let absent = if world.rank() == 0 {
+        write_path
+            .try_exists()
+            .map(|exists| !exists)
+            .unwrap_or(false)
+    } else {
+        true
+    };
+    let ok = matches!(
+        result,
+        Err(NamedIoError::Io(IoError::CollectiveDescriptorMismatch))
+    ) && absent;
+    record_case(
+        world,
+        failures,
+        "default_named_mpi_write_decomposition_mismatch",
+        ok,
+        &format!("{result:?} file_absent={absent}"),
+    );
+
+    let recovery_path = dir.join("issue38-named-write-recovery.pio");
+    reset(world, &recovery_path);
+    let source = decomposition_array(world, [0, 1], None);
+    let result = write_mpi_named(&recovery_path, "field", source.view());
+    record_case(
+        world,
+        failures,
+        "default_named_mpi_write_decomposition_mismatch/recovery",
+        result.is_ok(),
+        &format!("{result:?}"),
+    );
+}
+
 #[test]
 fn named_mpi_matrix() {
     eprintln!("named_mpi:start");
@@ -270,12 +398,15 @@ fn named_mpi_matrix() {
     assert_i32(&ar, 2);
     let before = raw.clone();
     let duplicate = append_mpi_named(&path, "A", a.view());
+    // Every rank must call root_bytes unconditionally: its broadcasts and the
+    // check() reduction must reach all ranks in the same order even when the
+    // rank-local outcome differs.
+    let after = root_bytes(&world, &path);
     check(
         &world,
         &mut failures,
         "duplicate rejected",
-        matches!(duplicate, Err(NamedIoError::DuplicateName))
-            && root_bytes(&world, &path) == before,
+        matches!(duplicate, Err(NamedIoError::DuplicateName)) && after == before,
     );
 
     let missing = dir.join("missing.pio");
@@ -296,11 +427,12 @@ fn named_mpi_matrix() {
     } else {
         append_mpi_named(&path, "X", a.view())
     };
+    let after_op = root_bytes(&world, &path);
     check(
         &world,
         &mut failures,
         "old/new operation rank mismatch",
-        op.is_err() && root_bytes(&world, &path) == mismatch_before,
+        op.is_err() && after_op == mismatch_before,
     );
     world.barrier();
     let name = if world.rank() == 0 {
@@ -313,11 +445,12 @@ fn named_mpi_matrix() {
     } else {
         Some(append_mpi_named(&path, name, a.view()))
     };
+    let after_mismatch = root_bytes(&world, &path);
     check(
         &world,
         &mut failures,
         "name mismatch recovery",
-        size == 1 || (mismatch.unwrap().is_err() && root_bytes(&world, &path) == mismatch_before),
+        size == 1 || (mismatch.unwrap().is_err() && after_mismatch == mismatch_before),
     );
     world.barrier();
     let type_array =
@@ -399,11 +532,12 @@ fn named_mpi_matrix() {
     world.barrier();
     let malformed = root_bytes(&world, &path);
     let tail = append_mpi_named(&path, "tail", a.view());
+    let after_tail = root_bytes(&world, &path);
     check(
         &world,
         &mut failures,
         "malformed tail append rejected unchanged",
-        tail.is_err() && root_bytes(&world, &path) == malformed,
+        tail.is_err() && after_tail == malformed,
     );
     let mut again = PencilArray::from_elem(
         Pencil::<2, 2>::new(MpiTopology::new(&world, [1, size]).unwrap(), [4, 5], [1, 0]).unwrap(),
@@ -533,6 +667,7 @@ fn named_mpi_matrix() {
         eprintln!("sparse fixture creation failed: {fixture:?}");
         failures.push("sparse fixture creation failed collectively".into());
     }
+    issue38_named_mpi_cases(&world, &dir, &mut failures);
     cleanup_owned_temp_dir(&world, &dir);
     if !failures.is_empty() {
         panic!("named MPI failures: {failures:?}");

@@ -4,7 +4,10 @@ use mpi::collective::CommunicatorCollectives;
 use mpi::traits::Communicator;
 use num_complex::{Complex32, Complex64};
 use pencil_array::{ExtraShape, MpiTopology, Pencil, PencilArray};
-use pencil_io::{ScalarType, append_mpi_named, write_mpi, write_mpi_collection, write_mpi_named};
+use pencil_io::{
+    MpiFileSession, MpiIoOptions, ScalarType, append_mpi_named, write_mpi, write_mpi_collection,
+    write_mpi_named,
+};
 use pencil_io::{read_mpi_catalog, read_mpi_named, read_mpi_named_catalog};
 
 mod support;
@@ -46,9 +49,12 @@ fn u64_at(b: &[u8], p: usize) -> u64 {
 // Keep these fixtures independent of the array writers: catalog decoding must
 // be tested against the on-disk codes, not only against Rust type dispatch.
 fn native_fixture(code: u64, width: usize) -> Vec<u8> {
+    native_fixture_grid(&[1], code, width)
+}
+
+fn native_fixture_grid(grid: &[u64], code: u64, width: usize) -> Vec<u8> {
     let n = 2usize;
     let er = 2usize;
-    let grid = [1u64];
     let global = [4u64, 5];
     let extra = [3u64, 2];
     let perm = [0u64, 1];
@@ -71,7 +77,12 @@ fn native_fixture(code: u64, width: usize) -> Vec<u8> {
     ] {
         h[p..p + 8].copy_from_slice(&x.to_le_bytes());
     }
-    for x in global.into_iter().chain(extra).chain(grid).chain(perm) {
+    for x in global
+        .into_iter()
+        .chain(extra)
+        .chain(grid.iter().copied())
+        .chain(perm)
+    {
         h.extend_from_slice(&x.to_le_bytes());
     }
     h.extend(vec![0; payload]);
@@ -108,6 +119,70 @@ fn named_fixture(code: u64, width: usize) -> Vec<u8> {
     out.extend_from_slice(&meta);
     out.extend(vec![0; payload]);
     out.extend_from_slice(&0x434f_4d4d_4954_5445u64.to_le_bytes());
+    out
+}
+
+const NAMED_KEY_BYTES: usize = 1_018;
+const COMMIT_WORD: u64 = 0x434f_4d4d_4954_5445;
+
+// Raw named-v2 fixture: 1-D global extent 1 (8-byte payload), keys are a
+// 1,018-byte common prefix plus six digits. Independent of the production
+// writers, as in `named_fixture`.
+fn raw_named_record(index: usize) -> Vec<u8> {
+    let mut name = vec![b'p'; NAMED_KEY_BYTES];
+    name.extend_from_slice(format!("{index:06}").as_bytes());
+    assert_eq!(name.len(), 1_024);
+    let metadata_len = 16 + 8;
+    let payload = 8usize;
+    let total = 72 + name.len() + metadata_len + payload + 8;
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"PIOREC02");
+    for value in [
+        2u64,
+        name.len() as u64,
+        metadata_len as u64,
+        payload as u64,
+        total as u64,
+        ScalarType::F64.code(),
+        8,
+        0,
+    ] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(&name);
+    out.extend_from_slice(&1u64.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
+    out.extend_from_slice(&1u64.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
+    out.extend_from_slice(&COMMIT_WORD.to_le_bytes());
+    out
+}
+
+fn raw_named_key(index: usize) -> String {
+    let mut key = String::from_utf8(vec![b'p'; NAMED_KEY_BYTES]).unwrap();
+    key.push_str(&format!("{index:06}"));
+    key
+}
+
+fn raw_named_records(count: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"PIONAM02");
+    for value in [2u64, 32, 0] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.reserve(count * 1_136);
+    for index in 0..count {
+        out.extend_from_slice(&raw_named_record(index));
+    }
+    out
+}
+
+fn raw_empty_named_container() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"PIONAM02");
+    for value in [2u64, 32, 0] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
     out
 }
 
@@ -224,6 +299,11 @@ fn catalog_integration() {
         barrier_file(comm, &np, &named_fixture(code, width));
         assert!(read_mpi_named_catalog(&np, comm).is_err());
     }
+
+    // A writer grid may not have more axes than the spatial rank.
+    let bad_grid = dir.join("bad-grid.pio");
+    barrier_file(comm, &bad_grid, &native_fixture_grid(&[1, 1, 1], 9, 4));
+    assert!(read_mpi_catalog(&bad_grid, comm).is_err());
 
     // Collections keep the collection extra shape; the member count is not inferred.
     let collection_topo = MpiTopology::new(&world, [world.size() as usize, 1]).unwrap();
@@ -389,6 +469,52 @@ fn catalog_integration() {
         &[4, 5]
     );
 
+    // An empty named container is rejected by the strict path catalog but is a
+    // valid empty session catalog.
+    let empty_named = dir.join("named-empty.pio");
+    barrier_file(comm, &empty_named, &raw_empty_named_container());
+    assert!(read_mpi_named_catalog(&empty_named, comm).is_err());
+    {
+        let options = MpiIoOptions::default();
+        let mut session = MpiFileSession::open_read(comm, &empty_named, &options).unwrap();
+        assert!(session.catalog().unwrap().is_empty());
+        session.close().unwrap();
+    }
+
+    // The 65,536-record catalog limit and the unbounded path read bound. Build
+    // the raw fixture once on root; every other rank passes an empty slice.
+    let include_max = |count: usize| -> Vec<u8> {
+        if world.rank() == 0 {
+            raw_named_records(count)
+        } else {
+            Vec::new()
+        }
+    };
+    let max_records = dir.join("named-max-records.pio");
+    barrier_file(comm, &max_records, &include_max(65_536));
+    let catalog = read_mpi_named_catalog(&max_records, comm).unwrap();
+    assert_eq!(catalog.len(), 65_536);
+    assert_eq!(catalog[0].name(), Some(raw_named_key(0).as_str()));
+    assert_eq!(catalog[65_535].name(), Some(raw_named_key(65_535).as_str()));
+    assert_eq!(catalog[0].global_shape(), &[1]);
+    assert_eq!(catalog[0].scalar_type(), ScalarType::F64);
+    assert!(catalog.iter().enumerate().all(|(index, info)| {
+        info.name()
+            .is_some_and(|name| name.ends_with(&format!("{index:06}")))
+    }));
+
+    let over_records = dir.join("named-over-records.pio");
+    barrier_file(comm, &over_records, &include_max(65_537));
+    assert!(read_mpi_named_catalog(&over_records, comm).is_err());
+    let read_pencil = Pencil::<1, 1>::new(
+        MpiTopology::new(&world, [world.size() as usize]).unwrap(),
+        [1],
+        [0],
+    )
+    .unwrap();
+    let mut destination = PencilArray::from_elem(read_pencil, ExtraShape::scalar(), -1.0).unwrap();
+    assert!(read_mpi_named(&over_records, raw_named_key(65_536), destination.view_mut()).is_ok());
+
     #[cfg(feature = "parallel-hdf5")]
     hdf_cases(&world, comm, &dir, &a);
 
@@ -438,6 +564,43 @@ fn hdf_cases<C: Communicator>(
     }
     comm.barrier();
     assert!(read_hdf5_catalog(&unknown, comm).is_err());
+
+    // A writer grid may not have more axes than the spatial rank.
+    for named in [false, true] {
+        let bad = dir.join(if named {
+            "bad-grid-named.h5"
+        } else {
+            "bad-grid.h5"
+        });
+        if named {
+            write_hdf5_named(&bad, "data", a.view()).unwrap();
+        } else {
+            write_hdf5(&bad, a.view()).unwrap();
+        }
+        comm.barrier();
+        if comm.rank() == 0 {
+            let f = hdf5_metno::File::open_rw(&bad).unwrap();
+            let dataset = if named {
+                let group = f.group("pencil_io_named_v1").unwrap();
+                let members = group.member_names().unwrap();
+                assert_eq!(members.len(), 1);
+                group.dataset(members[0].as_str()).unwrap()
+            } else {
+                f.dataset("/pencil_io_v1/data").unwrap()
+            };
+            dataset.delete_attr("pencil_io_writer_grid").unwrap();
+            dataset
+                .new_attr::<u64>()
+                .shape([3usize])
+                .create("pencil_io_writer_grid")
+                .unwrap()
+                .write_raw(&[1u64, 1, 1])
+                .unwrap();
+            f.close().unwrap();
+        }
+        comm.barrier();
+        assert!(read_hdf5_catalog(&bad, comm).is_err());
+    }
 
     // Links are not catalog objects: neither namespace roots nor leaf datasets
     // may escape the file/object graph inspected by the catalog reader.

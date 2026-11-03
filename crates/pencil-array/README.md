@@ -45,8 +45,10 @@ descriptor, owner/index maps, MPI counts/displacements, checked standard
 `Default`. Apply, including ordinary failed preflight, performs no Rust
 allocation and does not call user `Clone`, `Default`, `Equivalence`, or datatype
 methods. Ordinary errors preserve source, destination, and all plan contents.
-Zero-sized payloads and counts/displacements beyond MPI `Count` are rejected;
-large-message chunking is not provided. The unsafe `Equivalence` implementation
+Zero-sized payloads are rejected, as is any peer count or displacement beyond
+MPI `Count`; segment ends and total lengths use checked `usize` arithmetic and
+may exceed MPI `Count`. Large-message chunking is not provided. The unsafe
+`Equivalence` implementation
 must accurately describe initialized fields within each `T`; the plan checks
 extent and true extent but cannot prove a custom typemap correct. Drop the plan
 before MPI finalization. MPI failures, process loss, and arbitrary panics do not

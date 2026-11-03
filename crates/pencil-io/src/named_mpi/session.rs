@@ -1,5 +1,6 @@
 //! Retained native handles for the existing named-v2 format.
 use super::*;
+use crate::format::prepare_physical_decode;
 use crate::mpi_io::{CommGuard, FileGuard, abort_unrecoverable, collective_state};
 use crate::{CatalogError, DatasetInfo, ScalarType};
 use mpi::topology::CartesianCommunicator;
@@ -52,9 +53,16 @@ pub enum MpiSessionError {
 /// session methods never communicate implicitly through the view's context.
 /// Same-file writers require external serialization, including other sessions.
 ///
-/// Reads commit staged values after operation datatype/view cleanup and collective
-/// agreement, **before** the eventual file close. Legacy path reads still close
-/// their file before committing. Read-only opens expose the committed prefix;
+/// The MPI local payload limit is 2147483647 bytes/rank and applies to each
+/// `write_named`/`read_named` record, not the whole container. A violation is
+/// returned on every rank as `MpiSessionError::Named(NamedIoError::Io(
+/// IoError::SizeLimit { what: "MPI local byte count" }))` before packing or
+/// staging, and the session remains usable for a later operation.
+///
+/// Reads decode staged bytes into the destination after operation datatype/view
+/// cleanup and collective agreement, **before** the eventual file close.
+/// Legacy path reads still close their file before committing. Read-only opens
+/// expose the committed prefix;
 /// append opens and catalogs require a complete committed tail.
 ///
 /// Call [`Self::close`] collectively before MPI finalization. Dropping an open
@@ -266,6 +274,7 @@ impl<'c> MpiFileSession<'c> {
             pencil.global_shape(),
             extra,
             pencil.topology().process_grid(),
+            pencil.decomposition(),
             pencil.permutation().axes(),
             code,
             width,
@@ -298,6 +307,8 @@ impl<'c> MpiFileSession<'c> {
         reset
     }
     /// Append one uniquely named record using the existing flush/commit protocol.
+    /// Applies the same per-record 2147483647 bytes/rank local payload limit as
+    /// the session.
     pub fn write_named<T: IoElement, const N: usize, const M: usize>(
         &mut self,
         name: impl AsRef<str>,
@@ -317,19 +328,21 @@ impl<'c> MpiFileSession<'c> {
             return Err(MpiSessionError::ReadOnly);
         }
         let comm = self.comm;
+        let layout_result = build_layout(
+            view.pencil().global_shape(),
+            view.extra_shape().dimensions(),
+            &view.local_spatial_shape(),
+            view.pencil().local_ranges(),
+            view.len(),
+            T::WIDTH,
+        );
+        if let Err(agreement) =
+            agree_mpi_preparation(comm, layout_result.as_ref().err(), "session write layout")
+        {
+            return Err(NamedIoError::Io(agreement).into());
+        }
+        let layout = layout_result.map_err(NamedIoError::Io)?;
         let packed = prepared(comm, pack_view(&view), "session payload packing")?;
-        let layout = prepared(
-            comm,
-            build_layout(
-                view.pencil().global_shape(),
-                view.extra_shape().dimensions(),
-                &view.local_spatial_shape(),
-                view.pencil().local_ranges(),
-                view.len(),
-                T::WIDTH,
-            ),
-            "session write layout",
-        )?;
         let (records, tail, size) = self.scan()?;
         if tail != size {
             return Err(NamedIoError::InvalidTail.into());
@@ -414,6 +427,7 @@ impl<'c> MpiFileSession<'c> {
         cleanup
     }
     /// Read a committed record, committing only after operation cleanup/agreement.
+    /// The same per-record local payload limit applies before staging.
     pub fn read_named<T: IoElement, const N: usize, const M: usize>(
         &mut self,
         name: impl AsRef<str>,
@@ -430,18 +444,20 @@ impl<'c> MpiFileSession<'c> {
             READ,
         )?;
         let comm = self.comm;
-        let layout = prepared(
-            comm,
-            build_layout(
-                view.pencil().global_shape(),
-                view.extra_shape().dimensions(),
-                &view.local_spatial_shape(),
-                view.pencil().local_ranges(),
-                view.len(),
-                T::WIDTH,
-            ),
-            "session read layout",
-        )?;
+        let layout_result = build_layout(
+            view.pencil().global_shape(),
+            view.extra_shape().dimensions(),
+            &view.local_spatial_shape(),
+            view.pencil().local_ranges(),
+            view.len(),
+            T::WIDTH,
+        );
+        if let Err(agreement) =
+            agree_mpi_preparation(comm, layout_result.as_ref().err(), "session read layout")
+        {
+            return Err(NamedIoError::Io(agreement).into());
+        }
+        let layout = layout_result.map_err(NamedIoError::Io)?;
         let size = prepared(
             comm,
             view.len().checked_mul(T::WIDTH).ok_or(IoError::SizeLimit {
@@ -465,7 +481,7 @@ impl<'c> MpiFileSession<'c> {
         )?;
         let file = self.file();
         let mut datatype = None;
-        let result = (|| -> Result<Vec<T>, MpiSessionError> {
+        let result = (|| -> Result<_, MpiSessionError> {
             let native = if layout.empty {
                 Ok(None)
             } else {
@@ -503,15 +519,15 @@ impl<'c> MpiFileSession<'c> {
             )?;
             Ok(prepared(
                 comm,
-                prepare_physical_values(&view, &packed),
+                prepare_physical_decode(&view, &packed),
                 "session physical staging",
             )?)
         })();
         let cleanup = self.finish_operation(datatype);
-        let physical = result?;
+        let plan = result?;
         cleanup?;
         agree_phase(comm, true, "session read commit")?;
-        view.as_mut_slice().copy_from_slice(&physical);
+        plan.decode_into(&packed, view.as_mut_slice());
         Ok(())
     }
     /// Strict metadata-only inspection on the retained native file handle.

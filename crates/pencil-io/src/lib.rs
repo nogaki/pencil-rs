@@ -52,9 +52,34 @@
 //! the packing is local and never gathers data at rank zero.  Readers may use
 //! a different process grid or memory-axis permutation.
 //!
+//! MPI local payloads are limited to 2147483647 bytes/rank, checked as
+//! `local_elements * scalar_width` (for `f64`, up to 268435455 elements). If
+//! any rank exceeds it, every rank returns the same underlying
+//! [`IoError::SizeLimit`] with `what == "MPI local byte count"` (wrapped by the
+//! API's error type) before packing or staging that payload.
+//! Collections apply the limit to their combined payload and sessions to each
+//! record; this is not a whole-file or container byte cap. Existing dimension,
+//! start and offset representation limits remain. Normal successful paths still
+//! pack the full local payload and allocate byte or typed staging. HDF5 and
+//! metadata-only catalog operations are not subject to this MPI local byte
+//! limit.
+//!
 //! `write_mpi` and `read_mpi` are collective over the view's Cartesian
 //! communicator. Views may borrow an owning `pencil_array::PencilArray` or
-//! validated external slices. All array, topology, and MPI-IO objects must be
+//! validated external slices. Every rank must pass the same global shape, extra
+//! shape, element type, process grid, ordered decomposition (including axes whose
+//! grid extent is one), memory permutation, and path. When every rank builds its
+//! agreement descriptor and passes the agreement's size and allocation checks,
+//! any such difference makes all ranks return
+//! `IoError::CollectiveDescriptorMismatch`; single-call APIs return before the
+//! file is opened, and persistent sessions return before the member is accessed.
+//! Failures before that comparison, such as an invalid path, the 64 KiB per-rank
+//! or 64 MiB total descriptor limit, or an allocation failure, are reported
+//! instead and can differ between ranks. Writer and reader may still use
+//! different grids or decompositions, and the named and parallel HDF5 APIs apply
+//! the same rule.
+//!
+//! All array, topology, and MPI-IO objects must be
 //! dropped before MPI finalization; persistent sessions require explicit close. Do not
 //! overlap an I/O call with another operation on that topology communicator;
 //! the call temporarily installs `MPI_ERRORS_RETURN` only around
@@ -159,7 +184,11 @@ use thiserror::Error;
 ///
 /// For collective I/O, variants can differ across ranks: a flush failure on rank
 /// zero may report [`IoError::WriteIncomplete`] there and
-/// [`IoError::CollectivePrecondition`] on peers. All ranks must still follow the
+/// [`IoError::CollectivePrecondition`] on peers.  The MPI local payload byte
+/// limit is agreed collectively instead: every rank returns the same
+/// [`IoError::SizeLimit`] with `what == "MPI local byte count"` before packing
+/// or staging the payload.  That limit is per local payload, not a whole-file or
+/// container cap.  All ranks must still follow the
 /// same subsequent collective call order,
 /// not branch independently on their local error variant.
 #[derive(Debug, Clone, Error)]
@@ -184,6 +213,9 @@ pub enum IoError {
     },
 
     /// A checked size calculation overflowed or exceeded the native limit.
+    /// For MPI I/O, the `"MPI local byte count"` case is agreed by every rank
+    /// before payload packing or staging allocation and is not a whole-file or
+    /// container cap.
     #[error("I/O size or native count limit exceeded: {what}")]
     SizeLimit {
         /// The checked quantity that exceeded its native representation.
@@ -320,6 +352,9 @@ const OP_APPEND_HDF5_NAMED: u64 = 6;
 const OP_READ_HDF5_NAMED: u64 = 7;
 
 #[cfg(all(test, feature = "mpi"))]
+mod mpi_preflight_tests;
+
+#[cfg(all(test, feature = "mpi"))]
 mod tests {
     use std::path::Path;
 
@@ -329,6 +364,12 @@ mod tests {
     use pencil_array::{ExtraShape, MpiTopology, Pencil, PencilArray};
 
     use super::{IoError, read_mpi, write_mpi};
+
+    #[test]
+    #[ignore = "requires an MPI launcher and one fresh MPI process"]
+    fn mpi_payload_limit_precedes_allocation() {
+        crate::mpi_preflight_tests::run();
+    }
 
     mod support {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/mod.rs"));
@@ -349,6 +390,54 @@ mod tests {
         let mut all_ok = 0;
         world.all_reduce_into(&local_ok, &mut all_ok, SystemOperation::min());
         assert_eq!(all_ok, 1, "root test setup failed: {:?}", result.err());
+    }
+
+    use super::{CollectionIoError, NamedIoError};
+
+    fn every_rank<C, F>(world: &C, holds: F)
+    where
+        C: CommunicatorCollectives,
+        F: FnOnce() -> bool,
+    {
+        let local_ok = i32::from(holds());
+        let mut all_ok = 0;
+        world.all_reduce_into(&local_ok, &mut all_ok, SystemOperation::min());
+        assert_eq!(all_ok, 1, "per-rank expectation failed");
+    }
+
+    fn inner_io(error: &CollectionIoError) -> Option<&IoError> {
+        match error {
+            CollectionIoError::Io(error) => Some(error),
+            CollectionIoError::Named(NamedIoError::Io(error)) => Some(error),
+            _ => None,
+        }
+    }
+
+    fn member_views(
+        members: &mut [PencilArray<i32, 2, 2>],
+    ) -> Vec<pencil_array::PencilArrayViewMut<'_, i32, 2, 2>> {
+        members.iter_mut().map(|array| array.view_mut()).collect()
+    }
+
+    fn poison_members(members: &mut [PencilArray<i32, 2, 2>]) {
+        // Distinct negative sentinels never match the non-negative fixture, so a
+        // failed read that still publishes file values is detected.
+        for (index, member) in members.iter_mut().enumerate() {
+            member.as_mut_slice().fill(-10_000 - index as i32);
+        }
+    }
+
+    fn snapshot(members: &[PencilArray<i32, 2, 2>]) -> Vec<Vec<i32>> {
+        members
+            .iter()
+            .map(|array| array.as_slice().to_vec())
+            .collect()
+    }
+
+    fn assert_members_unchanged(members: &[PencilArray<i32, 2, 2>], before: &[Vec<i32>]) {
+        for (member, saved) in members.iter().zip(before) {
+            assert_eq!(member.as_slice(), saved.as_slice(), "member changed");
+        }
     }
 
     fn reset(path: &Path) -> Result<(), String> {
@@ -392,6 +481,35 @@ mod tests {
 
         if std::env::var_os("PENCIL_MPI_SESSION_CLEANUP_CHILD").is_some() {
             crate::named_mpi::session::test_native_cleanup_child(&directory, &source);
+        }
+
+        {
+            let mut empty = PencilArray::from_elem(
+                std::sync::Arc::clone(source.pencil()),
+                ExtraShape::new([usize::MAX, 2, 0]).unwrap(),
+                0i32,
+            )
+            .unwrap();
+            let view = empty.view_mut();
+            assert!(matches!(
+                crate::format::prepare_physical_decode(&view, &[]),
+                Err(IoError::SizeLimit {
+                    what: "element count"
+                })
+            ));
+        }
+
+        {
+            let mut empty = PencilArray::from_elem(
+                std::sync::Arc::clone(source.pencil()),
+                ExtraShape::new([0, usize::MAX, 2]).unwrap(),
+                0i32,
+            )
+            .unwrap();
+            let mut view = empty.view_mut();
+            let plan = crate::format::prepare_physical_decode(&view, &[]).unwrap();
+            plan.decode_into(&[], view.as_mut_slice());
+            assert!(view.is_empty());
         }
         crate::chunked::tests::cleanup_and_native_contracts(&world);
         let valid_path = directory.join("valid.pio");
@@ -827,6 +945,7 @@ mod tests {
             })
             .collect();
         for index in 0..members.len() {
+            poison_members(&mut members);
             let before: Vec<_> = members.iter().map(|a| a.as_slice().to_vec()).collect();
             let calls = crate::ffi::test_payload_calls();
             crate::collections::STAGING_FAILURE
@@ -998,6 +1117,324 @@ mod tests {
             &options,
         )
         .unwrap();
+
+        // Collection reads reserve one combined byte payload, read it once, and
+        // publish only after native cleanup. Every injected failure must leave
+        // all members unchanged, and the following read must recover.
+        let plain_collection = directory.join("plain-collection.pio");
+        super::write_mpi_collection(&plain_collection, comm, &[source.view(), source.view()])
+            .unwrap();
+        #[cfg(feature = "parallel-hdf5")]
+        let hdf5_collections = {
+            let plain = directory.join("plain-collection.h5");
+            let options_path = directory.join("option-collection.h5");
+            let named = directory.join("named-collection.h5");
+            let write = super::Hdf5WriteOptions::default();
+            super::write_hdf5_collection(&plain, comm, &[source.view(), source.view()]).unwrap();
+            super::write_hdf5_collection_with_options(
+                &options_path,
+                comm,
+                &[source.view(), source.view()],
+                &write,
+            )
+            .unwrap();
+            super::write_hdf5_named_collection(
+                &named,
+                "members",
+                comm,
+                &[source.view(), source.view()],
+                &write,
+            )
+            .unwrap();
+            (plain, options_path, named)
+        };
+
+        macro_rules! collection_failures {
+            ($label:literal, $read:expr) => {{
+                poison_members(&mut members);
+                let before = snapshot(&members);
+
+                crate::collections::STAGING_ALLOCATION_FAILURE.with(|f| f.set(world.rank() == 0));
+                let calls = crate::ffi::test_payload_calls();
+                let error = $read().expect_err(concat!($label, ": staging allocation failure"));
+                crate::collections::STAGING_ALLOCATION_FAILURE.with(|f| f.set(false));
+                let expected = if world.rank() == 0 {
+                    matches!(inner_io(&error), Some(IoError::AllocationFailed { .. }))
+                } else {
+                    matches!(
+                        inner_io(&error),
+                        Some(IoError::CollectivePrecondition {
+                            phase: "collection staging allocation"
+                        })
+                    )
+                };
+                every_rank(&world, || expected);
+                assert_eq!(
+                    calls,
+                    crate::ffi::test_payload_calls(),
+                    concat!($label, ": staging failure must precede the payload read")
+                );
+                assert_members_unchanged(&members, &before);
+
+                crate::format::PLAN_FAILURE.with(|f| f.set(world.rank() == 0));
+                let calls = crate::ffi::test_payload_calls();
+                let error = $read().expect_err(concat!($label, ": plan preparation failure"));
+                crate::format::PLAN_FAILURE.with(|f| f.set(false));
+                // Named readers report the collective staging agreement even on
+                // the failing rank, so only the local allocation is required there.
+                let expected = if world.rank() == 0 {
+                    matches!(
+                        inner_io(&error),
+                        Some(
+                            IoError::AllocationFailed { requested: 8 }
+                                | IoError::CollectivePrecondition { .. }
+                        )
+                    )
+                } else {
+                    matches!(
+                        inner_io(&error),
+                        Some(IoError::CollectivePrecondition { .. })
+                    )
+                };
+                every_rank(&world, || expected);
+                assert_ne!(
+                    calls,
+                    crate::ffi::test_payload_calls(),
+                    concat!($label, ": plan failure must follow the payload read")
+                );
+                assert_members_unchanged(&members, &before);
+
+                crate::mpi_io::POST_CLEANUP_FAILURE.with(|f| f.set(world.rank() == 0));
+                let error = $read().expect_err(concat!($label, ": post-cleanup failure"));
+                crate::mpi_io::POST_CLEANUP_FAILURE.with(|f| f.set(false));
+                let expected = if world.rank() == 0 {
+                    matches!(
+                        inner_io(&error),
+                        Some(IoError::Native {
+                            operation: "test post-cleanup result" | "named post-cleanup result",
+                            code: -1
+                        })
+                    )
+                } else {
+                    matches!(
+                        inner_io(&error),
+                        Some(IoError::CollectivePrecondition {
+                            phase: "post-cleanup result"
+                        })
+                    )
+                };
+                every_rank(&world, || expected);
+                assert_members_unchanged(&members, &before);
+
+                $read().expect(concat!($label, ": recovery read"));
+                assert_i32_values(&members[0]);
+                assert_i32_values(&members[1]);
+                world.barrier();
+            }};
+        }
+
+        collection_failures!("read_mpi_collection", || super::read_mpi_collection(
+            &plain_collection,
+            comm,
+            &mut member_views(&mut members)
+        ));
+        collection_failures!("read_mpi_collection_with_options", || {
+            super::read_mpi_collection_with_options(
+                &option_collection,
+                comm,
+                &mut member_views(&mut members),
+                &options,
+            )
+        });
+        collection_failures!("read_mpi_named_collection", || {
+            super::read_mpi_named_collection(
+                &collection,
+                "members",
+                comm,
+                &mut member_views(&mut members),
+                &options,
+            )
+        });
+
+        // Native collection controls reach the payload read, not just the
+        // pre-staging agreement.
+        let native_collection_options = super::MpiIoOptions::default()
+            .mode(super::MpiIoMode::Independent)
+            .hint("cb_buffer_size", "3145728");
+        let counts = crate::ffi::test_payload_calls();
+        super::read_mpi_collection_with_options(
+            &option_collection,
+            comm,
+            &mut member_views(&mut members),
+            &native_collection_options,
+        )
+        .unwrap();
+        let after = crate::ffi::test_payload_calls();
+        assert_eq!(
+            [after[2] - counts[2], after[3] - counts[3]],
+            [0, 1],
+            "collection options read dispatch"
+        );
+        assert_eq!(crate::ffi::test_info_arguments()[1], 3145728);
+        assert_i32_values(&members[0]);
+        assert_i32_values(&members[1]);
+        let counts = crate::ffi::test_payload_calls();
+        super::read_mpi_named_collection(
+            &collection,
+            "members",
+            comm,
+            &mut member_views(&mut members),
+            &native_collection_options,
+        )
+        .unwrap();
+        let after = crate::ffi::test_payload_calls();
+        assert_eq!(
+            [after[2] - counts[2], after[3] - counts[3]],
+            [0, 1],
+            "named collection options read dispatch"
+        );
+        assert_eq!(crate::ffi::test_info_arguments()[1], 3145728);
+        assert_i32_values(&members[0]);
+        assert_i32_values(&members[1]);
+        world.barrier();
+
+        #[cfg(feature = "parallel-hdf5")]
+        {
+            let (plain, options_path, named) = &hdf5_collections;
+            let read = super::Hdf5ReadOptions::default();
+            collection_failures!("read_hdf5_collection", || super::read_hdf5_collection(
+                plain,
+                comm,
+                &mut member_views(&mut members)
+            ));
+            collection_failures!("read_hdf5_collection_with_options", || {
+                super::read_hdf5_collection_with_options(
+                    options_path,
+                    comm,
+                    &mut member_views(&mut members),
+                    &read,
+                )
+            });
+            collection_failures!("read_hdf5_named_collection", || {
+                super::read_hdf5_named_collection(
+                    named,
+                    "members",
+                    comm,
+                    &mut member_views(&mut members),
+                    &read,
+                )
+            });
+
+            let native_hdf5_read = super::Hdf5ReadOptions::default()
+                .mode(super::MpiIoMode::Independent)
+                .hint("cb_buffer_size", "3145728");
+            let counts = crate::ffi::test_payload_calls();
+            super::read_hdf5_collection_with_options(
+                options_path,
+                comm,
+                &mut member_views(&mut members),
+                &native_hdf5_read,
+            )
+            .unwrap();
+            let after = crate::ffi::test_payload_calls();
+            assert_eq!(
+                [after[4] - counts[4], after[5] - counts[5]],
+                [0, 1],
+                "HDF5 collection options read dispatch"
+            );
+            assert_eq!(crate::ffi::test_info_arguments()[2], 3145728);
+            assert_i32_values(&members[0]);
+            assert_i32_values(&members[1]);
+            let counts = crate::ffi::test_payload_calls();
+            super::read_hdf5_named_collection(
+                named,
+                "members",
+                comm,
+                &mut member_views(&mut members),
+                &native_hdf5_read,
+            )
+            .unwrap();
+            let after = crate::ffi::test_payload_calls();
+            assert_eq!(
+                [after[4] - counts[4], after[5] - counts[5]],
+                [0, 1],
+                "named HDF5 collection options read dispatch"
+            );
+            assert_eq!(crate::ffi::test_info_arguments()[2], 3145728);
+            assert_i32_values(&members[0]);
+            assert_i32_values(&members[1]);
+            world.barrier();
+        }
+
+        // Collection preparation validates every member and the staging length
+        // before commit, including products that overflow only after a zero extent.
+        {
+            let extra = ExtraShape::new([2]).unwrap();
+            let mut members: Vec<_> = (0..2)
+                .map(|_| {
+                    PencilArray::from_elem(destination.pencil().clone(), extra.clone(), -41i32)
+                        .unwrap()
+                })
+                .collect();
+            let count = members.len();
+            let len = members[0].len() * count;
+            let mut views = member_views(&mut members);
+            {
+                let target = crate::format::ReadTarget::collection(
+                    &mut views,
+                    vec![count, 2],
+                    len,
+                    Vec::new(),
+                );
+                let wrong = vec![0u8; len * std::mem::size_of::<i32>() + 1];
+                assert!(matches!(
+                    target.prepare(&wrong),
+                    Err(IoError::InvalidFile {
+                        reason: "local staging length"
+                    })
+                ));
+            }
+            drop(views);
+            assert!(
+                members
+                    .iter()
+                    .all(|member| member.as_slice().iter().all(|&value| value == -41))
+            );
+
+            let overflow =
+                ExtraShape::new([i32::MAX as usize, i32::MAX as usize, i32::MAX as usize, 0])
+                    .unwrap();
+            let mut empty: Vec<_> = (0..2)
+                .map(|_| {
+                    PencilArray::from_elem(destination.pencil().clone(), overflow.clone(), -42i32)
+                        .unwrap()
+                })
+                .collect();
+            let count = empty.len();
+            let mut views = member_views(&mut empty);
+            let target = crate::format::ReadTarget::collection(
+                &mut views,
+                vec![
+                    count,
+                    i32::MAX as usize,
+                    i32::MAX as usize,
+                    i32::MAX as usize,
+                    0,
+                ],
+                0,
+                Vec::new(),
+            );
+            assert!(matches!(
+                target.prepare(&[]),
+                Err(IoError::SizeLimit {
+                    what: "element count"
+                })
+            ));
+            drop(target);
+            drop(views);
+            assert!(empty.iter().all(|member| member.is_empty()));
+        }
+
         let calls = crate::ffi::test_payload_calls();
         assert_eq!(
             super::read_mpi_named_catalog(&collection, comm).unwrap()[0].extra_shape(),

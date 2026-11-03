@@ -47,10 +47,13 @@
 //! [`TransposeWorkspace::from_vecs`] and both plans'
 //! `workspace_requirements` methods are noncollective and do not call MPI.
 //! Workspace validation uses initialized `len`, never capacity, and execution
-//! does not resize or reallocate the backing vectors. Count, displacement,
-//! checked total, offset, view length, and workspace length constraints are
-//! checked before payload communication. Ordinary preflight errors return on
-//! all ranks before communication: out-of-place execution preserves its source,
+//! does not resize or reallocate the backing vectors. Each peer count must fit
+//! `mpi::Count`; Alltoallv additionally requires each displacement to fit
+//! `mpi::Count`. Segment ends, total lengths, and point-to-point displacements
+//! use checked `usize` arithmetic and may exceed `mpi::Count::MAX`. All segments
+//! and view/workspace lengths are validated before payload communication.
+//! Ordinary preflight errors return on all ranks before communication:
+//! out-of-place execution preserves its source,
 //! destination, and workspace; both in-place APIs preserve array state, active
 //! data, and workspace. Successful out-of-place execution writes the destination;
 //! successful in-place execution replaces the active layout/data and preserves
@@ -302,6 +305,7 @@ mod alltoallv_transpose;
 mod array;
 mod axis;
 mod checked;
+mod checked_partition;
 mod collectives;
 mod decomposition;
 mod error;

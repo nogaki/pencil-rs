@@ -8,9 +8,9 @@ use std::{fmt, sync::Arc};
 use mpi::traits::*;
 use num_complex::Complex64;
 use pencil_array::{
-    CollectiveError, ExtraShape, MpiTopology, Pencil, PencilArray, map_reduce_many, map_reduce3,
-    max_many_by, min_many_by, norm_many_by, pointwise_many, pointwise_many_in_place, pointwise3,
-    pointwise3_in_place, sum_many_by,
+    CollectiveError, ExtraShape, MpiTopology, Pencil, PencilArray, all_ranks_succeeded,
+    map_reduce_many, map_reduce3, max_many_by, min_many_by, norm_many_by, pointwise_many,
+    pointwise_many_in_place, pointwise3, pointwise3_in_place, sum_many_by,
 };
 
 #[derive(Debug, PartialEq)]
@@ -319,8 +319,16 @@ fn multi_input_current_api_and_edge_cases() {
         );
     }
 
-    let overflow = sum_many_by(topology.communicator(), &views4, |_| i64::MAX);
-    assert!(matches!(overflow, Err(CollectiveError::IntegerOverflow)));
+    let overflow_calls = std::cell::Cell::new(0usize);
+    let overflow = sum_many_by(topology.communicator(), &views4, |_| {
+        overflow_calls.set(overflow_calls.get() + 1);
+        i64::MAX
+    });
+    assert!(all_ranks_succeeded(
+        &topology,
+        matches!(overflow, Err(CollectiveError::IntegerOverflow))
+            && overflow_calls.get() == 6 * pencil.local_len()
+    ));
     let extremes = array(
         Arc::clone(&pencil),
         ExtraShape::scalar(),
@@ -431,6 +439,69 @@ fn multi_input_current_api_and_edge_cases() {
         sum_many_by(topology.communicator(), &mixed_views, |_| 1_i64).unwrap(),
         0
     );
+
+    // A zero extent keeps the extra element count empty even when an earlier
+    // axis product overflows usize. Stride preparation must skip that product
+    // rather than report an overflow before reaching the zero.
+    for dims in [[usize::MAX, 2, 0], [0, usize::MAX, 2]] {
+        let shape = ExtraShape::new(dims).unwrap();
+        let input = array(Arc::clone(&pencil), shape.clone(), 1_i32);
+        let wide = array(Arc::clone(&pencil), shape.clone(), 2_i64);
+        let narrow = array(Arc::clone(&pencil), shape.clone(), 3_u8);
+        let second = array(Arc::clone(&pencil), shape.clone(), 4_i32);
+        let mut output = array(Arc::clone(&pencil), shape.clone(), 0_i64);
+        let calls = std::cell::Cell::new(0);
+        pointwise3(&input, &wide, &narrow, &mut output, |x, y, z| {
+            calls.set(calls.get() + 1);
+            i64::from(*x) + y + i64::from(*z)
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 0);
+        assert!(output.is_empty());
+        let calls = std::cell::Cell::new(0);
+        pointwise_many(&[&input, &second], &mut output, |xs| {
+            calls.set(calls.get() + 1);
+            i64::from(*xs[0])
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 0);
+        assert!(output.is_empty());
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            map_reduce3(
+                topology.communicator(),
+                &input.view(),
+                &input.view(),
+                &input.view(),
+                0_i64,
+                |x, _, _| {
+                    calls.set(calls.get() + 1);
+                    i64::from(*x)
+                },
+                reduce_i64,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(calls.get(), 0);
+        let calls = std::cell::Cell::new(0);
+        let views = [input.view(), input.view()];
+        assert_eq!(
+            map_reduce_many(
+                topology.communicator(),
+                &views,
+                0_i64,
+                |xs| {
+                    calls.set(calls.get() + 1);
+                    i64::from(*xs[0])
+                },
+                reduce_i64,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(calls.get(), 0);
+    }
 
     // Pointwise operations use the real APIs and do not require Clone.
     let na =

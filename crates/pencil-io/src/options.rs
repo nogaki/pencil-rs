@@ -181,8 +181,9 @@ pub(crate) fn agree_controls<C: CommunicatorCollectives>(
     Ok(())
 }
 
-// The legacy descriptor omits decomposition axes. New entry points agree them
-// separately without changing the legacy header or collective sequence.
+// The shared descriptor already includes the ordered decomposition axes; this
+// separate agreement is kept so the options paths' existing collective
+// sequence is unchanged.
 pub(crate) fn agree_decomposition<const N: usize, const M: usize>(
     pencil: &pencil_array::Pencil<N, M>,
 ) -> Result<(), IoError> {

@@ -15,8 +15,8 @@ use mpi::{
 use thiserror::Error;
 
 use crate::{
-    ArrayError, ExtraShape, ManyPencilArray, Pencil, PencilArrayView, PencilArrayViewMut,
-    checked::checked_product, geometry::row_major_offset,
+    ArrayError, AxisPermutation, ExtraShape, ManyPencilArray, Pencil, PencilArrayView,
+    PencilArrayViewMut, checked::checked_product, geometry::row_major_offset,
 };
 
 const DESCRIPTOR_SCHEMA: u64 = 1;
@@ -99,9 +99,10 @@ impl CommunicationMode {
 
 /// Errors returned by checked Alltoallv and point-to-point transpose operations.
 ///
-/// Both distributed transports use this canonical error type, so their
-/// collective validation, ordinary preflight, and workspace contracts cannot
-/// diverge. Normal preflight errors are agreed by the source topology before
+/// Both distributed transports use this canonical error type and share
+/// collective validation, ordinary preflight guarantees, and
+/// initialized-workspace contracts. MPI count limits depend on the transport.
+/// Normal preflight errors are agreed by the source topology before
 /// either transport starts payload communication; MPI failures, arbitrary
 /// panics, and process loss are outside the recovery guarantee.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
@@ -147,7 +148,8 @@ pub enum TransposeError {
         receive_len: usize,
     },
 
-    /// A count, displacement, total, or checked multiplication does not fit.
+    /// A required MPI value does not fit `mpi::Count`, or checked length
+    /// arithmetic overflows.
     #[error("MPI count or displacement overflowed")]
     CountOverflow,
 
@@ -251,7 +253,9 @@ impl<T> TransposeWorkspace<T> {
 /// transpose and one exact extra shape.
 ///
 /// Requirements are computed locally and noncollectively. A caller must obtain
-/// and satisfy the requirements independently on each rank.
+/// and satisfy the requirements independently on each rank. Lengths use checked
+/// `usize` arithmetic; the selected plan checks the MPI values required by its
+/// transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransposeWorkspaceRequirements {
     /// Number of initialized send elements required.
@@ -270,6 +274,7 @@ pub(crate) struct TransposePlanCore<const N: usize, const M: usize> {
     changed_topology_axis: usize,
     peers: Vec<PeerMetadata<N>>,
     descriptor: Vec<u64>,
+    mode: CommunicationMode,
 }
 
 #[derive(Debug)]
@@ -284,6 +289,8 @@ pub(crate) struct PeerMetadata<const N: usize> {
     pub(crate) receive_spatial_displacement: usize,
 }
 
+// Displacement vectors are populated only for Alltoallv; point-to-point uses
+// PeerMetadata's usize displacements.
 #[derive(Debug)]
 pub(crate) struct PreparedExchange {
     pub(crate) requirements: TransposeWorkspaceRequirements,
@@ -350,6 +357,7 @@ impl<const N: usize, const M: usize> TransposePlanCore<N, M> {
             changed_topology_axis,
             peers,
             descriptor,
+            mode,
         })
     }
 
@@ -388,47 +396,14 @@ impl<const N: usize, const M: usize> TransposePlanCore<N, M> {
     /// Returns the initialized workspace lengths required for `extra_shape`.
     ///
     /// This method is noncollective and does not allocate workspace storage.
-    /// The returned lengths include all peer segments and are checked against
-    /// `mpi::Count` for the counts and displacements used by execution.
+    /// The returned lengths include all peer segments. Each count must fit
+    /// `mpi::Count`; Alltoallv additionally checks each displacement against
+    /// that type. Segment ends and total lengths use checked `usize` arithmetic.
     pub(crate) fn workspace_requirements(
         &self,
         extra_shape: &ExtraShape,
     ) -> Result<TransposeWorkspaceRequirements, TransposeError> {
-        let batch = extra_shape.element_count();
-        let mut send_len = 0usize;
-        let mut receive_len = 0usize;
-        for peer in &self.peers {
-            let send_count = peer
-                .send_spatial_len
-                .checked_mul(batch)
-                .ok_or(TransposeError::CountOverflow)?;
-            let receive_count = peer
-                .receive_spatial_len
-                .checked_mul(batch)
-                .ok_or(TransposeError::CountOverflow)?;
-            let send_displacement = peer
-                .send_spatial_displacement
-                .checked_mul(batch)
-                .ok_or(TransposeError::CountOverflow)?;
-            let receive_displacement = peer
-                .receive_spatial_displacement
-                .checked_mul(batch)
-                .ok_or(TransposeError::CountOverflow)?;
-            checked_count(send_count, send_displacement)?;
-            checked_count(receive_count, receive_displacement)?;
-            send_len = send_len
-                .checked_add(send_count)
-                .ok_or(TransposeError::CountOverflow)?;
-            receive_len = receive_len
-                .checked_add(receive_count)
-                .ok_or(TransposeError::CountOverflow)?;
-        }
-        Count::try_from(send_len).map_err(|_| TransposeError::CountOverflow)?;
-        Count::try_from(receive_len).map_err(|_| TransposeError::CountOverflow)?;
-        Ok(TransposeWorkspaceRequirements {
-            send_len,
-            receive_len,
-        })
+        workspace_requirements_for_peers(&self.peers, extra_shape.element_count(), self.mode)
     }
 
     pub(crate) fn prepare_execution<T>(
@@ -476,7 +451,12 @@ impl<const N: usize, const M: usize> TransposePlanCore<N, M> {
             });
         }
 
-        let prepared = prepare_exchange_counts(self, extra_shape)?;
+        let prepared = prepare_exchange_counts(
+            &self.peers,
+            extra_shape.element_count(),
+            self.source.topology().process_grid()[self.changed_topology_axis],
+            self.mode,
+        )?;
         if requirements.send_len != source_len || requirements.receive_len != destination_len {
             return Err(TransposeError::PreparationFailed);
         }
@@ -503,13 +483,19 @@ impl<const N: usize, const M: usize> TransposePlanCore<N, M> {
                 return Err(TransposeError::PreparationFailed);
             }
             validate_region_offsets(
-                self.source.as_ref(),
+                self.source.local_ranges(),
+                &self.source.local_shape_memory(),
+                self.source.permutation(),
+                self.source.local_len(),
                 source_len,
                 &peer.send_region,
                 extra_shape.element_count(),
             )?;
             validate_region_offsets(
-                self.destination.as_ref(),
+                self.destination.local_ranges(),
+                &self.destination.local_shape_memory(),
+                self.destination.permutation(),
+                self.destination.local_len(),
                 destination_len,
                 &peer.receive_region,
                 extra_shape.element_count(),
@@ -683,20 +669,67 @@ fn region_spatial_len<const N: usize>(region: &[Range<usize>; N]) -> Result<usiz
     checked_product(&shape).map_err(|_| TransposeError::PreparationFailed)
 }
 
-fn prepare_exchange_counts<const N: usize, const M: usize>(
-    plan: &TransposePlanCore<N, M>,
-    extra_shape: &ExtraShape,
-) -> Result<PreparedExchange, TransposeError> {
-    let requirements = plan.workspace_requirements(extra_shape)?;
-    let peer_count = plan.peers.len();
-    let mut send_counts = zeroed_vec(peer_count)?;
-    let mut send_displacements = zeroed_vec(peer_count)?;
-    let mut receive_counts = zeroed_vec(peer_count)?;
-    let mut receive_displacements = zeroed_vec(peer_count)?;
-    let batch = extra_shape.element_count();
-    let coordinate_extent = plan.source.topology().process_grid()[plan.changed_topology_axis];
+fn workspace_requirements_for_peers<const N: usize>(
+    peers: &[PeerMetadata<N>],
+    batch: usize,
+    mode: CommunicationMode,
+) -> Result<TransposeWorkspaceRequirements, TransposeError> {
+    let mut send_len = 0usize;
+    let mut receive_len = 0usize;
+    for peer in peers {
+        let send_count = peer
+            .send_spatial_len
+            .checked_mul(batch)
+            .ok_or(TransposeError::CountOverflow)?;
+        let receive_count = peer
+            .receive_spatial_len
+            .checked_mul(batch)
+            .ok_or(TransposeError::CountOverflow)?;
+        let send_displacement = peer
+            .send_spatial_displacement
+            .checked_mul(batch)
+            .ok_or(TransposeError::CountOverflow)?;
+        let receive_displacement = peer
+            .receive_spatial_displacement
+            .checked_mul(batch)
+            .ok_or(TransposeError::CountOverflow)?;
+        checked_count(send_count, send_displacement, mode)?;
+        checked_count(receive_count, receive_displacement, mode)?;
+        send_len = send_len
+            .checked_add(send_count)
+            .ok_or(TransposeError::CountOverflow)?;
+        receive_len = receive_len
+            .checked_add(receive_count)
+            .ok_or(TransposeError::CountOverflow)?;
+    }
+    Ok(TransposeWorkspaceRequirements {
+        send_len,
+        receive_len,
+    })
+}
 
-    for peer in &plan.peers {
+fn prepare_exchange_counts<const N: usize>(
+    peers: &[PeerMetadata<N>],
+    batch: usize,
+    coordinate_extent: usize,
+    mode: CommunicationMode,
+) -> Result<PreparedExchange, TransposeError> {
+    let requirements = workspace_requirements_for_peers(peers, batch, mode)?;
+    let peer_count = peers.len();
+    let mut send_counts = zeroed_vec(peer_count)?;
+    let mut send_displacements = if mode == CommunicationMode::AllToAllv {
+        zeroed_vec(peer_count)?
+    } else {
+        Vec::new()
+    };
+    let mut receive_counts = zeroed_vec(peer_count)?;
+    let mut receive_displacements = if mode == CommunicationMode::AllToAllv {
+        zeroed_vec(peer_count)?
+    } else {
+        Vec::new()
+    };
+
+    for peer in peers {
         let index =
             usize::try_from(peer.peer_rank).map_err(|_| TransposeError::PreparationFailed)?;
         if index >= peer_count || peer.peer_coordinate >= coordinate_extent {
@@ -718,17 +751,23 @@ fn prepare_exchange_counts<const N: usize, const M: usize>(
             .receive_spatial_displacement
             .checked_mul(batch)
             .ok_or(TransposeError::CountOverflow)?;
+
         send_counts[index] =
-            checked_partition_count(send_count, send_displacement, requirements.send_len)?;
-        send_displacements[index] =
-            Count::try_from(send_displacement).map_err(|_| TransposeError::CountOverflow)?;
+            checked_partition_count(send_count, send_displacement, requirements.send_len, mode)?;
+        if mode == CommunicationMode::AllToAllv {
+            send_displacements[index] =
+                Count::try_from(send_displacement).map_err(|_| TransposeError::CountOverflow)?;
+        }
         receive_counts[index] = checked_partition_count(
             receive_count,
             receive_displacement,
             requirements.receive_len,
+            mode,
         )?;
-        receive_displacements[index] =
-            Count::try_from(receive_displacement).map_err(|_| TransposeError::CountOverflow)?;
+        if mode == CommunicationMode::AllToAllv {
+            receive_displacements[index] =
+                Count::try_from(receive_displacement).map_err(|_| TransposeError::CountOverflow)?;
+        }
     }
     Ok(PreparedExchange {
         requirements,
@@ -739,35 +778,35 @@ fn prepare_exchange_counts<const N: usize, const M: usize>(
     })
 }
 
+fn checked_count(
+    count: usize,
+    displacement: usize,
+    mode: CommunicationMode,
+) -> Result<Count, TransposeError> {
+    let count_as_mpi = Count::try_from(count).map_err(|_| TransposeError::CountOverflow)?;
+    if mode == CommunicationMode::AllToAllv {
+        Count::try_from(displacement).map_err(|_| TransposeError::CountOverflow)?;
+    }
+    count
+        .checked_add(displacement)
+        .ok_or(TransposeError::CountOverflow)?;
+    Ok(count_as_mpi)
+}
+
 fn checked_partition_count(
     count: usize,
     displacement: usize,
     total: usize,
+    mode: CommunicationMode,
 ) -> Result<Count, TransposeError> {
-    let count_as_mpi = Count::try_from(count).map_err(|_| TransposeError::CountOverflow)?;
-    let displacement_as_mpi =
-        Count::try_from(displacement).map_err(|_| TransposeError::CountOverflow)?;
-    count_as_mpi
-        .checked_add(displacement_as_mpi)
-        .ok_or(TransposeError::CountOverflow)?;
-    if count
+    let count_as_mpi = checked_count(count, displacement, mode)?;
+    let end = count
         .checked_add(displacement)
-        .ok_or(TransposeError::CountOverflow)?
-        > total
-    {
+        .ok_or(TransposeError::CountOverflow)?;
+    if end > total {
         return Err(TransposeError::PreparationFailed);
     }
     Ok(count_as_mpi)
-}
-
-fn checked_count(count: usize, displacement: usize) -> Result<(), TransposeError> {
-    let count_as_mpi = Count::try_from(count).map_err(|_| TransposeError::CountOverflow)?;
-    let displacement_as_mpi =
-        Count::try_from(displacement).map_err(|_| TransposeError::CountOverflow)?;
-    count_as_mpi
-        .checked_add(displacement_as_mpi)
-        .ok_or(TransposeError::CountOverflow)?;
-    Ok(())
 }
 
 fn checked_count_len(len: usize) -> Result<(), TransposeError> {
@@ -785,8 +824,13 @@ fn zeroed_vec<T: Copy + Default>(len: usize) -> Result<Vec<T>, TransposeError> {
     Ok(values)
 }
 
-fn validate_region_offsets<const N: usize, const M: usize>(
-    pencil: &Pencil<N, M>,
+// Bounds the region with metadata only; the elementwise scan survives as the
+// #[cfg(test)] reference implementation below, which this must match exactly.
+fn validate_region_offsets<const N: usize>(
+    local_ranges: &[Range<usize>; N],
+    local_shape_memory: &[usize; N],
+    permutation: &AxisPermutation<N>,
+    local_len: usize,
     storage_len: usize,
     region: &[Range<usize>; N],
     extra_count: usize,
@@ -794,24 +838,33 @@ fn validate_region_offsets<const N: usize, const M: usize>(
     if extra_count == 0 {
         return Ok(());
     }
-    let spatial_len = region_spatial_len(region)?;
-    if spatial_len == 0 {
+    if region_spatial_len(region)? == 0 {
         return Ok(());
     }
-    for extra_linear in 0..extra_count {
-        let extra_offset = extra_linear
-            .checked_mul(pencil.local_len())
-            .ok_or(TransposeError::PreparationFailed)?;
-        for linear in 0..spatial_len {
-            let global = region_index(region, linear)?;
-            let spatial_offset = local_spatial_offset(pencil, global)?;
-            let offset = extra_offset
-                .checked_add(spatial_offset)
-                .ok_or(TransposeError::PreparationFailed)?;
-            if offset >= storage_len {
-                return Err(TransposeError::PreparationFailed);
-            }
+
+    let mut last_local = [0usize; N];
+    for axis in 0..N {
+        let local = &local_ranges[axis];
+        let requested = &region[axis];
+        if requested.start < local.start || requested.end > local.end {
+            return Err(TransposeError::PreparationFailed);
         }
+        last_local[axis] = requested
+            .end
+            .checked_sub(1)
+            .and_then(|last| last.checked_sub(local.start))
+            .ok_or(TransposeError::PreparationFailed)?;
+    }
+
+    let last_memory = permutation.permute(last_local);
+    let max_spatial = row_major_offset(local_shape_memory, &last_memory)
+        .map_err(|_| TransposeError::PreparationFailed)?;
+    let max_offset = (extra_count - 1)
+        .checked_mul(local_len)
+        .and_then(|extra_offset| extra_offset.checked_add(max_spatial))
+        .ok_or(TransposeError::PreparationFailed)?;
+    if max_offset >= storage_len {
+        return Err(TransposeError::PreparationFailed);
     }
     Ok(())
 }
@@ -1209,13 +1262,692 @@ fn collective_descriptor<C: CommunicatorCollectives>(
 
 #[cfg(test)]
 mod tests {
-    use super::checked_count_len;
-    use mpi::Count;
+    use super::*;
+
+    /// Local pencil metadata that the offset validator needs.
+    struct RegionMetadata<const N: usize> {
+        local_ranges: [Range<usize>; N],
+        local_shape_memory: [usize; N],
+        permutation: AxisPermutation<N>,
+        local_len: usize,
+    }
+
+    /// Element-by-element copy of the pre-metadata validator. It stays test-only
+    /// so production preflight never scans spatial_len * extra_count elements.
+    fn validate_region_offsets_reference<const N: usize>(
+        local_ranges: &[Range<usize>; N],
+        local_shape_memory: &[usize; N],
+        permutation: &AxisPermutation<N>,
+        local_len: usize,
+        storage_len: usize,
+        region: &[Range<usize>; N],
+        extra_count: usize,
+    ) -> Result<(), TransposeError> {
+        if extra_count == 0 {
+            return Ok(());
+        }
+        let spatial_len = region_spatial_len(region)?;
+        if spatial_len == 0 {
+            return Ok(());
+        }
+
+        for extra_linear in 0..extra_count {
+            let extra_offset = extra_linear
+                .checked_mul(local_len)
+                .ok_or(TransposeError::PreparationFailed)?;
+            for linear in 0..spatial_len {
+                let global = region_index(region, linear)?;
+                let mut local = [0usize; N];
+                for axis in 0..N {
+                    let range = &local_ranges[axis];
+                    if global[axis] < range.start || global[axis] >= range.end {
+                        return Err(TransposeError::PreparationFailed);
+                    }
+                    local[axis] = global[axis] - range.start;
+                }
+                let memory = permutation.permute(local);
+                let spatial_offset = row_major_offset(local_shape_memory, &memory)
+                    .map_err(|_| TransposeError::PreparationFailed)?;
+                let offset = extra_offset
+                    .checked_add(spatial_offset)
+                    .ok_or(TransposeError::PreparationFailed)?;
+                if offset >= storage_len {
+                    return Err(TransposeError::PreparationFailed);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs both validators, asserts that they agree, and returns the
+    /// production result.
+    fn checked_offsets<const N: usize>(
+        metadata: &RegionMetadata<N>,
+        region: &[Range<usize>; N],
+        extra_count: usize,
+        storage_len: usize,
+    ) -> Result<(), TransposeError> {
+        let actual = validate_region_offsets(
+            &metadata.local_ranges,
+            &metadata.local_shape_memory,
+            &metadata.permutation,
+            metadata.local_len,
+            storage_len,
+            region,
+            extra_count,
+        );
+        let reference = validate_region_offsets_reference(
+            &metadata.local_ranges,
+            &metadata.local_shape_memory,
+            &metadata.permutation,
+            metadata.local_len,
+            storage_len,
+            region,
+            extra_count,
+        );
+        assert_eq!(
+            actual,
+            reference,
+            "region {region:?}, extra_count {extra_count}, storage_len {storage_len}, permutation {:?}",
+            metadata.permutation.axes(),
+        );
+        actual
+    }
+
+    fn all_permutations<const N: usize>() -> Vec<AxisPermutation<N>> {
+        fn fill<const N: usize>(
+            position: usize,
+            current: &mut [usize; N],
+            used: &mut [bool; N],
+            out: &mut Vec<[usize; N]>,
+        ) {
+            if position == N {
+                out.push(*current);
+                return;
+            }
+            for axis in 0..N {
+                if !used[axis] {
+                    used[axis] = true;
+                    current[position] = axis;
+                    fill(position + 1, current, used, out);
+                    used[axis] = false;
+                }
+            }
+        }
+        let mut axes = Vec::new();
+        fill(0, &mut [0usize; N], &mut [false; N], &mut axes);
+        axes.into_iter()
+            .map(|axes| AxisPermutation::new(axes).expect("valid permutation"))
+            .collect()
+    }
+
+    fn region_candidates(local: &Range<usize>) -> [Range<usize>; 7] {
+        let (start, end) = (local.start, local.end);
+        [
+            start..end,
+            start + 1..end,
+            start..end - 1,
+            end + 1..end + 1,
+            start - 1..end,
+            start..end + 1,
+            end..start,
+        ]
+    }
+
+    fn check_exhaustive_against_reference<const N: usize>() {
+        let local_ranges: [Range<usize>; N] = std::array::from_fn(|axis| {
+            let start = 3 + 2 * axis;
+            start..start + 2 + axis
+        });
+        let logical_shape: [usize; N] = std::array::from_fn(|axis| 2 + axis);
+        let local_len = logical_shape.iter().product::<usize>();
+        let candidates: Vec<[Range<usize>; 7]> =
+            local_ranges.iter().map(region_candidates).collect();
+
+        for permutation in all_permutations::<N>() {
+            let metadata = RegionMetadata {
+                local_ranges: local_ranges.clone(),
+                local_shape_memory: permutation.permute(logical_shape),
+                permutation,
+                local_len,
+            };
+            for code in 0..7usize.pow(N as u32) {
+                let mut remainder = code;
+                let region: [Range<usize>; N] = std::array::from_fn(|axis| {
+                    let choice = remainder % 7;
+                    remainder /= 7;
+                    candidates[axis][choice].clone()
+                });
+                for extra_count in 0..=3 {
+                    let max_storage = local_len * extra_count + 1;
+                    for storage_len in 0..=max_storage {
+                        let _ = checked_offsets(&metadata, &region, extra_count, storage_len);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn region_offsets_match_elementwise_reference() {
+        check_exhaustive_against_reference::<1>();
+        check_exhaustive_against_reference::<2>();
+        check_exhaustive_against_reference::<3>();
+    }
+
+    #[test]
+    fn region_offsets_preserve_zero_and_empty_cases() {
+        let metadata = RegionMetadata {
+            local_ranges: [5..8, 0..4],
+            local_shape_memory: [4, 3],
+            permutation: AxisPermutation::new([1, 0]).expect("valid permutation"),
+            local_len: 12,
+        };
+        let cases = [
+            ([6..8, 1..4], 2, 24, Ok(())),
+            ([6..8, 1..4], 2, 23, Err(TransposeError::PreparationFailed)),
+            ([4..7, 1..4], 2, 24, Err(TransposeError::PreparationFailed)),
+            ([9..9, 0..4], 2, 0, Ok(())),
+            ([Range { start: 8, end: 7 }, 0..4], 0, 0, Ok(())),
+            (
+                [9..9, Range { start: 4, end: 3 }],
+                1,
+                0,
+                Err(TransposeError::PreparationFailed),
+            ),
+        ];
+        for (region, extra_count, storage_len, expected) in cases {
+            assert_eq!(
+                checked_offsets(&metadata, &region, extra_count, storage_len),
+                expected,
+                "region {region:?}, extra_count {extra_count}, storage_len {storage_len}",
+            );
+        }
+    }
+
+    // clippy's single_range_in_vec_init misreads one-axis `[Range; 1]` arrays.
+    #[allow(clippy::single_range_in_vec_init)]
+    #[test]
+    fn region_offsets_check_storage_and_usize_boundaries() {
+        let maximum = usize::MAX;
+        let half = maximum / 2 + 1;
+
+        let tall = RegionMetadata {
+            local_ranges: [0..half],
+            local_shape_memory: [half],
+            permutation: AxisPermutation::identity(),
+            local_len: half,
+        };
+        assert_eq!(checked_offsets(&tall, &[0..1], 2, half + 1), Ok(()));
+        assert_eq!(
+            checked_offsets(&tall, &[0..1], 3, maximum),
+            Err(TransposeError::PreparationFailed),
+        );
+
+        let huge_local = RegionMetadata {
+            local_ranges: [0..maximum],
+            local_shape_memory: [maximum],
+            permutation: AxisPermutation::identity(),
+            local_len: maximum,
+        };
+        assert_eq!(
+            checked_offsets(&huge_local, &[1..2], 2, maximum),
+            Err(TransposeError::PreparationFailed),
+        );
+
+        let single = RegionMetadata {
+            local_ranges: [0..1],
+            local_shape_memory: [1],
+            permutation: AxisPermutation::identity(),
+            local_len: 1,
+        };
+        assert_eq!(checked_offsets(&single, &[0..1], 1, 1), Ok(()));
+        assert_eq!(
+            checked_offsets(&single, &[0..1], 1, 0),
+            Err(TransposeError::PreparationFailed),
+        );
+
+        let row_multiplication = RegionMetadata {
+            local_ranges: [0..3, 0..maximum],
+            local_shape_memory: [3, maximum],
+            permutation: AxisPermutation::identity(),
+            local_len: 1,
+        };
+        assert_eq!(
+            checked_offsets(&row_multiplication, &[2..3, 0..1], 1, maximum),
+            Err(TransposeError::PreparationFailed),
+        );
+
+        let row_addition = RegionMetadata {
+            local_ranges: [0..2, 0..maximum],
+            local_shape_memory: [2, maximum],
+            permutation: AxisPermutation::identity(),
+            local_len: 1,
+        };
+        assert_eq!(
+            checked_offsets(&row_addition, &[1..2, 1..2], 1, maximum),
+            Err(TransposeError::PreparationFailed),
+        );
+
+        let region_product = RegionMetadata {
+            local_ranges: [0..maximum, 0..2],
+            local_shape_memory: [maximum, 2],
+            permutation: AxisPermutation::identity(),
+            local_len: 1,
+        };
+        assert_eq!(
+            checked_offsets(&region_product, &[0..maximum, 0..2], 1, maximum),
+            Err(TransposeError::PreparationFailed),
+        );
+
+        let zero_extent = RegionMetadata {
+            local_ranges: [0..2, 0..2],
+            local_shape_memory: [0, 2],
+            permutation: AxisPermutation::identity(),
+            local_len: 1,
+        };
+        assert_eq!(
+            checked_offsets(&zero_extent, &[0..1, 0..1], 1, maximum),
+            Err(TransposeError::PreparationFailed),
+        );
+
+        let short_memory = RegionMetadata {
+            local_ranges: [0..2, 0..2],
+            local_shape_memory: [1, 2],
+            permutation: AxisPermutation::identity(),
+            local_len: 1,
+        };
+        assert_eq!(
+            checked_offsets(&short_memory, &[1..2, 0..1], 1, maximum),
+            Err(TransposeError::PreparationFailed),
+        );
+
+        let zero_product = RegionMetadata {
+            local_ranges: [0..maximum, 0..2, 0..0],
+            local_shape_memory: [maximum, 2, 0],
+            permutation: AxisPermutation::identity(),
+            local_len: 0,
+        };
+        assert_eq!(
+            checked_offsets(&zero_product, &[0..maximum, 0..2, 0..0], 1, 0),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn region_offsets_large_region_uses_metadata() {
+        let shape = [512usize, 512, 512];
+        let local_len = 512usize.pow(3);
+        let local_ranges: [Range<usize>; 3] = std::array::from_fn(|axis| 0..shape[axis]);
+        let permutation = AxisPermutation::<3>::identity();
+        let storage_len = 3 * local_len;
+        let region = local_ranges.clone();
+        assert_eq!(
+            validate_region_offsets(
+                &local_ranges,
+                &shape,
+                &permutation,
+                local_len,
+                storage_len,
+                &region,
+                3,
+            ),
+            Ok(()),
+        );
+    }
 
     #[test]
     fn descriptor_count_boundary_is_checked_without_allocation() {
         let maximum = usize::try_from(Count::MAX).expect("Count::MAX fits usize");
         assert!(checked_count_len(maximum).is_ok());
         assert!(checked_count_len(maximum + 1).is_err());
+    }
+
+    /// One-dimensional peers whose send and receive segments are identical.
+    /// Each tuple is `(spatial_count, spatial_displacement)`.
+    #[allow(clippy::single_range_in_vec_init)]
+    fn count_test_peers(segments: &[(usize, usize)]) -> Vec<PeerMetadata<1>> {
+        segments
+            .iter()
+            .enumerate()
+            .map(|(index, &(count, displacement))| PeerMetadata {
+                peer_rank: Count::try_from(index).unwrap(),
+                peer_coordinate: index,
+                send_region: [0..count],
+                receive_region: [0..count],
+                send_spatial_len: count,
+                receive_spatial_len: count,
+                send_spatial_displacement: displacement,
+                receive_spatial_displacement: displacement,
+            })
+            .collect()
+    }
+
+    /// Keeps the boundary value on one direction and zeroes the other.
+    #[allow(clippy::single_range_in_vec_init)]
+    fn zero_direction(peers: &mut [PeerMetadata<1>], send_side: bool) {
+        for peer in peers {
+            if send_side {
+                peer.receive_region = [0..0];
+                peer.receive_spatial_len = 0;
+                peer.receive_spatial_displacement = 0;
+            } else {
+                peer.send_region = [0..0];
+                peer.send_spatial_len = 0;
+                peer.send_spatial_displacement = 0;
+            }
+        }
+    }
+
+    fn count_values(values: &[usize]) -> Vec<Count> {
+        values
+            .iter()
+            .map(|&value| Count::try_from(value).expect("Count conversion"))
+            .collect()
+    }
+
+    fn both_modes() -> [CommunicationMode; 2] {
+        [
+            CommunicationMode::AllToAllv,
+            CommunicationMode::PointToPoint,
+        ]
+    }
+
+    #[test]
+    fn count_limits_accept_issue_peer_sizes() {
+        let count = usize::try_from(1_500_000_000_u64).unwrap();
+        let total = usize::try_from(3_000_000_000_u64).unwrap();
+        let peers = count_test_peers(&[(count, 0), (count, count)]);
+        for mode in both_modes() {
+            let requirements = workspace_requirements_for_peers(&peers, 1, mode).unwrap();
+            assert_eq!(
+                requirements,
+                TransposeWorkspaceRequirements {
+                    send_len: total,
+                    receive_len: total,
+                }
+            );
+
+            let prepared = prepare_exchange_counts(&peers, 1, peers.len(), mode).unwrap();
+            assert_eq!(prepared.requirements, requirements);
+            assert_eq!(prepared.send_counts, count_values(&[count, count]));
+            assert_eq!(prepared.receive_counts, count_values(&[count, count]));
+            if mode == CommunicationMode::AllToAllv {
+                assert_eq!(prepared.send_displacements, count_values(&[0, count]));
+                assert_eq!(prepared.receive_displacements, count_values(&[0, count]));
+            } else {
+                assert!(prepared.send_displacements.is_empty());
+                assert!(prepared.receive_displacements.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn count_limits_keep_point_to_point_displacements_in_usize() {
+        let count = usize::try_from(1_100_000_000_u64).unwrap();
+        let total = 3 * count;
+        let peers = count_test_peers(&[(count, 0), (count, count), (count, 2 * count)]);
+
+        let requirements =
+            workspace_requirements_for_peers(&peers, 1, CommunicationMode::PointToPoint).unwrap();
+        assert_eq!(
+            requirements,
+            TransposeWorkspaceRequirements {
+                send_len: total,
+                receive_len: total,
+            }
+        );
+        let prepared =
+            prepare_exchange_counts(&peers, 1, peers.len(), CommunicationMode::PointToPoint)
+                .unwrap();
+        assert_eq!(prepared.requirements, requirements);
+        assert_eq!(prepared.send_counts, count_values(&[count, count, count]));
+        assert_eq!(
+            prepared.receive_counts,
+            count_values(&[count, count, count])
+        );
+        assert!(prepared.send_displacements.is_empty());
+        assert!(prepared.receive_displacements.is_empty());
+
+        assert_eq!(
+            workspace_requirements_for_peers(&peers, 1, CommunicationMode::AllToAllv).unwrap_err(),
+            TransposeError::CountOverflow,
+        );
+        assert_eq!(
+            prepare_exchange_counts(&peers, 1, peers.len(), CommunicationMode::AllToAllv)
+                .unwrap_err(),
+            TransposeError::CountOverflow,
+        );
+    }
+
+    #[test]
+    fn count_limits_bound_peer_counts_and_arithmetic() {
+        let maximum = usize::try_from(Count::MAX).unwrap();
+        let above_maximum = maximum + 1;
+        let half = usize::MAX / 2 + 1;
+
+        for mode in both_modes() {
+            let peers = count_test_peers(&[(maximum, 0)]);
+            let requirements = workspace_requirements_for_peers(&peers, 1, mode).unwrap();
+            assert_eq!(
+                requirements,
+                TransposeWorkspaceRequirements {
+                    send_len: maximum,
+                    receive_len: maximum,
+                }
+            );
+            let prepared = prepare_exchange_counts(&peers, 1, peers.len(), mode).unwrap();
+            assert_eq!(prepared.requirements, requirements);
+            assert_eq!(prepared.send_counts, count_values(&[maximum]));
+            assert_eq!(prepared.receive_counts, count_values(&[maximum]));
+        }
+
+        let overflow_cases: &[(&[(usize, usize)], usize)] = &[
+            (&[(above_maximum, 0)], 1),
+            (&[(maximum, 0)], 2),
+            (&[(half, 0)], 2),
+            (&[(0, half)], 2),
+        ];
+        for mode in both_modes() {
+            for &(segments, batch) in overflow_cases {
+                let peers = count_test_peers(segments);
+                assert_eq!(
+                    workspace_requirements_for_peers(&peers, batch, mode).unwrap_err(),
+                    TransposeError::CountOverflow,
+                );
+                assert_eq!(
+                    prepare_exchange_counts(&peers, batch, peers.len(), mode).unwrap_err(),
+                    TransposeError::CountOverflow,
+                );
+            }
+
+            let peers = count_test_peers(&[(1, usize::MAX)]);
+            assert_eq!(
+                workspace_requirements_for_peers(&peers, 1, mode).unwrap_err(),
+                TransposeError::CountOverflow,
+            );
+            assert_eq!(
+                prepare_exchange_counts(&peers, 1, peers.len(), mode).unwrap_err(),
+                TransposeError::CountOverflow,
+            );
+
+            let peers = count_test_peers(&[(1, 1)]);
+            assert_eq!(
+                workspace_requirements_for_peers(&peers, 1, mode).unwrap(),
+                TransposeWorkspaceRequirements {
+                    send_len: 1,
+                    receive_len: 1,
+                }
+            );
+            assert_eq!(
+                prepare_exchange_counts(&peers, 1, peers.len(), mode).unwrap_err(),
+                TransposeError::PreparationFailed,
+            );
+
+            let peers = count_test_peers(&[(usize::MAX, usize::MAX)]);
+            let requirements = workspace_requirements_for_peers(&peers, 0, mode).unwrap();
+            assert_eq!(
+                requirements,
+                TransposeWorkspaceRequirements {
+                    send_len: 0,
+                    receive_len: 0,
+                }
+            );
+            let prepared = prepare_exchange_counts(&peers, 0, peers.len(), mode).unwrap();
+            assert_eq!(prepared.requirements, requirements);
+            assert_eq!(prepared.send_counts, count_values(&[0]));
+            assert_eq!(prepared.receive_counts, count_values(&[0]));
+            if mode == CommunicationMode::AllToAllv {
+                assert_eq!(prepared.send_displacements, count_values(&[0]));
+                assert_eq!(prepared.receive_displacements, count_values(&[0]));
+            } else {
+                assert!(prepared.send_displacements.is_empty());
+                assert!(prepared.receive_displacements.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn count_limits_check_send_and_receive_independently() {
+        let maximum = usize::try_from(Count::MAX).unwrap();
+        let above_maximum = maximum + 1;
+        let half = usize::MAX / 2 + 1;
+
+        for mode in both_modes() {
+            for send_side in [true, false] {
+                for (segments, batch) in [(vec![(half, 0)], 2usize), (vec![(above_maximum, 0)], 1)]
+                {
+                    let mut peers = count_test_peers(&segments);
+                    zero_direction(&mut peers, send_side);
+                    assert_eq!(
+                        workspace_requirements_for_peers(&peers, batch, mode).unwrap_err(),
+                        TransposeError::CountOverflow,
+                    );
+                    assert_eq!(
+                        prepare_exchange_counts(&peers, batch, peers.len(), mode).unwrap_err(),
+                        TransposeError::CountOverflow,
+                    );
+                }
+
+                let mut peers = count_test_peers(&[(1, 1)]);
+                zero_direction(&mut peers, send_side);
+                let (send_len, receive_len) = if send_side { (1, 0) } else { (0, 1) };
+                assert_eq!(
+                    workspace_requirements_for_peers(&peers, 1, mode).unwrap(),
+                    TransposeWorkspaceRequirements {
+                        send_len,
+                        receive_len,
+                    }
+                );
+                assert_eq!(
+                    prepare_exchange_counts(&peers, 1, peers.len(), mode).unwrap_err(),
+                    TransposeError::PreparationFailed,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn count_limits_reject_invalid_peer_indices() {
+        let expected = TransposeWorkspaceRequirements {
+            send_len: 1,
+            receive_len: 1,
+        };
+        for mode in both_modes() {
+            let mut peers = count_test_peers(&[(1, 0)]);
+            peers[0].peer_rank = -1;
+            assert_eq!(
+                workspace_requirements_for_peers(&peers, 1, mode).unwrap(),
+                expected,
+            );
+            assert_eq!(
+                prepare_exchange_counts(&peers, 1, peers.len(), mode).unwrap_err(),
+                TransposeError::PreparationFailed,
+            );
+
+            let mut peers = count_test_peers(&[(1, 0)]);
+            peers[0].peer_rank = 1;
+            assert_eq!(
+                workspace_requirements_for_peers(&peers, 1, mode).unwrap(),
+                expected,
+            );
+            assert_eq!(
+                prepare_exchange_counts(&peers, 1, peers.len(), mode).unwrap_err(),
+                TransposeError::PreparationFailed,
+            );
+
+            let mut peers = count_test_peers(&[(1, 0)]);
+            peers[0].peer_coordinate = 1;
+            assert_eq!(
+                workspace_requirements_for_peers(&peers, 1, mode).unwrap(),
+                expected,
+            );
+            assert_eq!(
+                prepare_exchange_counts(&peers, 1, 1, mode).unwrap_err(),
+                TransposeError::PreparationFailed,
+            );
+        }
+    }
+
+    #[test]
+    fn checked_count_and_partition_count_boundaries() {
+        let maximum = usize::try_from(Count::MAX).unwrap();
+        let above_maximum = maximum + 1;
+
+        for mode in both_modes() {
+            assert_eq!(checked_count(maximum, 0, mode), Ok(Count::MAX));
+            assert_eq!(
+                checked_count(above_maximum, 0, mode).unwrap_err(),
+                TransposeError::CountOverflow,
+            );
+            let wide_displacement = checked_count(0, above_maximum, mode);
+            if mode == CommunicationMode::AllToAllv {
+                assert_eq!(
+                    wide_displacement.unwrap_err(),
+                    TransposeError::CountOverflow
+                );
+            } else {
+                assert_eq!(wide_displacement, Ok(0));
+            }
+            assert_eq!(
+                checked_count(1, usize::MAX, mode).unwrap_err(),
+                TransposeError::CountOverflow,
+            );
+
+            assert_eq!(
+                checked_partition_count(maximum, 0, maximum, mode),
+                Ok(Count::MAX),
+            );
+            assert_eq!(
+                checked_partition_count(1, maximum, above_maximum, mode),
+                Ok(1),
+            );
+            assert_eq!(
+                checked_partition_count(1, maximum, maximum, mode).unwrap_err(),
+                TransposeError::PreparationFailed,
+            );
+            assert_eq!(checked_partition_count(0, maximum, maximum, mode), Ok(0));
+            assert_eq!(
+                checked_partition_count(0, maximum, maximum - 1, mode).unwrap_err(),
+                TransposeError::PreparationFailed,
+            );
+            let wide_count = checked_partition_count(1, above_maximum, maximum + 2, mode);
+            if mode == CommunicationMode::AllToAllv {
+                assert_eq!(wide_count.unwrap_err(), TransposeError::CountOverflow);
+            } else {
+                assert_eq!(wide_count, Ok(1));
+            }
+            assert_eq!(
+                checked_partition_count(1, usize::MAX, usize::MAX, mode).unwrap_err(),
+                TransposeError::CountOverflow,
+            );
+            let wide_zero = checked_partition_count(0, usize::MAX, usize::MAX, mode);
+            if mode == CommunicationMode::AllToAllv {
+                assert_eq!(wide_zero.unwrap_err(), TransposeError::CountOverflow);
+            } else {
+                assert_eq!(wide_zero, Ok(0));
+            }
+            assert_eq!(checked_partition_count(0, 0, 0, mode), Ok(0));
+        }
     }
 }

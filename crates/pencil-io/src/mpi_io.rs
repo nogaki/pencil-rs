@@ -10,7 +10,7 @@ use mpi::traits::AsRaw;
 use crate::ffi;
 use pencil_array::{PencilArrayView, PencilArrayViewMut, SpatialAxis};
 
-use crate::format::{IoElement, element_count, pack_view, prepare_physical_values};
+use crate::format::{IoElement, ReadTarget, element_count, pack_view};
 use crate::options::{InfoGuard, MpiIoMode, MpiIoOptions, agree_options};
 use crate::{
     COMMIT_MARKER, FORMAT_VERSION, INCOMPLETE_MARKER, IO_NAMESPACE, IoError, MAX_DESCRIPTOR_BYTES,
@@ -18,6 +18,7 @@ use crate::{
 };
 
 const HEADER_PREFIX_BYTES: usize = 96;
+pub(crate) const MPI_LOCAL_BYTE_LIMIT_WHAT: &str = "MPI local byte count";
 const MAGIC: &[u8; 8] = b"PENCILIO";
 const COMMIT_OFFSET: i64 = 24;
 const ROOT_RANK: i32 = 0;
@@ -179,6 +180,12 @@ pub(crate) fn abort_unrecoverable(comm: ffi::MPI_Comm, _operation: &'static str)
 
 /// Writes one view collectively using native MPI-IO.
 ///
+/// Each rank's local payload is limited to 2147483647 bytes/rank, checked as
+/// `local_elements * scalar_width` (for `f64`, up to 268435455 elements). If any
+/// rank exceeds it, every rank returns the same [`IoError::SizeLimit`] with
+/// `what == "MPI local byte count"` before packing. See the crate-level
+/// Collective I/O documentation for the shared scope.
+///
 /// Failure does not roll back file mutations, and a valid commit may remain.
 /// [`IoError::CommitUncertain`] is not a safe-retry guarantee.
 pub fn write_mpi<P, T, const N: usize, const M: usize>(
@@ -192,7 +199,8 @@ where
     write_mpi_inner(path, view, false, None)
 }
 
-/// Option-bearing additive form of [`write_mpi`].
+/// Option-bearing additive form of [`write_mpi`]. Applies the same MPI local
+/// payload limit and collective preflight.
 pub fn write_mpi_with_options<P, T, const N: usize, const M: usize>(
     path: P,
     view: PencilArrayView<'_, T, N, M>,
@@ -227,24 +235,30 @@ where
         global,
         extra,
         grid,
+        view.pencil().decomposition(),
         permutation,
         T::CODE,
         T::WIDTH,
     )?;
 
-    let path_c = match CString::new(path_bytes(path.as_ref())?) {
-        Ok(path) => Ok(path),
-        Err(_) => Err(IoError::InvalidPath),
-    };
-    let path_ok = path_c.is_ok();
-    if let Err(agreement) = agree_phase(comm, path_ok, "path preparation") {
-        return Err(if path_ok {
-            agreement
-        } else {
-            path_c.unwrap_err()
-        });
+    let path_result = path_bytes(path.as_ref())
+        .and_then(|bytes| CString::new(bytes).map_err(|_| IoError::InvalidPath));
+    let header_result = Header::for_write(&view);
+    let layout_result = build_layout(
+        global,
+        extra,
+        &view.local_spatial_shape(),
+        view.pencil().local_ranges(),
+        view.len(),
+        T::WIDTH,
+    );
+    let prep_error = first_error3(&layout_result, &path_result, &header_result);
+    if let Err(agreement) = agree_mpi_preparation(comm, prep_error.as_ref(), "path preparation") {
+        return Err(mpi_preparation_error(prep_error, agreement));
     }
-    let path_c = path_c.expect("path agreement established");
+    let path_c = path_result.expect("path preparation agreement established");
+    let header = header_result.expect("path preparation agreement established");
+    let layout = layout_result.expect("path preparation agreement established");
 
     // These are all local preparation phases.  Every rank completes them before
     // the communicator is duplicated or the next collective is entered.
@@ -260,23 +274,12 @@ where
         })
         .transpose()?;
     let native_info = info.as_ref().map_or_else(ffi::info_null, |i| i.raw);
-    let header_result = Header::for_write(&view);
     let packed_result = pack_view(&view);
-    let layout_result = build_layout(
-        global,
-        extra,
-        &view.local_spatial_shape(),
-        view.pencil().local_ranges(),
-        view.len(),
-        T::WIDTH,
-    );
-    let prep_error = first_error3(&header_result, &packed_result, &layout_result);
-    if let Err(agreement) = agree_phase(comm, prep_error.is_none(), "write preparation") {
-        return Err(prep_error.unwrap_or(agreement));
+    let pack_error = packed_result.as_ref().err().cloned();
+    if let Err(agreement) = agree_phase(comm, pack_error.is_none(), "write preparation") {
+        return Err(pack_error.unwrap_or(agreement));
     }
-    let header = header_result.expect("write preparation agreement established");
     let packed = packed_result.expect("write preparation agreement established");
-    let layout = layout_result.expect("write preparation agreement established");
     let header_count =
         c_int::try_from(header.bytes.len()).expect("validated header is below MPI count limit");
     let header_offset =
@@ -472,7 +475,8 @@ where
 
 /// Reads one MPI-IO file collectively into a view. The destination is published
 /// only after staging, validation, explicit native cleanup, and collective
-/// success agreement; a returned error leaves it unchanged.
+/// success agreement; a returned error leaves it unchanged. The same 2147483647
+/// bytes/rank local payload limit as [`write_mpi`] applies before staging.
 pub fn read_mpi<P, T, const N: usize, const M: usize>(
     path: P,
     view: PencilArrayViewMut<'_, T, N, M>,
@@ -481,10 +485,11 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_mpi_inner(path, view, false, None)
+    read_mpi_inner(path, ReadTarget::Single(view), false, None)
 }
 
-/// Option-bearing additive form of [`read_mpi`].
+/// Option-bearing additive form of [`read_mpi`]. Applies the same MPI local
+/// payload limit and destination guarantee.
 pub fn read_mpi_with_options<P, T, const N: usize, const M: usize>(
     path: P,
     view: PencilArrayViewMut<'_, T, N, M>,
@@ -494,12 +499,27 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_mpi_inner(path, view, false, Some(options))
+    read_mpi_inner(path, ReadTarget::Single(view), false, Some(options))
+}
+
+/// Reads directly into a single view or a collection of member views using one
+/// byte-staging payload. Collection callers must prepare the target and its
+/// staging reservation first.
+pub(crate) fn read_mpi_target<P, T, const N: usize, const M: usize>(
+    path: P,
+    target: ReadTarget<'_, '_, T, N, M>,
+    options: Option<&MpiIoOptions>,
+) -> Result<(), IoError>
+where
+    P: AsRef<Path>,
+    T: IoElement,
+{
+    read_mpi_inner(path, target, false, options)
 }
 
 fn read_mpi_inner<P, T, const N: usize, const M: usize>(
     path: P,
-    mut view: PencilArrayViewMut<'_, T, N, M>,
+    mut target: ReadTarget<'_, '_, T, N, M>,
     inject_post_cleanup_failure: bool,
     options: Option<&MpiIoOptions>,
 ) -> Result<(), IoError>
@@ -507,11 +527,13 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    let comm = view.pencil().topology().communicator();
-    let global = view.pencil().global_shape();
-    let extra = view.extra_shape().dimensions();
-    let grid = view.pencil().topology().process_grid();
-    let permutation = view.pencil().permutation().axes();
+    // Take the reserved staging out before borrowing the target's metadata.
+    let mut staging = target.take_staging();
+    let comm = target.pencil().topology().communicator();
+    let global = target.pencil().global_shape();
+    let extra = target.extra();
+    let grid = target.pencil().topology().process_grid();
+    let permutation = target.pencil().permutation().axes();
     descriptor_agreement(
         comm,
         path.as_ref(),
@@ -519,24 +541,32 @@ where
         global,
         extra,
         grid,
+        target.pencil().decomposition(),
         permutation,
         T::CODE,
         T::WIDTH,
     )?;
 
-    let path_c = match CString::new(path_bytes(path.as_ref())?) {
-        Ok(path) => Ok(path),
-        Err(_) => Err(IoError::InvalidPath),
-    };
-    let path_ok = path_c.is_ok();
-    if let Err(agreement) = agree_phase(comm, path_ok, "path preparation") {
-        return Err(if path_ok {
-            agreement
-        } else {
-            path_c.unwrap_err()
-        });
+    let path_result = path_bytes(path.as_ref())
+        .and_then(|bytes| CString::new(bytes).map_err(|_| IoError::InvalidPath));
+    let global_shape = target.pencil().global_shape();
+    let local_shape = target.local_spatial_shape();
+    let layout_result = build_layout(
+        global_shape,
+        extra,
+        &local_shape,
+        target.pencil().local_ranges(),
+        target.len(),
+        T::WIDTH,
+    );
+    let staged_bytes = checked_local_byte_count(target.len(), T::WIDTH);
+    let prep_error = first_error3(&staged_bytes, &layout_result, &path_result);
+    if let Err(agreement) = agree_mpi_preparation(comm, prep_error.as_ref(), "path preparation") {
+        return Err(mpi_preparation_error(prep_error, agreement));
     }
-    let path_c = path_c.expect("path agreement established");
+    let path_c = path_result.expect("path preparation agreement established");
+    let layout = layout_result.expect("path preparation agreement established");
+    let staging_len = staged_bytes.expect("path preparation agreement established");
 
     let defaults = MpiIoOptions::default();
     let controls = options.unwrap_or(&defaults);
@@ -545,39 +575,25 @@ where
     }
     let info = options
         .map(|_| {
-            crate::options::agree_decomposition(view.pencil())?;
+            crate::options::agree_decomposition(target.pencil())?;
             InfoGuard::new(comm, controls)
         })
         .transpose()?;
     let native_info = info.as_ref().map_or_else(ffi::info_null, |i| i.raw);
-    let global_shape = view.pencil().global_shape();
-    let local_shape = view.local_spatial_shape();
-    let layout_result = build_layout(
-        global_shape,
-        extra,
-        &local_shape,
-        view.pencil().local_ranges(),
-        view.len(),
-        T::WIDTH,
-    );
-    let staged_bytes = view.len().checked_mul(T::WIDTH).ok_or(IoError::SizeLimit {
-        what: "local staging bytes",
-    });
-    let mut staging = Vec::new();
-    let staging_result = match staged_bytes {
-        Ok(bytes) => staging
-            .try_reserve_exact(bytes)
-            .map(|_| bytes)
-            .map_err(|_| IoError::AllocationFailed { requested: bytes }),
-        Err(error) => Err(error),
-    };
-    let prep_error = first_error2(&layout_result, &staging_result);
+    let staging_result = staging
+        .try_reserve_exact(staging_len)
+        .map(|_| staging_len)
+        .map_err(|_| IoError::AllocationFailed {
+            requested: staging_len,
+        });
+    let prep_error = staging_result.as_ref().err().cloned();
     if let Err(agreement) = agree_phase(comm, prep_error.is_none(), "read preparation") {
         return Err(prep_error.unwrap_or(agreement));
     }
-    let layout = layout_result.expect("read preparation agreement established");
-    let staging_len = staging_result.expect("read preparation agreement established");
-    staging.resize(staging_len, 0);
+    staging.resize(
+        staging_result.expect("read preparation agreement established"),
+        0,
+    );
 
     let duplicate = duplicate_comm(comm)?;
 
@@ -795,30 +811,28 @@ where
         return Err(cleanup.unwrap_or(agreement));
     }
 
-    // Decode, map, and allocate the final physical-order buffer while every
-    // native resource is still owned.  No rank can reach cleanup or commit
-    // alone after this agreement.
-    let values_result = prepare_physical_values(&view, &staging);
-    if let Err(agreement) = agree_phase(comm, values_result.is_ok(), "MPI-IO read physical staging")
-    {
+    // Validate layout and allocate decode scratch before native cleanup.
+    let plan_result = target.prepare(&staging);
+    if let Err(agreement) = agree_phase(comm, plan_result.is_ok(), "MPI-IO read physical staging") {
         let cleanup = finish_resources(comm, duplicate, file, datatype);
-        return Err(cleanup.unwrap_or(values_result.err().unwrap_or(agreement)));
+        return Err(cleanup.unwrap_or(plan_result.err().unwrap_or(agreement)));
     }
-    let values = values_result.expect("read physical staging agreement established");
+    let plan = plan_result.expect("read physical staging agreement established");
     let cleanup = finish_resources(comm, duplicate, file, datatype);
     drop(info);
-    let injected = if inject_post_cleanup_failure && comm.rank() == ROOT_RANK {
-        Some(IoError::Native {
-            operation: "test post-cleanup result",
-            code: -1,
-        })
-    } else {
-        None
-    };
+    let injected =
+        if post_cleanup_failure_injected(inject_post_cleanup_failure) && comm.rank() == ROOT_RANK {
+            Some(IoError::Native {
+                operation: "test post-cleanup result",
+                code: -1,
+            })
+        } else {
+            None
+        };
     if let Some(error) = aggregate_cleanup_result(comm, cleanup.or(injected)) {
         return Err(error);
     }
-    view.as_mut_slice().copy_from_slice(&values);
+    target.commit(plan, &staging);
     Ok(())
 }
 
@@ -831,7 +845,7 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_mpi_inner(path, view, true, None)
+    read_mpi_inner(path, ReadTarget::Single(view), true, None)
 }
 
 #[derive(Debug)]
@@ -892,6 +906,25 @@ pub(crate) fn cleanup_result(cleanup: Option<IoError>, primary: IoError) -> IoEr
         primary
     } else {
         cleanup.unwrap_or(primary)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only injection of a post-cleanup failure on the calling rank,
+    /// applied by every single-call, named, and collection read.
+    pub(crate) static POST_CLEANUP_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Combines the per-entry injection flag with the thread-local test hook.
+pub(crate) fn post_cleanup_failure_injected(local: bool) -> bool {
+    #[cfg(test)]
+    {
+        local || POST_CLEANUP_FAILURE.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        local
     }
 }
 
@@ -988,6 +1021,37 @@ where
     }
 }
 
+/// Agrees a preparation failure in one maximum reduction.  A local byte-limit
+/// failure takes precedence over every other local preparation error.
+pub(crate) fn agree_mpi_preparation<C: CommunicatorCollectives>(
+    comm: &C,
+    local_error: Option<&IoError>,
+    phase: &'static str,
+) -> Result<(), IoError> {
+    let state = match local_error {
+        None => 0,
+        Some(IoError::SizeLimit { what }) if *what == MPI_LOCAL_BYTE_LIMIT_WHAT => 2,
+        Some(_) => 1,
+    };
+    let mut global = 0;
+    comm.all_reduce_into(&state, &mut global, SystemOperation::max());
+    match global {
+        0 => Ok(()),
+        2 => Err(IoError::SizeLimit {
+            what: MPI_LOCAL_BYTE_LIMIT_WHAT,
+        }),
+        _ => Err(IoError::CollectivePrecondition { phase }),
+    }
+}
+
+pub(crate) fn mpi_preparation_error(local_error: Option<IoError>, agreement: IoError) -> IoError {
+    if matches!(&agreement, IoError::SizeLimit { what } if *what == MPI_LOCAL_BYTE_LIMIT_WHAT) {
+        agreement
+    } else {
+        local_error.unwrap_or(agreement)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn descriptor_agreement<const N: usize, const M: usize>(
     comm: &mpi::topology::CartesianCommunicator,
@@ -996,6 +1060,7 @@ pub(crate) fn descriptor_agreement<const N: usize, const M: usize>(
     global: &[usize; N],
     extra: &[usize],
     grid: &[usize; M],
+    decomposition: &[SpatialAxis; M],
     permutation: &[SpatialAxis; N],
     type_code: u64,
     width: usize,
@@ -1006,6 +1071,7 @@ pub(crate) fn descriptor_agreement<const N: usize, const M: usize>(
         global,
         extra,
         grid,
+        decomposition,
         permutation,
         type_code,
         width,
@@ -1086,6 +1152,7 @@ fn build_descriptor<const N: usize, const M: usize>(
     global: &[usize; N],
     extra: &[usize],
     grid: &[usize; M],
+    decomposition: &[SpatialAxis; M],
     permutation: &[SpatialAxis; N],
     type_code: u64,
     width: usize,
@@ -1123,6 +1190,11 @@ fn build_descriptor<const N: usize, const M: usize>(
     for &extent in grid {
         descriptor.push_u64(u64::try_from(extent).map_err(|_| IoError::SizeLimit {
             what: "process grid",
+        })?)?;
+    }
+    for axis in decomposition {
+        descriptor.push_u64(u64::try_from(axis.index()).map_err(|_| IoError::SizeLimit {
+            what: "decomposition",
         })?)?;
     }
     for axis in permutation {
@@ -1309,6 +1381,7 @@ impl Header {
         if n > MAX_PROTOCOL_RANK as u64
             || extra_rank > MAX_PROTOCOL_RANK as u64
             || writer_grid_rank > MAX_PROTOCOL_RANK as u64
+            || writer_grid_rank > n
         {
             return Err(IoError::InvalidFile {
                 reason: "rank bound",
@@ -1570,6 +1643,51 @@ pub(crate) fn is_permutation(values: &[u64], n: usize) -> bool {
     true
 }
 
+/// Checks one rank's local payload bytes against the native MPI count limit.
+/// Test-only overrides can lower the limit but never raise the production one.
+pub(crate) fn checked_local_byte_count(elements: usize, width: usize) -> Result<usize, IoError> {
+    let bytes = elements.checked_mul(width).ok_or(IoError::SizeLimit {
+        what: MPI_LOCAL_BYTE_LIMIT_WHAT,
+    })?;
+    #[cfg(test)]
+    let limit = LOCAL_BYTE_LIMIT_OVERRIDE.with(|override_limit| {
+        override_limit
+            .get()
+            .map_or(c_int::MAX as usize, |limit| limit.min(c_int::MAX as usize))
+    });
+    #[cfg(not(test))]
+    let limit = c_int::MAX as usize;
+    if bytes > limit {
+        return Err(IoError::SizeLimit {
+            what: MPI_LOCAL_BYTE_LIMIT_WHAT,
+        });
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOCAL_BYTE_LIMIT_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct LocalByteLimitGuard(Option<usize>);
+
+#[cfg(test)]
+impl LocalByteLimitGuard {
+    pub(crate) fn new(limit: usize) -> Self {
+        let previous = LOCAL_BYTE_LIMIT_OVERRIDE.with(|value| value.replace(Some(limit)));
+        Self(previous)
+    }
+}
+
+#[cfg(test)]
+impl Drop for LocalByteLimitGuard {
+    fn drop(&mut self) {
+        LOCAL_BYTE_LIMIT_OVERRIDE.with(|value| value.set(self.0));
+    }
+}
+
 pub(crate) struct MpiLayout {
     pub(crate) global: Vec<c_int>,
     pub(crate) local: Vec<c_int>,
@@ -1585,6 +1703,7 @@ pub(crate) fn build_layout<const N: usize>(
     local_elements: usize,
     width: usize,
 ) -> Result<MpiLayout, IoError> {
+    let local_bytes = checked_local_byte_count(local_elements, width)?;
     let rank = extra
         .len()
         .checked_add(N)
@@ -1595,16 +1714,6 @@ pub(crate) fn build_layout<const N: usize>(
     if rank == 0 || rank > MAX_PROTOCOL_RANK {
         return Err(IoError::SizeLimit {
             what: "MPI datatype rank",
-        });
-    }
-    let local_bytes = local_elements
-        .checked_mul(width)
-        .ok_or(IoError::SizeLimit {
-            what: "MPI local byte count",
-        })?;
-    if local_bytes > c_int::MAX as usize {
-        return Err(IoError::SizeLimit {
-            what: "MPI local byte count",
         });
     }
     let reserve = rank
@@ -1727,5 +1836,112 @@ impl MpiCodeExt for i32 {
         } else {
             Err(self)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_local_limit_error<T>(result: Result<T, IoError>) -> bool {
+        matches!(
+            result,
+            Err(IoError::SizeLimit { what }) if what == MPI_LOCAL_BYTE_LIMIT_WHAT
+        )
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn local_byte_count_boundaries() {
+        assert_eq!(checked_local_byte_count(0, 8).unwrap(), 0);
+        assert_eq!(
+            checked_local_byte_count(c_int::MAX as usize, 1).unwrap(),
+            c_int::MAX as usize
+        );
+        assert!(is_local_limit_error(checked_local_byte_count(
+            c_int::MAX as usize + 1,
+            1
+        )));
+        assert_eq!(
+            checked_local_byte_count(268_435_455, 8).unwrap(),
+            2_147_483_640
+        );
+        assert!(is_local_limit_error(checked_local_byte_count(
+            268_435_456,
+            8
+        )));
+        assert!(is_local_limit_error(checked_local_byte_count(
+            usize::MAX,
+            2
+        )));
+        assert!(matches!(
+            checked_local_byte_count(268_435_456, 8),
+            Err(IoError::SizeLimit { what }) if what == MPI_LOCAL_BYTE_LIMIT_WHAT
+        ));
+
+        // build_layout applies the same byte guard before its datatype-rank check.
+        let global = [1usize];
+        let ranges = [0usize..1];
+        let local_shape = [1usize];
+        assert!(is_local_limit_error(build_layout(
+            &global,
+            &[],
+            &local_shape,
+            &ranges,
+            268_435_456,
+            8,
+        )));
+        let too_many_extra = vec![1usize; MAX_PROTOCOL_RANK];
+        assert!(matches!(
+            build_layout(
+                &global,
+                &too_many_extra,
+                &local_shape,
+                &ranges,
+                268_435_456,
+                8,
+            ),
+            Err(IoError::SizeLimit { what }) if what == MPI_LOCAL_BYTE_LIMIT_WHAT
+        ));
+
+        // Zero local bytes must not skip dimension or start validation.
+        assert!(matches!(
+            build_layout(&[usize::MAX], &[], &[0], &[0..0], 0, 8),
+            Err(IoError::SizeLimit { what }) if what == "MPI global dimension"
+        ));
+        assert!(matches!(
+            build_layout(&[1], &[], &[1], &[usize::MAX..usize::MAX], 0, 8),
+            Err(IoError::SizeLimit { what }) if what == "MPI subarray start"
+        ));
+
+        {
+            let _guard = LocalByteLimitGuard::new(100);
+            assert!(is_local_limit_error(checked_local_byte_count(101, 1)));
+            assert_eq!(checked_local_byte_count(100, 1).unwrap(), 100);
+        }
+        assert_eq!(checked_local_byte_count(101, 1).unwrap(), 101);
+    }
+
+    #[test]
+    fn mpi_preparation_error_prioritizes_size_limit() {
+        let local = IoError::AllocationFailed { requested: 7 };
+        let size = IoError::SizeLimit {
+            what: MPI_LOCAL_BYTE_LIMIT_WHAT,
+        };
+        assert!(matches!(
+            mpi_preparation_error(Some(local.clone()), size),
+            IoError::SizeLimit { what } if what == MPI_LOCAL_BYTE_LIMIT_WHAT
+        ));
+        assert!(matches!(
+            mpi_preparation_error(
+                Some(local),
+                IoError::CollectivePrecondition { phase: "test" }
+            ),
+            IoError::AllocationFailed { requested: 7 }
+        ));
+        assert!(matches!(
+            mpi_preparation_error(None, IoError::CollectivePrecondition { phase: "test" }),
+            IoError::CollectivePrecondition { phase: "test" }
+        ));
     }
 }

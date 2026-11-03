@@ -208,6 +208,8 @@ fn serial_hdf5_contract() {
         ("writer_grid", &[][..]),
         ("writer_grid", &[0][..]),
         ("writer_grid", &[u64::MAX, 2][..]),
+        // The writer grid rank may not exceed the spatial rank.
+        ("writer_grid", &[1, 1, 1][..]),
         ("writer_permutation", &[0, 0][..]),
         ("writer_permutation", &[0, 2][..]),
         ("writer_permutation", &[0][..]),

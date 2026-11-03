@@ -69,10 +69,13 @@ replace that communicator, collective-order, type, or `Equivalence` contract.
 `AllToAllvTransposeWorkspaceRequirements` names are compatibility aliases for
 the same types. `workspace_requirements` and
 `TransposeWorkspace::from_vecs` are noncollective and do not call MPI;
-execution checks initialized `len` (not capacity), does not resize or
-reallocate workspace vectors, and checks count/length/displacement/offset
-limits before payload communication. Ordinary out-of-place preflight errors
-preserve the source, destination, and workspace. Ordinary in-place preflight
+execution checks initialized `len` (not capacity) and does not resize or
+reallocate workspace vectors. Each peer count must fit `mpi::Count`; Alltoallv
+additionally requires each displacement to fit `mpi::Count`. Segment ends,
+total lengths, and point-to-point displacements use checked `usize` arithmetic
+and may exceed `mpi::Count::MAX`. All segments and view/workspace lengths are
+validated before payload communication. Ordinary out-of-place preflight
+errors preserve the source, destination, and workspace. Ordinary in-place
 errors preserve the array state, active data, and workspace for both
 Alltoallv and point-to-point. Point-to-point uses a fixed internal tag on the
 topology-owned changed-axis context, posts all receives before sends, waits for
@@ -170,9 +173,18 @@ With its default `mpi` feature, `pencil-io` also provides `write_mpi_collection`
 `read_mpi_collection`; their HDF5 counterparts require `parallel-hdf5`.
 These accept the Cartesian communicator explicitly and view
 slices, and store one `[component, extra..., spatial...]` payload using the
-existing single-dataset format. Every read destination is staged until native
-cleanup and agreement succeed. Option-bearing collection forms preserve the
-same staging guarantees. `write_mpi_named_collection`, `append_mpi_named_collection`,
+existing single-dataset format. For the MPI collection APIs, each rank's
+combined payload is limited to 2147483647 bytes/rank
+(`combined_local_elements * scalar_width`; for `f64`, up to 268435455 elements),
+not each member separately. If any rank exceeds it, every rank returns
+`CollectionIoError::Io(IoError::SizeLimit { what: "MPI local byte count" })`
+before payload staging or combined typed storage is allocated; this is not a
+whole-file cap. The same combined limit applies to named MPI collection records;
+the HDF5 collection paths are not subject to this MPI local byte limit. A
+collection read reserves one combined byte-staging payload and decodes every
+member directly from it only after native cleanup and agreement succeed, so no
+combined typed storage is retained; option-bearing and named collection forms
+preserve the same guarantee. `write_mpi_named_collection`, `append_mpi_named_collection`,
 `read_mpi_named_collection` and their HDF5 counterparts store one combined named
 dataset and accept explicit options. Names, options and all members agree before
 payload staging or mutation. These APIs do not pretend several independent
@@ -565,9 +577,25 @@ byte-subarray file views; readers stage and validate the complete payload before
 mutating the destination. Writes use exclusive file creation and a flushed commit
 marker, so incomplete and committed states are reported separately. The format
 records type, width, logical shapes, writer process grid, and writer permutation;
-writer layout metadata is provenance, not a read-layout requirement. Native
+writer layout metadata is provenance, not a read-layout requirement, though a
+writer grid with more axes than the spatial rank is rejected. Native
 cleanup failures that can leave an unrecoverable handle are fail-stop paths via
 MPI abort, not recoverable Rust errors.
+
+Open MPI 4.1.6 can lose collective writes; update it or apply the
+[workaround](#open-mpi-416-collective-write-data-loss).
+
+MPI local payloads are limited to 2147483647 bytes/rank, checked as
+`local_elements * scalar_width` (for `f64`, up to 268435455 elements). If any
+rank exceeds the limit, every rank returns the same underlying
+`IoError::SizeLimit` with `what == "MPI local byte count"` (wrapped by the
+API's error type) before packing or staging that payload.
+Collections apply the limit to their combined payload and sessions to each
+record; this is not a whole-file or container byte cap. Existing dimension,
+start and offset representation limits remain. Normal successful paths still
+pack the full local payload and allocate byte or typed staging. The limit does
+not apply to HDF5 or metadata-only catalog operations. The API documentation
+identifies the wrapper type for each path.
 
 Enable the optional native parallel HDF5 backend with
 `pencil-io/parallel-hdf5`. It stores one versioned dataset at
@@ -597,8 +625,13 @@ Append adds a new name; it never overwrites an earlier dataset. Each record has
 its own checked framing and commit marker. Earlier committed records remain
 readable when a later tail is malformed or incomplete, while further append is
 refused until that invalid tail is handled outside this API. There is no
-artificial global 1 GiB limit; native per-rank count, dimension and file-offset
-limits still apply.
+artificial global container byte cap. Each record's local payload is limited to
+2147483647 bytes/rank (`local_elements * scalar_width`; for `f64`, up to
+268435455 elements), and every rank returns
+`NamedIoError::Io(IoError::SizeLimit { what: "MPI local byte count" })` before
+packing or staging that record. Native dimension and file-offset limits still
+apply. Reads use the same per-record limit and preserve the destination when it
+is rejected.
 
 The `parallel-hdf5` counterparts are `write_hdf5_named`, `append_hdf5_named`, and
 `read_hdf5_named`. They use `/pencil_io_named_v1` with injectively encoded UTF-8
@@ -618,7 +651,10 @@ input. The view supplies type and global shape; options select a byte offset
 and native/little/big byte order. File elements follow canonical logical
 `[extra..., spatial...]` row-major order; each complex component is decoded
 separately. Prefixes and trailing records are allowed, but the complete requested
-range must fit the file and native count/offset limits. No type, shape, layout or
+range must fit the file and native count/offset limits. The requested local
+payload is subject to the same 2147483647 bytes/rank MPI limit; every rank
+returns `IoError::SizeLimit { what: "MPI local byte count" }` before staging,
+and the destination remains unchanged. No type, shape, layout or
 Julia-wire detection is implied. Existing readers never silently fall back to
 this less self-describing format, and failed raw reads preserve the destination.
 
@@ -678,8 +714,12 @@ counts, offsets, payload coverage and exact file length are checked before
 payload reads, and destination writes wait for native cleanup agreement.
 `read_mpi_chunked_catalog(path, comm, &options)` returns one metadata-only
 `DatasetInfo`; its separate API identifies this storage mode. Metadata is
-bounded to 1 MiB and each rank's payload to `i32::MAX` bytes. Existing files are
-never replaced. No Julia binary/JSON compatibility is implied.
+bounded to 1 MiB and each rank's payload to 2147483647 bytes
+(`local_elements * scalar_width`; for `f64`, up to 268435455 elements). If any
+rank exceeds that payload limit, every rank returns `IoError::SizeLimit { what:
+"MPI local byte count" }` before buffer allocation; successful paths still pack
+and stage the full local payload. Existing files are never replaced. No Julia
+binary/JSON compatibility is implied.
 
 ### Persistent parallel file sessions
 
@@ -689,7 +729,12 @@ retain a native MPI file and duplicated communicator across `write_named`,
 container, interoperating with the old named path APIs—not the new chunked
 format. Writes append unique committed names. Read-only sessions can read the
 known committed prefix, while append and catalog operations require a complete
-valid tail. MPI hints and payload mode are fixed when opening the session.
+valid tail. MPI hints and payload mode are fixed when opening the session. The
+2147483647 bytes/rank MPI payload limit applies to each `write_named`/
+`read_named` record, not the whole container. A violation makes every rank
+return `MpiSessionError::Named(NamedIoError::Io(IoError::SizeLimit { what: "MPI
+local byte count" }))` before packing or staging, and the session remains usable
+for a later operation.
 
 With `parallel-hdf5`, `Hdf5FileSession::create(path, comm, &options)` and matching
 open methods retain the native HDF5 file. `create_group("flow")` followed by
@@ -714,7 +759,7 @@ path are distinct. Do not overlap calls on that communicator. Read-only and
 ordinary preflight errors leave the session usable; uncertain mutations poison
 it until close. Session reads publish after per-operation cleanup agreement;
 a later close failure cannot undo earlier successful operations. Old path reads
-retain their close-before-destination-copy guarantee. External serialization
+retain their close-before-destination-update guarantee. External serialization
 of same-file writers is still the caller's responsibility.
 
 Run the MPI-IO integration test at the required 1/4/6 rank matrix:
@@ -784,6 +829,56 @@ The default build uses upstream rsmpi and native MPI bindings:
 - `mpicc` and `mpiexec` available on `PATH`
 - libclang and its C development headers, required by bindgen while building
   the MPI bindings
+
+### Open MPI 4.1.6 collective-write data loss
+
+CI covers two stacks:
+
+- The five existing jobs run on Ubuntu 26.04. The MPI jobs (`rust`, `msrv`,
+  `rsmpi-rt`) currently see Open MPI 5.0.10. `local-fft` and `serial-hdf5` have
+  no MPI; `serial-hdf5` uses serial HDF5 only.
+- `mpi-io-openmpi4` runs on Ubuntu 24.04 and requires Open MPI 4.1.x. The
+  current package is 4.1.6. It covers MPI-IO only, with the workaround below.
+
+On Open MPI 4.1.6 the default MPI-IO component (OMPIO) can lose collective
+writes: the write returns `Ok` and the commit marker is present, but parts of
+the payload stay zero. It reproduced at four ranks with a `[4, 1]`
+decomposition under default settings.
+
+Confirmed affected: ordinary MPI-IO writes, named datasets and append, and
+`MpiFileSession`. Other collective-write paths (collections, chunked I/O,
+external views) can be affected as well. Parallel HDF5 on top of OMPIO is
+untested.
+
+The cause is an upstream bug,
+https://github.com/open-mpi/ompi/issues/12718. It was reproduced with Ubuntu's
+`4.1.6-7ubuntu2`; earlier versions were not checked exhaustively. The source
+fix is in 4.1.7 and later (commit 6973c470) and in 5.0.6 and later (commit
+0f1fea8f); 5.0.10 was verified.
+
+Workarounds, in order:
+
+1. Update to Open MPI 4.1.7 or later, or to 5.0.6 or later.
+2. On a local filesystem, keep 4.1.6 and set the lock algorithm for every rank
+   from launch:
+
+   ```bash
+   mpiexec --mca fs_ufs_lock_algorithm 3 ...
+   ```
+
+   ```bash
+   export OMPI_MCA_fs_ufs_lock_algorithm=3
+   ```
+
+3. Alternatively, disable write data sieving or switch the IO component:
+   `OMPI_MCA_fbtl_posix_write_datasieving=0` may slow down non-contiguous I/O,
+   and `OMPI_MCA_io=romio321` needs `ompi_info | grep 'MCA io'` to confirm the
+   component is available.
+
+On NFS, 4.1.6 locks whole files by default and `3` switches that to range
+locks, so prefer updating there. No workaround repairs files that are already
+missing data; rewrite files written in an affected environment. pencil-io does
+not change these settings itself.
 
 ### Experimental runtime MPI (rsmpi-rt)
 
@@ -904,6 +999,28 @@ for n in 1 4 6; do
   timeout --foreground --kill-after=5s 120s mpiexec --oversubscribe -n "$n" \
     cargo test -p pencil-fft --features distributed --test distributed_mixed \
       --locked -- --nocapture --test-threads=1 || exit 1
+done
+```
+
+`main` is protected by a GitHub ruleset. The ruleset enforces pull requests,
+six required checks (`local-fft`, `rust`, `msrv`, `serial-hdf5`, `rsmpi-rt`,
+and `mpi-io-openmpi4`), and branches up to date with `main` (strict). Required
+approvals are 0.
+
+Merging also requires an independent review and confirmation that every check
+passed on the pull request head. The ruleset does not enforce these; reviewers
+do. When a CI job is renamed or removed, the repository owner updates the
+ruleset's required checks in the same change.
+
+To run MPI-IO locally on Open MPI 4.1.6, apply the workaround and cover one,
+four, and six ranks:
+
+```bash
+export OMPI_MCA_fs_ufs_lock_algorithm=3
+for n in 1 4 6; do
+  mpiexec --oversubscribe -n "$n" \
+    cargo test -p pencil-io --no-default-features --features mpi \
+    --test mpi_io --locked -- --test-threads=1
 done
 ```
 

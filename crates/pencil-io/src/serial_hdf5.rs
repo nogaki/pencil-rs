@@ -431,6 +431,7 @@ fn validate_metadata<T: IoElement>(
         .copied()
         .eq(global.iter().map(|&n| n as u64))
         || grid.is_empty()
+        || grid.len() > global.len()
         || grid.contains(&0)
         || grid
             .iter()

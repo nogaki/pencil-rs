@@ -10,7 +10,7 @@ use std::{
 use mpi::{
     Count,
     collective::{CommunicatorCollectives, SystemOperation},
-    datatype::{DatatypeRef, Equivalence, MutView, Partition, PartitionMut, UserDatatype, View},
+    datatype::{DatatypeRef, Equivalence, UserDatatype},
     raw::traits::{AsRaw, FromRaw},
     topology::Communicator,
 };
@@ -19,6 +19,9 @@ use thiserror::Error;
 use crate::{
     ExtraShape, MpiTopology, Pencil, PencilError, TopologyError,
     checked::checked_product,
+    checked_partition::{
+        CheckedPartition, CheckedPartitionMut, DatatypePartition, DatatypePartitionMut,
+    },
     geometry::{partition_range, row_major_offset},
 };
 
@@ -118,7 +121,6 @@ struct OwnerRoutes {
     entries: Vec<RequestRoute>,
     counts: Vec<Count>,
     displacements: Vec<Count>,
-    total_count: Count,
 }
 
 struct RequestBuffers {
@@ -139,8 +141,6 @@ struct PayloadLayout {
     receive_displacements: Vec<Count>,
     send_len: usize,
     receive_len: usize,
-    send_count: Count,
-    receive_count: Count,
 }
 
 /// A reusable, collectively prepared affine redistribution plan.
@@ -188,8 +188,6 @@ pub struct SpatialRemapPlan<T, const N: usize, const M: usize> {
     receive_buffer: Vec<T>,
     send_len: usize,
     receive_len: usize,
-    send_count: Count,
-    receive_count: Count,
     datatype: UserDatatype,
 }
 
@@ -217,8 +215,10 @@ where
     /// call order, and correct `Equivalence` implementation. Preparation
     /// compares the complete descriptor and allocates all routes and initialized
     /// payload buffers before returning. `buffer_init` is copied into those
-    /// buffers; it need not implement `Default`. Zero-sized payload types and
-    /// payload counts beyond MPI `Count` are rejected rather than chunked.
+    /// buffers; it need not implement `Default`. Zero-sized payload types are
+    /// rejected. Each peer count and displacement must fit `mpi::Count`;
+    /// segment ends and total lengths use checked `usize` arithmetic and need
+    /// not fit `mpi::Count`. Large-message chunking is not provided.
     pub fn prepare(
         source: Arc<Pencil<N, M>>,
         destination: Arc<Pencil<N, M>>,
@@ -273,12 +273,12 @@ where
             allocate_request_buffers(&routes, receive_layout.total),
         )?;
 
-        let send_partition = Partition::new(
+        let send_partition = CheckedPartition::new(
             &request_buffers.send_indices[..],
             routes.counts.as_slice(),
             routes.displacements.as_slice(),
         );
-        let mut receive_partition = PartitionMut::new(
+        let mut receive_partition = CheckedPartitionMut::new(
             &mut request_buffers.receive_indices[..],
             receive_counts.as_slice(),
             receive_layout.displacements.as_slice(),
@@ -334,8 +334,6 @@ where
             receive_buffer,
             send_len: payload.send_len,
             receive_len: payload.receive_len,
-            send_count: payload.send_count,
-            receive_count: payload.receive_count,
             datatype,
         })
     }
@@ -375,40 +373,31 @@ where
 
         pack_payload(self, source.as_slice());
         {
-            let send_view =
-                // SAFETY: `prepare` duplicated and checked this datatype: its extent
-                // equals `size_of::<T>()`, its true typemap lies within one T, and
-                // `Equivalence` guarantees it does not read uninitialized padding.
-                // Counts/displacements were checked against the initialized logical
-                // lengths; the physical one-element dummy is used only for count zero.
-                unsafe {
-                    View::with_count_and_datatype(
-                        &self.send_buffer[..],
-                        self.send_count,
-                        &self.datatype,
-                    )
-                };
-            let mut receive_view =
-                // SAFETY: the corresponding receive datatype, bounds, and logical
-                // count were validated during preparation; the exclusive view cannot
-                // alias the source or its separately owned send buffer.
-                unsafe {
-                    MutView::with_count_and_datatype(
-                        &mut self.receive_buffer[..],
-                        self.receive_count,
-                        &self.datatype,
-                    )
-                };
-            let send_partition = Partition::new(
-                &send_view,
-                self.payload_send_counts.as_slice(),
-                self.payload_send_displacements.as_slice(),
-            );
-            let mut receive_partition = PartitionMut::new(
-                &mut receive_view,
-                self.payload_receive_counts.as_slice(),
-                self.payload_receive_displacements.as_slice(),
-            );
+            // SAFETY: `prepare` duplicated and checked this datatype: its extent
+            // equals `size_of::<T>()`, its true typemap lies within one T, and
+            // `Equivalence` guarantees it does not read uninitialized padding.
+            // Peer counts and displacements were checked against the initialized
+            // logical lengths and fit `mpi::Count`; the physical one-element
+            // dummy is used only when the logical length is zero.
+            let send_partition = unsafe {
+                DatatypePartition::new(
+                    &self.send_buffer[..],
+                    self.payload_send_counts.as_slice(),
+                    self.payload_send_displacements.as_slice(),
+                    &self.datatype,
+                )
+            };
+            // SAFETY: the same checked receive datatype and bounds apply; the
+            // exclusive view cannot alias the source or the separately owned
+            // send buffer.
+            let mut receive_partition = unsafe {
+                DatatypePartitionMut::new(
+                    &mut self.receive_buffer[..],
+                    self.payload_receive_counts.as_slice(),
+                    self.payload_receive_displacements.as_slice(),
+                    &self.datatype,
+                )
+            };
             communicator.all_to_all_varcount_into(&send_partition, &mut receive_partition);
         }
         unpack_payload(self, destination.as_mut_slice());
@@ -783,13 +772,10 @@ fn build_owner_routes<const N: usize, const M: usize>(
         counts[peer] = Count::try_from(count).map_err(|_| SpatialRemapError::MpiCountOverflow)?;
         displacements[peer] =
             Count::try_from(displacement).map_err(|_| SpatialRemapError::MpiCountOverflow)?;
-        checked_count_end(counts[peer], displacements[peer])?;
         displacement = displacement
             .checked_add(count)
             .ok_or(SpatialRemapError::SizeOverflow)?;
     }
-    let total_count =
-        Count::try_from(displacement).map_err(|_| SpatialRemapError::MpiCountOverflow)?;
     if displacement != entries.len() {
         return Err(SpatialRemapError::StructuralInconsistency);
     }
@@ -798,7 +784,6 @@ fn build_owner_routes<const N: usize, const M: usize>(
         entries,
         counts,
         displacements,
-        total_count,
     })
 }
 
@@ -911,12 +896,10 @@ fn receive_layout(
         }
         displacements[peer] =
             Count::try_from(total).map_err(|_| SpatialRemapError::MpiCountOverflow)?;
-        checked_count_end(count, displacements[peer])?;
         total = total
             .checked_add(usize::try_from(count).map_err(|_| SpatialRemapError::MpiCountOverflow)?)
             .ok_or(SpatialRemapError::SizeOverflow)?;
     }
-    Count::try_from(total).map_err(|_| SpatialRemapError::MpiCountOverflow)?;
     validate_partition_layout(counts, &displacements, total)?;
     if total != expected_total {
         return Err(SpatialRemapError::StructuralInconsistency);
@@ -1024,7 +1007,7 @@ fn payload_layout<T>(
         || routes.displacements.len() != communicator_size
         || request_receive_counts.len() != communicator_size
         || request_receive_displacements.len() != communicator_size
-        || usize::try_from(routes.total_count).ok() != Some(routes.entries.len())
+        || routes.entries.len() != destination_spatial_len
         || size_of::<T>() == 0
     {
         return Err(if size_of::<T>() == 0 {
@@ -1089,7 +1072,6 @@ fn payload_layout<T>(
             Count::try_from(send_elements).map_err(|_| SpatialRemapError::MpiCountOverflow)?;
         send_displacements[peer] =
             Count::try_from(send_offset).map_err(|_| SpatialRemapError::MpiCountOverflow)?;
-        checked_count_end(send_counts[peer], send_displacements[peer])?;
 
         let receive_elements = outgoing
             .checked_mul(extra_count)
@@ -1101,13 +1083,9 @@ fn payload_layout<T>(
             Count::try_from(receive_elements).map_err(|_| SpatialRemapError::MpiCountOverflow)?;
         receive_displacements[peer] =
             Count::try_from(receive_offset).map_err(|_| SpatialRemapError::MpiCountOverflow)?;
-        checked_count_end(receive_counts[peer], receive_displacements[peer])?;
     }
     validate_partition_layout(&send_counts, &send_displacements, send_len)?;
     validate_partition_layout(&receive_counts, &receive_displacements, receive_len)?;
-    let send_count = Count::try_from(send_len).map_err(|_| SpatialRemapError::MpiCountOverflow)?;
-    let receive_count =
-        Count::try_from(receive_len).map_err(|_| SpatialRemapError::MpiCountOverflow)?;
     Ok(PayloadLayout {
         send_counts,
         send_displacements,
@@ -1115,16 +1093,7 @@ fn payload_layout<T>(
         receive_displacements,
         send_len,
         receive_len,
-        send_count,
-        receive_count,
     })
-}
-
-fn checked_count_end(count: Count, displacement: Count) -> Result<(), SpatialRemapError> {
-    if count < 0 || displacement < 0 || count.checked_add(displacement).is_none() {
-        return Err(SpatialRemapError::MpiCountOverflow);
-    }
-    Ok(())
 }
 
 fn validate_partition_layout(
@@ -1137,7 +1106,9 @@ fn validate_partition_layout(
     }
     let mut next = 0usize;
     for (&count, &displacement) in counts.iter().zip(displacements) {
-        checked_count_end(count, displacement)?;
+        if count < 0 || displacement < 0 {
+            return Err(SpatialRemapError::MpiCountOverflow);
+        }
         let count = usize::try_from(count).map_err(|_| SpatialRemapError::MpiCountOverflow)?;
         let displacement =
             usize::try_from(displacement).map_err(|_| SpatialRemapError::MpiCountOverflow)?;
@@ -1319,10 +1290,35 @@ fn unpack_payload<T: Copy, const N: usize, const M: usize>(
 #[cfg(test)]
 mod tests {
     use super::{
-        SpatialRemapError, SpatialRemapPlan, affine_coordinate, checked_count_end,
-        local_coordinate, partition_owner, validate_partition_layout,
+        OwnerRoutes, RequestRoute, SpatialRemapError, SpatialRemapPlan, affine_coordinate,
+        local_coordinate, partition_owner, payload_layout, receive_layout,
+        validate_partition_layout,
     };
     use mpi::Count;
+
+    fn count_max() -> usize {
+        usize::try_from(Count::MAX).unwrap()
+    }
+
+    fn routes_with_counts(counts: &[Count]) -> OwnerRoutes {
+        let mut displacements = Vec::new();
+        let mut next = 0usize;
+        for &count in counts {
+            displacements.push(Count::try_from(next).unwrap());
+            next += usize::try_from(count).unwrap();
+        }
+        OwnerRoutes {
+            entries: (0..next)
+                .map(|index| RequestRoute {
+                    owner: 0,
+                    global_index: u64::try_from(index).unwrap(),
+                    destination_offset: index,
+                })
+                .collect(),
+            counts: counts.to_vec(),
+            displacements,
+        }
+    }
 
     #[test]
     fn affine_mapping_handles_full_width_offsets_and_signs() {
@@ -1359,13 +1355,117 @@ mod tests {
             Err(SpatialRemapError::StructuralInconsistency),
         ));
         assert_eq!(
-            validate_partition_layout(&[Count::MAX], &[0], usize::try_from(Count::MAX).unwrap())
-                .unwrap(),
-            usize::try_from(Count::MAX).unwrap(),
+            validate_partition_layout(&[Count::MAX], &[0], count_max()).unwrap(),
+            count_max(),
         );
+    }
+
+    #[test]
+    fn count_layout_accepts_total_above_count_max() {
+        let total = count_max() + 1;
+        assert_eq!(
+            validate_partition_layout(&[Count::MAX, 1], &[0, Count::MAX], total).unwrap(),
+            total,
+        );
+    }
+
+    #[test]
+    fn count_layout_rejects_invalid_metadata() {
+        let cases: &[(&[Count], &[Count], usize)] = &[
+            (&[1], &[], 0),
+            (&[], &[0], 0),
+            (&[-1], &[0], 0),
+            (&[0], &[-1], 0),
+            (&[2], &[1], 4),
+            (&[2, 1], &[0, 1], 4),
+            (&[1, 2], &[0, 4], 5),
+            (&[2], &[0], 3),
+        ];
+        for &(counts, displacements, logical_len) in cases {
+            assert!(
+                matches!(
+                    validate_partition_layout(counts, displacements, logical_len),
+                    Err(SpatialRemapError::StructuralInconsistency)
+                        | Err(SpatialRemapError::MpiCountOverflow),
+                ),
+                "accepted counts {counts:?} displacements {displacements:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn receive_layout_accepts_total_above_count_max() {
+        let total = count_max() + 1;
+        let layout = receive_layout(&[Count::MAX, 1], total).unwrap();
+        assert_eq!(layout.displacements, [0, Count::MAX]);
+        assert_eq!(layout.total, total);
+    }
+
+    #[test]
+    fn receive_layout_rejects_displacement_above_count_max() {
         assert!(matches!(
-            checked_count_end(Count::MAX, 1),
+            receive_layout(&[Count::MAX, 1, 0], count_max() + 1),
             Err(SpatialRemapError::MpiCountOverflow),
+        ));
+    }
+
+    #[test]
+    fn payload_layout_accepts_aggregate_above_count_max() {
+        let extra = Count::MAX as usize / 2 + 1;
+        let extra_count = Count::try_from(extra).unwrap();
+        let routes = routes_with_counts(&[1, 1]);
+        let payload = payload_layout::<u8>(&routes, &[1, 1], &[0, 1], 2, 2, extra, 2).unwrap();
+        assert_eq!(payload.send_len, count_max() + 1);
+        assert_eq!(payload.receive_len, count_max() + 1);
+        assert_eq!(payload.send_counts, [extra_count, extra_count]);
+        assert_eq!(payload.send_displacements, [0, extra_count]);
+        assert_eq!(payload.receive_counts, [extra_count, extra_count]);
+        assert_eq!(payload.receive_displacements, [0, extra_count]);
+    }
+
+    #[test]
+    fn payload_layout_rejects_peer_count_above_count_max() {
+        let routes = routes_with_counts(&[1]);
+        assert!(matches!(
+            payload_layout::<u8>(&routes, &[1], &[0], 1, 1, count_max() + 1, 1),
+            Err(SpatialRemapError::MpiCountOverflow),
+        ));
+    }
+
+    #[test]
+    fn payload_layout_rejects_peer_displacement_above_count_max() {
+        let extra = Count::MAX as usize / 2 + 1;
+        let routes = routes_with_counts(&[1, 1, 1]);
+        assert!(matches!(
+            payload_layout::<u8>(&routes, &[1, 1, 1], &[0, 1, 2], 3, 3, extra, 3),
+            Err(SpatialRemapError::MpiCountOverflow),
+        ));
+    }
+
+    #[test]
+    fn payload_layout_rejects_byte_count_overflow() {
+        let routes = routes_with_counts(&[1]);
+        assert!(matches!(
+            payload_layout::<u16>(&routes, &[1], &[0], 1, 1, usize::MAX, 1),
+            Err(SpatialRemapError::SizeOverflow),
+        ));
+    }
+
+    #[test]
+    fn payload_layout_rejects_element_count_overflow() {
+        let routes = routes_with_counts(&[1, 0]);
+        let huge_source_len = count_max().checked_mul(2).unwrap();
+        assert!(matches!(
+            payload_layout::<u8>(
+                &routes,
+                &[Count::MAX, Count::MAX],
+                &[0, Count::MAX],
+                huge_source_len,
+                1,
+                usize::MAX / 2 + 1,
+                2,
+            ),
+            Err(SpatialRemapError::SizeOverflow),
         ));
     }
 
@@ -1479,8 +1579,6 @@ mod tests {
             plan.offsets,
             plan.send_len,
             plan.receive_len,
-            plan.send_count,
-            plan.receive_count,
             plan.datatype.as_raw(),
         );
         let source_before = source_data.clone();
@@ -1527,8 +1625,6 @@ mod tests {
                 plan.offsets,
                 plan.send_len,
                 plan.receive_len,
-                plan.send_count,
-                plan.receive_count,
                 plan.datatype.as_raw(),
             ),
             metadata_before,

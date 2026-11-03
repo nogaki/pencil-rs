@@ -7,6 +7,7 @@ use mpi::{
 
 use crate::{
     ExtraShape, ManyPencilArray, Pencil, PencilArrayView, PencilArrayViewMut,
+    checked_partition::{CheckedPartition, CheckedPartitionMut},
     transpose::{
         CommunicationMode, PreparedExchange, TransposeError, TransposePlanCore, TransposeWorkspace,
         TransposeWorkspaceRequirements, agree_execute_descriptor, agree_preflight, finish_in_place,
@@ -30,9 +31,11 @@ use crate::{
 /// global shape, and differ in exactly one ordered decomposition position.
 /// `workspace_requirements` and [`TransposeWorkspace::from_vecs`] are local
 /// operations and do not call MPI; requirements and workspace lengths are
-/// checked using initialized `len`, not capacity. Every count, displacement,
-/// total, and required view/workspace prefix must fit the checked limits before
-/// payload communication starts.
+/// checked using initialized `len`, not capacity. Each peer count and
+/// displacement must fit `mpi::Count`. Segment ends and total lengths use
+/// checked `usize` arithmetic and need not fit `mpi::Count`. Execution validates
+/// every segment against its required initialized buffer prefix before payload
+/// communication starts.
 ///
 /// [`Self::execute_views`] is out-of-place: it preserves the source and leaves
 /// the destination and workspace unchanged for ordinary descriptor or
@@ -69,8 +72,10 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
     ///
     /// This method is noncollective and does not call MPI or allocate the
     /// returned storage. The result is local to the calling rank because peer
-    /// partitions can have different lengths. It includes all peer segments
-    /// and checks the `mpi::Count` bounds used by execution.
+    /// partitions can have different lengths. It includes all peer segments,
+    /// checks each count and displacement against `mpi::Count`, and computes
+    /// segment ends and total lengths with checked `usize` arithmetic. The
+    /// returned lengths may exceed `mpi::Count::MAX`.
     pub fn workspace_requirements(
         &self,
         extra_shape: &ExtraShape,
@@ -88,10 +93,12 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
     /// communication, or destination writes, so the destination and workspace
     /// remain unchanged on those paths. Workspace initialized lengths are
     /// checked by `len`; only required prefixes are used and no vector is
-    /// resized or reallocated. Every count and displacement, including their
-    /// checked sum and total, must fit `mpi::Count`/buffer limits. After the
-    /// `MPI_Alltoallv` call starts, an MPI failure, arbitrary panic, or process
-    /// loss does not guarantee that a `Result` is recovered or that the
+    /// resized or reallocated. Each peer count and displacement must fit
+    /// `mpi::Count`. Segment ends and total lengths use checked `usize`
+    /// arithmetic, and every segment must lie within its required initialized
+    /// prefix. Segment ends and total lengths need not fit `mpi::Count`. After
+    /// the `MPI_Alltoallv` call starts, an MPI failure, arbitrary panic, or
+    /// process loss does not guarantee that a `Result` is recovered or that the
     /// destination is unchanged. The source and destination views must use the
     /// layouts held by this plan and have exactly equal extra shapes.
     pub fn execute_views<T>(
@@ -193,6 +200,8 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
     }
 
     /// Executes the transpose by replacing the active layout in shared storage.
+    ///
+    /// The count and buffer limits of [`Self::execute_views`] also apply.
     ///
     /// Every rank must call this method in the same order on the same source
     /// communicator context, with the same `T` and a correct `Equivalence`
@@ -340,12 +349,12 @@ fn execute_exchange<T, const N: usize, const M: usize>(
     } else {
         let send_buffer = &workspace.send_buffer[..prepared.requirements.send_len];
         let receive_buffer = &mut workspace.receive_buffer[..prepared.requirements.receive_len];
-        let send_partition = Partition::new(
+        let send_partition = CheckedPartition::new(
             send_buffer,
             prepared.send_counts.as_slice(),
             prepared.send_displacements.as_slice(),
         );
-        let mut receive_partition = PartitionMut::new(
+        let mut receive_partition = CheckedPartitionMut::new(
             receive_buffer,
             prepared.receive_counts.as_slice(),
             prepared.receive_displacements.as_slice(),

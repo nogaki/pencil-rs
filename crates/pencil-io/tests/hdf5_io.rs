@@ -10,7 +10,9 @@ use pencil_io::{IoError, read_hdf5, read_hdf5_serial, write_hdf5, write_hdf5_ser
 
 mod support;
 use support::{
-    cleanup_owned_temp_dir, owned_temp_dir, reset_file, root_read, root_status, run_scalar_case,
+    cleanup_owned_temp_dir, decomposition_array, decomposition_values_match,
+    mismatched_decomposition, owned_temp_dir, record_case, reset_file, root_read, root_status,
+    run_scalar_case,
 };
 
 const COMMIT_MARKER: u64 = 0x434f_4d4d_4954_5445;
@@ -350,6 +352,24 @@ fn parallel_hdf5_preserves_logical_order_and_rejects_bad_files() {
         )
     });
 
+    // The writer grid rank may not exceed the spatial rank.
+    prepare_case(&world, &baseline_path, &case_path, |case| {
+        let file = h5(File::open_rw(case))?;
+        let dataset =
+            h5(file.group("/pencil_io_v1")).and_then(|group| h5(group.dataset("data")))?;
+        replace_u64_attr(&dataset, "pencil_io_writer_grid", &[1, 1, 1])?;
+        h5(file.flush())?;
+        h5(file.close())
+    });
+    assert_hdf5_failure(&world, &case_path, &mut destination, |error| {
+        matches!(
+            error,
+            IoError::MetadataMismatch {
+                field: "shape or writer provenance"
+            }
+        )
+    });
+
     prepare_case(&world, &baseline_path, &case_path, |case| {
         recreate_dataset(
             case,
@@ -527,7 +547,94 @@ fn parallel_hdf5_preserves_logical_order_and_rejects_bad_files() {
         (x as f64) - (y as f64),
     ));
 
+    let issue38_failures = issue38_decomposition_cases(&world, &directory);
     cleanup_owned_temp_dir(&world, &directory);
+    if !issue38_failures.is_empty() {
+        panic!("issue38 failures: {issue38_failures:?}");
+    }
+}
+
+// Issue #38: the default parallel-HDF5 calls must reject a decomposition that
+// differs between ranks, and the rejected call must not touch the file or
+// destination.
+fn issue38_decomposition_cases<C>(world: &C, directory: &Path) -> Vec<String>
+where
+    C: Communicator + CommunicatorCollectives,
+{
+    let mut failures = Vec::new();
+    let size = usize::try_from(world.size()).unwrap();
+    if size == 1 {
+        if world.rank() == 0 {
+            eprintln!("issue38 skipped: 1 rank");
+        }
+        return failures;
+    }
+
+    let read_path = directory.join("issue38-default-read.h5");
+    reset_file(world, &read_path);
+    let source = decomposition_array(world, [0, 1], None);
+    write_hdf5(&read_path, source.view()).unwrap();
+    world.barrier();
+
+    let mut destination = decomposition_array(world, mismatched_decomposition(world), Some(-888));
+    let before = destination.as_slice().to_vec();
+    let result = read_hdf5(&read_path, destination.view_mut());
+    let ok = matches!(result, Err(IoError::CollectiveDescriptorMismatch))
+        && destination.as_slice() == before.as_slice();
+    record_case(
+        world,
+        &mut failures,
+        "default_hdf5_read_decomposition_mismatch",
+        ok,
+        &format!("{result:?}"),
+    );
+
+    let mut recovered = decomposition_array(world, [1, 0], Some(-888));
+    let result = read_hdf5(&read_path, recovered.view_mut());
+    let ok = result.is_ok() && decomposition_values_match(&recovered);
+    record_case(
+        world,
+        &mut failures,
+        "default_hdf5_read_decomposition_mismatch/recovery",
+        ok,
+        &format!("{result:?}"),
+    );
+
+    let write_path = directory.join("issue38-default-write.h5");
+    reset_file(world, &write_path);
+    let source = decomposition_array(world, mismatched_decomposition(world), None);
+    let result = write_hdf5(&write_path, source.view());
+    let local_ok = matches!(result, Err(IoError::CollectiveDescriptorMismatch));
+    world.barrier();
+    let absent = if world.rank() == 0 {
+        write_path
+            .try_exists()
+            .map(|exists| !exists)
+            .unwrap_or(false)
+    } else {
+        true
+    };
+    record_case(
+        world,
+        &mut failures,
+        "default_hdf5_write_decomposition_mismatch",
+        local_ok && absent,
+        &format!("{result:?} file_absent={absent}"),
+    );
+
+    let recovery_path = directory.join("issue38-default-write-recovery.h5");
+    reset_file(world, &recovery_path);
+    let source = decomposition_array(world, [0, 1], None);
+    let result = write_hdf5(&recovery_path, source.view());
+    record_case(
+        world,
+        &mut failures,
+        "default_hdf5_write_decomposition_mismatch/recovery",
+        result.is_ok(),
+        &format!("{result:?}"),
+    );
+
+    failures
 }
 
 fn assert_i32_values(array: &PencilArray<i32, 2, 2>) {

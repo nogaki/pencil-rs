@@ -436,6 +436,149 @@ fn run_complex_sum_tests<C: CommunicatorCollectives>(
     successful_empty_collective(communicator, followup);
 }
 
+fn run_mapped_reduction_tests<C: CommunicatorCollectives>(
+    communicator: &C,
+    rank: usize,
+    size: usize,
+    topology: &Arc<MpiTopology<2>>,
+    pencil: &Arc<Pencil<2, 2>>,
+    array: &PencilArray<i64, 2, 2>,
+    followup: &PencilArray<i64, 2, 2>,
+) {
+    // Every rank needs at least the first three callback positions below.
+    check_all(communicator, array.len() >= 3);
+    let local_input_count = array.len();
+
+    // The checked local fold overflows at the second value even though the
+    // mathematical total (127) fits, and mapping still visits every value.
+    let calls = Cell::new(0usize);
+    let result = sum_by(&array.view(), |_| {
+        let k = calls.get();
+        calls.set(k + 1);
+        match k {
+            0 => 127_i8,
+            1 => 1,
+            2 => -1,
+            _ => 0,
+        }
+    });
+    check_all(
+        communicator,
+        matches!(result, Err(CollectiveError::IntegerOverflow)) && calls.get() == local_input_count,
+    );
+    successful_empty_collective(communicator, followup);
+
+    // The local partial passes through +inf into NaN, but nonfinite handling
+    // uses the raw callback values, so the declared -inf dominates.
+    let calls = Cell::new(0usize);
+    let result = sum_by(&array.view(), |_| {
+        let k = calls.get();
+        calls.set(k + 1);
+        match k {
+            0 | 1 => f64::MAX,
+            2 => f64::NEG_INFINITY,
+            _ => 0.0,
+        }
+    });
+    check_all(
+        communicator,
+        result == Ok(f64::NEG_INFINITY) && calls.get() == local_input_count,
+    );
+
+    let calls = Cell::new(0usize);
+    let result = sum_by(&array.view(), |_| {
+        let k = calls.get();
+        calls.set(k + 1);
+        if k == 0 { f64::NAN } else { 1.0 }
+    });
+    check_all(
+        communicator,
+        matches!(result, Ok(value) if value.is_nan()) && calls.get() == local_input_count,
+    );
+
+    let calls = Cell::new(0usize);
+    let result = sum_by(&array.view(), |_| {
+        let k = calls.get();
+        calls.set(k + 1);
+        if k == 0 { f64::INFINITY } else { 1.0 }
+    });
+    check_all(
+        communicator,
+        result == Ok(f64::INFINITY) && calls.get() == local_input_count,
+    );
+
+    // NaN wins over infinity in the norm policy.
+    let calls = Cell::new(0usize);
+    let result = norm_by(&array.view(), |_| {
+        let k = calls.get();
+        calls.set(k + 1);
+        match k {
+            0 => f64::INFINITY,
+            1 => f64::NAN,
+            _ => 1.0,
+        }
+    });
+    check_all(
+        communicator,
+        matches!(result, Ok(value) if value.is_nan()) && calls.get() == local_input_count,
+    );
+
+    // Finite complex components can still have an infinite magnitude.
+    let result = norm_by(&array.view(), |_| Complex64::new(f64::MAX, f64::MAX));
+    check_all(
+        communicator,
+        matches!(result, Ok(value) if value.is_infinite() && value.is_sign_positive()),
+    );
+
+    let result = norm_by(&array.view(), |_| -0.0_f64);
+    check_all(
+        communicator,
+        matches!(result, Ok(value) if value == 0.0 && value.is_sign_positive()),
+    );
+
+    let empty =
+        PencilArray::from_elem(Arc::clone(pencil), ExtraShape::new([0]).unwrap(), 1_i64).unwrap();
+    let calls = Cell::new(0usize);
+    let result = norm_by(&empty.view(), |value| {
+        calls.set(calls.get() + 1);
+        *value as f64
+    });
+    check_all(
+        communicator,
+        matches!(result, Ok(value) if value == 0.0 && value.is_sign_positive()) && calls.get() == 0,
+    );
+
+    // Rank-local scales differ by 2^rank. The squared norm is
+    // sum_r 4^r * 30 = 10 * (4^P - 1).
+    let grid = *topology.process_grid();
+    let scaled_pencil =
+        Pencil::<2, 2>::new(Arc::clone(topology), [2 * grid[0], 2 * grid[1]], [0, 1]).unwrap();
+    let mut scaled =
+        PencilArray::<f64, 2, 2>::from_elem(Arc::clone(&scaled_pencil), ExtraShape::scalar(), 0.0)
+            .unwrap();
+    for (k, value) in scaled.as_mut_slice().iter_mut().enumerate() {
+        *value = 2f64.powi(rank as i32) * (k + 1) as f64;
+    }
+    let expected = (10.0 * (4f64.powi(size as i32) - 1.0)).sqrt();
+    let calls = Cell::new(0usize);
+    let mapped = norm_by(&scaled.view(), |value| {
+        calls.set(calls.get() + 1);
+        *value
+    });
+    let direct = l2_norm(&scaled.view());
+    let local_ok = scaled_pencil.local_len() == 4
+        && calls.get() == 4
+        && match (mapped, direct) {
+            (Ok(mapped), Ok(direct)) => {
+                (mapped - expected).abs() / expected < 1.0e-12
+                    && (direct - expected).abs() / expected < 1.0e-12
+                    && (mapped - direct).abs() / expected < 1.0e-12
+            }
+            _ => false,
+        };
+    check_all(communicator, local_ok);
+}
+
 #[test]
 fn reductions_and_logical_gather_cover_permuted_pencils() {
     let universe = mpi::initialize().expect("MPI initialization failed");
@@ -556,4 +699,13 @@ fn reductions_and_logical_gather_cover_permuted_pencils() {
     run_descriptor_mismatch_suite(&world, rank, size, &pencil, &empty_rank_array);
     run_integer_overflow_tests(&world, rank, size, &topology, &pencil, &empty_rank_array);
     run_complex_sum_tests(&world, rank, size, &pencil, &empty_rank_array);
+    run_mapped_reduction_tests(
+        &world,
+        rank,
+        size,
+        &topology,
+        &pencil,
+        &array,
+        &empty_rank_array,
+    );
 }

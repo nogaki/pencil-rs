@@ -630,6 +630,44 @@ fn failures(topology: &Arc<MpiTopology<1>>, native: bool) {
         }
     }
 
+    // Issue #43: a batch count just past the endpoint chunk boundary keeps the
+    // same policy, including a last-chunk rejection that preserves both arrays.
+    {
+        const CHUNKED_BATCHES: usize = 1025; // endpoint chunk (1024) + 1
+        let plan = C2rPlan::<f64, 2, 1>::from_shape(
+            Arc::clone(topology),
+            [4, 3],
+            6,
+            ExtraShape::new([CHUNKED_BATCHES]).unwrap(),
+        )
+        .unwrap();
+        let mut source = plan.allocate_input().unwrap();
+        let mut target = plan.allocate_output().unwrap();
+        let mut workspace = plan.allocate_workspace().unwrap();
+        source.as_mut_slice().fill(Complex::new(0.0, 0.0));
+        target.as_mut_slice().fill(17.0);
+        let source_before = source.as_slice().to_vec();
+        plan.forward(&source, &mut target, &mut workspace).unwrap();
+        assert_eq!(source.as_slice(), source_before);
+
+        source.as_mut_slice().fill(Complex::new(0.0, 0.0));
+        for i in 0..3 {
+            if let Some(value) = source.get_global_mut(&[CHUNKED_BATCHES - 1], [0, i]) {
+                *value = Complex::new(0.0, 1e30);
+            }
+        }
+        let source_before = source.as_slice().to_vec();
+        target.as_mut_slice().fill(17.0);
+        let target_before = target.as_slice().to_vec();
+        let result = plan.forward(&source, &mut target, &mut workspace);
+        assert!(
+            matches!(result, Err(C2rError::InvalidSpectrum)),
+            "{result:?}"
+        );
+        assert_eq!(source.as_slice(), source_before);
+        assert_eq!(target.as_slice(), target_before);
+    }
+
     #[cfg(feature = "fftw")]
     if native {
         use pencil_fft::{BackendInitError, PlanOptions};

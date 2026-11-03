@@ -215,6 +215,7 @@ fn leaf(
         comm,
         size.is_some()
             && !grid.is_empty()
+            && grid.len() <= n
             && grid.iter().all(|&x| x > 0)
             && ranks.is_some()
             && is_permutation(&perm, n),

@@ -1,8 +1,9 @@
-use crate::format::{IoElement, element_count, prepare_physical_values};
+use crate::format::{IoElement, element_count, prepare_physical_decode};
 use crate::mpi_io::{
-    DatatypeGuard, FileGuard, abort_unrecoverable, aggregate_cleanup_result, agree_phase,
-    build_layout, collective_state, descriptor_agreement, duplicate_comm, finish_comm,
-    finish_resources, path_bytes, set_file_errors_return,
+    DatatypeGuard, FileGuard, abort_unrecoverable, aggregate_cleanup_result, agree_mpi_preparation,
+    agree_phase, build_layout, checked_local_byte_count, collective_state, descriptor_agreement,
+    duplicate_comm, finish_comm, finish_resources, mpi_preparation_error, path_bytes,
+    set_file_errors_return,
 };
 use crate::options::{InfoGuard, MpiIoMode, RawByteOrder, RawReadOptions, agree_options};
 use crate::{IoError, OP_READ_RAW_MPI, ffi};
@@ -14,8 +15,12 @@ use std::{ffi::CString, path::Path};
 ///
 /// The view supplies its type and global shape. No header, commit marker, format,
 /// type or Julia-wire detection is performed. Prefix and trailing records are
-/// allowed. Every rank participates even with independent payload transfers.
-/// The destination changes only after native cleanup and collective agreement.
+/// allowed. Every rank participates even with independent payload transfers. The
+/// local payload is limited to 2147483647 bytes/rank (`local_elements *
+/// scalar_width`; for `f64`, up to 268435455 elements); every rank returns the
+/// same `IoError::SizeLimit` with `what == "MPI local byte count"` before staging
+/// when any rank exceeds it. The destination changes only after native cleanup and
+/// collective agreement.
 pub fn read_mpi_raw<P, T, const N: usize, const M: usize>(
     path: P,
     view: PencilArrayViewMut<'_, T, N, M>,
@@ -58,6 +63,7 @@ fn read_raw_inner<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
         global,
         extra,
         view.pencil().topology().process_grid(),
+        view.pencil().decomposition(),
         view.pencil().permutation().axes(),
         T::CODE,
         T::WIDTH,
@@ -73,7 +79,7 @@ fn read_raw_inner<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
         ],
     )?;
     let preparation = (|| {
-        let path = CString::new(path_bytes(path.as_ref())?).map_err(|_| IoError::InvalidPath)?;
+        let local_bytes = checked_local_byte_count(view.len(), T::WIDTH)?;
         let layout = build_layout(
             global,
             extra,
@@ -82,6 +88,7 @@ fn read_raw_inner<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
             view.len(),
             T::WIDTH,
         )?;
+        let path = CString::new(path_bytes(path.as_ref())?).map_err(|_| IoError::InvalidPath)?;
         let payload = (element_count(global)? as u64)
             .checked_mul(element_count(extra)? as u64)
             .and_then(|n| n.checked_mul(T::WIDTH as u64))
@@ -99,20 +106,15 @@ fn read_raw_inner<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
         ffi::MPI_Offset::try_from(end).map_err(|_| IoError::SizeLimit {
             what: "raw payload end",
         })?;
-        let n = view.len().checked_mul(T::WIDTH).ok_or(IoError::SizeLimit {
-            what: "raw local bytes",
-        })?;
-        let mut staging = Vec::new();
-        staging
-            .try_reserve_exact(n)
-            .map_err(|_| IoError::AllocationFailed { requested: n })?;
-        staging.resize(n, 0);
-        Ok::<_, IoError>((path, layout, offset, end, staging))
+        Ok::<_, IoError>((path, layout, offset, end, local_bytes))
     })();
-    if let Err(e) = agree_phase(comm, preparation.is_ok(), "raw preparation") {
-        return Err(preparation.err().unwrap_or(e));
+    if let Err(agreement) =
+        agree_mpi_preparation(comm, preparation.as_ref().err(), "raw preparation")
+    {
+        return Err(mpi_preparation_error(preparation.err(), agreement));
     }
-    let (path, layout, offset, end, mut staging) = preparation?;
+    let (path, layout, offset, end, local_bytes) =
+        preparation.expect("raw preparation agreement established");
     let info = InfoGuard::new(comm, &options.mpi)?;
     let duplicate = duplicate_comm(comm)?;
     let opened = ffi::file_open_with_info(duplicate.raw, &path, false, info.raw);
@@ -141,23 +143,29 @@ fn read_raw_inner<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
                 })
                 .unwrap_or(e));
         }
-        let size = ffi::file_get_size(file.raw)
-            .map_err(|code| IoError::Mpi {
+        let allocation = (|| {
+            let size = ffi::file_get_size(file.raw).map_err(|code| IoError::Mpi {
                 operation: "MPI_File_get_size",
                 code,
-            })
-            .and_then(|n| {
-                if u64::try_from(n).is_ok_and(|n| n >= end) {
-                    Ok(())
-                } else {
-                    Err(IoError::InvalidFile {
-                        reason: "truncated raw payload",
-                    })
-                }
-            });
-        if let Err(e) = agree_phase(comm, size.is_ok(), "raw file size") {
-            return Err(size.err().unwrap_or(e));
+            })?;
+            if !u64::try_from(size).is_ok_and(|n| n >= end) {
+                return Err(IoError::InvalidFile {
+                    reason: "truncated raw payload",
+                });
+            }
+            let mut staging = Vec::new();
+            staging
+                .try_reserve_exact(local_bytes)
+                .map_err(|_| IoError::AllocationFailed {
+                    requested: local_bytes,
+                })?;
+            Ok::<_, IoError>(staging)
+        })();
+        if let Err(e) = agree_phase(comm, allocation.is_ok(), "raw file size") {
+            return Err(allocation.err().unwrap_or(e));
         }
+        let mut staging = allocation.expect("raw file-size agreement established");
+        staging.resize(local_bytes, 0);
         if !layout.empty {
             datatype = ffi::type_create_subarray(
                 &layout.global,
@@ -205,11 +213,11 @@ fn read_raw_inner<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
                 component.reverse();
             }
         }
-        let values = prepare_physical_values(&view, &staging);
-        if let Err(e) = agree_phase(comm, values.is_ok(), "raw physical values") {
-            return Err(values.err().unwrap_or(e));
+        let plan_result = prepare_physical_decode(&view, &staging);
+        if let Err(e) = agree_phase(comm, plan_result.is_ok(), "raw physical values") {
+            return Err(plan_result.err().unwrap_or(e));
         }
-        values
+        plan_result.map(|plan| (plan, staging))
     })();
     let cleanup = finish_resources(comm, duplicate, file, datatype);
     drop(info);
@@ -230,7 +238,7 @@ fn read_raw_inner<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
     if let Some(e) = error {
         return Err(e);
     }
-    view.as_mut_slice()
-        .copy_from_slice(&result.expect("read and cleanup agreement"));
+    let (plan, staging) = result.expect("read and cleanup agreement");
+    plan.decode_into(&staging, view.as_mut_slice());
     Ok(())
 }

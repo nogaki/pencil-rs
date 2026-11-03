@@ -67,11 +67,32 @@ cargo doc -p pencil-io --no-default-features --features hdf5 --no-deps --locked
 ## Collective I/O (`mpi` / `parallel-hdf5`)
 
 Every participating rank must enter collective open/read/write/close operations
-in the same order with compatible descriptors. Coordinate local failures before
+in the same order with descriptors that agree on the global and extra shapes,
+element type, process grid, ordered decomposition axes, memory permutation, and
+path. Rank-to-rank agreement allows one 64 KiB descriptor per rank and 64 MiB
+in total across all ranks, including 8 bytes per decomposition axis. Coordinate
+local failures before
 the next collective. **Call persistent `session.close()` collectively before
 MPI finalization.** Dropping an open session is fail-stop, not an implicit
 rank-local close. Drop other MPI-owned objects before finalization as well.
+
+MPI local payloads are limited to 2147483647 bytes/rank, checked as
+`local_elements * scalar_width` (for `f64`, up to 268435455 elements). Every
+rank returns the same underlying `IoError::SizeLimit` with
+`what == "MPI local byte count"` (wrapped by the API's error type) before
+packing or staging when any rank exceeds it. Collections apply the limit
+to their combined payload and sessions to each record; this is not a whole-file
+or container cap. Existing dimension, start and offset representation limits
+remain. Normal successful paths still pack the full local payload and allocate
+byte or typed staging. HDF5 and metadata-only catalogs are not subject to this
+MPI limit. See the API documentation for each wrapper error type.
 Consult the API documentation for file formats and per-operation guarantees.
+
+Open MPI 4.1.6 can lose collective-write payloads; update to 4.1.7 or later
+(5.0.6 or later also works) or launch with
+`mpiexec --mca fs_ufs_lock_algorithm 3`. That lock algorithm setting targets
+local filesystems; on NFS, prefer updating. See
+[the known-issue notes](https://github.com/nogaki/pencil-rs#open-mpi-416-collective-write-data-loss).
 
 No Julia, FFTW, or GPU is required. If transforms are also needed, `pencil-fft`
 uses MPI-free RustFFT/RealFFT by default, with distributed and native FFTW paths

@@ -92,3 +92,8 @@ required-features = ["mpi"]
 name = "serial_hdf5"
 path = "tests/serial_hdf5.rs"
 required-features = ["hdf5"]
+
+[[test]]
+name = "staging_memory"
+path = "tests/staging_memory.rs"
+required-features = ["mpi"]

@@ -2,7 +2,7 @@ use super::*;
 use crate::IoError;
 use crate::ffi;
 use crate::ffi::hdf5 as native;
-use crate::format::{IoElement, pack_view, prepare_physical_values};
+use crate::format::{IoElement, pack_view, prepare_physical_decode};
 use crate::hdf5_io::{Hdf5Settings, validate_options};
 use crate::mpi_io::{agree_phase, descriptor_agreement};
 use pencil_array::{PencilArrayView, PencilArrayViewMut};
@@ -37,6 +37,7 @@ impl<'c> Hdf5FileSession<'c> {
             view.pencil().global_shape(),
             view.extra_shape().dimensions(),
             view.pencil().topology().process_grid(),
+            view.pencil().decomposition(),
             view.pencil().permutation().axes(),
             T::CODE,
             T::WIDTH,
@@ -103,6 +104,7 @@ impl<'c> Hdf5FileSession<'c> {
             view.pencil().global_shape(),
             view.extra_shape().dimensions(),
             view.pencil().topology().process_grid(),
+            view.pencil().decomposition(),
             view.pencil().permutation().axes(),
             T::CODE,
             T::WIDTH,
@@ -489,7 +491,13 @@ where
         };
     resources.dataset = Some(dataset);
 
-    if let Err(error) = validate_read_metadata(comm, duplicate, dataset, &view) {
+    if let Err(error) = validate_read_metadata::<T, N, M>(
+        comm,
+        duplicate,
+        dataset,
+        view.pencil(),
+        view.extra_shape().dimensions(),
+    ) {
         return Err(cleanup_session(comm, resources, error));
     }
 
@@ -614,23 +622,21 @@ where
         return Err(cleanup_session(comm, resources, primary));
     }
 
-    // Decode and map before any close.  After the collective prepare agreement
-    // and successful cleanup, the destination is changed by one infallible
-    // physical-order copy only.
-    let values_result = prepare_physical_values(&view, &staging);
-    if let Err(agreement) = agree_phase(comm, values_result.is_ok(), "HDF5 read physical staging") {
+    // Validate layout and allocate decode scratch before native cleanup.
+    let plan_result = prepare_physical_decode(&view, &staging);
+    if let Err(agreement) = agree_phase(comm, plan_result.is_ok(), "HDF5 read physical staging") {
         return Err(cleanup_session(
             comm,
             resources,
-            values_result.err().unwrap_or(agreement),
+            plan_result.err().unwrap_or(agreement),
         ));
     }
-    let values = values_result.expect("HDF5 read physical staging agreement");
+    let plan = plan_result.expect("HDF5 read physical staging agreement");
     if let Some(error) = finish_session(comm, resources) {
         return Err(error);
     }
     #[cfg(test)]
     test_post_op(comm, 2)?;
-    view.as_mut_slice().copy_from_slice(&values);
+    plan.decode_into(&staging, view.as_mut_slice());
     Ok(())
 }
