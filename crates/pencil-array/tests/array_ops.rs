@@ -264,6 +264,50 @@ fn reductions(p: &Arc<Pencil<2, 1>>, size: usize, rank: usize) {
     assert_eq!(global_sum(&a.view()).unwrap(), (p.global_len() * 6) as i64);
 }
 
+// A zero extent keeps the extra element count empty even when an earlier
+// axis product overflows usize. The empty plan must skip the stride products
+// that would otherwise overflow before reaching the zero.
+fn empty_overflow_shapes(p: &Arc<Pencil<2, 1>>) {
+    for dims in [[usize::MAX, 2, 0], [0, usize::MAX, 2]] {
+        let input = array(p, &dims, 1i64);
+        let mut output = array(p, &dims, 9i64);
+        let calls = Cell::new(0);
+        pointwise2(&input, &input, &mut output, |_, _| {
+            calls.set(calls.get() + 1);
+            0
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 0);
+        assert!(output.is_empty());
+        let calls = Cell::new(0);
+        assert_eq!(
+            zip_sum_by(&input.view(), &input.view(), |_, _| {
+                calls.set(calls.get() + 1);
+                1i64
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(calls.get(), 0);
+        let calls = Cell::new(0);
+        assert_eq!(
+            map_reduce2(
+                &input.view(),
+                &input.view(),
+                0i64,
+                |_, _| {
+                    calls.set(calls.get() + 1);
+                    1i64
+                },
+                |x, y| x + y
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(calls.get(), 0);
+    }
+}
+
 // Broadcast count and stride overflows are agreed before any callback runs.
 // Rank-local allocation failures for prepared integer partials are covered by
 // tests/mapped_reduction_alloc.rs.
@@ -321,6 +365,7 @@ fn array_ops() {
         )
         .unwrap();
         pointwise(&p);
+        empty_overflow_shapes(&p);
         reductions(&p, size, p.topology().communicator().rank() as usize);
     }
 }

@@ -440,6 +440,69 @@ fn multi_input_current_api_and_edge_cases() {
         0
     );
 
+    // A zero extent keeps the extra element count empty even when an earlier
+    // axis product overflows usize. Stride preparation must skip that product
+    // rather than report an overflow before reaching the zero.
+    for dims in [[usize::MAX, 2, 0], [0, usize::MAX, 2]] {
+        let shape = ExtraShape::new(dims).unwrap();
+        let input = array(Arc::clone(&pencil), shape.clone(), 1_i32);
+        let wide = array(Arc::clone(&pencil), shape.clone(), 2_i64);
+        let narrow = array(Arc::clone(&pencil), shape.clone(), 3_u8);
+        let second = array(Arc::clone(&pencil), shape.clone(), 4_i32);
+        let mut output = array(Arc::clone(&pencil), shape.clone(), 0_i64);
+        let calls = std::cell::Cell::new(0);
+        pointwise3(&input, &wide, &narrow, &mut output, |x, y, z| {
+            calls.set(calls.get() + 1);
+            i64::from(*x) + y + i64::from(*z)
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 0);
+        assert!(output.is_empty());
+        let calls = std::cell::Cell::new(0);
+        pointwise_many(&[&input, &second], &mut output, |xs| {
+            calls.set(calls.get() + 1);
+            i64::from(*xs[0])
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 0);
+        assert!(output.is_empty());
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            map_reduce3(
+                topology.communicator(),
+                &input.view(),
+                &input.view(),
+                &input.view(),
+                0_i64,
+                |x, _, _| {
+                    calls.set(calls.get() + 1);
+                    i64::from(*x)
+                },
+                reduce_i64,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(calls.get(), 0);
+        let calls = std::cell::Cell::new(0);
+        let views = [input.view(), input.view()];
+        assert_eq!(
+            map_reduce_many(
+                topology.communicator(),
+                &views,
+                0_i64,
+                |xs| {
+                    calls.set(calls.get() + 1);
+                    i64::from(*xs[0])
+                },
+                reduce_i64,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(calls.get(), 0);
+    }
+
     // Pointwise operations use the real APIs and do not require Clone.
     let na =
         PencilArray::from_fn(Arc::clone(&pencil), ExtraShape::scalar(), || NonClone(2)).unwrap();

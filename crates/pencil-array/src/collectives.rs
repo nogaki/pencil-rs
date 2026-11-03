@@ -1425,13 +1425,25 @@ where
         b.extra_shape().dimensions(),
         d.extra_shape().dimensions(),
     ];
-    let strides = dims.map(strides_for_dims);
-    let output_strides = strides_for_dims(&shape);
+    let extra = extra_count(&shape).ok();
+    let empty = extra == Some(0);
+    // No element is visited for an empty extra shape, so the stride products
+    // may overflow without affecting the reduction.
+    let strides = if empty {
+        [Ok(Vec::new()), Ok(Vec::new()), Ok(Vec::new())]
+    } else {
+        dims.map(strides_for_dims)
+    };
+    let output_strides = if empty {
+        Ok(Vec::new())
+    } else {
+        strides_for_dims(&shape)
+    };
     let ok = strides.iter().all(Result::is_ok) && output_strides.is_ok();
     if !collective_valid(c, ok) || !ok {
         return Err(CollectiveError::PreparationFailed);
     }
-    let extra = extra_count(&shape)?;
+    let extra = extra.ok_or(CollectiveError::CountOverflow)?;
     let count = a.pencil().local_len().checked_mul(extra);
     let global_count = a.pencil().global_len().checked_mul(extra);
     if !collective_valid(c, count.is_some() && global_count.is_some()) {
@@ -1596,18 +1608,22 @@ where
             )?
             .ok_or(CollectiveError::CollectivePreconditionFailed)?;
         }
-        let mut strides = Vec::new();
-        strides
-            .try_reserve_exact(inputs.len())
-            .map_err(|_| CollectiveError::AllocationFailed {
-                elements: inputs.len(),
-            })?;
-        for input in inputs {
-            strides.push(strides_for_dims(input.extra_shape().dimensions())?);
-        }
-        let output_strides = strides_for_dims(&shape)?;
-        let spatial = inputs[0].pencil().local_len();
         let extra = extra_count(&shape)?;
+        let (strides, output_strides) = if extra == 0 {
+            (Vec::new(), Vec::new())
+        } else {
+            let mut strides = Vec::new();
+            strides.try_reserve_exact(inputs.len()).map_err(|_| {
+                CollectiveError::AllocationFailed {
+                    elements: inputs.len(),
+                }
+            })?;
+            for input in inputs {
+                strides.push(strides_for_dims(input.extra_shape().dimensions())?);
+            }
+            (strides, strides_for_dims(&shape)?)
+        };
+        let spatial = inputs[0].pencil().local_len();
         // Keep reporting CountOverflow when the local output count does not fit usize.
         spatial
             .checked_mul(extra)
@@ -1796,11 +1812,18 @@ where
     let shape = shape.expect("broadcast shape validated");
     let left_dims = left.extra_shape().dimensions();
     let right_dims = right.extra_shape().dimensions();
-    let prepared = (
-        strides_for_dims(left_dims),
-        strides_for_dims(right_dims),
-        strides_for_dims(&shape),
-    );
+    let extra = extra_count(&shape).ok();
+    // No element is visited for an empty extra shape, so the stride products
+    // may overflow without affecting the reduction.
+    let prepared = if extra == Some(0) {
+        (Ok(Vec::new()), Ok(Vec::new()), Ok(Vec::new()))
+    } else {
+        (
+            strides_for_dims(left_dims),
+            strides_for_dims(right_dims),
+            strides_for_dims(&shape),
+        )
+    };
     let preparation_error = prepared
         .0
         .as_ref()
@@ -1814,7 +1837,6 @@ where
     ) {
         return Err(preparation_error.unwrap_or(CollectiveError::CollectivePreconditionFailed));
     }
-    let extra = extra_count(&shape).ok();
     let count = extra.and_then(|extra| left.pencil().local_len().checked_mul(extra));
     let global_count = extra.and_then(|extra| left.pencil().global_len().checked_mul(extra));
     if !collective_valid(communicator, count.is_some() && global_count.is_some()) {
@@ -1870,9 +1892,7 @@ fn broadcast_shape(
 }
 
 fn extra_count(shape: &[usize]) -> Result<usize, CollectiveError> {
-    shape.iter().try_fold(1usize, |a, &b| {
-        a.checked_mul(b).ok_or(CollectiveError::CountOverflow)
-    })
+    checked_product(shape).map_err(|_| CollectiveError::CountOverflow)
 }
 fn for_each_pair<A, B, F, const N: usize, const M: usize>(
     left: &PencilArrayView<'_, A, N, M>,

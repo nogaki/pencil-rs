@@ -1,4 +1,6 @@
-use crate::{ArrayError, PencilArray, PencilArrayView, PencilArrayViewMut};
+use crate::{
+    ArrayError, PencilArray, PencilArrayView, PencilArrayViewMut, checked::checked_product,
+};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -224,22 +226,27 @@ impl Plan {
         let left_dims = copy(left_dimensions)?;
         let right_dims = copy(right_dimensions)?;
         let spatial = left_pencil.local_len();
-        let output_strides = strides(&output_dims)?;
-        let extra_count = output_dims
-            .iter()
-            .try_fold(1usize, |a, &b| a.checked_mul(b))
-            .ok_or(ArrayError::AllocationFailed {
-                required: usize::MAX,
-            })?;
+        let extra_count = checked_product(&output_dims).map_err(ArrayError::from)?;
         spatial
             .checked_mul(extra_count)
             .ok_or(ArrayError::AllocationFailed {
                 required: usize::MAX,
             })?;
+        // No element is visited for an empty extra shape, so the stride
+        // products may overflow without affecting the operation.
+        let (output_strides, left_strides, right_strides) = if extra_count == 0 {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            (
+                strides(&output_dims)?,
+                strides(&left_dims)?,
+                strides(&right_dims)?,
+            )
+        };
         Ok(Self {
             output_strides,
-            left_strides: strides(&left_dims)?,
-            right_strides: strides(&right_dims)?,
+            left_strides,
+            right_strides,
             output_dims,
             left_dims,
             right_dims,
