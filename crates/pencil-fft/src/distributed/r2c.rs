@@ -36,11 +36,14 @@ use super::{
     OPERATION_R2C_INVERSE, OPERATION_R2C_INVERSE_IN_PLACE, OPERATION_R2C_PLAN, R2cError,
     StagePreparation, TransformPlanCore, TransformStage, TransformTiming, TransposeMethod,
     VALUE_KIND_R2C, agree_execution_descriptor_ref, agree_header, agree_result, build_descriptor,
-    build_route, build_transitions, collective_valid, descriptor_len, initialized_vec,
-    map_array_allocation, prepare_complex_stage_for_backend, registered_stage_pencils,
-    strided_complex_line_len, validate_out_of_place, validate_workspace_lengths_values,
-    zero_complex,
+    build_route, build_transitions, collective_valid, descriptor_len, endpoint_chunk_buffers,
+    endpoint_chunk_count, endpoint_chunk_len, initialized_vec, map_array_allocation,
+    prepare_complex_stage_for_backend, registered_stage_pencils, strided_complex_line_len,
+    validate_out_of_place, validate_workspace_lengths_values, zero_complex,
 };
+
+#[cfg(test)]
+use super::{EndpointReductionEvent, record_endpoint_reduction};
 use crate::BackendInitError;
 #[cfg(test)]
 use crate::LocalR2cError;
@@ -4860,6 +4863,20 @@ fn r2c_lengths<R: FftReal, const N: usize, const M: usize>(
     (plan.real_len(), plan.complex_len())
 }
 
+struct R2cEndpointStatistics {
+    local_len: usize,
+    stride: usize,
+    local_axis_len: usize,
+    global_axis_start: usize,
+    complex_len: usize,
+    plane_count: usize,
+    relative: f64,
+    absolute: f64,
+    local_stats: Vec<[f64; 4]>,
+    global_maxima: Vec<[f64; 4]>,
+    global_sums: Vec<[f64; 4]>,
+}
+
 fn validate_boundary<R: FftReal, const N: usize, const M: usize>(
     core: &TransformPlanCore<R, N, M>,
     intermediate: &ManyPencilArray<Complex<R>, N, M>,
@@ -4870,117 +4887,203 @@ where
     Complex<R>: Equivalence,
 {
     let communicator = core.stages[0].input.topology().communicator();
-    let view = intermediate.active_view().map_err(FftError::Array)?;
-    let local_len = view.pencil().local_len();
-    let (real_len, complex_len) = r2c_lengths(core);
-    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
-    let reduction_axis = core.stages[boundary].axis;
-    let stride = super::memory_stride(view.pencil(), reduction_axis)?;
-    let local_axis_len = view.pencil().local_shape_logical()[reduction_axis];
-    let global_axis_start = view.pencil().local_ranges()[reduction_axis].start;
-    let depth = normalization_depth(
-        *core.stages[0].input.global_shape(),
-        core.selection,
-        reduction_axis,
-    );
-    let plane_count = if real_len % 2 == 0 { 2 } else { 1 };
-    let relative = 128.0 * <R as crate::private::Sealed>::pencil_fft_epsilon_f64() * depth;
-    let absolute = if normalize_inverse {
-        128.0 * <R as crate::private::Sealed>::pencil_fft_min_subnormal_f64() * depth
-    } else {
-        raw_absolute_threshold
-    };
-    let mut invalid = false;
-
-    // ponytail: two full-Cartesian reductions per batch keep the four-word
-    // statistics bounded; batch reductions can be fused only if latency is
-    // measured to justify the added buffering.
-    for batch in 0..core.extra_shape.element_count() {
-        let start = batch
+    let batch_count = core.extra_shape.element_count();
+    let chunk_len = batch_count.min(super::ENDPOINT_BATCH_CHUNK);
+    // The active view, span checks, and chunk allocations are agreed before the
+    // first statistics reduction. Every rank then runs the same chunks; a local
+    // numeric failure must not return early.
+    let preparation = (|| {
+        let view = intermediate.active_view().map_err(FftError::Array)?;
+        let local_len = view.pencil().local_len();
+        let (real_len, complex_len) = r2c_lengths(core);
+        let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
+        let reduction_axis = core.stages[boundary].axis;
+        let stride = super::memory_stride(view.pencil(), reduction_axis)?;
+        let local_axis_len = view.pencil().local_shape_logical()[reduction_axis];
+        let global_axis_start = view.pencil().local_ranges()[reduction_axis].start;
+        let depth = normalization_depth(
+            *core.stages[0].input.global_shape(),
+            core.selection,
+            reduction_axis,
+        );
+        let plane_count = if real_len % 2 == 0 { 2 } else { 1 };
+        let relative = 128.0 * <R as crate::private::Sealed>::pencil_fft_epsilon_f64() * depth;
+        let absolute = if normalize_inverse {
+            128.0 * <R as crate::private::Sealed>::pencil_fft_min_subnormal_f64() * depth
+        } else {
+            raw_absolute_threshold
+        };
+        let data = view.as_slice();
+        let required_len = batch_count
             .checked_mul(local_len)
-            .expect("validated extra and local lengths fit the intermediate");
-        let end = start
-            .checked_add(local_len)
-            .expect("validated extra and local lengths fit the intermediate");
-        let values = &view.as_slice()[start..end];
-        let mut local_max = [0.0_f64; 4];
-        if local_len != 0 {
-            for (offset, value) in values.iter().enumerate() {
-                let coord = (offset / stride) % local_axis_len;
-                let k = global_axis_start + coord;
-                let plane = if k == 0 {
-                    Some(0)
-                } else if plane_count == 2 && k == complex_len - 1 {
-                    Some(1)
-                } else {
-                    None
-                };
-                let Some(plane) = plane else { continue };
-                let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
-                let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
-                if !re.is_finite() || !im.is_finite() {
-                    invalid = true;
-                    continue;
-                }
-                let slot = plane * 2;
-                local_max[slot] = local_max[slot].max(re.abs().max(im.abs()));
-                local_max[slot + 1] = local_max[slot + 1].max(im.abs());
-            }
+            .ok_or(FftError::PreparationFailed)?;
+        if data.len() < required_len {
+            return Err(R2cError::Fft(FftError::PreparationFailed));
         }
-        let mut global_max = [0.0_f64; 4];
-        communicator.all_reduce_into(&local_max, &mut global_max, SystemOperation::max());
+        if local_len != 0 {
+            if stride == 0 || local_axis_len == 0 || complex_len == 0 {
+                return Err(R2cError::Fft(FftError::PreparationFailed));
+            }
+            // The reduced-axis coordinate of every scanned offset must stay in
+            // range without wrapping; the plane match itself tolerates other k.
+            let last_coord = local_axis_len - 1;
+            let _last_k = global_axis_start
+                .checked_add(last_coord)
+                .ok_or(FftError::PreparationFailed)?;
+        }
+        let [local_stats, global_maxima, global_sums] = endpoint_chunk_buffers(chunk_len)?;
+        Ok(R2cEndpointStatistics {
+            local_len,
+            stride,
+            local_axis_len,
+            global_axis_start,
+            complex_len,
+            plane_count,
+            relative,
+            absolute,
+            local_stats,
+            global_maxima,
+            global_sums,
+        })
+    })();
+    #[cfg(test)]
+    record_endpoint_reduction(EndpointReductionEvent::PreparationAgreement);
+    let R2cEndpointStatistics {
+        local_len,
+        stride,
+        local_axis_len,
+        global_axis_start,
+        complex_len,
+        plane_count,
+        relative,
+        absolute,
+        mut local_stats,
+        mut global_maxima,
+        mut global_sums,
+    } = agree_result(communicator, preparation)?;
+    let mut invalid = false;
+    let view = intermediate
+        .active_view()
+        .expect("validated R2C boundary active layout");
+    let data = view.as_slice();
 
-        let mut local_sum = [0.0_f64; 4];
-        if local_len != 0 {
-            for (offset, value) in values.iter().enumerate() {
-                let coord = (offset / stride) % local_axis_len;
-                let k = global_axis_start + coord;
-                let plane = if k == 0 {
-                    Some(0)
-                } else if plane_count == 2 && k == complex_len - 1 {
-                    Some(1)
-                } else {
-                    None
-                };
-                let Some(plane) = plane else { continue };
-                let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
-                let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
-                if !re.is_finite() || !im.is_finite() {
-                    continue;
-                }
-                let slot = plane * 2;
-                let scale = global_max[slot];
-                if scale != 0.0 && scale.is_finite() {
-                    let normalized_re = re / scale;
-                    let normalized_im = im / scale;
-                    local_sum[slot] += normalized_re * normalized_re;
-                    local_sum[slot + 1] += normalized_im * normalized_im;
+    for chunk_index in 0..endpoint_chunk_count(batch_count) {
+        let chunk_start = chunk_index * super::ENDPOINT_BATCH_CHUNK;
+        let chunk = endpoint_chunk_len(batch_count, chunk_start);
+        let local = &mut local_stats[..chunk];
+        let maxima = &mut global_maxima[..chunk];
+        let sums = &mut global_sums[..chunk];
+
+        local.fill([0.0_f64; 4]);
+        for (batch_max, batch) in local.iter_mut().zip(chunk_start..chunk_start + chunk) {
+            let start = batch
+                .checked_mul(local_len)
+                .expect("validated extra and local lengths fit the intermediate");
+            let values = &data[start..start + local_len];
+            if local_len != 0 {
+                for (offset, value) in values.iter().enumerate() {
+                    let coord = (offset / stride) % local_axis_len;
+                    let k = global_axis_start + coord;
+                    let plane = if k == 0 {
+                        Some(0)
+                    } else if plane_count == 2 && k == complex_len - 1 {
+                        Some(1)
+                    } else {
+                        None
+                    };
+                    let Some(plane) = plane else { continue };
+                    let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
+                    let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
+                    if !re.is_finite() || !im.is_finite() {
+                        invalid = true;
+                        continue;
+                    }
+                    let slot = plane * 2;
+                    batch_max[slot] = batch_max[slot].max(re.abs().max(im.abs()));
+                    batch_max[slot + 1] = batch_max[slot + 1].max(im.abs());
                 }
             }
         }
-        let mut global_sum = [0.0_f64; 4];
-        communicator.all_reduce_into(&local_sum, &mut global_sum, SystemOperation::sum());
-        if global_max[..plane_count * 2]
-            .iter()
-            .any(|value| !value.is_finite())
-            || global_sum[..plane_count * 2]
+        #[cfg(test)]
+        record_endpoint_reduction(EndpointReductionEvent::MaxReduction {
+            elements: 4 * chunk,
+        });
+        communicator.all_reduce_into(
+            local.as_flattened(),
+            maxima.as_flattened_mut(),
+            SystemOperation::max(),
+        );
+
+        local.fill([0.0_f64; 4]);
+        for (batch, (local_sum, global_max)) in local.iter_mut().zip(maxima.iter()).enumerate() {
+            let start = (chunk_start + batch)
+                .checked_mul(local_len)
+                .expect("validated extra and local lengths fit the intermediate");
+            let values = &data[start..start + local_len];
+            if local_len != 0 {
+                for (offset, value) in values.iter().enumerate() {
+                    let coord = (offset / stride) % local_axis_len;
+                    let k = global_axis_start + coord;
+                    let plane = if k == 0 {
+                        Some(0)
+                    } else if plane_count == 2 && k == complex_len - 1 {
+                        Some(1)
+                    } else {
+                        None
+                    };
+                    let Some(plane) = plane else { continue };
+                    let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
+                    let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
+                    if !re.is_finite() || !im.is_finite() {
+                        continue;
+                    }
+                    let slot = plane * 2;
+                    let scale = global_max[slot];
+                    if scale != 0.0 && scale.is_finite() {
+                        let normalized_re = re / scale;
+                        let normalized_im = im / scale;
+                        local_sum[slot] += normalized_re * normalized_re;
+                        local_sum[slot + 1] += normalized_im * normalized_im;
+                    }
+                }
+            }
+        }
+        #[cfg(test)]
+        record_endpoint_reduction(EndpointReductionEvent::SumReduction {
+            elements: 4 * chunk,
+        });
+        communicator.all_reduce_into(
+            local.as_flattened(),
+            sums.as_flattened_mut(),
+            SystemOperation::sum(),
+        );
+
+        for batch in 0..chunk {
+            let global_max = maxima[batch];
+            let global_sum = sums[batch];
+            if global_max[..plane_count * 2]
                 .iter()
                 .any(|value| !value.is_finite())
-            || !relative.is_finite()
-            || !absolute.is_finite()
-        {
-            invalid = true;
-        }
-        for plane in 0..plane_count {
-            let slot = plane * 2;
-            let absolute_ok = global_max[slot + 1] <= absolute;
-            let relative_ok = global_sum[slot + 1].sqrt() <= relative * global_sum[slot].sqrt();
-            if !(absolute_ok || relative_ok) {
+                || global_sum[..plane_count * 2]
+                    .iter()
+                    .any(|value| !value.is_finite())
+                || !relative.is_finite()
+                || !absolute.is_finite()
+            {
                 invalid = true;
+            }
+            for plane in 0..plane_count {
+                let slot = plane * 2;
+                let absolute_ok = global_max[slot + 1] <= absolute;
+                let relative_ok = global_sum[slot + 1].sqrt() <= relative * global_sum[slot].sqrt();
+                if !(absolute_ok || relative_ok) {
+                    invalid = true;
+                }
             }
         }
     }
-
+    #[cfg(test)]
+    record_endpoint_reduction(EndpointReductionEvent::FinalAgreement);
     if !collective_valid(communicator, !invalid) {
         return Err(R2cError::InvalidSpectrum);
     }
@@ -5057,5 +5160,739 @@ fn raw_absolute_threshold_for_shape<R: FftReal, const N: usize>(
         Ok(raw_absolute)
     } else {
         Err(FftError::PreparationFailed)
+    }
+}
+
+#[cfg(test)]
+mod endpoint_reduction_tests {
+    use super::super::{
+        ENDPOINT_BATCH_CHUNK, EndpointReductionEvent, endpoint_reduction_log,
+        endpoint_ulp_neighbors, force_endpoint_allocation_failure, reset_endpoint_reduction_log,
+    };
+    use super::*;
+    use mpi::topology::Communicator;
+
+    fn chunk_plan<R: FftReal, const M: usize>(
+        topology: &Arc<MpiTopology<M>>,
+        batch_count: usize,
+        real_len: usize,
+    ) -> R2cPlan<R, 2, M>
+    where
+        Complex<R>: Equivalence,
+    {
+        R2cPlan::from_shape(
+            Arc::clone(topology),
+            [4, real_len],
+            ExtraShape::new(vec![batch_count]).unwrap(),
+        )
+        .unwrap()
+    }
+
+    // The boundary intermediate's active layout, reconstructed as an ordinary
+    // array so tests can address constrained planes by global coordinates.
+    fn boundary_data<R: FftReal, const M: usize>(
+        plan: &R2cPlan<R, 2, M>,
+        workspace: &R2cWorkspace<R, 2, M>,
+    ) -> PencilArray<Complex<R>, 2, M>
+    where
+        Complex<R>: Equivalence,
+    {
+        let pencil = workspace.intermediate.active_pencil().unwrap();
+        let pencil = pencil.with_global_shape(*pencil.global_shape()).unwrap();
+        PencilArray::from_elem(pencil, plan.core.extra_shape.clone(), zero_complex::<R>()).unwrap()
+    }
+
+    fn validate_with<R: FftReal, const M: usize>(
+        plan: &R2cPlan<R, 2, M>,
+        workspace: &mut R2cWorkspace<R, 2, M>,
+        data: &PencilArray<Complex<R>, 2, M>,
+    ) -> Result<(), R2cError>
+    where
+        Complex<R>: Equivalence,
+    {
+        validate_with_mode(plan, workspace, data, true)
+    }
+
+    fn validate_with_mode<R: FftReal, const M: usize>(
+        plan: &R2cPlan<R, 2, M>,
+        workspace: &mut R2cWorkspace<R, 2, M>,
+        data: &PencilArray<Complex<R>, 2, M>,
+        normalize: bool,
+    ) -> Result<(), R2cError>
+    where
+        Complex<R>: Equivalence,
+    {
+        workspace
+            .intermediate
+            .active_view_mut()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(data.as_slice());
+        validate_boundary(
+            &plan.core,
+            &workspace.intermediate,
+            normalize,
+            plan.raw_absolute_threshold,
+        )
+    }
+
+    fn chunk_protocol(batch_count: usize) {
+        let chunk = batch_count.min(ENDPOINT_BATCH_CHUNK);
+        let log = endpoint_reduction_log();
+        let mut allocations = Vec::new();
+        let mut maxima = Vec::new();
+        let mut sums = Vec::new();
+        let mut preparations = 0;
+        let mut finals = 0;
+        for event in &log {
+            match *event {
+                EndpointReductionEvent::Allocation { slot, length } => {
+                    assert_eq!(slot, allocations.len(), "batch_count={batch_count}");
+                    assert_eq!(length, chunk, "batch_count={batch_count}");
+                    allocations.push(length);
+                }
+                EndpointReductionEvent::PreparationAgreement => preparations += 1,
+                EndpointReductionEvent::MaxReduction { elements } => maxima.push(elements),
+                EndpointReductionEvent::SumReduction { elements } => sums.push(elements),
+                EndpointReductionEvent::FinalAgreement => finals += 1,
+            }
+        }
+        assert_eq!(allocations.len(), 3, "batch_count={batch_count}");
+        assert_eq!(log[3], EndpointReductionEvent::PreparationAgreement);
+        assert_eq!(preparations, 1, "batch_count={batch_count}");
+        assert_eq!(finals, 1, "batch_count={batch_count}");
+        assert_eq!(
+            log.last(),
+            Some(&EndpointReductionEvent::FinalAgreement),
+            "batch_count={batch_count}"
+        );
+        let expected: Vec<usize> = (0..endpoint_chunk_count(batch_count))
+            .map(|index| 4 * endpoint_chunk_len(batch_count, index * ENDPOINT_BATCH_CHUNK))
+            .collect();
+        assert_eq!(maxima, expected, "MAX chunks for batch_count={batch_count}");
+        assert_eq!(sums, expected, "SUM chunks for batch_count={batch_count}");
+    }
+
+    fn assert_no_statistics_reduction(log: &[EndpointReductionEvent]) {
+        assert!(
+            log.iter().all(|event| !matches!(
+                event,
+                EndpointReductionEvent::MaxReduction { .. }
+                    | EndpointReductionEvent::SumReduction { .. }
+                    | EndpointReductionEvent::FinalAgreement
+            )),
+            "statistics reductions ran after a preparation failure: {log:?}"
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|event| matches!(event, EndpointReductionEvent::PreparationAgreement))
+                .count(),
+            1,
+            "{log:?}"
+        );
+    }
+
+    fn chunked_statistics<R: FftReal, const M: usize>(topology: &Arc<MpiTopology<M>>)
+    where
+        Complex<R>: Equivalence,
+    {
+        let chunk = ENDPOINT_BATCH_CHUNK;
+        for real_len in [6, 7, 1] {
+            for batch_count in [0, 1, chunk - 1, chunk, chunk + 1, 2 * chunk + 1] {
+                let plan = chunk_plan::<R, M>(topology, batch_count, real_len);
+                let mut workspace = plan.allocate_workspace().unwrap();
+                let data = boundary_data(&plan, &workspace);
+                reset_endpoint_reduction_log();
+                validate_with(&plan, &mut workspace, &data).unwrap();
+                chunk_protocol(batch_count);
+            }
+        }
+        // A permuted boundary layout keeps the same bounded protocol.
+        let batch_count = chunk + 1;
+        let plan = R2cPlan::<R, 2, M>::from_shape_with_layout(
+            Arc::clone(topology),
+            [4, 6],
+            ExtraShape::new(vec![batch_count]).unwrap(),
+            DistributedLayout {
+                permute_dims: true,
+                ..DistributedLayout::default()
+            },
+        )
+        .unwrap();
+        let mut workspace = plan.allocate_workspace().unwrap();
+        let data = boundary_data(&plan, &workspace);
+        reset_endpoint_reduction_log();
+        validate_with(&plan, &mut workspace, &data).unwrap();
+        chunk_protocol(batch_count);
+    }
+
+    // Four exactly representable unit real parts make the fused SUM exactly 4,
+    // so the relative threshold is 2*relative. Replacing the SUM with a MAX
+    // would see 1 and reject the accepted neighbor, so this fixture pins the
+    // fused sum across batches and ranks.
+    fn multi_contribution_probes<R: FftReal, const M: usize>(topology: &Arc<MpiTopology<M>>)
+    where
+        Complex<R>: Equivalence,
+    {
+        let plan = R2cPlan::<R, 2, M>::from_shape_with_selection(
+            Arc::clone(topology),
+            [4, 2],
+            ExtraShape::scalar(),
+            AxisSelection::all(),
+        )
+        .unwrap();
+        let mut workspace = plan.allocate_workspace().unwrap();
+        let boundary = plan.core.real_stage_index.unwrap();
+        let reduction_axis = plan.core.stages[boundary].axis;
+        assert_eq!(reduction_axis, 1);
+        let (real_len, complex_len) = r2c_lengths(&plan.core);
+        assert_eq!((real_len, complex_len), (2, 2));
+        let depth = normalization_depth([4, 2], plan.core.selection, reduction_axis);
+        assert_eq!(depth, 3.0);
+        let relative = 128.0 * <R as crate::private::Sealed>::pencil_fft_epsilon_f64() * depth;
+        let inverse_absolute =
+            128.0 * <R as crate::private::Sealed>::pencil_fft_min_subnormal_f64() * depth;
+        // The unnormalized threshold carries the transverse extent 4.
+        assert_eq!(plan.raw_absolute_threshold, 4.0 * inverse_absolute);
+        let one = R::from_f64(1.0).unwrap();
+        for normalize in [true, false] {
+            let absolute = if normalize {
+                inverse_absolute
+            } else {
+                plan.raw_absolute_threshold
+            };
+            for plane in 0..2 {
+                let k = if plane == 0 { 0 } else { complex_len - 1 };
+                for (im, accepted) in endpoint_ulp_neighbors::<R>(2.0 * relative)
+                    .into_iter()
+                    .zip([true, true, false])
+                {
+                    let mut data = boundary_data(&plan, &workspace);
+                    for row in 0..4 {
+                        if let Some(value) = data.get_global_mut(&[], [row, k]) {
+                            *value = Complex::new(one, R::zero());
+                        }
+                    }
+                    if let Some(value) = data.get_global_mut(&[], [0, k]) {
+                        *value = Complex::new(one, R::from_f64(im).unwrap());
+                    }
+                    let result = validate_with_mode(&plan, &mut workspace, &data, normalize);
+                    assert_eq!(
+                        result.is_ok(),
+                        accepted,
+                        "plane={plane} normalize={normalize} im={im}: {result:?}"
+                    );
+                    if !accepted {
+                        assert!(matches!(result, Err(R2cError::InvalidSpectrum)));
+                    }
+                }
+                // The absolute test sees a single imaginary endpoint.
+                for (im, accepted) in endpoint_ulp_neighbors::<R>(absolute)
+                    .into_iter()
+                    .zip([true, true, false])
+                {
+                    let mut data = boundary_data(&plan, &workspace);
+                    if let Some(value) = data.get_global_mut(&[], [0, k]) {
+                        *value = Complex::new(R::zero(), R::from_f64(im).unwrap());
+                    }
+                    let result = validate_with_mode(&plan, &mut workspace, &data, normalize);
+                    assert_eq!(
+                        result.is_ok(),
+                        accepted,
+                        "absolute plane={plane} normalize={normalize} im={im}: {result:?}"
+                    );
+                    if !accepted {
+                        assert!(matches!(result, Err(R2cError::InvalidSpectrum)));
+                    }
+                }
+            }
+        }
+    }
+
+    fn invalid_batches<R: FftReal, const M: usize>(topology: &Arc<MpiTopology<M>>)
+    where
+        Complex<R>: Equivalence,
+    {
+        let chunk = ENDPOINT_BATCH_CHUNK;
+        let batch_count = 2 * chunk + 1;
+        let plan = chunk_plan::<R, M>(topology, batch_count, 6);
+        let mut workspace = plan.allocate_workspace().unwrap();
+        let (_, complex_len) = r2c_lengths(&plan.core);
+        for (batch, plane, re, im) in [
+            (0, 0, 0.0, 1e30),
+            (2 * chunk, 0, 0.0, 1e30),
+            (chunk, complex_len - 1, 0.0, 1e30),
+            (2 * chunk, 0, f64::NAN, 0.0),
+            (0, 0, 0.0, f64::INFINITY),
+        ] {
+            let mut data = boundary_data(&plan, &workspace);
+            for i in 0..4 {
+                if let Some(value) = data.get_global_mut(&[batch], [i, plane]) {
+                    *value = Complex::new(R::from_f64(re).unwrap(), R::from_f64(im).unwrap());
+                }
+            }
+            reset_endpoint_reduction_log();
+            let result = validate_with(&plan, &mut workspace, &data);
+            assert!(
+                matches!(result, Err(R2cError::InvalidSpectrum)),
+                "batch={batch} plane={plane} re={re} im={im}: {result:?}"
+            );
+            // The first or last invalid chunk does not stop later chunks.
+            chunk_protocol(batch_count);
+        }
+    }
+
+    fn plane_and_batch_separation<R: FftReal, const M: usize>(topology: &Arc<MpiTopology<M>>)
+    where
+        Complex<R>: Equivalence,
+    {
+        let chunk = ENDPOINT_BATCH_CHUNK;
+        let batch_count = chunk + 1;
+        let plan = chunk_plan::<R, M>(topology, batch_count, 6);
+        let mut workspace = plan.allocate_workspace().unwrap();
+        let (_, complex_len) = r2c_lengths(&plan.core);
+        let huge = R::from_f64(1e20).unwrap();
+        let small = R::from_f64(1.0).unwrap();
+        for (batch, plane) in [
+            (0, 0),
+            (0, complex_len - 1),
+            (chunk, 0),
+            (chunk, complex_len - 1),
+        ] {
+            let mut data = boundary_data(&plan, &workspace);
+            data.as_mut_slice().fill(Complex::new(huge, R::zero()));
+            for i in 0..4 {
+                if let Some(value) = data.get_global_mut(&[batch], [i, plane]) {
+                    *value = Complex::new(R::zero(), small);
+                }
+            }
+            reset_endpoint_reduction_log();
+            let result = validate_with(&plan, &mut workspace, &data);
+            assert!(
+                matches!(result, Err(R2cError::InvalidSpectrum)),
+                "batch={batch} plane={plane}: {result:?}"
+            );
+            chunk_protocol(batch_count);
+        }
+        // Uniformly large clean endpoints are accepted.
+        let mut data = boundary_data(&plan, &workspace);
+        data.as_mut_slice().fill(Complex::new(huge, R::zero()));
+        validate_with(&plan, &mut workspace, &data).unwrap();
+        // Signed zero is accepted.
+        let mut data = boundary_data(&plan, &workspace);
+        data.as_mut_slice().fill(Complex::new(
+            R::from_f64(-0.0).unwrap(),
+            R::from_f64(-0.0).unwrap(),
+        ));
+        validate_with(&plan, &mut workspace, &data).unwrap();
+        // Non-endpoint bins stay unconstrained.
+        let mut data = boundary_data(&plan, &workspace);
+        for i in 0..4 {
+            if let Some(value) = data.get_global_mut(&[chunk], [i, 1]) {
+                *value = Complex::new(R::zero(), huge);
+            }
+        }
+        validate_with(&plan, &mut workspace, &data).unwrap();
+        // Odd and length-one real axes constrain DC only.
+        for real_len in [7, 1] {
+            let plan = chunk_plan::<R, M>(topology, batch_count, real_len);
+            let mut workspace = plan.allocate_workspace().unwrap();
+            let (_, complex_len) = r2c_lengths(&plan.core);
+            if real_len % 2 == 1 && complex_len > 1 {
+                let mut data = boundary_data(&plan, &workspace);
+                for i in 0..4 {
+                    if let Some(value) =
+                        data.get_global_mut(&[batch_count - 1], [i, complex_len - 1])
+                    {
+                        *value = Complex::new(R::zero(), huge);
+                    }
+                }
+                validate_with(&plan, &mut workspace, &data).unwrap();
+            }
+            let mut data = boundary_data(&plan, &workspace);
+            for i in 0..4 {
+                if let Some(value) = data.get_global_mut(&[batch_count - 1], [i, 0]) {
+                    *value = Complex::new(R::zero(), huge);
+                }
+            }
+            let result = validate_with(&plan, &mut workspace, &data);
+            assert!(
+                matches!(result, Err(R2cError::InvalidSpectrum)),
+                "real_len={real_len}: {result:?}"
+            );
+        }
+    }
+
+    fn allocation_and_preparation_failures<R: FftReal, const M: usize>(
+        topology: &Arc<MpiTopology<M>>,
+        rank: usize,
+    ) where
+        Complex<R>: Equivalence,
+    {
+        let chunk = ENDPOINT_BATCH_CHUNK;
+        let batch_count = chunk + 1;
+        let plan = chunk_plan::<R, M>(topology, batch_count, 6);
+        let mut workspace = plan.allocate_workspace().unwrap();
+        let data = boundary_data(&plan, &workspace);
+        for slot in 0..3 {
+            reset_endpoint_reduction_log();
+            if rank == 0 {
+                force_endpoint_allocation_failure(slot);
+            }
+            let result = validate_with(&plan, &mut workspace, &data);
+            match (rank, result) {
+                (0, Err(R2cError::Fft(FftError::AllocationFailed { required }))) => {
+                    assert_eq!(required, chunk, "slot={slot}")
+                }
+                (_, Err(R2cError::Fft(FftError::CollectivePreconditionFailed))) => {}
+                (_, other) => panic!("unexpected allocation failure for slot {slot}: {other:?}"),
+            }
+            let log = endpoint_reduction_log();
+            assert_no_statistics_reduction(&log);
+            // The injecting rank stops at its failing slot; every other rank
+            // allocated all three buffers before the preparation agreement.
+            let allocated = log
+                .iter()
+                .filter(|event| matches!(event, EndpointReductionEvent::Allocation { .. }))
+                .count();
+            assert_eq!(
+                allocated,
+                if rank == 0 { slot + 1 } else { 3 },
+                "slot={slot}: {log:?}"
+            );
+        }
+        // A poisoned active layout on one rank is agreed before any reduction.
+        reset_endpoint_reduction_log();
+        let mut poisoned = plan.allocate_workspace().unwrap();
+        if rank == 0 {
+            let target = {
+                let pencil = poisoned.intermediate.active_pencil().unwrap();
+                pencil.with_global_shape(*pencil.global_shape()).unwrap()
+            };
+            poisoned
+                .intermediate
+                .overwrite_with(&target, |_| Err::<(), _>(()))
+                .unwrap_err();
+        }
+        let result = validate_boundary(
+            &plan.core,
+            &poisoned.intermediate,
+            true,
+            plan.raw_absolute_threshold,
+        );
+        match (rank, result) {
+            (0, Err(R2cError::Fft(FftError::Array(ArrayError::Poisoned)))) => {}
+            (_, Err(R2cError::Fft(FftError::CollectivePreconditionFailed))) => {}
+            (_, other) => panic!("unexpected poisoned-view result: {other:?}"),
+        }
+        let log = endpoint_reduction_log();
+        assert_no_statistics_reduction(&log);
+        // Only the rank with the poisoned layout skips allocation.
+        assert_eq!(
+            log.iter()
+                .filter(|event| matches!(event, EndpointReductionEvent::Allocation { .. }))
+                .count(),
+            if rank == 0 { 0 } else { 3 },
+            "{log:?}"
+        );
+    }
+
+    fn public_routes<R: FftReal>(topology: &Arc<MpiTopology<1>>)
+    where
+        Complex<R>: Equivalence,
+    {
+        let chunk = ENDPOINT_BATCH_CHUNK;
+        let batch_count = chunk + 1;
+        let plan = chunk_plan::<R, 1>(topology, batch_count, 6);
+        let mut source = plan.allocate_output().unwrap();
+        source.as_mut_slice().fill(zero_complex::<R>());
+        let mut destination = plan.allocate_input().unwrap();
+        let mut workspace = plan.allocate_workspace().unwrap();
+        for raw in [false, true] {
+            reset_endpoint_reduction_log();
+            destination.as_mut_slice().fill(R::from_f64(7.0).unwrap());
+            if raw {
+                plan.backward(&source, &mut destination, &mut workspace)
+                    .unwrap();
+            } else {
+                plan.inverse(&source, &mut destination, &mut workspace)
+                    .unwrap();
+            }
+            chunk_protocol(batch_count);
+        }
+        reset_endpoint_reduction_log();
+        plan.inverse_with_timing(&source, &mut destination, &mut workspace)
+            .unwrap();
+        chunk_protocol(batch_count);
+        reset_endpoint_reduction_log();
+        plan.backward_with_timing(&source, &mut destination, &mut workspace)
+            .unwrap();
+        chunk_protocol(batch_count);
+
+        let mut array = plan.allocate_in_place().unwrap();
+        let mut in_place_workspace = plan.allocate_in_place_workspace().unwrap();
+        for raw in [false, true] {
+            plan.forward_in_place(&mut array, &mut in_place_workspace)
+                .unwrap();
+            array
+                .complex_view_mut()
+                .unwrap()
+                .as_mut_slice()
+                .fill(zero_complex::<R>());
+            reset_endpoint_reduction_log();
+            if raw {
+                plan.backward_in_place(&mut array, &mut in_place_workspace)
+                    .unwrap();
+            } else {
+                plan.inverse_in_place(&mut array, &mut in_place_workspace)
+                    .unwrap();
+            }
+            chunk_protocol(batch_count);
+        }
+
+        let overlap_plan = R2cPlan::<R, 2, 1>::from_shape_with_layout(
+            Arc::clone(topology),
+            [4, 6],
+            ExtraShape::new(vec![batch_count]).unwrap(),
+            DistributedLayout {
+                transpose_method: TransposeMethod::PointToPoint,
+                permute_dims: false,
+            },
+        )
+        .unwrap();
+        let mut overlap_source = overlap_plan.allocate_output().unwrap();
+        overlap_source.as_mut_slice().fill(zero_complex::<R>());
+        let mut overlap_destination = overlap_plan.allocate_input().unwrap();
+        let mut overlap_workspace = overlap_plan.allocate_workspace().unwrap();
+        reset_endpoint_reduction_log();
+        overlap_plan
+            .inverse_with_overlap(
+                &overlap_source,
+                &mut overlap_destination,
+                &mut overlap_workspace,
+            )
+            .unwrap();
+        chunk_protocol(batch_count);
+        reset_endpoint_reduction_log();
+        overlap_plan
+            .backward_with_overlap(
+                &overlap_source,
+                &mut overlap_destination,
+                &mut overlap_workspace,
+            )
+            .unwrap();
+        chunk_protocol(batch_count);
+
+        let mut source = plan.allocate_output().unwrap();
+        source.as_mut_slice().fill(zero_complex::<R>());
+        for i in 0..4 {
+            if let Some(value) = source.get_global_mut(&[batch_count - 1], [i, 0]) {
+                *value = Complex::new(R::zero(), R::from_f64(1e30).unwrap());
+            }
+        }
+        let source_before = source.as_slice().to_vec();
+        destination.as_mut_slice().fill(R::from_f64(7.0).unwrap());
+        let destination_before = destination.as_slice().to_vec();
+        reset_endpoint_reduction_log();
+        let result = plan.inverse(&source, &mut destination, &mut workspace);
+        assert!(
+            matches!(result, Err(R2cError::InvalidSpectrum)),
+            "{result:?}"
+        );
+        chunk_protocol(batch_count);
+        assert_eq!(source.as_slice(), source_before);
+        assert_eq!(destination.as_slice(), destination_before);
+
+        let mut array = plan.allocate_in_place().unwrap();
+        let mut in_place_workspace = plan.allocate_in_place_workspace().unwrap();
+        plan.forward_in_place(&mut array, &mut in_place_workspace)
+            .unwrap();
+        {
+            let mut view = array.complex_view_mut().unwrap();
+            view.as_mut_slice().fill(zero_complex::<R>());
+            for i in 0..4 {
+                if let Some(value) = view.get_global_mut(&[batch_count - 1], [i, 0]) {
+                    *value = Complex::new(R::zero(), R::from_f64(1e30).unwrap());
+                }
+            }
+        }
+        reset_endpoint_reduction_log();
+        let result = plan.inverse_in_place(&mut array, &mut in_place_workspace);
+        assert!(
+            matches!(result, Err(R2cError::InvalidSpectrum)),
+            "{result:?}"
+        );
+        chunk_protocol(batch_count);
+        assert_eq!(array.state(), crate::R2cState::Poisoned);
+    }
+
+    // The overlap route can validate an intermediate whose reduced axis is
+    // split across ranks. Build that layout directly so ranks without any
+    // endpoint and ranks with an empty local region still join every chunk.
+    fn distributed_reduced_axis<R: FftReal>(topology: &Arc<MpiTopology<1>>)
+    where
+        Complex<R>: Equivalence,
+    {
+        let chunk = ENDPOINT_BATCH_CHUNK;
+        let batch_count = chunk + 1;
+        let plan = chunk_plan::<R, 1>(topology, batch_count, 6);
+        let pencil = Pencil::<2, 1>::new(Arc::clone(topology), [4, 4], [1]).unwrap();
+        let mut array = ManyPencilArray::<Complex<R>, 2, 1>::from_elem(
+            vec![pencil],
+            0,
+            plan.core.extra_shape.clone(),
+            zero_complex::<R>(),
+        )
+        .unwrap();
+        reset_endpoint_reduction_log();
+        validate_boundary(&plan.core, &array, true, plan.raw_absolute_threshold).unwrap();
+        chunk_protocol(batch_count);
+
+        let (local_len, stride, local_axis_len, global_axis_start) = {
+            let view = array.active_view().unwrap();
+            let pencil = view.pencil();
+            let boundary = plan.core.real_stage_index.unwrap();
+            let reduction_axis = plan.core.stages[boundary].axis;
+            (
+                pencil.local_len(),
+                super::super::memory_stride(pencil, reduction_axis).unwrap(),
+                pencil.local_shape_logical()[reduction_axis],
+                pencil.local_ranges()[reduction_axis].start,
+            )
+        };
+        {
+            let mut view = array.active_view_mut().unwrap();
+            let data = view.as_mut_slice();
+            for batch in [0, batch_count - 1] {
+                let start = batch * local_len;
+                for offset in 0..local_len {
+                    let coord = (offset / stride) % local_axis_len;
+                    if global_axis_start + coord == 0 {
+                        data[start + offset] = Complex::new(R::zero(), R::from_f64(1e30).unwrap());
+                    }
+                }
+            }
+        }
+        reset_endpoint_reduction_log();
+        let result = validate_boundary(&plan.core, &array, true, plan.raw_absolute_threshold);
+        assert!(
+            matches!(result, Err(R2cError::InvalidSpectrum)),
+            "{result:?}"
+        );
+        chunk_protocol(batch_count);
+    }
+
+    // The overlap route validates outside the receive callback, so a
+    // preparation failure surfaces as an operation error on every rank: the
+    // injecting rank keeps its own error and its peers report the collective
+    // precondition.
+    fn overlap_preparation_failures<R: FftReal>(topology: &Arc<MpiTopology<1>>, rank: usize)
+    where
+        Complex<R>: Equivalence,
+    {
+        let chunk = ENDPOINT_BATCH_CHUNK;
+        let batch_count = chunk + 1;
+        let plan = R2cPlan::<R, 2, 1>::from_shape_with_layout(
+            Arc::clone(topology),
+            [4, 6],
+            ExtraShape::new(vec![batch_count]).unwrap(),
+            DistributedLayout {
+                transpose_method: TransposeMethod::PointToPoint,
+                permute_dims: false,
+            },
+        )
+        .unwrap();
+        let mut source = plan.allocate_output().unwrap();
+        source.as_mut_slice().fill(zero_complex::<R>());
+        let source_before = source.as_slice().to_vec();
+        let mut destination = plan.allocate_input().unwrap();
+        destination.as_mut_slice().fill(R::from_f64(7.0).unwrap());
+        let destination_before = destination.as_slice().to_vec();
+        for slot in 0..3 {
+            let mut workspace = plan.allocate_workspace().unwrap();
+            reset_endpoint_reduction_log();
+            if rank == 0 {
+                force_endpoint_allocation_failure(slot);
+            }
+            let error = plan
+                .inverse_with_overlap(&source, &mut destination, &mut workspace)
+                .unwrap_err();
+            match (rank, error) {
+                (
+                    0,
+                    FftOverlapError::Operation(R2cError::Fft(FftError::AllocationFailed {
+                        required,
+                    })),
+                ) => assert_eq!(required, chunk, "slot={slot}"),
+                (
+                    _,
+                    FftOverlapError::Operation(R2cError::Fft(
+                        FftError::CollectivePreconditionFailed,
+                    )),
+                ) => {}
+                (_, error) => {
+                    panic!("unexpected overlap allocation failure for slot {slot}: {error:?}")
+                }
+            }
+            let log = endpoint_reduction_log();
+            assert_no_statistics_reduction(&log);
+            assert_eq!(
+                log.iter()
+                    .filter(|event| matches!(event, EndpointReductionEvent::Allocation { .. }))
+                    .count(),
+                if rank == 0 { slot + 1 } else { 3 },
+                "slot={slot}: {log:?}"
+            );
+            assert_eq!(source.as_slice(), source_before);
+        }
+        // The last batch's DC plane rejects the whole overlap call and keeps
+        // the source and real destination.
+        let mut source = plan.allocate_output().unwrap();
+        source.as_mut_slice().fill(zero_complex::<R>());
+        for i in 0..4 {
+            if let Some(value) = source.get_global_mut(&[batch_count - 1], [i, 0]) {
+                *value = Complex::new(R::zero(), R::from_f64(1e30).unwrap());
+            }
+        }
+        let source_before = source.as_slice().to_vec();
+        for raw in [false, true] {
+            let mut workspace = plan.allocate_workspace().unwrap();
+            destination.as_mut_slice().fill(R::from_f64(7.0).unwrap());
+            reset_endpoint_reduction_log();
+            let error = if raw {
+                plan.backward_with_overlap(&source, &mut destination, &mut workspace)
+                    .unwrap_err()
+            } else {
+                plan.inverse_with_overlap(&source, &mut destination, &mut workspace)
+                    .unwrap_err()
+            };
+            assert!(
+                matches!(error, FftOverlapError::Operation(R2cError::InvalidSpectrum)),
+                "{error:?}"
+            );
+            chunk_protocol(batch_count);
+            assert_eq!(source.as_slice(), source_before);
+            assert_eq!(destination.as_slice(), destination_before);
+        }
+    }
+
+    #[test]
+    #[ignore = "MPI must be initialized in a separate test process"]
+    fn endpoint_reductions_are_chunked() {
+        let universe = mpi::initialize().unwrap();
+        let world = universe.world();
+        let size = world.size() as usize;
+        assert!(matches!(size, 1 | 4 | 6));
+        let rank = usize::try_from(world.rank()).unwrap();
+        let topology = pencil_array::MpiTopology::<1>::new(&world, [size]).unwrap();
+        chunked_statistics::<f64, 1>(&topology);
+        multi_contribution_probes::<f32, 1>(&topology);
+        multi_contribution_probes::<f64, 1>(&topology);
+        invalid_batches::<f64, 1>(&topology);
+        plane_and_batch_separation::<f64, 1>(&topology);
+        allocation_and_preparation_failures::<f64, 1>(&topology, rank);
+        public_routes::<f64>(&topology);
+        distributed_reduced_axis::<f64>(&topology);
+        overlap_preparation_failures::<f64>(&topology, rank);
     }
 }

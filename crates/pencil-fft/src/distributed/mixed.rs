@@ -45,10 +45,14 @@ use super::{
     OPERATION_MIXED_R2C_INVERSE_IN_PLACE, RouteCandidate, StagePreparation, TransformStage,
     TransformTiming, TransposeMethod, VALUE_KIND_C2C, VALUE_KIND_R2C,
     agree_execution_descriptor_ref, agree_header, agree_result, build_route, build_transitions,
-    collective_descriptor, collective_valid, initialized_vec, map_array_allocation, memory_stride,
+    collective_descriptor, collective_valid, endpoint_chunk_buffers, endpoint_chunk_count,
+    endpoint_chunk_len, initialized_vec, map_array_allocation, memory_stride,
     r2c::validate_recast_capacity, strided_line_count, validate_input,
     validate_workspace_lengths_values, zero_complex,
 };
+
+#[cfg(test)]
+use super::{EndpointReductionEvent, record_endpoint_reduction};
 
 use crate::r2r::AxisR2rKind;
 
@@ -5816,6 +5820,21 @@ where
     }
 }
 
+struct MixedEndpointStatistics<'a, R: FftReal> {
+    data: &'a [Complex<R>],
+    local_len: usize,
+    stride: usize,
+    line_count: usize,
+    line_block: usize,
+    plane_count: usize,
+    relative: f64,
+    absolute: f64,
+    invalid: bool,
+    local_stats: Vec<[f64; 4]>,
+    global_maxima: Vec<[f64; 4]>,
+    global_sums: Vec<[f64; 4]>,
+}
+
 fn validate_mixed_boundary_data<R: FftReal, const N: usize, const M: usize>(
     core: &MixedR2cCore<R, N, M>,
     input: Result<(&Pencil<N, M>, &[Complex<R>]), MixedError>,
@@ -5825,6 +5844,11 @@ where
     Complex<R>: Equivalence,
 {
     let communicator = core.stages[0].input.topology().communicator();
+    let batch_count = core.extra_shape.element_count();
+    let chunk_len = batch_count.min(super::ENDPOINT_BATCH_CHUNK);
+    // Index preparation, allocation, and ownership checks are agreed as one
+    // result before the first statistics reduction. Afterwards every rank runs
+    // the same chunks, so a local numeric failure must not return early.
     let preparation = (|| {
         let (pencil, data) = input?;
         let local_len = pencil.local_len();
@@ -5846,57 +5870,36 @@ where
         } else {
             1
         };
-        let batch_count = core.extra_shape.element_count();
-        let mut local_maxima = Vec::new();
-        local_maxima.try_reserve_exact(batch_count).map_err(|_| {
-            MixedError::Fft(FftError::AllocationFailed {
-                required: batch_count,
-            })
-        })?;
-        let mut invalid = !relative.is_finite() || !absolute.is_finite();
-        for batch in 0..batch_count {
-            let start = batch
-                .checked_mul(local_len)
-                .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-            let end = start
-                .checked_add(local_len)
-                .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-            let values = data
-                .get(start..end)
-                .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-            let mut local_max = [0.0f64; 4];
-            for outer in 0..line_count {
-                let base = outer
-                    .checked_mul(line_block)
-                    .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-                for inner in 0..stride {
-                    for plane in 0..plane_count {
-                        let k = if plane == 0 { 0 } else { core.complex_len - 1 };
-                        let index = base
-                            .checked_add(
-                                k.checked_mul(stride)
-                                    .ok_or(MixedError::Fft(FftError::PreparationFailed))?,
-                            )
-                            .and_then(|value| value.checked_add(inner))
-                            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-                        let value = values
-                            .get(index)
-                            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-                        let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
-                        let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
-                        if !re.is_finite() || !im.is_finite() {
-                            invalid = true;
-                            continue;
-                        }
-                        let slot = plane * 2;
-                        local_max[slot] = local_max[slot].max(re.abs().max(im.abs()));
-                        local_max[slot + 1] = local_max[slot + 1].max(im.abs());
-                    }
-                }
-            }
-            local_maxima.push(local_max);
+        let required_len = batch_count
+            .checked_mul(local_len)
+            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
+        if data.len() < required_len {
+            return Err(MixedError::Fft(FftError::PreparationFailed));
         }
-        Ok::<_, MixedError>((
+        if local_len != 0 {
+            let plane_offset = if plane_count == 2 {
+                core.complex_len
+                    .checked_sub(1)
+                    .and_then(|last| last.checked_mul(stride))
+            } else {
+                Some(0)
+            }
+            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
+            let last_inner = stride
+                .checked_sub(1)
+                .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
+            let last_index = line_count
+                .checked_sub(1)
+                .and_then(|last| last.checked_mul(line_block))
+                .and_then(|base| base.checked_add(plane_offset))
+                .and_then(|base| base.checked_add(last_inner))
+                .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
+            if last_index >= local_len {
+                return Err(MixedError::Fft(FftError::PreparationFailed));
+            }
+        }
+        let [local_stats, global_maxima, global_sums] = endpoint_chunk_buffers(chunk_len)?;
+        Ok(MixedEndpointStatistics {
             data,
             local_len,
             stride,
@@ -5905,11 +5908,15 @@ where
             plane_count,
             relative,
             absolute,
-            local_maxima,
-            invalid,
-        ))
+            invalid: !relative.is_finite() || !absolute.is_finite(),
+            local_stats,
+            global_maxima,
+            global_sums,
+        })
     })();
-    let (
+    #[cfg(test)]
+    record_endpoint_reduction(EndpointReductionEvent::PreparationAgreement);
+    let MixedEndpointStatistics {
         data,
         local_len,
         stride,
@@ -5918,72 +5925,135 @@ where
         plane_count,
         relative,
         absolute,
-        local_maxima,
         mut invalid,
-    ) = agree_result(communicator, preparation)?;
+        mut local_stats,
+        mut global_maxima,
+        mut global_sums,
+    } = agree_result(communicator, preparation)?;
 
-    for (batch, local_max) in local_maxima.into_iter().enumerate() {
-        let mut global_max = [0.0f64; 4];
-        communicator.all_reduce_into(&local_max, &mut global_max, SystemOperation::max());
-        let mut local_sum = [0.0f64; 4];
-        let start = batch
-            .checked_mul(local_len)
-            .expect("validated mixed boundary batch offset");
-        let end = start
-            .checked_add(local_len)
-            .expect("validated mixed boundary batch end");
-        let values = &data[start..end];
-        for outer in 0..line_count {
-            let base = outer
-                .checked_mul(line_block)
-                .expect("validated mixed boundary line offset");
-            for inner in 0..stride {
-                for plane in 0..plane_count {
-                    let k = if plane == 0 { 0 } else { core.complex_len - 1 };
-                    let index = base
-                        .checked_add(
-                            k.checked_mul(stride)
-                                .expect("validated mixed boundary plane offset"),
-                        )
-                        .and_then(|value| value.checked_add(inner))
-                        .expect("validated mixed boundary endpoint index");
-                    let value = values[index];
-                    let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
-                    let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
-                    if !re.is_finite() || !im.is_finite() {
-                        continue;
-                    }
-                    let slot = plane * 2;
-                    let scale = global_max[slot];
-                    if scale != 0.0 && scale.is_finite() {
-                        let re = re / scale;
-                        let im = im / scale;
-                        local_sum[slot] += re * re;
-                        local_sum[slot + 1] += im * im;
+    for chunk_index in 0..endpoint_chunk_count(batch_count) {
+        let chunk_start = chunk_index * super::ENDPOINT_BATCH_CHUNK;
+        let chunk = endpoint_chunk_len(batch_count, chunk_start);
+        let local = &mut local_stats[..chunk];
+        let maxima = &mut global_maxima[..chunk];
+        let sums = &mut global_sums[..chunk];
+
+        local.fill([0.0_f64; 4]);
+        for (batch_max, batch) in local.iter_mut().zip(chunk_start..chunk_start + chunk) {
+            let start = batch
+                .checked_mul(local_len)
+                .expect("validated mixed boundary batch offset");
+            let values = &data[start..start + local_len];
+            for outer in 0..line_count {
+                let base = outer
+                    .checked_mul(line_block)
+                    .expect("validated mixed boundary line offset");
+                for inner in 0..stride {
+                    for plane in 0..plane_count {
+                        let k = if plane == 0 { 0 } else { core.complex_len - 1 };
+                        let index = base
+                            .checked_add(
+                                k.checked_mul(stride)
+                                    .expect("validated mixed boundary plane offset"),
+                            )
+                            .and_then(|value| value.checked_add(inner))
+                            .expect("validated mixed boundary endpoint index");
+                        let value = values[index];
+                        let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
+                        let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
+                        if !re.is_finite() || !im.is_finite() {
+                            invalid = true;
+                            continue;
+                        }
+                        let slot = plane * 2;
+                        batch_max[slot] = batch_max[slot].max(re.abs().max(im.abs()));
+                        batch_max[slot + 1] = batch_max[slot + 1].max(im.abs());
                     }
                 }
             }
         }
-        let mut global_sum = [0.0f64; 4];
-        communicator.all_reduce_into(&local_sum, &mut global_sum, SystemOperation::sum());
-        if global_max[..plane_count * 2]
-            .iter()
-            .any(|value| !value.is_finite())
-            || global_sum[..plane_count * 2]
+        #[cfg(test)]
+        record_endpoint_reduction(EndpointReductionEvent::MaxReduction {
+            elements: 4 * chunk,
+        });
+        communicator.all_reduce_into(
+            local.as_flattened(),
+            maxima.as_flattened_mut(),
+            SystemOperation::max(),
+        );
+
+        local.fill([0.0_f64; 4]);
+        for (batch, (local_sum, global_max)) in local.iter_mut().zip(maxima.iter()).enumerate() {
+            let start = (chunk_start + batch)
+                .checked_mul(local_len)
+                .expect("validated mixed boundary batch offset");
+            let values = &data[start..start + local_len];
+            for outer in 0..line_count {
+                let base = outer
+                    .checked_mul(line_block)
+                    .expect("validated mixed boundary line offset");
+                for inner in 0..stride {
+                    for plane in 0..plane_count {
+                        let k = if plane == 0 { 0 } else { core.complex_len - 1 };
+                        let index = base
+                            .checked_add(
+                                k.checked_mul(stride)
+                                    .expect("validated mixed boundary plane offset"),
+                            )
+                            .and_then(|value| value.checked_add(inner))
+                            .expect("validated mixed boundary endpoint index");
+                        let value = values[index];
+                        let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
+                        let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
+                        if !re.is_finite() || !im.is_finite() {
+                            continue;
+                        }
+                        let slot = plane * 2;
+                        let scale = global_max[slot];
+                        if scale != 0.0 && scale.is_finite() {
+                            let re = re / scale;
+                            let im = im / scale;
+                            local_sum[slot] += re * re;
+                            local_sum[slot + 1] += im * im;
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(test)]
+        record_endpoint_reduction(EndpointReductionEvent::SumReduction {
+            elements: 4 * chunk,
+        });
+        communicator.all_reduce_into(
+            local.as_flattened(),
+            sums.as_flattened_mut(),
+            SystemOperation::sum(),
+        );
+
+        for batch in 0..chunk {
+            let global_max = maxima[batch];
+            let global_sum = sums[batch];
+            if global_max[..plane_count * 2]
                 .iter()
                 .any(|value| !value.is_finite())
-        {
-            invalid = true;
-        }
-        for plane in 0..plane_count {
-            let slot = plane * 2;
-            let absolute_ok = global_max[slot + 1] <= absolute;
-            let relative_ok = global_sum[slot + 1].sqrt() <= relative * global_sum[slot].sqrt();
-            if !(absolute_ok || relative_ok) {
+                || global_sum[..plane_count * 2]
+                    .iter()
+                    .any(|value| !value.is_finite())
+            {
                 invalid = true;
+            }
+            for plane in 0..plane_count {
+                let slot = plane * 2;
+                let absolute_ok = global_max[slot + 1] <= absolute;
+                let relative_ok = global_sum[slot + 1].sqrt() <= relative * global_sum[slot].sqrt();
+                if !(absolute_ok || relative_ok) {
+                    invalid = true;
+                }
             }
         }
     }
+    #[cfg(test)]
+    record_endpoint_reduction(EndpointReductionEvent::FinalAgreement);
     if !collective_valid(communicator, !invalid) {
         return Err(MixedError::InvalidSpectrum);
     }
@@ -7371,8 +7441,8 @@ mod reverse_overlap_tests {
         super::super::consume_c2c_callback_injection().map_err(MixedError::Fft)
     }
 
-    fn endpoint_threshold_probes<R: FftReal, const N: usize>(
-        plan: &MixedR2cPlan<R, N, 2>,
+    fn endpoint_threshold_probes<R: FftReal, const N: usize, const M: usize>(
+        plan: &MixedR2cPlan<R, N, M>,
         extra_indices: &[usize],
         normalize: bool,
         depth: f64,
@@ -7403,14 +7473,7 @@ mod reverse_overlap_tests {
             let mut position = [0; N];
             position[stage.axis] = if plane == 0 { 0 } else { core.complex_len - 1 };
             for (re, threshold) in [(1.0, relative), (0.0, absolute)] {
-                let neighbors = if size_of::<R>() == size_of::<f32>() {
-                    let bits = (threshold as f32).to_bits();
-                    [bits - 1, bits, bits + 1].map(|bits| f32::from_bits(bits) as f64)
-                } else {
-                    let bits = threshold.to_bits();
-                    [bits - 1, bits, bits + 1].map(f64::from_bits)
-                };
-                assert_eq!(neighbors[1], threshold, "fixture threshold must be exact");
+                let neighbors = endpoint_ulp_neighbors::<R>(threshold);
                 for (im, accepted) in neighbors.into_iter().zip([true, true, false]) {
                     // One globally nonzero entry avoids norm-summation roundoff.
                     data.as_mut_slice().fill(zero_complex::<R>());
@@ -8087,5 +8150,740 @@ mod reverse_overlap_tests {
                 }
             }
         }
+    }
+
+    use super::super::{
+        ENDPOINT_BATCH_CHUNK, EndpointReductionEvent, endpoint_reduction_log,
+        endpoint_ulp_neighbors, force_endpoint_allocation_failure, reset_endpoint_reduction_log,
+    };
+
+    fn chunk_plan<R: FftReal>(
+        topology: &Arc<MpiTopology<1>>,
+        batch_count: usize,
+        real_len: usize,
+        layout: DistributedLayout,
+    ) -> MixedR2cPlan<R, 2, 1>
+    where
+        Complex<R>: Equivalence,
+    {
+        MixedR2cPlan::from_shape_with_layout(
+            Arc::clone(topology),
+            [4, real_len],
+            ExtraShape::new(vec![batch_count]).unwrap(),
+            [AxisTransform::Fft, AxisTransform::Rfft],
+            layout,
+        )
+        .unwrap()
+    }
+
+    fn boundary_array<R: FftReal>(plan: &MixedR2cPlan<R, 2, 1>) -> PencilArray<Complex<R>, 2, 1>
+    where
+        Complex<R>: Equivalence,
+    {
+        PencilArray::from_elem(
+            Arc::clone(&plan.core.stages[plan.core.real_stage_index].output),
+            plan.core.extra_shape.clone(),
+            zero_complex::<R>(),
+        )
+        .unwrap()
+    }
+
+    // Only successful validation: three allocations of the bounded length, one
+    // preparation agreement, then one MAX and one SUM per chunk, then one final
+    // agreement.
+    fn chunk_protocol(batch_count: usize) {
+        let chunk = batch_count.min(ENDPOINT_BATCH_CHUNK);
+        let log = endpoint_reduction_log();
+        let mut allocations = Vec::new();
+        let mut maxima = Vec::new();
+        let mut sums = Vec::new();
+        let mut preparations = 0;
+        let mut finals = 0;
+        for event in &log {
+            match *event {
+                EndpointReductionEvent::Allocation { slot, length } => {
+                    assert_eq!(slot, allocations.len(), "batch_count={batch_count}");
+                    assert_eq!(length, chunk, "batch_count={batch_count}");
+                    allocations.push(length);
+                }
+                EndpointReductionEvent::PreparationAgreement => preparations += 1,
+                EndpointReductionEvent::MaxReduction { elements } => maxima.push(elements),
+                EndpointReductionEvent::SumReduction { elements } => sums.push(elements),
+                EndpointReductionEvent::FinalAgreement => finals += 1,
+            }
+        }
+        assert_eq!(allocations.len(), 3, "batch_count={batch_count}");
+        assert_eq!(log[3], EndpointReductionEvent::PreparationAgreement);
+        assert_eq!(preparations, 1, "batch_count={batch_count}");
+        assert_eq!(finals, 1, "batch_count={batch_count}");
+        assert_eq!(
+            log.last(),
+            Some(&EndpointReductionEvent::FinalAgreement),
+            "batch_count={batch_count}"
+        );
+        let expected: Vec<usize> = (0..endpoint_chunk_count(batch_count))
+            .map(|index| 4 * endpoint_chunk_len(batch_count, index * ENDPOINT_BATCH_CHUNK))
+            .collect();
+        assert_eq!(maxima, expected, "MAX chunks for batch_count={batch_count}");
+        assert_eq!(sums, expected, "SUM chunks for batch_count={batch_count}");
+    }
+
+    fn assert_no_statistics_reduction(log: &[EndpointReductionEvent]) {
+        assert!(
+            log.iter().all(|event| !matches!(
+                event,
+                EndpointReductionEvent::MaxReduction { .. }
+                    | EndpointReductionEvent::SumReduction { .. }
+                    | EndpointReductionEvent::FinalAgreement
+            )),
+            "statistics reductions ran after a preparation failure: {log:?}"
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|event| matches!(event, EndpointReductionEvent::PreparationAgreement))
+                .count(),
+            1,
+            "{log:?}"
+        );
+    }
+
+    fn chunked_statistics<R: FftReal>(topology: &Arc<MpiTopology<1>>)
+    where
+        Complex<R>: Equivalence,
+    {
+        let chunk = ENDPOINT_BATCH_CHUNK;
+        for real_len in [6, 7, 1] {
+            for batch_count in [0, 1, chunk - 1, chunk, chunk + 1, 2 * chunk + 1] {
+                let plan = chunk_plan::<R>(
+                    topology,
+                    batch_count,
+                    real_len,
+                    DistributedLayout::default(),
+                );
+                let pencil = &plan.core.stages[plan.core.real_stage_index].output;
+                let data = boundary_array(&plan);
+                reset_endpoint_reduction_log();
+                validate_mixed_boundary_data(&plan.core, Ok((pencil, data.as_slice())), true)
+                    .unwrap();
+                chunk_protocol(batch_count);
+            }
+        }
+        // A permuted boundary layout keeps the same bounded protocol.
+        let batch_count = chunk + 1;
+        let plan = chunk_plan::<R>(
+            topology,
+            batch_count,
+            6,
+            DistributedLayout {
+                permute_dims: true,
+                ..DistributedLayout::default()
+            },
+        );
+        let pencil = &plan.core.stages[plan.core.real_stage_index].output;
+        let data = boundary_array(&plan);
+        reset_endpoint_reduction_log();
+        validate_mixed_boundary_data(&plan.core, Ok((pencil, data.as_slice())), true).unwrap();
+        chunk_protocol(batch_count);
+    }
+
+    // Existing ULP probes, placed in the first, middle, and last chunk. Values
+    // are exactly representable per batch, so MPI's reduction order cannot
+    // change the decision.
+    fn threshold_fixtures<R: FftReal>(topology: &Arc<MpiTopology<1>>)
+    where
+        Complex<R>: Equivalence,
+    {
+        let chunk = ENDPOINT_BATCH_CHUNK;
+        let batch_count = 2 * chunk + 1;
+        let plan = chunk_plan::<R>(topology, batch_count, 6, DistributedLayout::default());
+        let (depth, factor) = mixed_endpoint_policy(&plan.core).unwrap();
+        for batch in [0, chunk - 1, chunk, chunk + 1, 2 * chunk] {
+            for normalize in [true, false] {
+                endpoint_threshold_probes(&plan, &[batch], normalize, depth, factor);
+            }
+        }
+    }
+
+    // Four exactly representable unit real parts make the fused SUM exactly 4,
+    // so the relative threshold is 2*relative. Replacing the SUM with a MAX
+    // would see 1 and reject the accepted neighbor, so this fixture pins the
+    // fused sum across batches and ranks.
+    fn multi_contribution_probes<R: FftReal>(topology: &Arc<MpiTopology<1>>)
+    where
+        Complex<R>: Equivalence,
+    {
+        let plan = MixedR2cPlan::<R, 2, 1>::from_shape(
+            Arc::clone(topology),
+            [4, 2],
+            ExtraShape::scalar(),
+            [AxisTransform::None, AxisTransform::Rfft],
+        )
+        .unwrap();
+        let (depth, factor) = mixed_endpoint_policy(&plan.core).unwrap();
+        assert_eq!((depth, factor), (1.0, 1.0));
+        let pencil = &plan.core.stages[plan.core.real_stage_index].output;
+        let relative = 128.0 * <R as crate::private::Sealed>::pencil_fft_epsilon_f64() * depth;
+        let inverse_absolute =
+            128.0 * <R as crate::private::Sealed>::pencil_fft_min_subnormal_f64() * depth;
+        assert_eq!(plan.core.raw_absolute_threshold, inverse_absolute * factor);
+        let one = R::from_f64(1.0).unwrap();
+        let mut data = PencilArray::from_elem(
+            Arc::clone(pencil),
+            plan.core.extra_shape.clone(),
+            zero_complex::<R>(),
+        )
+        .unwrap();
+        let plane_count = if plan.core.real_len.is_multiple_of(2) {
+            2
+        } else {
+            1
+        };
+        for normalize in [true, false] {
+            let absolute = if normalize {
+                inverse_absolute
+            } else {
+                plan.core.raw_absolute_threshold
+            };
+            for plane in 0..plane_count {
+                let k = if plane == 0 {
+                    0
+                } else {
+                    plan.core.complex_len - 1
+                };
+                for (im, accepted) in endpoint_ulp_neighbors::<R>(2.0 * relative)
+                    .into_iter()
+                    .zip([true, true, false])
+                {
+                    data.as_mut_slice().fill(zero_complex::<R>());
+                    for row in 0..4 {
+                        if let Some(value) = data.get_global_mut(&[], [row, k]) {
+                            *value = Complex::new(one, R::zero());
+                        }
+                    }
+                    if let Some(value) = data.get_global_mut(&[], [0, k]) {
+                        *value = Complex::new(one, R::from_f64(im).unwrap());
+                    }
+                    let result = validate_mixed_boundary_data(
+                        &plan.core,
+                        Ok((pencil, data.as_slice())),
+                        normalize,
+                    );
+                    assert_eq!(
+                        result.is_ok(),
+                        accepted,
+                        "plane={plane} normalize={normalize} im={im}: {result:?}"
+                    );
+                    if !accepted {
+                        assert!(matches!(result, Err(MixedError::InvalidSpectrum)));
+                    }
+                }
+                // The absolute test sees a single imaginary endpoint.
+                for (im, accepted) in endpoint_ulp_neighbors::<R>(absolute)
+                    .into_iter()
+                    .zip([true, true, false])
+                {
+                    data.as_mut_slice().fill(zero_complex::<R>());
+                    if let Some(value) = data.get_global_mut(&[], [0, k]) {
+                        *value = Complex::new(R::zero(), R::from_f64(im).unwrap());
+                    }
+                    let result = validate_mixed_boundary_data(
+                        &plan.core,
+                        Ok((pencil, data.as_slice())),
+                        normalize,
+                    );
+                    assert_eq!(
+                        result.is_ok(),
+                        accepted,
+                        "absolute plane={plane} normalize={normalize} im={im}: {result:?}"
+                    );
+                    if !accepted {
+                        assert!(matches!(result, Err(MixedError::InvalidSpectrum)));
+                    }
+                }
+            }
+        }
+    }
+
+    fn invalid_batches<R: FftReal>(topology: &Arc<MpiTopology<1>>)
+    where
+        Complex<R>: Equivalence,
+    {
+        let chunk = ENDPOINT_BATCH_CHUNK;
+        let batch_count = 2 * chunk + 1;
+        let plan = chunk_plan::<R>(topology, batch_count, 6, DistributedLayout::default());
+        let pencil = &plan.core.stages[plan.core.real_stage_index].output;
+        let complex_len = plan.core.complex_len;
+        for (batch, plane, re, im) in [
+            (0, 0, 0.0, 1e30),
+            (2 * chunk, 0, 0.0, 1e30),
+            (chunk, complex_len - 1, 0.0, 1e30),
+            (2 * chunk, 0, f64::NAN, 0.0),
+            (0, complex_len - 1, 0.0, f64::INFINITY),
+        ] {
+            let mut data = boundary_array(&plan);
+            for i in 0..4 {
+                if let Some(value) = data.get_global_mut(&[batch], [i, plane]) {
+                    *value = Complex::new(R::from_f64(re).unwrap(), R::from_f64(im).unwrap());
+                }
+            }
+            reset_endpoint_reduction_log();
+            let result =
+                validate_mixed_boundary_data(&plan.core, Ok((pencil, data.as_slice())), true);
+            assert!(
+                matches!(result, Err(MixedError::InvalidSpectrum)),
+                "batch={batch} plane={plane} re={re} im={im}: {result:?}"
+            );
+            // The first or last invalid chunk does not stop later chunks.
+            chunk_protocol(batch_count);
+        }
+    }
+
+    fn plane_and_batch_separation<R: FftReal>(topology: &Arc<MpiTopology<1>>)
+    where
+        Complex<R>: Equivalence,
+    {
+        let chunk = ENDPOINT_BATCH_CHUNK;
+        let batch_count = chunk + 1;
+        let plan = chunk_plan::<R>(topology, batch_count, 6, DistributedLayout::default());
+        let pencil = &plan.core.stages[plan.core.real_stage_index].output;
+        let complex_len = plan.core.complex_len;
+        let huge = R::from_f64(1e20).unwrap();
+        let small = R::from_f64(1.0).unwrap();
+        for (batch, plane) in [
+            (0, 0),
+            (0, complex_len - 1),
+            (chunk, 0),
+            (chunk, complex_len - 1),
+        ] {
+            // Large clean real parts elsewhere must not hide this plane.
+            let mut data = boundary_array(&plan);
+            data.as_mut_slice().fill(Complex::new(huge, R::zero()));
+            for i in 0..4 {
+                if let Some(value) = data.get_global_mut(&[batch], [i, plane]) {
+                    *value = Complex::new(R::zero(), small);
+                }
+            }
+            reset_endpoint_reduction_log();
+            let result =
+                validate_mixed_boundary_data(&plan.core, Ok((pencil, data.as_slice())), true);
+            assert!(
+                matches!(result, Err(MixedError::InvalidSpectrum)),
+                "batch={batch} plane={plane}: {result:?}"
+            );
+            chunk_protocol(batch_count);
+        }
+        // A uniformly large but real plane is accepted: the relative test is
+        // scale invariant, and the absolute test uses its imaginary part.
+        let mut data = boundary_array(&plan);
+        data.as_mut_slice().fill(Complex::new(huge, R::zero()));
+        validate_mixed_boundary_data(&plan.core, Ok((pencil, data.as_slice())), true).unwrap();
+        // Signed zero is accepted.
+        let mut data = boundary_array(&plan);
+        data.as_mut_slice().fill(Complex::new(
+            R::from_f64(-0.0).unwrap(),
+            R::from_f64(-0.0).unwrap(),
+        ));
+        validate_mixed_boundary_data(&plan.core, Ok((pencil, data.as_slice())), true).unwrap();
+        // Non-endpoint bins stay unconstrained.
+        let mut data = boundary_array(&plan);
+        for i in 0..4 {
+            if let Some(value) = data.get_global_mut(&[chunk], [i, 1]) {
+                *value = Complex::new(R::zero(), huge);
+            }
+        }
+        validate_mixed_boundary_data(&plan.core, Ok((pencil, data.as_slice())), true).unwrap();
+        // Odd and length-one real axes constrain DC only.
+        for real_len in [7, 1] {
+            let plan = chunk_plan::<R>(
+                topology,
+                batch_count,
+                real_len,
+                DistributedLayout::default(),
+            );
+            let pencil = &plan.core.stages[plan.core.real_stage_index].output;
+            let complex_len = plan.core.complex_len;
+            if real_len % 2 == 1 && complex_len > 1 {
+                let mut data = boundary_array(&plan);
+                for i in 0..4 {
+                    if let Some(value) =
+                        data.get_global_mut(&[batch_count - 1], [i, complex_len - 1])
+                    {
+                        *value = Complex::new(R::zero(), huge);
+                    }
+                }
+                validate_mixed_boundary_data(&plan.core, Ok((pencil, data.as_slice())), true)
+                    .unwrap();
+            }
+            let mut data = boundary_array(&plan);
+            for i in 0..4 {
+                if let Some(value) = data.get_global_mut(&[batch_count - 1], [i, 0]) {
+                    *value = Complex::new(R::zero(), huge);
+                }
+            }
+            let result =
+                validate_mixed_boundary_data(&plan.core, Ok((pencil, data.as_slice())), true);
+            assert!(
+                matches!(result, Err(MixedError::InvalidSpectrum)),
+                "real_len={real_len}: {result:?}"
+            );
+        }
+    }
+
+    fn allocation_and_preparation_failures<R: FftReal>(
+        topology: &Arc<MpiTopology<1>>,
+        rank: usize,
+        size: usize,
+    ) where
+        Complex<R>: Equivalence,
+    {
+        let chunk = ENDPOINT_BATCH_CHUNK;
+        let batch_count = chunk + 1;
+        let plan = chunk_plan::<R>(topology, batch_count, 6, DistributedLayout::default());
+        let pencil = &plan.core.stages[plan.core.real_stage_index].output;
+        let data = boundary_array(&plan);
+        for slot in 0..3 {
+            reset_endpoint_reduction_log();
+            if rank == 0 {
+                force_endpoint_allocation_failure(slot);
+            }
+            let result =
+                validate_mixed_boundary_data(&plan.core, Ok((pencil, data.as_slice())), true);
+            match (rank, result) {
+                (0, Err(MixedError::Fft(FftError::AllocationFailed { required }))) => {
+                    assert_eq!(required, chunk, "slot={slot}")
+                }
+                (_, Err(MixedError::Fft(FftError::CollectivePreconditionFailed))) => {}
+                (_, other) => {
+                    panic!("unexpected allocation failure result for slot {slot}: {other:?}")
+                }
+            }
+            let log = endpoint_reduction_log();
+            assert_no_statistics_reduction(&log);
+            // The injecting rank stops at its failing slot; every other rank
+            // allocated all three buffers before the preparation agreement.
+            let allocated = log
+                .iter()
+                .filter(|event| matches!(event, EndpointReductionEvent::Allocation { .. }))
+                .count();
+            assert_eq!(
+                allocated,
+                if rank == 0 { slot + 1 } else { 3 },
+                "slot={slot}: {log:?}"
+            );
+        }
+        // A rank-local input error is agreed before allocation and reduction.
+        reset_endpoint_reduction_log();
+        let result = if rank == 0 {
+            validate_mixed_boundary_data(
+                &plan.core,
+                Err(MixedError::Fft(FftError::PreparationFailed)),
+                true,
+            )
+        } else {
+            validate_mixed_boundary_data(&plan.core, Ok((pencil, data.as_slice())), true)
+        };
+        match (rank, result) {
+            (0, Err(MixedError::Fft(FftError::PreparationFailed))) => {}
+            (_, Err(MixedError::Fft(FftError::CollectivePreconditionFailed))) => {}
+            (_, other) => panic!("unexpected input failure result: {other:?}"),
+        }
+        let log = endpoint_reduction_log();
+        assert_no_statistics_reduction(&log);
+        assert_eq!(
+            log.iter()
+                .filter(|event| matches!(event, EndpointReductionEvent::Allocation { .. }))
+                .count(),
+            if rank == 0 { 0 } else { 3 },
+            "{log:?}"
+        );
+        // A short input buffer is a preparation failure on one rank. The last
+        // rank owns the tail of the leading axis for every tested rank count,
+        // so it always has a nonempty local buffer to shorten.
+        let shortener = size - 1;
+        assert!(!data.as_slice().is_empty() || rank != shortener);
+        reset_endpoint_reduction_log();
+        let result = if rank == shortener {
+            validate_mixed_boundary_data(
+                &plan.core,
+                Ok((pencil, &data.as_slice()[..data.as_slice().len() - 1])),
+                true,
+            )
+        } else {
+            validate_mixed_boundary_data(&plan.core, Ok((pencil, data.as_slice())), true)
+        };
+        match (rank, result) {
+            (_, Err(MixedError::Fft(FftError::PreparationFailed))) if rank == shortener => {}
+            (_, Err(MixedError::Fft(FftError::CollectivePreconditionFailed))) => {}
+            (_, other) => panic!("unexpected short input result: {other:?}"),
+        }
+        let log = endpoint_reduction_log();
+        assert_no_statistics_reduction(&log);
+        assert_eq!(
+            log.iter()
+                .filter(|event| matches!(event, EndpointReductionEvent::Allocation { .. }))
+                .count(),
+            if rank == shortener { 0 } else { 3 },
+            "{log:?}"
+        );
+    }
+
+    fn public_routes<R: FftReal>(topology: &Arc<MpiTopology<1>>)
+    where
+        Complex<R>: Equivalence,
+    {
+        let chunk = ENDPOINT_BATCH_CHUNK;
+        let batch_count = chunk + 1;
+        let plan = chunk_plan::<R>(topology, batch_count, 6, DistributedLayout::default());
+        let mut source = plan.allocate_output().unwrap();
+        source.as_mut_slice().fill(zero_complex::<R>());
+        let mut destination = plan.allocate_input().unwrap();
+        let mut workspace = plan.allocate_workspace().unwrap();
+        for raw in [false, true] {
+            reset_endpoint_reduction_log();
+            destination.as_mut_slice().fill(R::from_f64(7.0).unwrap());
+            if raw {
+                plan.backward(&source, &mut destination, &mut workspace)
+                    .unwrap();
+            } else {
+                plan.inverse(&source, &mut destination, &mut workspace)
+                    .unwrap();
+            }
+            chunk_protocol(batch_count);
+        }
+        reset_endpoint_reduction_log();
+        plan.inverse_with_timing(&source, &mut destination, &mut workspace)
+            .unwrap();
+        chunk_protocol(batch_count);
+        reset_endpoint_reduction_log();
+        plan.backward_with_timing(&source, &mut destination, &mut workspace)
+            .unwrap();
+        chunk_protocol(batch_count);
+
+        let mut array = plan.allocate_in_place().unwrap();
+        let mut in_place_workspace = plan.allocate_in_place_workspace().unwrap();
+        for raw in [false, true] {
+            plan.forward_in_place(&mut array, &mut in_place_workspace)
+                .unwrap();
+            array
+                .complex_view_mut()
+                .unwrap()
+                .as_mut_slice()
+                .fill(zero_complex::<R>());
+            reset_endpoint_reduction_log();
+            if raw {
+                plan.backward_in_place(&mut array, &mut in_place_workspace)
+                    .unwrap();
+            } else {
+                plan.inverse_in_place(&mut array, &mut in_place_workspace)
+                    .unwrap();
+            }
+            chunk_protocol(batch_count);
+        }
+
+        // The overlap route validates inside its boundary callback.
+        let overlap_plan = chunk_plan::<R>(
+            topology,
+            batch_count,
+            6,
+            DistributedLayout {
+                transpose_method: TransposeMethod::PointToPoint,
+                permute_dims: false,
+            },
+        );
+        let mut overlap_source = overlap_plan.allocate_output().unwrap();
+        overlap_source.as_mut_slice().fill(zero_complex::<R>());
+        let mut overlap_destination = overlap_plan.allocate_input().unwrap();
+        let mut overlap_workspace = overlap_plan.allocate_workspace().unwrap();
+        reset_endpoint_reduction_log();
+        overlap_plan
+            .inverse_with_overlap(
+                &overlap_source,
+                &mut overlap_destination,
+                &mut overlap_workspace,
+            )
+            .unwrap();
+        chunk_protocol(batch_count);
+        reset_endpoint_reduction_log();
+        overlap_plan
+            .backward_with_overlap(
+                &overlap_source,
+                &mut overlap_destination,
+                &mut overlap_workspace,
+            )
+            .unwrap();
+        chunk_protocol(batch_count);
+
+        // The last batch's DC plane rejects the whole call and preserves the
+        // source and real destination.
+        let mut source = plan.allocate_output().unwrap();
+        source.as_mut_slice().fill(zero_complex::<R>());
+        for i in 0..4 {
+            if let Some(value) = source.get_global_mut(&[batch_count - 1], [i, 0]) {
+                *value = Complex::new(R::zero(), R::from_f64(1e30).unwrap());
+            }
+        }
+        let source_before = source.as_slice().to_vec();
+        destination.as_mut_slice().fill(R::from_f64(7.0).unwrap());
+        let destination_before = destination.as_slice().to_vec();
+        reset_endpoint_reduction_log();
+        let result = plan.inverse(&source, &mut destination, &mut workspace);
+        assert!(
+            matches!(result, Err(MixedError::InvalidSpectrum)),
+            "{result:?}"
+        );
+        chunk_protocol(batch_count);
+        assert_eq!(source.as_slice(), source_before);
+        assert_eq!(destination.as_slice(), destination_before);
+
+        // In-place reverse poisons the array after the same collective check.
+        let mut array = plan.allocate_in_place().unwrap();
+        let mut in_place_workspace = plan.allocate_in_place_workspace().unwrap();
+        plan.forward_in_place(&mut array, &mut in_place_workspace)
+            .unwrap();
+        {
+            let mut view = array.complex_view_mut().unwrap();
+            view.as_mut_slice().fill(zero_complex::<R>());
+            for i in 0..4 {
+                if let Some(value) = view.get_global_mut(&[batch_count - 1], [i, 0]) {
+                    *value = Complex::new(R::zero(), R::from_f64(1e30).unwrap());
+                }
+            }
+        }
+        reset_endpoint_reduction_log();
+        let result = plan.inverse_in_place(&mut array, &mut in_place_workspace);
+        assert!(
+            matches!(result, Err(MixedError::InvalidSpectrum)),
+            "{result:?}"
+        );
+        chunk_protocol(batch_count);
+        assert_eq!(array.state(), crate::R2cState::Poisoned);
+    }
+
+    // A preparation agreement inside a P2P boundary callback fails every rank
+    // as a callback error: the injecting rank keeps its own error and its peers
+    // report the collective precondition. The boundary array stays poisoned.
+    fn overlap_preparation_failures<R: FftReal>(topology: &Arc<MpiTopology<1>>, rank: usize)
+    where
+        Complex<R>: Equivalence,
+    {
+        let chunk = ENDPOINT_BATCH_CHUNK;
+        let batch_count = chunk + 1;
+        let plan = chunk_plan::<R>(
+            topology,
+            batch_count,
+            6,
+            DistributedLayout {
+                transpose_method: TransposeMethod::PointToPoint,
+                permute_dims: false,
+            },
+        );
+        assert!(matches!(
+            plan.core.transitions[plan.core.real_stage_index].backward,
+            super::super::C2cTransition::PointToPoint(_)
+        ));
+        let mut source = plan.allocate_output().unwrap();
+        source.as_mut_slice().fill(zero_complex::<R>());
+        let source_before = source.as_slice().to_vec();
+        let mut destination = plan.allocate_input().unwrap();
+        destination.as_mut_slice().fill(R::from_f64(7.0).unwrap());
+        let destination_before = destination.as_slice().to_vec();
+        for slot in 0..3 {
+            let mut workspace = plan.allocate_workspace().unwrap();
+            reset_endpoint_reduction_log();
+            if rank == 0 {
+                force_endpoint_allocation_failure(slot);
+            }
+            let error = plan
+                .inverse_with_overlap(&source, &mut destination, &mut workspace)
+                .unwrap_err();
+            match (rank, error) {
+                (
+                    0,
+                    FftOverlapError::Overlap(OverlapError::Callback(MixedError::Fft(
+                        FftError::AllocationFailed { required },
+                    ))),
+                ) => assert_eq!(required, chunk, "slot={slot}"),
+                (
+                    _,
+                    FftOverlapError::Overlap(OverlapError::Callback(MixedError::Fft(
+                        FftError::CollectivePreconditionFailed,
+                    ))),
+                ) => {}
+                (_, error) => {
+                    panic!("unexpected overlap allocation failure for slot {slot}: {error:?}")
+                }
+            }
+            let log = endpoint_reduction_log();
+            assert_no_statistics_reduction(&log);
+            assert_eq!(
+                log.iter()
+                    .filter(|event| matches!(event, EndpointReductionEvent::Allocation { .. }))
+                    .count(),
+                if rank == 0 { slot + 1 } else { 3 },
+                "slot={slot}: {log:?}"
+            );
+            assert!(matches!(
+                workspace.intermediate.active_view(),
+                Err(ArrayError::Poisoned)
+            ));
+            assert_eq!(source.as_slice(), source_before);
+        }
+        // The last batch's DC plane rejects the whole overlap call and keeps
+        // the source and real destination.
+        let mut source = plan.allocate_output().unwrap();
+        source.as_mut_slice().fill(zero_complex::<R>());
+        for i in 0..4 {
+            if let Some(value) = source.get_global_mut(&[batch_count - 1], [i, 0]) {
+                *value = Complex::new(R::zero(), R::from_f64(1e30).unwrap());
+            }
+        }
+        let source_before = source.as_slice().to_vec();
+        for raw in [false, true] {
+            let mut workspace = plan.allocate_workspace().unwrap();
+            destination.as_mut_slice().fill(R::from_f64(7.0).unwrap());
+            reset_endpoint_reduction_log();
+            let error = if raw {
+                plan.backward_with_overlap(&source, &mut destination, &mut workspace)
+                    .unwrap_err()
+            } else {
+                plan.inverse_with_overlap(&source, &mut destination, &mut workspace)
+                    .unwrap_err()
+            };
+            assert!(
+                matches!(
+                    error,
+                    FftOverlapError::Overlap(OverlapError::Callback(MixedError::InvalidSpectrum))
+                ),
+                "{error:?}"
+            );
+            chunk_protocol(batch_count);
+            assert!(matches!(
+                workspace.intermediate.active_view(),
+                Err(ArrayError::Poisoned)
+            ));
+            assert_eq!(source.as_slice(), source_before);
+            assert_eq!(destination.as_slice(), destination_before);
+        }
+    }
+
+    #[test]
+    #[ignore = "MPI must be initialized in a separate test process"]
+    fn endpoint_reductions_are_chunked() {
+        let universe = mpi::initialize().unwrap();
+        let world = universe.world();
+        let size = world.size() as usize;
+        assert!(matches!(size, 1 | 4 | 6));
+        let rank = usize::try_from(world.rank()).unwrap();
+        let topology = pencil_array::MpiTopology::<1>::new(&world, [size]).unwrap();
+        chunked_statistics::<f64>(&topology);
+        threshold_fixtures::<f32>(&topology);
+        threshold_fixtures::<f64>(&topology);
+        multi_contribution_probes::<f32>(&topology);
+        multi_contribution_probes::<f64>(&topology);
+        invalid_batches::<f64>(&topology);
+        plane_and_batch_separation::<f64>(&topology);
+        allocation_and_preparation_failures::<f64>(&topology, rank, size);
+        public_routes::<f64>(&topology);
+        overlap_preparation_failures::<f64>(&topology, rank);
     }
 }

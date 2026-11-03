@@ -412,7 +412,7 @@ jobs:
               cargo test -p pencil-fft --features distributed,fftw --lib --locked \
                 distributed::fftw_tests::fftw_descriptor_and_factory_preflight_all_six -- \
                 --exact --ignored --nocapture --test-threads=1
-            for contract in distributed::tests::r2c_overlap_callback_error_and_panic_map_per_rank distributed::mixed::reverse_overlap_tests::reverse_local_routes_run_callbacks_and_independent_spectrum; do
+            for contract in distributed::tests::r2c_overlap_callback_error_and_panic_map_per_rank distributed::mixed::reverse_overlap_tests::reverse_local_routes_run_callbacks_and_independent_spectrum distributed::mixed::reverse_overlap_tests::endpoint_reductions_are_chunked distributed::r2c::endpoint_reduction_tests::endpoint_reductions_are_chunked; do
               run_one timeout --kill-after=5s 240s \
                 mpiexec --oversubscribe -n "$n" \
                 cargo test -p pencil-fft --features distributed --lib --locked "$contract" -- \
