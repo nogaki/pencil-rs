@@ -2037,6 +2037,7 @@ fn validate_read_metadata<T: IoElement, const N: usize, const M: usize>(
             .copied()
             .eq(view.extra_shape().dimensions().iter().map(|&v| v as u64))
         && valid_extents(&writer_grid)
+        && writer_grid.len() <= N
         && is_permutation(&writer_perm, N);
     if let Err(agreement) = agree_phase(comm, metadata_ok, "HDF5 shape metadata validation") {
         return Err(if metadata_ok {
@@ -2699,6 +2700,7 @@ pub(crate) fn inspect_catalog(
                 let grid_product = grid.iter().try_fold(1u64, |p, &x| p.checked_mul(x));
                 let shape_ok = !global.is_empty()
                     && !grid.is_empty()
+                    && grid.len() <= n
                     && global.len() + extra.len() <= MAX_PROTOCOL_RANK
                     && bytes_product.is_some()
                     && grid.iter().all(|&x| x > 0)

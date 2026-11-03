@@ -98,7 +98,8 @@ impl ScalarType {
 /// The shape vectors are strict metadata: readers do not infer or alter them.
 /// Provenance contains the writer process-grid extents followed by the writer
 /// axis permutation, encoded as little-endian u64 values. The final
-/// `global_shape().len()` values are the permutation. Named MPI catalogs do not
+/// `global_shape().len()` values are the permutation. The writer grid never has
+/// more axes than the spatial rank. Named MPI catalogs do not
 /// store writer provenance and therefore return an empty slice.
 /// Collection component axes remain verbatim in `extra_shape`; no component
 /// count is inferred. Legacy path catalogs are bounded to 65,536 named datasets
@@ -393,6 +394,7 @@ pub fn read_mpi_catalog<P: AsRef<Path>>(
             .ok_or(CatalogError::Malformed("shape"))?;
         if global.is_empty()
             || global.len() > MAX_PROTOCOL_RANK
+            || grid.len() > global.len()
             || !dims_ok(&grid)
             || gp == 0
             || ep.checked_mul(st.width() as u64) != Some(pb as u64)

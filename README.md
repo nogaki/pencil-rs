@@ -576,7 +576,8 @@ byte-subarray file views; readers stage and validate the complete payload before
 mutating the destination. Writes use exclusive file creation and a flushed commit
 marker, so incomplete and committed states are reported separately. The format
 records type, width, logical shapes, writer process grid, and writer permutation;
-writer layout metadata is provenance, not a read-layout requirement. Native
+writer layout metadata is provenance, not a read-layout requirement, though a
+writer grid with more axes than the spatial rank is rejected. Native
 cleanup failures that can leave an unrecoverable handle are fail-stop paths via
 MPI abort, not recoverable Rust errors.
 

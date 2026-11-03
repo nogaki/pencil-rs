@@ -46,9 +46,12 @@ fn u64_at(b: &[u8], p: usize) -> u64 {
 // Keep these fixtures independent of the array writers: catalog decoding must
 // be tested against the on-disk codes, not only against Rust type dispatch.
 fn native_fixture(code: u64, width: usize) -> Vec<u8> {
+    native_fixture_grid(&[1], code, width)
+}
+
+fn native_fixture_grid(grid: &[u64], code: u64, width: usize) -> Vec<u8> {
     let n = 2usize;
     let er = 2usize;
-    let grid = [1u64];
     let global = [4u64, 5];
     let extra = [3u64, 2];
     let perm = [0u64, 1];
@@ -71,7 +74,12 @@ fn native_fixture(code: u64, width: usize) -> Vec<u8> {
     ] {
         h[p..p + 8].copy_from_slice(&x.to_le_bytes());
     }
-    for x in global.into_iter().chain(extra).chain(grid).chain(perm) {
+    for x in global
+        .into_iter()
+        .chain(extra)
+        .chain(grid.iter().copied())
+        .chain(perm)
+    {
         h.extend_from_slice(&x.to_le_bytes());
     }
     h.extend(vec![0; payload]);
@@ -224,6 +232,11 @@ fn catalog_integration() {
         barrier_file(comm, &np, &named_fixture(code, width));
         assert!(read_mpi_named_catalog(&np, comm).is_err());
     }
+
+    // A writer grid may not have more axes than the spatial rank.
+    let bad_grid = dir.join("bad-grid.pio");
+    barrier_file(comm, &bad_grid, &native_fixture_grid(&[1, 1, 1], 9, 4));
+    assert!(read_mpi_catalog(&bad_grid, comm).is_err());
 
     // Collections keep the collection extra shape; the member count is not inferred.
     let collection_topo = MpiTopology::new(&world, [world.size() as usize, 1]).unwrap();
@@ -438,6 +451,43 @@ fn hdf_cases<C: Communicator>(
     }
     comm.barrier();
     assert!(read_hdf5_catalog(&unknown, comm).is_err());
+
+    // A writer grid may not have more axes than the spatial rank.
+    for named in [false, true] {
+        let bad = dir.join(if named {
+            "bad-grid-named.h5"
+        } else {
+            "bad-grid.h5"
+        });
+        if named {
+            write_hdf5_named(&bad, "data", a.view()).unwrap();
+        } else {
+            write_hdf5(&bad, a.view()).unwrap();
+        }
+        comm.barrier();
+        if comm.rank() == 0 {
+            let f = hdf5_metno::File::open_rw(&bad).unwrap();
+            let dataset = if named {
+                let group = f.group("pencil_io_named_v1").unwrap();
+                let members = group.member_names().unwrap();
+                assert_eq!(members.len(), 1);
+                group.dataset(members[0].as_str()).unwrap()
+            } else {
+                f.dataset("/pencil_io_v1/data").unwrap()
+            };
+            dataset.delete_attr("pencil_io_writer_grid").unwrap();
+            dataset
+                .new_attr::<u64>()
+                .shape([3usize])
+                .create("pencil_io_writer_grid")
+                .unwrap()
+                .write_raw(&[1u64, 1, 1])
+                .unwrap();
+            f.close().unwrap();
+        }
+        comm.barrier();
+        assert!(read_hdf5_catalog(&bad, comm).is_err());
+    }
 
     // Links are not catalog objects: neither namespace roots nor leaf datasets
     // may escape the file/object graph inspected by the catalog reader.

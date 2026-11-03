@@ -200,6 +200,22 @@ fn mpi_io_preserves_logical_order_and_rejects_bad_files() {
         )
     });
 
+    // The writer grid rank may not exceed the spatial rank.
+    prepare_case(&world, &baseline_path, &case_path, |bytes| {
+        patch_u64(bytes, 80, 3)?;
+        bytes.splice(136..136, 1u64.to_le_bytes());
+        patch_u64(bytes, 16, 160)?;
+        patch_u64(bytes, 64, 160)
+    });
+    assert_mpi_failure(&world, &case_path, &mut destination, |error| {
+        matches!(
+            error,
+            IoError::InvalidFile {
+                reason: "rank bound"
+            }
+        )
+    });
+
     // A valid header with a different logical extent is a metadata mismatch.
     prepare_case(&world, &baseline_path, &case_path, |bytes| {
         patch_u64(bytes, 96, 3)?;

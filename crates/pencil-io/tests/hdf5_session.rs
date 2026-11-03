@@ -380,5 +380,36 @@ fn persistent_native_hierarchy_and_protocol() {
             }
         }
     });
+    // A writer grid with more axes than the spatial rank is invalid provenance:
+    // both the catalog and a read must reject it without touching the array.
+    let bad_grid = directory.join("bad-grid.h5");
+    let mut grid_session =
+        Hdf5FileSession::create(&bad_grid, comm, &MpiIoOptions::default()).unwrap();
+    grid_session
+        .write("grid", source.view(), &Hdf5WriteOptions::default())
+        .unwrap();
+    grid_session.close().unwrap();
+    root_action(&world, || {
+        let file = hdf5_metno::File::open_rw(&bad_grid).unwrap();
+        let dataset = file.dataset("pencil_io_tree_v1/grid").unwrap();
+        dataset.delete_attr("pencil_io_writer_grid").unwrap();
+        dataset
+            .new_attr::<u64>()
+            .shape([3usize])
+            .create("pencil_io_writer_grid")
+            .unwrap()
+            .write_raw(&[1u64, 1, 1])
+            .unwrap();
+        file.close().unwrap();
+    });
+    let mut bad = Hdf5FileSession::open_read(&bad_grid, comm, &MpiIoOptions::default()).unwrap();
+    assert!(bad.catalog().is_err());
+    let mut untouched = array(&world, ExtraShape::scalar(), -5i32);
+    assert!(
+        bad.read("grid", untouched.view_mut(), &Hdf5ReadOptions::default())
+            .is_err()
+    );
+    assert!(untouched.as_slice().iter().all(|&v| v == -5));
+    bad.close().unwrap();
     cleanup_owned_temp_dir(&world, &directory);
 }

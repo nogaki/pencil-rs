@@ -1345,6 +1345,7 @@ impl Header {
         if n > MAX_PROTOCOL_RANK as u64
             || extra_rank > MAX_PROTOCOL_RANK as u64
             || writer_grid_rank > MAX_PROTOCOL_RANK as u64
+            || writer_grid_rank > n
         {
             return Err(IoError::InvalidFile {
                 reason: "rank bound",

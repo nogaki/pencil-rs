@@ -352,6 +352,24 @@ fn parallel_hdf5_preserves_logical_order_and_rejects_bad_files() {
         )
     });
 
+    // The writer grid rank may not exceed the spatial rank.
+    prepare_case(&world, &baseline_path, &case_path, |case| {
+        let file = h5(File::open_rw(case))?;
+        let dataset =
+            h5(file.group("/pencil_io_v1")).and_then(|group| h5(group.dataset("data")))?;
+        replace_u64_attr(&dataset, "pencil_io_writer_grid", &[1, 1, 1])?;
+        h5(file.flush())?;
+        h5(file.close())
+    });
+    assert_hdf5_failure(&world, &case_path, &mut destination, |error| {
+        matches!(
+            error,
+            IoError::MetadataMismatch {
+                field: "shape or writer provenance"
+            }
+        )
+    });
+
     prepare_case(&world, &baseline_path, &case_path, |case| {
         recreate_dataset(
             case,
