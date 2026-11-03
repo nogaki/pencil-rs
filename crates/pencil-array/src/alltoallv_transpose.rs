@@ -1,16 +1,13 @@
-use std::{ffi::c_void, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
 use mpi::{
-    Count,
     collective::CommunicatorCollectives,
-    datatype::{
-        AsDatatype, Equivalence, Partition, PartitionMut, Partitioned, PartitionedBuffer,
-        PartitionedBufferMut, Pointer, PointerMut,
-    },
+    datatype::{Equivalence, Partition, PartitionMut},
 };
 
 use crate::{
     ExtraShape, ManyPencilArray, Pencil, PencilArrayView, PencilArrayViewMut,
+    checked_partition::{CheckedPartition, CheckedPartitionMut},
     transpose::{
         CommunicationMode, PreparedExchange, TransposeError, TransposePlanCore, TransposeWorkspace,
         TransposeWorkspaceRequirements, agree_execute_descriptor, agree_preflight, finish_in_place,
@@ -321,120 +318,6 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
     }
 }
 
-fn assert_partition_bounds(len: usize, counts: &[Count], displacements: &[Count]) {
-    assert_eq!(
-        counts.len(),
-        displacements.len(),
-        "partition metadata lengths differ"
-    );
-    for (&count, &displacement) in counts.iter().zip(displacements) {
-        assert!(
-            count >= 0 && displacement >= 0,
-            "partition count and displacement must be nonnegative"
-        );
-        let end = (displacement as usize)
-            .checked_add(count as usize)
-            .expect("partition segment end overflowed usize");
-        assert!(end <= len, "partition segment exceeds buffer");
-    }
-}
-
-struct CheckedPartition<'a, T> {
-    buffer: &'a [T],
-    counts: &'a [Count],
-    displacements: &'a [Count],
-}
-
-impl<'a, T> CheckedPartition<'a, T> {
-    fn new(buffer: &'a [T], counts: &'a [Count], displacements: &'a [Count]) -> Self {
-        assert_partition_bounds(buffer.len(), counts, displacements);
-        Self {
-            buffer,
-            counts,
-            displacements,
-        }
-    }
-}
-
-impl<T> Partitioned for CheckedPartition<'_, T> {
-    fn counts(&self) -> &[Count] {
-        self.counts
-    }
-
-    fn displs(&self) -> &[Count] {
-        self.displacements
-    }
-}
-
-// SAFETY: the initialized slice supplies its own pointer and remains shared
-// for this partition's lifetime; every segment was checked against its length.
-unsafe impl<T: Equivalence> Pointer for CheckedPartition<'_, T> {
-    fn pointer(&self) -> *const c_void {
-        <[T] as Pointer>::pointer(self.buffer)
-    }
-}
-
-// SAFETY: the datatype comes from the same T slice that supplies the pointer.
-// Correct Equivalence has rsmpi's slice layout contract, including array stride
-// and a typemap that does not read uninitialized padding.
-unsafe impl<T: Equivalence> AsDatatype for CheckedPartition<'_, T> {
-    type Out = <T as Equivalence>::Out;
-
-    fn as_datatype(&self) -> Self::Out {
-        <[T] as AsDatatype>::as_datatype(self.buffer)
-    }
-}
-
-impl<T: Equivalence> PartitionedBuffer for CheckedPartition<'_, T> {}
-
-struct CheckedPartitionMut<'a, T> {
-    buffer: &'a mut [T],
-    counts: &'a [Count],
-    displacements: &'a [Count],
-}
-
-impl<'a, T> CheckedPartitionMut<'a, T> {
-    fn new(buffer: &'a mut [T], counts: &'a [Count], displacements: &'a [Count]) -> Self {
-        assert_partition_bounds(buffer.len(), counts, displacements);
-        Self {
-            buffer,
-            counts,
-            displacements,
-        }
-    }
-}
-
-impl<T> Partitioned for CheckedPartitionMut<'_, T> {
-    fn counts(&self) -> &[Count] {
-        self.counts
-    }
-
-    fn displs(&self) -> &[Count] {
-        self.displacements
-    }
-}
-
-// SAFETY: the initialized slice is exclusively borrowed for this partition's
-// lifetime; every segment was checked against its length.
-unsafe impl<T: Equivalence> PointerMut for CheckedPartitionMut<'_, T> {
-    fn pointer_mut(&mut self) -> *mut c_void {
-        <[T] as PointerMut>::pointer_mut(self.buffer)
-    }
-}
-
-// SAFETY: the datatype comes from the same exclusively borrowed T slice.
-// Correct Equivalence has rsmpi's slice layout contract, including array stride
-// and a typemap that does not read uninitialized padding.
-unsafe impl<T: Equivalence> AsDatatype for CheckedPartitionMut<'_, T> {
-    type Out = <T as Equivalence>::Out;
-
-    fn as_datatype(&self) -> Self::Out {
-        <[T] as AsDatatype>::as_datatype(self.buffer)
-    }
-}
-
-impl<T: Equivalence> PartitionedBufferMut for CheckedPartitionMut<'_, T> {}
-
 fn execute_exchange<T, const N: usize, const M: usize>(
     plan: &TransposePlanCore<N, M>,
     prepared: &PreparedExchange,
@@ -477,77 +360,5 @@ fn execute_exchange<T, const N: usize, const M: usize>(
             prepared.receive_displacements.as_slice(),
         );
         subcommunicator.all_to_all_varcount_into(&send_partition, &mut receive_partition);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn checked_partitions_preserve_metadata_and_slice_pointers() {
-        let buffer = [0u8; 4];
-        let counts = [1, 0, 2];
-        let displacements = [0, 4, 2];
-        let partition = CheckedPartition::new(&buffer, &counts, &displacements);
-        assert_eq!(partition.counts(), &counts);
-        assert_eq!(partition.displs(), &displacements);
-        assert_eq!(partition.pointer(), buffer.as_ptr().cast::<c_void>());
-
-        let mut buffer = [0u8; 4];
-        let expected_pointer = buffer.as_mut_ptr().cast::<c_void>();
-        let mut partition = CheckedPartitionMut::new(&mut buffer, &counts, &displacements);
-        assert_eq!(partition.counts(), &counts);
-        assert_eq!(partition.displs(), &displacements);
-        assert_eq!(partition.pointer_mut(), expected_pointer);
-    }
-
-    #[test]
-    fn checked_partitions_accept_empty_buffers() {
-        let buffer: [u8; 0] = [];
-        let _ = CheckedPartition::new(&buffer, &[], &[]);
-        let _ = CheckedPartition::new(&buffer, &[0], &[0]);
-
-        let mut buffer: [u8; 0] = [];
-        let _ = CheckedPartitionMut::new(&mut buffer, &[], &[]);
-        let _ = CheckedPartitionMut::new(&mut buffer, &[0], &[0]);
-    }
-
-    #[test]
-    fn partition_bounds_accept_total_above_count_max_without_payload() {
-        let count = 1_500_000_000;
-        let total = usize::try_from(3_000_000_000_u64).unwrap();
-        assert_partition_bounds(total, &[count, count], &[0, count]);
-    }
-
-    #[test]
-    fn checked_partitions_reject_invalid_metadata() {
-        let cases: &[(&[Count], &[Count])] = &[
-            (&[1], &[]),
-            (&[], &[0]),
-            (&[-1], &[0]),
-            (&[0], &[-1]),
-            (&[5], &[0]),
-            (&[2], &[3]),
-            (&[0], &[5]),
-            (&[1_500_000_000], &[1_500_000_000]),
-        ];
-
-        for &(counts, displacements) in cases {
-            assert!(
-                std::panic::catch_unwind(|| {
-                    let buffer = [0u8; 4];
-                    let _ = CheckedPartition::new(&buffer, counts, displacements);
-                })
-                .is_err()
-            );
-            assert!(
-                std::panic::catch_unwind(|| {
-                    let mut buffer = [0u8; 4];
-                    let _ = CheckedPartitionMut::new(&mut buffer, counts, displacements);
-                })
-                .is_err()
-            );
-        }
     }
 }

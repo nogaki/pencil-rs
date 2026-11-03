@@ -305,6 +305,7 @@ mod alltoallv_transpose;
 mod array;
 mod axis;
 mod checked;
+mod checked_partition;
 mod collectives;
 mod decomposition;
 mod error;

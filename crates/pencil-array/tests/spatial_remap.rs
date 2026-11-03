@@ -1165,6 +1165,76 @@ fn spatial_remap_collective_contract_and_oracles() {
         }
     }
 
+    // A peer count beyond MPI Count on the owning rank is rejected before any
+    // payload buffer is allocated, and an ordinary remap still succeeds.
+    {
+        let unit = Pencil::<3, 2>::new(Arc::clone(&topology), [1, 1, 1], [0, 1]).unwrap();
+        let oversized =
+            ExtraShape::new([usize::try_from(Count::MAX).unwrap().checked_add(1).unwrap()])
+                .unwrap();
+        let overflow = SpatialRemapPlan::<u8, 3, 2>::prepare(
+            Arc::clone(&unit),
+            Arc::clone(&unit),
+            oversized,
+            [1; 3],
+            [0; 3],
+            0,
+        );
+        if unit.local_len() > 0 {
+            assert!(matches!(overflow, Err(SpatialRemapError::MpiCountOverflow)));
+        } else {
+            assert!(matches!(
+                overflow,
+                Err(SpatialRemapError::CollectivePreconditionFailed)
+            ));
+        }
+
+        let scalar = ExtraShape::scalar();
+        let mut recovered = SpatialRemapPlan::<u8, 3, 2>::prepare(
+            Arc::clone(&unit),
+            Arc::clone(&unit),
+            scalar.clone(),
+            [1; 3],
+            [0; 3],
+            0,
+        )
+        .unwrap();
+        let unit_source = vec![7u8; unit.local_len()];
+        let mut unit_destination = vec![0u8; unit.local_len()];
+        let source_view = PencilArrayView::from_slice(&unit, &scalar, &unit_source).unwrap();
+        let destination_view =
+            PencilArrayViewMut::from_slice_mut(&unit, &scalar, &mut unit_destination).unwrap();
+        recovered
+            .apply_views(source_view, destination_view)
+            .unwrap();
+        assert_eq!(unit_destination, unit_source);
+    }
+
+    // A peer displacement beyond MPI Count is rejected even though every peer
+    // count fits, again before any payload buffer is allocated. On a 32-bit
+    // target the ordinary total length `size * extra` overflows `usize` first,
+    // so this case only exists where an aggregate can exceed MPI Count.
+    #[cfg(target_pointer_width = "64")]
+    if size >= 3 {
+        let linear = MpiTopology::<1>::new(&world, [size]).unwrap();
+        let linear_source = Pencil::<2, 1>::new(Arc::clone(&linear), [size, size], [0]).unwrap();
+        let linear_destination =
+            Pencil::<2, 1>::new(Arc::clone(&linear), [size, size], [1]).unwrap();
+        let oversized_half =
+            ExtraShape::new([usize::try_from(Count::MAX).unwrap() / 2 + 1]).unwrap();
+        assert!(matches!(
+            SpatialRemapPlan::<u8, 2, 1>::prepare(
+                linear_source,
+                linear_destination,
+                oversized_half,
+                [1, 1],
+                [0, 0],
+                0,
+            ),
+            Err(SpatialRemapError::MpiCountOverflow),
+        ));
+    }
+
     // A failed apply is followed by an ordinary successful collective.
     let mut destination_data = vec![Probe(0); source.local_len() * extra.element_count()];
     let source_view = PencilArrayView::from_slice(&source, &extra, &source_data).unwrap();
