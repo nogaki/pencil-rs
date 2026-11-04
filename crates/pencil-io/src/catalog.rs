@@ -1,15 +1,15 @@
 //! Collective, metadata-only catalog readers.
 use crate::mpi_io::{
-    FileGuard, abort_unrecoverable, collective_state, duplicate_comm, finish_resources, path_bytes,
+    FileGuard, HEADER_PREFIX_BYTES, V1Fields, V1HeaderDefect, abort_unrecoverable,
+    collective_state, duplicate_comm, finish_resources, is_permutation, path_bytes,
 };
 use crate::named_mpi::scan_file_bounded;
-use crate::{COMMIT_MARKER, FORMAT_VERSION, IoError, MAX_HEADER_BYTES, MAX_PROTOCOL_RANK, ffi};
+use crate::{FORMAT_VERSION, IoError, MAX_HEADER_BYTES, MAX_PROTOCOL_RANK, ffi};
 use mpi::collective::{CommunicatorCollectives, Root, SystemOperation};
 use mpi::raw::AsRaw;
 use mpi::topology::{CartesianCommunicator, Communicator};
 use std::{ffi::CString, path::Path};
 
-const MAGIC: &[u8; 8] = b"PENCILIO";
 const CATALOG_NAMESPACE: u64 = 0x494f_0000_0003;
 const MPI_CATALOG_OP: u64 = 0x401;
 const NAMED_CATALOG_OP: u64 = 0x402;
@@ -150,9 +150,6 @@ pub enum CatalogError {
     /// The file contains bytes after its committed records.
     #[error("invalid catalog tail")]
     InvalidTail,
-}
-fn u(b: &[u8], p: usize) -> Option<u64> {
-    b.get(p..p + 8)?.try_into().ok().map(u64::from_le_bytes)
 }
 fn path<P: AsRef<Path>>(p: P) -> Result<CString, CatalogError> {
     CString::new(path_bytes(p.as_ref())?).map_err(|_| IoError::InvalidPath.into())
@@ -296,10 +293,6 @@ fn close(
 ) -> Result<(), CatalogError> {
     finish_resources(c, d, FileGuard { raw: f }, None).map_or(Ok(()), |e| Err(CatalogError::Io(e)))
 }
-fn dims_ok(v: &[u64]) -> bool {
-    !v.is_empty() && v.len() <= MAX_PROTOCOL_RANK && v.iter().all(|&x| x > 0)
-}
-
 /// Read a strict metadata-only catalog from a native MPI v1 dataset collectively.
 ///
 /// All ranks in `c` must call this function with the same path. The returned
@@ -321,96 +314,83 @@ pub fn read_mpi_catalog<P: AsRef<Path>>(
         })?)
         .map_err(|_| CatalogError::Malformed("size"))?;
         agree_bytes(c, &(size as u64).to_le_bytes())?;
-        if size < 96 {
+        if size < HEADER_PREFIX_BYTES {
             return Err(CatalogError::Malformed("header"));
         }
-        let pre = read_at(c, f, 0, 96)?;
-        if &pre[..8] != MAGIC
-            || u(&pre, 8) != Some(FORMAT_VERSION)
-            || u(&pre, 24) != Some(COMMIT_MARKER)
-        {
-            return Err(CatalogError::Malformed("header"));
-        }
-        let hl = usize::try_from(u(&pre, 16).ok_or(CatalogError::Malformed("header"))?)
-            .map_err(|_| CatalogError::Malformed("header"))?;
-        if !(96..=MAX_HEADER_BYTES).contains(&hl) || hl > size {
+        let pre: [u8; HEADER_PREFIX_BYTES] = read_at(c, f, 0, HEADER_PREFIX_BYTES)?
+            .try_into()
+            .expect("catalog reads the complete v1 prefix");
+        let fields = V1Fields::read(&pre);
+        V1Fields::check_identity(&pre).map_err(|_| CatalogError::Malformed("header"))?;
+        let hl =
+            usize::try_from(fields.header_len).map_err(|_| CatalogError::Malformed("header"))?;
+        if !(HEADER_PREFIX_BYTES..=MAX_HEADER_BYTES).contains(&hl) || hl > size {
             return Err(CatalogError::Malformed("header bounds"));
         }
         let h = read_at(c, f, 0, hl)?;
-        let n = usize::try_from(u(&h, 32).ok_or(CatalogError::Malformed("rank"))?)
-            .map_err(|_| CatalogError::Malformed("rank"))?;
-        let er = usize::try_from(u(&h, 56).ok_or(CatalogError::Malformed("rank"))?)
-            .map_err(|_| CatalogError::Malformed("rank"))?;
-        let gr = usize::try_from(u(&h, 80).ok_or(CatalogError::Malformed("grid"))?)
-            .map_err(|_| CatalogError::Malformed("grid"))?;
+        let n = usize::try_from(fields.n).map_err(|_| CatalogError::Malformed("rank"))?;
+        let er = usize::try_from(fields.extra_rank).map_err(|_| CatalogError::Malformed("rank"))?;
+        let gr = usize::try_from(fields.grid_rank).map_err(|_| CatalogError::Malformed("grid"))?;
         if n == 0
             || n > MAX_PROTOCOL_RANK
             || er > MAX_PROTOCOL_RANK
             || n + er > MAX_PROTOCOL_RANK
             || gr == 0
             || gr > MAX_PROTOCOL_RANK
-            || hl
-                != 96
-                    + n.checked_add(er)
-                        .and_then(|x| x.checked_add(gr))
-                        .and_then(|x| x.checked_add(n))
-                        .ok_or(CatalogError::Malformed("header bounds"))?
-                        * 8
-            || hl > MAX_HEADER_BYTES
         {
             return Err(CatalogError::Malformed("header bounds"));
         }
-        let typ = u(&h, 40).ok_or(CatalogError::Malformed("type"))?;
-        let st = ScalarType::decode(typ, u(&h, 48).ok_or(CatalogError::Malformed("width"))?)
-            .ok_or(CatalogError::Malformed("type"))?;
-        let po = usize::try_from(u(&h, 64).ok_or(CatalogError::Malformed("payload"))?)
+        let expected_len = fields
+            .expected_header_len()
+            .map_err(|_| CatalogError::Malformed("header bounds"))?;
+        if hl as u64 != expected_len || hl > MAX_HEADER_BYTES {
+            return Err(CatalogError::Malformed("header bounds"));
+        }
+        let st = fields
+            .scalar_type()
+            .map_err(|_| CatalogError::Malformed("type"))?;
+        let po = usize::try_from(fields.payload_offset)
             .map_err(|_| CatalogError::Malformed("payload"))?;
-        let pb = usize::try_from(u(&h, 72).ok_or(CatalogError::Malformed("payload"))?)
+        let pb = usize::try_from(fields.payload_bytes)
             .map_err(|_| CatalogError::Malformed("payload"))?;
-        if po != hl || u(&h, 88) != Some(0) || po.checked_add(pb) != Some(size) {
+        if fields.check_payload_offset().is_err()
+            || V1Fields::check_reserved(&pre).is_err()
+            || po.checked_add(pb) != Some(size)
+        {
             return Err(CatalogError::Malformed("tail"));
         }
-        let mut at = 96;
-        let take = |at: &mut usize, k: usize| {
-            let mut v = Vec::with_capacity(k);
-            for _ in 0..k {
-                v.push(u(&h, *at)?);
-                *at += 8;
-            }
-            Some(v)
-        };
-        let global = take(&mut at, n).ok_or(CatalogError::Malformed("shape"))?;
-        let extra = take(&mut at, er).ok_or(CatalogError::Malformed("shape"))?;
-        let grid = take(&mut at, gr).ok_or(CatalogError::Malformed("grid"))?;
-        let perm = take(&mut at, n).ok_or(CatalogError::Malformed("permutation"))?;
-        let gp = grid
-            .iter()
-            .try_fold(1u64, |p, &x| p.checked_mul(x))
-            .ok_or(CatalogError::Malformed("grid"))?;
-        let ep = global
-            .iter()
-            .chain(extra.iter())
-            .try_fold(1u64, |p, &x| p.checked_mul(x))
-            .ok_or(CatalogError::Malformed("shape"))?;
-        if global.is_empty()
-            || global.len() > MAX_PROTOCOL_RANK
-            || grid.len() > global.len()
-            || !dims_ok(&grid)
-            || gp == 0
-            || ep.checked_mul(st.width() as u64) != Some(pb as u64)
-            || perm
-                .iter()
-                .enumerate()
-                .any(|(i, &x)| x >= n as u64 || perm[..i].contains(&x))
+        let arrays =
+            fields
+                .read_arrays(&h[HEADER_PREFIX_BYTES..])
+                .map_err(|defect| match defect {
+                    V1HeaderDefect::Allocation { requested } => {
+                        CatalogError::Io(IoError::AllocationFailed { requested })
+                    }
+                    _ => CatalogError::Malformed("shape/grid/permutation"),
+                })?;
+        let grid = arrays.check_writer_grid();
+        let payload = arrays.check_payload(st.width() as u64, fields.payload_bytes);
+        if matches!(grid, Err(V1HeaderDefect::WriterGridOverflow)) {
+            return Err(CatalogError::Malformed("grid"));
+        }
+        if matches!(payload, Err(V1HeaderDefect::PayloadElements)) {
+            return Err(CatalogError::Malformed("shape"));
+        }
+        if arrays.global.is_empty()
+            || arrays.global.len() > MAX_PROTOCOL_RANK
+            || grid.is_err()
+            || payload.is_err()
+            || !is_permutation(&arrays.writer_permutation, n)
         {
             return Err(CatalogError::Malformed("shape/grid/permutation"));
         }
+        let at = HEADER_PREFIX_BYTES + (n + er) * 8;
         Ok(vec![DatasetInfo {
             name: None,
             scalar_type: st,
-            global_shape: global,
-            extra_shape: extra,
-            provenance: h[96 + (n + er) * 8..].to_vec(),
+            global_shape: arrays.global,
+            extra_shape: arrays.extra,
+            provenance: h[at..].to_vec(),
         }])
     })();
     let agreement = agree(c, r.is_ok(), "catalog result validation");

@@ -17,7 +17,7 @@ use crate::{
     MAX_HEADER_BYTES, MAX_PROTOCOL_RANK, OP_READ_MPI, OP_WRITE_MPI, ScalarType,
 };
 
-const HEADER_PREFIX_BYTES: usize = 96;
+pub(crate) const HEADER_PREFIX_BYTES: usize = 96;
 pub(crate) const MPI_LOCAL_BYTE_LIMIT_WHAT: &str = "MPI local byte count";
 const MAGIC: &[u8; 8] = b"PENCILIO";
 const COMMIT_OFFSET: i64 = 24;
@@ -674,7 +674,7 @@ where
         return Err(cleanup.unwrap_or(primary));
     }
 
-    let prefix_result = HeaderPrefix::parse(&prefix);
+    let prefix_result = Header::parse_prefix(&prefix);
     if let Err(agreement) = agree_phase(comm, prefix_result.is_ok(), "header prefix validation") {
         let cleanup = finish_resources(comm, duplicate, file, None);
         return Err(cleanup.unwrap_or(prefix_result.err().unwrap_or(agreement)));
@@ -1358,68 +1358,27 @@ impl Header {
         debug_assert_eq!(offset, self.bytes.len());
     }
 
-    fn parse_prefix(bytes: &[u8; HEADER_PREFIX_BYTES]) -> Result<HeaderPrefix, IoError> {
-        if &bytes[0..8] != MAGIC {
-            return Err(IoError::InvalidFile { reason: "magic" });
-        }
-        if get_u64(bytes, 8) != FORMAT_VERSION {
-            return Err(IoError::InvalidFile { reason: "version" });
-        }
-        match get_u64(bytes, COMMIT_OFFSET as usize) {
-            COMMIT_MARKER => {}
-            INCOMPLETE_MARKER => return Err(IoError::IncompleteFile),
-            _ => {
-                return Err(IoError::InvalidFile {
-                    reason: "commit marker",
-                });
-            }
-        }
-        let header_len = get_u64(bytes, 16);
-        let n = get_u64(bytes, 32);
-        let extra_rank = get_u64(bytes, 56);
-        let writer_grid_rank = get_u64(bytes, 80);
-        if n > MAX_PROTOCOL_RANK as u64
-            || extra_rank > MAX_PROTOCOL_RANK as u64
-            || writer_grid_rank > MAX_PROTOCOL_RANK as u64
-            || writer_grid_rank > n
+    fn parse_prefix(bytes: &[u8; HEADER_PREFIX_BYTES]) -> Result<V1Fields, IoError> {
+        let fields = V1Fields::read(bytes);
+        V1Fields::check_identity(bytes).map_err(header_error)?;
+        if fields.n > MAX_PROTOCOL_RANK as u64
+            || fields.extra_rank > MAX_PROTOCOL_RANK as u64
+            || fields.grid_rank > MAX_PROTOCOL_RANK as u64
+            || fields.grid_rank > fields.n
         {
             return Err(IoError::InvalidFile {
                 reason: "rank bound",
             });
         }
-        let array_count = n
-            .checked_add(extra_rank)
-            .and_then(|count| count.checked_add(writer_grid_rank))
-            .and_then(|count| count.checked_add(n))
-            .ok_or(IoError::InvalidFile {
-                reason: "header dimensions",
-            })?;
-        let expected_len = u64::try_from(HEADER_PREFIX_BYTES)
-            .ok()
-            .and_then(|prefix| array_count.checked_mul(8)?.checked_add(prefix))
-            .ok_or(IoError::InvalidFile {
-                reason: "header length",
-            })?;
-        if header_len != expected_len || header_len as usize > MAX_HEADER_BYTES {
+        let expected_len = fields.expected_header_len().map_err(header_error)?;
+        if fields.header_len != expected_len || fields.header_len > MAX_HEADER_BYTES as u64 {
             return Err(IoError::InvalidFile {
                 reason: "header length",
             });
         }
-        if get_u64(bytes, 64) != header_len {
-            return Err(IoError::InvalidFile {
-                reason: "payload offset",
-            });
-        }
-        if ScalarType::decode(get_u64(bytes, 40), get_u64(bytes, 48)).is_none() {
-            return Err(IoError::InvalidFile {
-                reason: "type descriptor",
-            });
-        }
-        Ok(HeaderPrefix {
-            header_len,
-            type_code: get_u64(bytes, 40),
-            width: get_u64(bytes, 48),
-        })
+        fields.check_payload_offset().map_err(header_error)?;
+        fields.scalar_type().map_err(header_error)?;
+        Ok(fields)
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, IoError> {
@@ -1430,80 +1389,31 @@ impl Header {
         }
         let mut prefix = [0u8; HEADER_PREFIX_BYTES];
         prefix.copy_from_slice(&bytes[..HEADER_PREFIX_BYTES]);
-        let info = Self::parse_prefix(&prefix)?;
-        if usize::try_from(info.header_len).ok() != Some(bytes.len()) {
+        let fields = Self::parse_prefix(&prefix)?;
+        if usize::try_from(fields.header_len).ok() != Some(bytes.len()) {
             return Err(IoError::InvalidFile {
                 reason: "header trailing bytes",
             });
         }
-        let n = usize::try_from(get_u64(&prefix, 32))
-            .map_err(|_| IoError::InvalidFile { reason: "rank" })?;
-        let extra_rank =
-            usize::try_from(get_u64(&prefix, 56)).map_err(|_| IoError::InvalidFile {
-                reason: "extra rank",
-            })?;
-        let writer_grid_rank =
-            usize::try_from(get_u64(&prefix, 80)).map_err(|_| IoError::InvalidFile {
-                reason: "grid rank",
-            })?;
-        let mut offset = HEADER_PREFIX_BYTES;
-        let mut read_values = |count: usize| -> Result<Vec<u64>, IoError> {
-            let bytes_count = count.checked_mul(8).ok_or(IoError::InvalidFile {
-                reason: "header array",
-            })?;
-            let end = offset
-                .checked_add(bytes_count)
-                .ok_or(IoError::InvalidFile {
-                    reason: "header array",
-                })?;
-            if end > bytes.len() {
-                return Err(IoError::InvalidFile {
-                    reason: "header array",
-                });
-            }
-            let mut values = Vec::new();
-            values
-                .try_reserve_exact(count)
-                .map_err(|_| IoError::AllocationFailed {
-                    requested: bytes_count,
-                })?;
-            for chunk in bytes[offset..end].as_chunks::<8>().0 {
-                values.push(u64::from_le_bytes(*chunk));
-            }
-            offset = end;
-            Ok(values)
-        };
-        let global = read_values(n)?;
-        let extra = read_values(extra_rank)?;
-        let writer_grid = read_values(writer_grid_rank)?;
-        let writer_permutation = read_values(n)?;
-        if offset != bytes.len()
-            || !valid_dimensions(&global)
-            || !valid_extents(&writer_grid)
-            || !is_permutation(&writer_permutation, n)
+        // The catalog checks the reserved field after the type and payload
+        // fields; this is the reader's corresponding stage, once the complete
+        // header is available and before its arrays are interpreted.
+        V1Fields::check_reserved(&prefix).map_err(header_error)?;
+        let arrays = fields
+            .read_arrays(&bytes[HEADER_PREFIX_BYTES..])
+            .map_err(header_error)?;
+        let n = arrays.global.len();
+        if !valid_dimensions(&arrays.global)
+            || arrays.check_writer_grid().is_err()
+            || !is_permutation(&arrays.writer_permutation, n)
         {
             return Err(IoError::InvalidFile {
                 reason: "header metadata",
             });
         }
-        let expected_elements = global
-            .iter()
-            .chain(extra.iter())
-            .try_fold(1u64, |product, &extent| product.checked_mul(extent))
-            .ok_or(IoError::InvalidFile {
-                reason: "payload element count",
-            })?;
-        let expected_payload =
-            expected_elements
-                .checked_mul(info.width)
-                .ok_or(IoError::InvalidFile {
-                    reason: "payload bytes",
-                })?;
-        if expected_payload != get_u64(&prefix, 72) {
-            return Err(IoError::InvalidFile {
-                reason: "payload bytes",
-            });
-        }
+        arrays
+            .check_payload(fields.width, fields.payload_bytes)
+            .map_err(header_error)?;
         let mut stored_bytes = Vec::new();
         stored_bytes
             .try_reserve_exact(bytes.len())
@@ -1514,16 +1424,16 @@ impl Header {
         Ok(Self {
             bytes: stored_bytes,
             n,
-            type_code: info.type_code,
-            width: usize::try_from(info.width).map_err(|_| IoError::InvalidFile {
+            type_code: fields.type_code,
+            width: usize::try_from(fields.width).map_err(|_| IoError::InvalidFile {
                 reason: "type width",
             })?,
-            extra,
-            global,
-            writer_grid,
-            writer_permutation,
-            payload_offset: get_u64(&prefix, 64),
-            payload_bytes: get_u64(&prefix, 72),
+            extra: arrays.extra,
+            global: arrays.global,
+            writer_grid: arrays.writer_grid,
+            writer_permutation: arrays.writer_permutation,
+            payload_offset: fields.payload_offset,
+            payload_bytes: fields.payload_bytes,
         })
     }
 
@@ -1585,15 +1495,168 @@ impl Header {
     }
 }
 
-struct HeaderPrefix {
-    header_len: u64,
-    type_code: u64,
-    width: u64,
+/// Fixed-size fields of a native MPI v1 header.
+pub(crate) struct V1Fields {
+    pub(crate) header_len: u64,
+    pub(crate) n: u64,
+    pub(crate) extra_rank: u64,
+    pub(crate) grid_rank: u64,
+    pub(crate) type_code: u64,
+    pub(crate) width: u64,
+    pub(crate) payload_offset: u64,
+    pub(crate) payload_bytes: u64,
 }
 
-impl HeaderPrefix {
-    fn parse(bytes: &[u8; HEADER_PREFIX_BYTES]) -> Result<Self, IoError> {
-        Header::parse_prefix(bytes)
+impl V1Fields {
+    pub(crate) fn read(prefix: &[u8; HEADER_PREFIX_BYTES]) -> Self {
+        Self {
+            header_len: get_u64(prefix, 16),
+            n: get_u64(prefix, 32),
+            type_code: get_u64(prefix, 40),
+            width: get_u64(prefix, 48),
+            extra_rank: get_u64(prefix, 56),
+            payload_offset: get_u64(prefix, 64),
+            payload_bytes: get_u64(prefix, 72),
+            grid_rank: get_u64(prefix, 80),
+        }
+    }
+
+    pub(crate) fn check_identity(prefix: &[u8; HEADER_PREFIX_BYTES]) -> Result<(), V1HeaderDefect> {
+        if &prefix[0..8] != MAGIC {
+            return Err(Invalid("magic"));
+        }
+        if get_u64(prefix, 8) != FORMAT_VERSION {
+            return Err(Invalid("version"));
+        }
+        match get_u64(prefix, COMMIT_OFFSET as usize) {
+            COMMIT_MARKER => Ok(()),
+            INCOMPLETE_MARKER => Err(Incomplete),
+            _ => Err(Invalid("commit marker")),
+        }
+    }
+
+    pub(crate) fn expected_header_len(&self) -> Result<u64, V1HeaderDefect> {
+        self.n
+            .checked_add(self.extra_rank)
+            .and_then(|count| count.checked_add(self.grid_rank))
+            .and_then(|count| count.checked_add(self.n))
+            .ok_or(Invalid("header dimensions"))?
+            .checked_mul(8)
+            .and_then(|bytes| bytes.checked_add(HEADER_PREFIX_BYTES as u64))
+            .ok_or(Invalid("header length"))
+    }
+
+    pub(crate) fn scalar_type(&self) -> Result<ScalarType, V1HeaderDefect> {
+        ScalarType::decode(self.type_code, self.width).ok_or(Invalid("type descriptor"))
+    }
+
+    pub(crate) fn check_payload_offset(&self) -> Result<(), V1HeaderDefect> {
+        (self.payload_offset == self.header_len)
+            .then_some(())
+            .ok_or(Invalid("payload offset"))
+    }
+
+    pub(crate) fn check_reserved(prefix: &[u8; HEADER_PREFIX_BYTES]) -> Result<(), V1HeaderDefect> {
+        (get_u64(prefix, 88) == 0)
+            .then_some(())
+            .ok_or(Invalid("reserved field"))
+    }
+
+    pub(crate) fn read_arrays(&self, rest: &[u8]) -> Result<V1Arrays, V1HeaderDefect> {
+        let n = usize::try_from(self.n).map_err(|_| Invalid("rank"))?;
+        let extra_rank = usize::try_from(self.extra_rank).map_err(|_| Invalid("extra rank"))?;
+        let grid_rank = usize::try_from(self.grid_rank).map_err(|_| Invalid("grid rank"))?;
+        let mut offset = 0usize;
+        let mut read_values = |count: usize| -> Result<Vec<u64>, V1HeaderDefect> {
+            let bytes_count = count.checked_mul(8).ok_or(Invalid("header array"))?;
+            let end = offset
+                .checked_add(bytes_count)
+                .ok_or(Invalid("header array"))?;
+            let bytes = rest.get(offset..end).ok_or(Invalid("header array"))?;
+            let mut values = Vec::new();
+            values.try_reserve_exact(count).map_err(|_| Allocation {
+                requested: bytes_count,
+            })?;
+            for chunk in bytes.as_chunks::<8>().0 {
+                values.push(u64::from_le_bytes(*chunk));
+            }
+            offset = end;
+            Ok(values)
+        };
+        let global = read_values(n)?;
+        let extra = read_values(extra_rank)?;
+        let writer_grid = read_values(grid_rank)?;
+        let writer_permutation = read_values(n)?;
+        if offset != rest.len() {
+            return Err(Invalid("header array"));
+        }
+        Ok(V1Arrays {
+            global,
+            extra,
+            writer_grid,
+            writer_permutation,
+        })
+    }
+}
+
+pub(crate) struct V1Arrays {
+    pub(crate) global: Vec<u64>,
+    pub(crate) extra: Vec<u64>,
+    pub(crate) writer_grid: Vec<u64>,
+    pub(crate) writer_permutation: Vec<u64>,
+}
+
+impl V1Arrays {
+    pub(crate) fn check_writer_grid(&self) -> Result<(), V1HeaderDefect> {
+        if self
+            .writer_grid
+            .iter()
+            .try_fold(1u64, |product, &extent| product.checked_mul(extent))
+            .is_none()
+        {
+            return Err(WriterGridOverflow);
+        }
+        (valid_extents(&self.writer_grid) && self.writer_grid.len() <= self.global.len())
+            .then_some(())
+            .ok_or(Invalid("header metadata"))
+    }
+
+    pub(crate) fn check_payload(&self, width: u64, len: u64) -> Result<(), V1HeaderDefect> {
+        let elements = self
+            .global
+            .iter()
+            .chain(&self.extra)
+            .try_fold(1u64, |product, &extent| product.checked_mul(extent))
+            .ok_or(PayloadElements)?;
+        let bytes = elements
+            .checked_mul(width)
+            .ok_or(Invalid("payload bytes"))?;
+        (bytes == len).then_some(()).ok_or(Invalid("payload bytes"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum V1HeaderDefect {
+    Invalid(&'static str),
+    Incomplete,
+    WriterGridOverflow,
+    PayloadElements,
+    Allocation { requested: usize },
+}
+
+use V1HeaderDefect::{Allocation, Incomplete, Invalid, PayloadElements, WriterGridOverflow};
+
+fn header_error(defect: V1HeaderDefect) -> IoError {
+    match defect {
+        Invalid(reason) => IoError::InvalidFile { reason },
+        Incomplete => IoError::IncompleteFile,
+        WriterGridOverflow => IoError::InvalidFile {
+            reason: "header metadata",
+        },
+        PayloadElements => IoError::InvalidFile {
+            reason: "payload element count",
+        },
+        Allocation { requested } => IoError::AllocationFailed { requested },
     }
 }
 
@@ -1626,11 +1689,11 @@ pub(crate) fn is_permutation(values: &[u64], n: usize) -> bool {
     if values.len() != n {
         return false;
     }
-    let mut seen = Vec::new();
-    if seen.try_reserve_exact(n).is_err() {
+    // The protocol bounds every rank array by MAX_PROTOCOL_RANK.
+    let mut seen = [false; MAX_PROTOCOL_RANK];
+    let Some(seen) = seen.get_mut(..n) else {
         return false;
-    }
-    seen.resize(n, false);
+    };
     for &value in values {
         let Ok(index) = usize::try_from(value) else {
             return false;
@@ -1920,6 +1983,40 @@ mod tests {
             assert_eq!(checked_local_byte_count(100, 1).unwrap(), 100);
         }
         assert_eq!(checked_local_byte_count(101, 1).unwrap(), 101);
+    }
+
+    #[test]
+    fn v1_header_rejects_a_non_zero_reserved_field() {
+        // Two spatial axes, no extra axes, one writer-grid axis and the
+        // identity permutation: 96 + (2 + 0 + 1 + 2) * 8 = 136 bytes.
+        let mut header = vec![0u8; 136];
+        header[0..8].copy_from_slice(b"PENCILIO");
+        for (offset, value) in [
+            (8, crate::FORMAT_VERSION),
+            (16, 136),
+            (24, crate::COMMIT_MARKER),
+            (32, 2),
+            (40, 5),
+            (48, 4),
+            (56, 0),
+            (64, 136),
+            (72, 80),
+            (80, 1),
+            (88, 0),
+        ] {
+            header[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        for (offset, value) in [(96, 4u64), (104, 5), (112, 1), (120, 0), (128, 1)] {
+            header[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        assert!(Header::decode(&header).is_ok());
+        put_u64(&mut header, 88, 1);
+        assert!(matches!(
+            Header::decode(&header),
+            Err(IoError::InvalidFile {
+                reason: "reserved field"
+            })
+        ));
     }
 
     #[test]

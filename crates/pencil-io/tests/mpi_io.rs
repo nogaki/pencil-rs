@@ -186,6 +186,37 @@ fn mpi_io_preserves_logical_order_and_rejects_bad_files() {
         )
     });
 
+    // An empty writer grid must not preempt the type check in the prefix.
+    prepare_case(&world, &baseline_path, &case_path, |bytes| {
+        bytes.drain(112..136);
+        patch_u64(bytes, 16, 128)?;
+        patch_u64(bytes, 40, 99)?;
+        patch_u64(bytes, 56, 0)?;
+        patch_u64(bytes, 64, 128)?;
+        patch_u64(bytes, 80, 0)
+    });
+    assert_mpi_failure(&world, &case_path, &mut destination, |error| {
+        matches!(
+            error,
+            IoError::InvalidFile {
+                reason: "type descriptor"
+            }
+        )
+    });
+
+    // The reserved header field must be zero.
+    prepare_case(&world, &baseline_path, &case_path, |bytes| {
+        patch_u64(bytes, 88, 1)
+    });
+    assert_mpi_failure(&world, &case_path, &mut destination, |error| {
+        matches!(
+            error,
+            IoError::InvalidFile {
+                reason: "reserved field"
+            }
+        )
+    });
+
     // The first writer-grid dimension is provenance metadata and must stay a
     // positive extent even though it is not a reader-layout requirement.
     prepare_case(&world, &baseline_path, &case_path, |bytes| {
