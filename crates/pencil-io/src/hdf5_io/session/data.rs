@@ -17,7 +17,7 @@ impl<'c> Hdf5FileSession<'c> {
         view: PencilArrayView<'_, T, N, M>,
         options: &crate::hdf5_options::Hdf5WriteOptions,
     ) -> Result<(), Hdf5SessionError> {
-        self.entry(0x705, path)?;
+        self.entry_without_path(0x705)?;
         agree_phase(
             self.comm,
             matches!(
@@ -50,14 +50,6 @@ impl<'c> Hdf5FileSession<'c> {
             N + view.extra_shape().dimensions().len(),
             T::WIDTH,
         )?;
-        agree_settings(comm, settings)?;
-        agree_member(
-            comm,
-            view.pencil(),
-            view.extra_shape().dimensions(),
-            T::CODE,
-            T::WIDTH,
-        )?;
         self.check_hints(settings)?;
         self.writable()?;
         let (parent, name) = self.parent(path)?;
@@ -84,7 +76,7 @@ impl<'c> Hdf5FileSession<'c> {
         view: PencilArrayViewMut<'_, T, N, M>,
         options: &crate::hdf5_options::Hdf5ReadOptions,
     ) -> Result<(), Hdf5SessionError> {
-        self.entry(0x706, path)?;
+        self.entry_without_path(0x706)?;
         agree_phase(
             self.comm,
             matches!(
@@ -117,14 +109,6 @@ impl<'c> Hdf5FileSession<'c> {
             N + view.extra_shape().dimensions().len(),
             T::WIDTH,
         )?;
-        agree_settings(comm, settings)?;
-        agree_member(
-            comm,
-            view.pencil(),
-            view.extra_shape().dimensions(),
-            T::CODE,
-            T::WIDTH,
-        )?;
         self.check_hints(settings)?;
         let (parent, name) = self.parent(path)?;
         if let Err(e) = check_kind(comm, parent, &name, native::LinkObjectType::Dataset) {
@@ -147,13 +131,10 @@ fn cleanup_session(
     resources: Hdf5Resources,
     primary: IoError,
 ) -> IoError {
-    finish_session(comm, resources).unwrap_or(primary)
+    finish_session(comm, resources);
+    primary
 }
-pub(super) fn finish_session(
-    comm: &mpi::topology::CartesianCommunicator,
-    mut r: Hdf5Resources,
-) -> Option<IoError> {
-    let mut first = None;
+pub(super) fn finish_session(comm: &mpi::topology::CartesianCommunicator, mut r: Hdf5Resources) {
     for (slot, close) in [
         (
             &mut r.xfer,
@@ -167,9 +148,8 @@ pub(super) fn finish_session(
         (&mut r.dataset, native::dataset_close),
         (&mut r.group, native::group_close),
     ] {
-        close_optional(comm, slot, &mut first, close, "HDF5 session resource close");
+        close_optional(comm, slot, close, "HDF5 session resource close");
     }
-    aggregate_cleanup_result(comm, first)
 }
 #[allow(clippy::too_many_arguments)]
 fn session_write<T, const N: usize, const M: usize>(
@@ -384,9 +364,7 @@ where
         ));
     }
 
-    if let Some(error) = finish_session(comm, resources) {
-        return Err(error);
-    }
+    finish_session(comm, resources);
     #[cfg(test)]
     test_post_op(comm, 1)?;
     *poisoned = false;
@@ -589,9 +567,7 @@ where
         ));
     }
     let plan = plan_result.expect("HDF5 read physical staging agreement");
-    if let Some(error) = finish_session(comm, resources) {
-        return Err(error);
-    }
+    finish_session(comm, resources);
     #[cfg(test)]
     test_post_op(comm, 2)?;
     plan.decode_into(&staging, view.as_mut_slice());

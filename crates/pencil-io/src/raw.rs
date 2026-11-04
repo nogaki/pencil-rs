@@ -123,10 +123,11 @@ fn read_raw_inner<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
         abort_unrecoverable(comm.as_raw(), "raw file open");
     }
     if !all {
-        return Err(finish_comm(comm, duplicate).unwrap_or(IoError::Mpi {
+        finish_comm(comm, duplicate);
+        return Err(IoError::Mpi {
             operation: "MPI_File_open",
             code: opened.err().unwrap_or(-1),
-        }));
+        });
     }
     let file = FileGuard {
         raw: opened.expect("open agreement"),
@@ -219,7 +220,7 @@ fn read_raw_inner<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
         }
         plan_result.map(|plan| (plan, staging))
     })();
-    let cleanup = finish_resources(comm, duplicate, file, datatype);
+    finish_resources(comm, duplicate, file, datatype);
     drop(info);
     let injected = if inject_cleanup_failure && comm.rank() == 0 {
         Some(IoError::Native {
@@ -229,12 +230,7 @@ fn read_raw_inner<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
     } else {
         None
     };
-    let error = aggregate_cleanup_result(
-        comm,
-        cleanup
-            .or(injected)
-            .or_else(|| result.as_ref().err().cloned()),
-    );
+    let error = aggregate_cleanup_result(comm, injected.or_else(|| result.as_ref().err().cloned()));
     if let Some(e) = error {
         return Err(e);
     }

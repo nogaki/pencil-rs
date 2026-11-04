@@ -137,7 +137,7 @@ pub(crate) fn duplicate_comm(
         raw: duplicate_result.expect("communicator duplication agreement established"),
     };
     if restore_agreement.is_err() {
-        let _ = finish_comm(comm, duplicate);
+        finish_comm(comm, duplicate);
         abort_unrecoverable(
             comm.as_raw(),
             "original communicator error-handler restoration",
@@ -150,8 +150,8 @@ pub(crate) fn duplicate_comm(
             operation: "MPI_Comm_set_errhandler",
             code,
         });
-        let cleanup = finish_comm(comm, duplicate);
-        return Err(cleanup.unwrap_or(primary.unwrap_or(agreement)));
+        finish_comm(comm, duplicate);
+        return Err(primary.unwrap_or(agreement));
     }
     Ok(duplicate)
 }
@@ -301,8 +301,8 @@ where
             operation: "MPI_File_set_errhandler",
             code,
         });
-        let cleanup = finish_resources(comm, duplicate, file, None);
-        return Err(cleanup.unwrap_or(primary.unwrap_or(agreement)));
+        finish_resources(comm, duplicate, file, None);
+        return Err(primary.unwrap_or(agreement));
     }
 
     let header_write = if comm.rank() == ROOT_RANK {
@@ -321,17 +321,17 @@ where
         let primary = IoError::WriteIncomplete {
             stage: "header write",
         };
-        let cleanup = finish_resources(comm, duplicate, file, None);
-        return Err(cleanup_result(cleanup, primary));
+        finish_resources(comm, duplicate, file, None);
+        return Err(primary);
     }
     let header_flush = ffi::file_sync(file.raw).checked_success();
     if let Err(agreement) = agree_phase(comm, header_flush.is_ok(), "MPI-IO header flush") {
         let primary = IoError::WriteIncomplete {
             stage: "header flush",
         };
-        let cleanup = finish_resources(comm, duplicate, file, None);
+        finish_resources(comm, duplicate, file, None);
         let primary = header_flush.err().map(|_| primary).unwrap_or(agreement);
-        return Err(cleanup_result(cleanup, primary));
+        return Err(primary);
     }
 
     let mut datatype = None;
@@ -350,8 +350,8 @@ where
         let primary = IoError::WriteIncomplete {
             stage: "byte-subarray preparation",
         };
-        let cleanup = finish_resources(comm, duplicate, file, None);
-        return Err(cleanup_result(cleanup, primary));
+        finish_resources(comm, duplicate, file, None);
+        return Err(primary);
     }
     let filetype = datatype
         .as_ref()
@@ -362,9 +362,9 @@ where
         let primary = IoError::WriteIncomplete {
             stage: "MPI_File_set_view",
         };
-        let cleanup = finish_resources(comm, duplicate, file, datatype);
+        finish_resources(comm, duplicate, file, datatype);
         let primary = set_view.err().map(|_| primary).unwrap_or(agreement);
-        return Err(cleanup_result(cleanup, primary));
+        return Err(primary);
     }
 
     let payload_write = if controls.mode == MpiIoMode::Independent {
@@ -377,17 +377,17 @@ where
         let primary = IoError::WriteIncomplete {
             stage: "payload write",
         };
-        let cleanup = finish_resources(comm, duplicate, file, datatype);
-        return Err(cleanup_result(cleanup, primary));
+        finish_resources(comm, duplicate, file, datatype);
+        return Err(primary);
     }
     let payload_flush = ffi::file_sync(file.raw).checked_success();
     if let Err(agreement) = agree_phase(comm, payload_flush.is_ok(), "MPI-IO payload flush") {
         let primary = IoError::WriteIncomplete {
             stage: "payload flush",
         };
-        let cleanup = finish_resources(comm, duplicate, file, datatype);
+        finish_resources(comm, duplicate, file, datatype);
         let primary = payload_flush.err().map(|_| primary).unwrap_or(agreement);
-        return Err(cleanup_result(cleanup, primary));
+        return Err(primary);
     }
 
     let size_ok = match ffi::file_get_size(file.raw) {
@@ -398,8 +398,8 @@ where
         let primary = IoError::WriteIncomplete {
             stage: "payload size",
         };
-        let cleanup = finish_resources(comm, duplicate, file, datatype);
-        return Err(cleanup_result(cleanup, primary));
+        finish_resources(comm, duplicate, file, datatype);
+        return Err(primary);
     }
 
     // Explicit-offset MPI-IO offsets are expressed in the current view's
@@ -411,9 +411,9 @@ where
         let primary = IoError::WriteIncomplete {
             stage: "commit marker view",
         };
-        let cleanup = finish_resources(comm, duplicate, file, datatype);
+        finish_resources(comm, duplicate, file, datatype);
         let primary = marker_view.err().map(|_| primary).unwrap_or(agreement);
-        return Err(cleanup_result(cleanup, primary));
+        return Err(primary);
     }
 
     let marker = COMMIT_MARKER.to_le_bytes();
@@ -433,20 +433,20 @@ where
         let primary = IoError::CommitUncertain {
             stage: "commit marker write",
         };
-        let cleanup = finish_resources(comm, duplicate, file, datatype);
-        return Err(cleanup_result(cleanup, primary));
+        finish_resources(comm, duplicate, file, datatype);
+        return Err(primary);
     }
     let marker_flush = ffi::file_sync(file.raw).checked_success();
     if let Err(agreement) = agree_phase(comm, marker_flush.is_ok(), "MPI-IO commit marker flush") {
         let primary = IoError::CommitUncertain {
             stage: "commit marker flush",
         };
-        let cleanup = finish_resources(comm, duplicate, file, datatype);
+        finish_resources(comm, duplicate, file, datatype);
         let primary = marker_flush.err().map(|_| primary).unwrap_or(agreement);
-        return Err(cleanup_result(cleanup, primary));
+        return Err(primary);
     }
 
-    let cleanup = finish_resources(comm, duplicate, file, datatype);
+    finish_resources(comm, duplicate, file, datatype);
     drop(info);
     let injected = if inject_post_cleanup_failure && comm.rank() == ROOT_RANK {
         Some(IoError::CommitUncertain {
@@ -455,7 +455,7 @@ where
     } else {
         None
     };
-    if let Some(error) = aggregate_cleanup_result(comm, cleanup.or(injected)) {
+    if let Some(error) = aggregate_cleanup_result(comm, injected) {
         return Err(error);
     }
     Ok(())
@@ -607,21 +607,21 @@ where
             operation: "MPI_File_set_errhandler",
             code,
         });
-        let cleanup = finish_resources(comm, duplicate, file, None);
-        return Err(cleanup.unwrap_or(primary.unwrap_or(agreement)));
+        finish_resources(comm, duplicate, file, None);
+        return Err(primary.unwrap_or(agreement));
     }
 
     let file_size_result = ffi::file_get_size(file.raw);
     let size_ok = matches!(file_size_result, Ok(size) if size >= 0 && u64::try_from(size).is_ok());
     if let Err(agreement) = agree_phase(comm, size_ok, "MPI-IO file size") {
-        let cleanup = finish_resources(comm, duplicate, file, None);
-        return Err(cleanup.unwrap_or(if size_ok {
+        finish_resources(comm, duplicate, file, None);
+        return Err(if size_ok {
             agreement
         } else {
             IoError::InvalidFile {
                 reason: "file size",
             }
-        }));
+        });
     }
     let file_size = u64::try_from(file_size_result.expect("file size agreement established"))
         .expect("file size agreement established");
@@ -630,16 +630,16 @@ where
     comm.all_reduce_into(&file_size, &mut minimum_size, SystemOperation::min());
     comm.all_reduce_into(&file_size, &mut maximum_size, SystemOperation::max());
     if minimum_size != maximum_size {
-        let cleanup = finish_resources(comm, duplicate, file, None);
-        return Err(cleanup.unwrap_or(IoError::InvalidFile {
+        finish_resources(comm, duplicate, file, None);
+        return Err(IoError::InvalidFile {
             reason: "file size differs between ranks",
-        }));
+        });
     }
     if file_size < HEADER_PREFIX_BYTES as u64 {
-        let cleanup = finish_resources(comm, duplicate, file, None);
-        return Err(cleanup.unwrap_or(IoError::InvalidFile {
+        finish_resources(comm, duplicate, file, None);
+        return Err(IoError::InvalidFile {
             reason: "short header",
-        }));
+        });
     }
 
     let mut prefix = [0u8; HEADER_PREFIX_BYTES];
@@ -656,14 +656,14 @@ where
         Err(_) => false,
     };
     if let Err(agreement) = agree_phase(comm, prefix_ok, "MPI-IO header prefix read") {
-        let cleanup = finish_resources(comm, duplicate, file, None);
-        return Err(cleanup.unwrap_or(agreement));
+        finish_resources(comm, duplicate, file, None);
+        return Err(agreement);
     }
     let prefix_bcast = ffi::bcast_bytes(duplicate.raw, ROOT_RANK, &mut prefix).checked_success();
     if let Err(agreement) =
         agree_phase(comm, prefix_bcast.is_ok(), "MPI-IO header prefix broadcast")
     {
-        let cleanup = finish_resources(comm, duplicate, file, None);
+        finish_resources(comm, duplicate, file, None);
         let primary = prefix_bcast
             .err()
             .map(|code| IoError::Mpi {
@@ -671,22 +671,22 @@ where
                 code,
             })
             .unwrap_or(agreement);
-        return Err(cleanup.unwrap_or(primary));
+        return Err(primary);
     }
 
     let prefix_result = Header::parse_prefix(&prefix);
     if let Err(agreement) = agree_phase(comm, prefix_result.is_ok(), "header prefix validation") {
-        let cleanup = finish_resources(comm, duplicate, file, None);
-        return Err(cleanup.unwrap_or(prefix_result.err().unwrap_or(agreement)));
+        finish_resources(comm, duplicate, file, None);
+        return Err(prefix_result.err().unwrap_or(agreement));
     }
     let prefix_info = prefix_result.expect("header prefix agreement established");
     let header_len =
         usize::try_from(prefix_info.header_len).expect("validated header length fits usize");
     if u64::try_from(header_len).unwrap_or(u64::MAX) > file_size {
-        let cleanup = finish_resources(comm, duplicate, file, None);
-        return Err(cleanup.unwrap_or(IoError::InvalidFile {
+        finish_resources(comm, duplicate, file, None);
+        return Err(IoError::InvalidFile {
             reason: "truncated header",
-        }));
+        });
     }
     let mut full_header = Vec::new();
     let allocation_result =
@@ -696,8 +696,8 @@ where
                 requested: header_len,
             });
     if let Err(agreement) = agree_phase(comm, allocation_result.is_ok(), "header allocation") {
-        let cleanup = finish_resources(comm, duplicate, file, None);
-        return Err(cleanup.unwrap_or(allocation_result.err().unwrap_or(agreement)));
+        finish_resources(comm, duplicate, file, None);
+        return Err(allocation_result.err().unwrap_or(agreement));
     }
     full_header.resize(header_len, 0);
     let full_read = if comm.rank() == ROOT_RANK {
@@ -713,14 +713,14 @@ where
         Err(_) => false,
     };
     if let Err(agreement) = agree_phase(comm, full_ok, "MPI-IO complete header read") {
-        let cleanup = finish_resources(comm, duplicate, file, None);
-        return Err(cleanup.unwrap_or(agreement));
+        finish_resources(comm, duplicate, file, None);
+        return Err(agreement);
     }
     let full_bcast = ffi::bcast_bytes(duplicate.raw, ROOT_RANK, &mut full_header).checked_success();
     if let Err(agreement) =
         agree_phase(comm, full_bcast.is_ok(), "MPI-IO complete header broadcast")
     {
-        let cleanup = finish_resources(comm, duplicate, file, None);
+        finish_resources(comm, duplicate, file, None);
         let primary = full_bcast
             .err()
             .map(|code| IoError::Mpi {
@@ -728,7 +728,7 @@ where
                 code,
             })
             .unwrap_or(agreement);
-        return Err(cleanup.unwrap_or(primary));
+        return Err(primary);
     }
 
     let header_result = Header::decode(&full_header);
@@ -753,15 +753,15 @@ where
     };
     if let Err(agreement) = agree_phase(comm, header_matches.is_ok(), "header metadata validation")
     {
-        let cleanup = finish_resources(comm, duplicate, file, None);
-        return Err(cleanup.unwrap_or(header_matches.err().unwrap_or(agreement)));
+        finish_resources(comm, duplicate, file, None);
+        return Err(header_matches.err().unwrap_or(agreement));
     }
     let header = header_result.expect("header metadata agreement established");
     let header_offset = match to_offset(header.payload_offset) {
         Ok(offset) => offset,
         Err(error) => {
-            let cleanup = finish_resources(comm, duplicate, file, None);
-            return Err(cleanup.unwrap_or(error));
+            finish_resources(comm, duplicate, file, None);
+            return Err(error);
         }
     };
 
@@ -778,10 +778,10 @@ where
         abort_unrecoverable(comm.as_raw(), "MPI byte-subarray partial native datatype");
     }
     if !all_datatypes_ready {
-        let cleanup = finish_resources(comm, duplicate, file, None);
-        return Err(cleanup.unwrap_or(IoError::CollectivePrecondition {
+        finish_resources(comm, duplicate, file, None);
+        return Err(IoError::CollectivePrecondition {
             phase: "MPI byte-subarray preparation",
-        }));
+        });
     }
     let filetype = datatype
         .as_ref()
@@ -789,7 +789,7 @@ where
     let set_view = ffi::file_set_view_with_info(file.raw, header_offset, filetype, native_info)
         .checked_success();
     if let Err(agreement) = agree_phase(comm, set_view.is_ok(), "MPI-IO byte-subarray view") {
-        let cleanup = finish_resources(comm, duplicate, file, datatype);
+        finish_resources(comm, duplicate, file, datatype);
         let primary = set_view
             .err()
             .map(|code| IoError::Mpi {
@@ -797,7 +797,7 @@ where
                 code,
             })
             .unwrap_or(agreement);
-        return Err(cleanup.unwrap_or(primary));
+        return Err(primary);
     }
 
     let payload_read = if controls.mode == MpiIoMode::Independent {
@@ -807,18 +807,18 @@ where
     };
     let payload_ok = matches!(payload_read, Ok(actual) if actual == staging.len());
     if let Err(agreement) = agree_phase(comm, payload_ok, "MPI-IO payload read") {
-        let cleanup = finish_resources(comm, duplicate, file, datatype);
-        return Err(cleanup.unwrap_or(agreement));
+        finish_resources(comm, duplicate, file, datatype);
+        return Err(agreement);
     }
 
     // Validate layout and allocate decode scratch before native cleanup.
     let plan_result = target.prepare(&staging);
     if let Err(agreement) = agree_phase(comm, plan_result.is_ok(), "MPI-IO read physical staging") {
-        let cleanup = finish_resources(comm, duplicate, file, datatype);
-        return Err(cleanup.unwrap_or(plan_result.err().unwrap_or(agreement)));
+        finish_resources(comm, duplicate, file, datatype);
+        return Err(plan_result.err().unwrap_or(agreement));
     }
     let plan = plan_result.expect("read physical staging agreement established");
-    let cleanup = finish_resources(comm, duplicate, file, datatype);
+    finish_resources(comm, duplicate, file, datatype);
     drop(info);
     let injected =
         if post_cleanup_failure_injected(inject_post_cleanup_failure) && comm.rank() == ROOT_RANK {
@@ -829,7 +829,7 @@ where
         } else {
             None
         };
-    if let Some(error) = aggregate_cleanup_result(comm, cleanup.or(injected)) {
+    if let Some(error) = aggregate_cleanup_result(comm, injected) {
         return Err(error);
     }
     target.commit(plan, &staging);
@@ -895,18 +895,8 @@ fn cleanup_comm_error(
     duplicate: CommGuard,
     primary: IoError,
 ) -> IoError {
-    finish_comm(comm, duplicate).unwrap_or(primary)
-}
-
-pub(crate) fn cleanup_result(cleanup: Option<IoError>, primary: IoError) -> IoError {
-    if matches!(
-        &primary,
-        IoError::WriteIncomplete { .. } | IoError::CommitUncertain { .. }
-    ) {
-        primary
-    } else {
-        cleanup.unwrap_or(primary)
-    }
+    finish_comm(comm, duplicate);
+    primary
 }
 
 #[cfg(test)]
@@ -948,10 +938,7 @@ pub(crate) fn aggregate_cleanup_result<C: CommunicatorCollectives>(
     }
 }
 
-pub(crate) fn finish_comm(
-    comm: &mpi::topology::CartesianCommunicator,
-    mut duplicate: CommGuard,
-) -> Option<IoError> {
+pub(crate) fn finish_comm(comm: &mpi::topology::CartesianCommunicator, mut duplicate: CommGuard) {
     let code = ffi::comm_free(&mut duplicate.raw);
     let local_ok = code == ffi::MPI_SUCCESS as i32;
     let (all_closed, _mixed_close) = collective_state(comm, local_ok);
@@ -961,7 +948,6 @@ pub(crate) fn finish_comm(
         // communicator, never through the post-free duplicate.
         abort_unrecoverable(comm.as_raw(), "MPI_Comm_free unrecoverable native handle");
     }
-    None
 }
 
 pub(crate) fn finish_resources(
@@ -969,7 +955,7 @@ pub(crate) fn finish_resources(
     mut duplicate: CommGuard,
     mut file: FileGuard,
     mut datatype: Option<DatatypeGuard>,
-) -> Option<IoError> {
+) {
     // Derived datatypes must be released before closing the file that may
     // still reference their file view.  Every rank participates in each
     // agreement even when its local datatype is absent (empty rank).
@@ -1004,7 +990,6 @@ pub(crate) fn finish_resources(
         // topology communicator instead.
         abort_unrecoverable(comm.as_raw(), "MPI_Comm_free unrecoverable native handle");
     }
-    None
 }
 
 pub(crate) fn agree_phase<C>(comm: &C, local_ok: bool, phase: &'static str) -> Result<(), IoError>

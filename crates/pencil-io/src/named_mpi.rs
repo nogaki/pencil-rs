@@ -241,16 +241,13 @@ pub(crate) fn scan_path_for_test(
             collective_reads: at_calls_after[2] - at_calls[2],
         })
     })();
-    let cleanup = finish_resources(
+    finish_resources(
         comm,
         duplicate,
         crate::mpi_io::FileGuard { raw: file },
         None,
     );
     let scan = result?;
-    if let Some(error) = cleanup {
-        return Err(error.into());
-    }
     Ok(scan)
 }
 const CATALOG_CHUNK_BYTES: usize = 1 << 30;
@@ -1250,7 +1247,7 @@ fn write_named<T: IoElement, const N: usize, const M: usize>(
         )?;
         Ok(())
     })();
-    let cleanup = finish_resources(
+    finish_resources(
         comm,
         duplicate,
         crate::mpi_io::FileGuard { raw: file },
@@ -1261,7 +1258,7 @@ fn write_named<T: IoElement, const N: usize, const M: usize>(
             stage: "named post-cleanup result",
         })
     } else {
-        cleanup
+        None
     };
     drop(info);
     let cleanup = crate::mpi_io::aggregate_cleanup_result(comm, cleanup);
@@ -1483,7 +1480,7 @@ fn read_named_inner<T: IoElement, const N: usize, const M: usize>(
         )?;
         prepared(comm, target.prepare(&packed), "named physical staging")
     })();
-    let cleanup = finish_resources(
+    finish_resources(
         comm,
         duplicate,
         crate::mpi_io::FileGuard { raw: file },
@@ -1497,7 +1494,7 @@ fn read_named_inner<T: IoElement, const N: usize, const M: usize>(
             code: -1,
         })
     } else {
-        cleanup
+        None
     };
     drop(info);
     let cleanup = crate::mpi_io::aggregate_cleanup_result(comm, cleanup);

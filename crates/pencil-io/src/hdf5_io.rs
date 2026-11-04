@@ -17,8 +17,8 @@ use crate::hdf5_schema::{
     valid_global_shape, valid_permutation, valid_shape_bytes, valid_writer_grid,
 };
 use crate::mpi_io::{
-    CommGuard, abort_unrecoverable, aggregate_cleanup_result, agree_phase, cleanup_result,
-    collective_state, descriptor_agreement, duplicate_comm, first_error2, try_u64_values,
+    CommGuard, abort_unrecoverable, aggregate_cleanup_result, agree_phase, collective_state,
+    descriptor_agreement, duplicate_comm, first_error2, try_u64_values,
 };
 use crate::{
     COMMIT_MARKER, FORMAT_VERSION, INCOMPLETE_MARKER, IoError, MAX_PROTOCOL_RANK, NamedIoError,
@@ -454,7 +454,7 @@ where
         ));
     }
 
-    let cleanup = finish_hdf5(comm, duplicate, opened, resources);
+    finish_hdf5(comm, duplicate, opened, resources);
     let injected = if inject_post_cleanup_failure && comm.rank() == 0 {
         Some(IoError::CommitUncertain {
             stage: "test post-marker cleanup result",
@@ -462,7 +462,7 @@ where
     } else {
         None
     };
-    if let Some(error) = aggregate_cleanup_result(comm, cleanup.or(injected)) {
+    if let Some(error) = aggregate_cleanup_result(comm, injected) {
         return Err(error);
     }
     Ok(())
@@ -624,7 +624,7 @@ fn check_named_absent(
     };
     let exists_result = native::link_exists(group, link);
     let query_agreement = agree_phase(comm, exists_result.is_ok(), "HDF5 named link query");
-    let cleanup = finish_hdf5(
+    finish_hdf5(
         comm,
         dup,
         file,
@@ -639,9 +639,6 @@ fn check_named_absent(
         }
         Err(error) => return Err(NamedIoError::Io(error)),
     };
-    if let Some(error) = cleanup {
-        return Err(NamedIoError::Io(error));
-    }
     let (all_exist, mixed) = collective_state(comm, exists);
     if mixed {
         return Err(IoError::CollectiveDescriptorMismatch.into());
@@ -1242,7 +1239,7 @@ where
         ));
     }
     let plan = plan_result.expect("HDF5 read physical staging agreement");
-    let cleanup = finish_hdf5(comm, duplicate, opened, resources);
+    finish_hdf5(comm, duplicate, opened, resources);
     let injected = if crate::mpi_io::post_cleanup_failure_injected(inject_post_cleanup_failure)
         && comm.rank() == 0
     {
@@ -1253,7 +1250,7 @@ where
     } else {
         None
     };
-    if let Some(error) = aggregate_cleanup_result(comm, cleanup.or(injected)) {
+    if let Some(error) = aggregate_cleanup_result(comm, injected) {
         return Err(error);
     }
     target.commit(plan, &staging);
@@ -1767,7 +1764,8 @@ fn write_original_name(
             },
         ));
     }
-    finish_attr_handles(comm, handles).map_or(Ok(()), Err)
+    finish_attr_handles(comm, handles);
+    Ok(())
 }
 
 fn read_original_name(
@@ -1848,9 +1846,7 @@ fn read_original_name(
         ));
     }
     bytes.pop();
-    if let Some(error) = finish_attr_handles(comm, handles) {
-        return Err(error);
-    }
+    finish_attr_handles(comm, handles);
     Ok(bytes)
 }
 
@@ -1950,7 +1946,8 @@ fn write_attr_u64(
             },
         ));
     }
-    finish_attr_handles(comm, handles).map_or(Ok(()), Err)
+    finish_attr_handles(comm, handles);
+    Ok(())
 }
 
 fn write_existing_attr(
@@ -1994,7 +1991,8 @@ fn write_existing_attr(
             },
         ));
     }
-    finish_attr_handles(comm, handles).map_or(Ok(()), Err)
+    finish_attr_handles(comm, handles);
+    Ok(())
 }
 
 #[derive(Default)]
@@ -2010,38 +2008,30 @@ fn attr_error(
     handles: AttrHandles,
     primary: IoError,
 ) -> IoError {
-    finish_attr_handles(comm, handles).unwrap_or(primary)
+    finish_attr_handles(comm, handles);
+    primary
 }
 
-fn finish_attr_handles(
-    comm: &mpi::topology::CartesianCommunicator,
-    mut handles: AttrHandles,
-) -> Option<IoError> {
-    let mut first = None;
-    macro_rules! close {
-        ($slot:expr, $function:path, $operation:expr) => {
-            if !close_optional(comm, $slot, &mut first, $function, $operation) {
-                return first;
-            }
-        };
-    }
-    close!(
+fn finish_attr_handles(comm: &mpi::topology::CartesianCommunicator, mut handles: AttrHandles) {
+    close_optional(
+        comm,
         &mut handles.memory,
         native::type_close,
-        "H5Tclose(attribute memory)"
+        "H5Tclose(attribute memory)",
     );
-    close!(
+    close_optional(
+        comm,
         &mut handles.space,
         native::dataspace_close,
-        "H5Sclose(attribute)"
+        "H5Sclose(attribute)",
     );
-    close!(
+    close_optional(
+        comm,
         &mut handles.datatype,
         native::type_close,
-        "H5Tclose(attribute)"
+        "H5Tclose(attribute)",
     );
-    close!(&mut handles.attr, native::attr_close, "H5Aclose");
-    first
+    close_optional(comm, &mut handles.attr, native::attr_close, "H5Aclose");
 }
 
 fn validate_read_metadata<T: IoElement, const N: usize, const M: usize>(
@@ -2288,9 +2278,7 @@ fn read_attr_phase(
     for chunk in bytes.as_chunks::<8>().0 {
         values.push(u64::from_le_bytes(*chunk));
     }
-    if let Some(error) = finish_attr_handles(comm, handles) {
-        return Err(error);
-    }
+    finish_attr_handles(comm, handles);
     Ok(values)
 }
 
@@ -2330,7 +2318,8 @@ fn cleanup_ready(
     resources: Hdf5Resources,
     primary: IoError,
 ) -> IoError {
-    cleanup_result(finish_hdf5(comm, duplicate, file, resources), primary)
+    finish_hdf5(comm, duplicate, file, resources);
+    primary
 }
 
 fn finish_hdf5(
@@ -2338,35 +2327,40 @@ fn finish_hdf5(
     mut duplicate: CommGuard,
     file: native::Hid,
     mut resources: Hdf5Resources,
-) -> Option<IoError> {
-    let mut first = None;
-    macro_rules! close {
-        ($slot:expr, $function:path, $operation:expr) => {
-            if !close_optional(comm, $slot, &mut first, $function, $operation) {
-                return first;
-            }
-        };
-    }
-    close!(&mut resources.xfer, native::plist_close, "H5Pclose");
-    close!(&mut resources.dcpl, native::plist_close, "H5Pclose");
-    close!(
+) {
+    close_optional(comm, &mut resources.xfer, native::plist_close, "H5Pclose");
+    close_optional(comm, &mut resources.dcpl, native::plist_close, "H5Pclose");
+    close_optional(
+        comm,
         &mut resources.mem_space,
         native::dataspace_close,
-        "H5Sclose(memory)"
+        "H5Sclose(memory)",
     );
-    close!(
+    close_optional(
+        comm,
         &mut resources.file_space,
         native::dataspace_close,
-        "H5Sclose(file)"
+        "H5Sclose(file)",
     );
-    close!(&mut resources.datatype, native::type_close, "H5Tclose");
-    close!(
+    close_optional(
+        comm,
+        &mut resources.datatype,
+        native::type_close,
+        "H5Tclose",
+    );
+    close_optional(
+        comm,
         &mut resources.dataspace,
         native::dataspace_close,
-        "H5Sclose(dataset)"
+        "H5Sclose(dataset)",
     );
-    close!(&mut resources.dataset, native::dataset_close, "H5Dclose");
-    close!(&mut resources.group, native::group_close, "H5Gclose");
+    close_optional(
+        comm,
+        &mut resources.dataset,
+        native::dataset_close,
+        "H5Dclose",
+    );
+    close_optional(comm, &mut resources.group, native::group_close, "H5Gclose");
     let mut file_id = file;
     let file_code = native::file_close(&mut file_id);
     let (all_files_closed, _mixed_file_close) = collective_state(comm, file_code >= 0);
@@ -2384,16 +2378,14 @@ fn finish_hdf5(
         // only the original topology communicator is a valid fail-stop path.
         abort_unrecoverable(comm.as_raw(), "MPI_Comm_free unrecoverable native handle");
     }
-    first
 }
 
 fn close_optional(
     comm: &mpi::topology::CartesianCommunicator,
     slot: &mut Option<native::Hid>,
-    _first: &mut Option<IoError>,
     close: fn(&mut native::Hid) -> i32,
     operation: &'static str,
-) -> bool {
+) {
     let code = slot.as_mut().map_or(0, close);
     let (all_closed, _mixed_close) = collective_state(comm, code >= 0);
     if !all_closed {
@@ -2402,7 +2394,6 @@ fn close_optional(
         abort_unrecoverable(comm.as_raw(), operation);
     }
     slot.take();
-    true
 }
 
 fn phase_code(
@@ -2909,54 +2900,39 @@ pub(crate) fn inspect_catalog(
                     extra_shape: extra,
                     provenance,
                 });
-                let mut first = None;
                 close_optional(
                     comm,
                     &mut resources.datatype,
-                    &mut first,
                     native::type_close,
                     "H5Tclose(catalog)",
                 );
                 close_optional(
                     comm,
                     &mut resources.file_space,
-                    &mut first,
                     native::dataspace_close,
                     "H5Sclose(catalog)",
                 );
                 close_optional(
                     comm,
                     &mut resources.dataset,
-                    &mut first,
                     native::dataset_close,
                     "H5Dclose(catalog)",
                 );
-                if let Some(e) = first {
-                    return Err(CatalogError::Io(e));
-                }
             }
-            let mut first = None;
             close_optional(
                 comm,
                 &mut resources.group,
-                &mut first,
                 native::group_close,
                 "H5Gclose(catalog)",
             );
-            if let Some(e) = first {
-                return Err(CatalogError::Io(e));
-            }
         }
         Ok(out)
     })();
     let agreement = agree_phase(comm, result.is_ok(), "HDF5 catalog validation");
-    let cleanup = finish_hdf5(comm, duplicate, file, resources);
-    match cleanup {
-        Some(e) => Err(CatalogError::Io(e)),
-        None => match (result, agreement) {
-            (Err(e), _) => Err(e),
-            (Ok(_), Err(e)) => Err(CatalogError::Io(e)),
-            (Ok(x), Ok(())) => Ok(x),
-        },
+    finish_hdf5(comm, duplicate, file, resources);
+    match (result, agreement) {
+        (Err(e), _) => Err(e),
+        (Ok(_), Err(e)) => Err(CatalogError::Io(e)),
+        (Ok(x), Ok(())) => Ok(x),
     }
 }

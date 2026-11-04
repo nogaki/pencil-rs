@@ -295,10 +295,11 @@ fn with_file<T>(
         abort_unrecoverable(c.as_raw(), "chunked partial open");
     }
     if !all {
-        return Err(finish_comm(c, dup).unwrap_or(IoError::Mpi {
+        finish_comm(c, dup);
+        return Err(IoError::Mpi {
             operation: "MPI_File_open",
             code: opened.err().unwrap_or(-1),
-        }));
+        });
     }
     let file = FileGuard {
         raw: opened.unwrap(),
@@ -309,7 +310,7 @@ fn with_file<T>(
         "chunked file handler",
     )
     .and_then(|()| action(file.raw));
-    let cleanup = finish_resources(c, dup, file, None);
+    finish_resources(c, dup, file, None);
     drop(info);
     let fault = if inject && c.rank() == 0 {
         Some(IoError::Native {
@@ -319,10 +320,7 @@ fn with_file<T>(
     } else {
         None
     };
-    if let Some(e) = aggregate_cleanup_result(
-        c,
-        cleanup.or(fault).or_else(|| result.as_ref().err().cloned()),
-    ) {
+    if let Some(e) = aggregate_cleanup_result(c, fault.or_else(|| result.as_ref().err().cloned())) {
         return Err(e);
     }
     result

@@ -104,16 +104,13 @@ pub(crate) fn native_contracts(
         )
         .unwrap();
         write_existing_attr(comm, dataset, ATTR_COMMIT, marker).unwrap();
-        assert!(
-            data::finish_session(
-                comm,
-                Hdf5Resources {
-                    group: Some(group),
-                    dataset: Some(dataset),
-                    ..Hdf5Resources::default()
-                }
-            )
-            .is_none()
+        data::finish_session(
+            comm,
+            Hdf5Resources {
+                group: Some(group),
+                dataset: Some(dataset),
+                ..Hdf5Resources::default()
+            },
         );
         if marker == INCOMPLETE_MARKER {
             assert!(session.catalog().is_err());

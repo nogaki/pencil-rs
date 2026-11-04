@@ -263,7 +263,7 @@ fn open<P: AsRef<Path>>(
         abort_unrecoverable(c.as_raw(), "catalog MPI_File_open partial handle");
     }
     if !all_ok {
-        let _ = crate::mpi_io::finish_comm(c, d);
+        crate::mpi_io::finish_comm(c, d);
         return Err(r
             .err()
             .map(|code| IoError::Mpi {
@@ -281,17 +281,13 @@ fn open<P: AsRef<Path>>(
         ffi::file_set_errors_return(f) == ffi::MPI_SUCCESS as i32,
         "catalog file error handler",
     ) {
-        close(c, d, f)?;
+        close(c, d, f);
         return Err(e);
     }
     Ok((d, f))
 }
-fn close(
-    c: &CartesianCommunicator,
-    d: crate::mpi_io::CommGuard,
-    f: ffi::MPI_File,
-) -> Result<(), CatalogError> {
-    finish_resources(c, d, FileGuard { raw: f }, None).map_or(Ok(()), |e| Err(CatalogError::Io(e)))
+fn close(c: &CartesianCommunicator, d: crate::mpi_io::CommGuard, f: ffi::MPI_File) {
+    finish_resources(c, d, FileGuard { raw: f }, None);
 }
 /// Read a strict metadata-only catalog from a native MPI v1 dataset collectively.
 ///
@@ -394,7 +390,7 @@ pub fn read_mpi_catalog<P: AsRef<Path>>(
         }])
     })();
     let agreement = agree(c, r.is_ok(), "catalog result validation");
-    close(c, d, f)?;
+    close(c, d, f);
     if r.is_ok() {
         agreement?;
     }
@@ -462,7 +458,7 @@ pub fn read_mpi_named_catalog<P: AsRef<Path>>(
             .collect()
     })();
     let agreement = agree(c, r.is_ok(), "catalog result validation");
-    close(c, d, f)?;
+    close(c, d, f);
     if r.is_ok() {
         agreement?;
     }
