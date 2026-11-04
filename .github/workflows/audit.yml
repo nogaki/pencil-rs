@@ -1,0 +1,244 @@
+# 定期監査: 毎日 1 範囲ずつ巡回し、見つかった問題を GitHub Issue に起票する。
+#
+# 必要な Secret:
+#   OPENCODE_API_KEY  OpenCode Go の API キー（pi のモデル呼び出しに使う）
+#
+# schedule トリガーは、このファイルがデフォルトブランチ（main）に存在するときだけ動く。
+# スケジュール実行でも監査対象は dev（env.AUDIT_REF）である。
+#
+# 権限の分離: LLM（pi）が動く audit job は issues を読むだけで、書き込み権限を持たない。
+# 起票は、LLM を使わない決まった手順（.github/audit/issues.py）だけが行う file job に任せる。
+name: Scheduled audit
+
+on:
+  schedule:
+    # 毎日 06:00 JST。OpenCode Go のピーク料金時間帯の外。
+    - cron: "0 21 * * *"
+  workflow_dispatch:
+    inputs:
+      range:
+        description: 監査する範囲
+        type: choice
+        options:
+          - auto
+          - array
+          - fft-local
+          - fft-distributed
+          - io
+        default: auto
+      audit:
+        description: 実行する監査
+        type: choice
+        options:
+          - both
+          - design
+          - ponytail
+        default: both
+      dry_run:
+        description: Issue を作成せず報告だけ出す
+        type: boolean
+        default: false
+
+concurrency:
+  group: scheduled-audit
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AUDIT_REF: dev
+  PI_VERSION: 1.5.0
+  AUDIT_MODEL: opencode-go/deepseek-v4.1-flash
+  PONYTAIL_SKILL_URL: https://raw.githubusercontent.com/DietrichGebert/ponytail/16352ac229eb08a9598dcae48fe9f2b342567d86/skills/ponytail-audit/SKILL.md
+  PONYTAIL_SKILL_SHA256: 2b3223a02c386d1263e1b08343cb8eb3a53e444cdafb1d79e26c8ec2a8fcad28
+
+jobs:
+  plan:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      range: ${{ steps.plan.outputs.range }}
+      focus: ${{ steps.plan.outputs.focus }}
+      scope: ${{ steps.plan.outputs.scope }}
+      audits: ${{ steps.plan.outputs.audits }}
+      sha: ${{ steps.rev.outputs.sha }}
+      short_sha: ${{ steps.rev.outputs.short_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.AUDIT_REF }}
+          persist-credentials: false
+
+      - name: Record audit revision
+        id: rev
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short HEAD)" >>"$GITHUB_OUTPUT"
+
+      - name: Plan today's audit
+        id: plan
+        env:
+          AUDIT_RANGE: ${{ inputs.range || 'auto' }}
+          AUDIT_KIND: ${{ inputs.audit || 'both' }}
+        run: |
+          set -euo pipefail
+          bash .github/audit/plan.sh
+          cat "$GITHUB_OUTPUT"
+
+  audit:
+    needs: plan
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    # LLM には書き込み権限を渡さない。
+    permissions:
+      contents: read
+      issues: read
+    strategy:
+      fail-fast: false
+      matrix:
+        audit: ${{ fromJSON(needs.plan.outputs.audits) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pi
+        run: |
+          set -euo pipefail
+          node --version
+          npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}"
+          pi --version
+
+      - name: Fetch ponytail-audit skill
+        if: matrix.audit == 'ponytail'
+        run: |
+          set -euo pipefail
+          curl -fsSL "$PONYTAIL_SKILL_URL" -o "$RUNNER_TEMP/ponytail-audit.md"
+          echo "${PONYTAIL_SKILL_SHA256}  $RUNNER_TEMP/ponytail-audit.md" | sha256sum -c -
+
+      - name: Fetch existing audit issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/existing-issues.json"
+          gh api --paginate "repos/${GH_REPO}/issues?labels=audit&state=all&per_page=100" \
+            | jq -s 'add // []
+                | map(select(has("pull_request") | not))
+                | map({number, title, state, state_reason, body: ((.body // "")[0:2000])})' \
+            >"$out"
+          echo "既存の監査 Issue: $(jq 'length' "$out") 件"
+
+      - name: Build prompt
+        run: |
+          set -euo pipefail
+          prompt="$RUNNER_TEMP/prompt.md"
+          {
+            echo "# 定期監査"
+            echo
+            echo "- 監査の種類: ${{ matrix.audit }}"
+            echo "- 範囲名: ${{ needs.plan.outputs.range }}"
+            echo "- scope: ${{ needs.plan.outputs.scope }}"
+            echo "- 重点: ${{ needs.plan.outputs.focus }}"
+            echo "- 監査対象: ブランチ ${{ env.AUDIT_REF }}（${{ needs.plan.outputs.short_sha }}）"
+            echo "- モデル: ${{ env.AUDIT_MODEL }}"
+            echo "- dry run: ${{ inputs.dry_run || false }}"
+            echo
+          } >"$prompt"
+          if [[ "${{ matrix.audit }}" == "design" ]]; then
+            cat .github/audit/design.md >>"$prompt"
+          else
+            cat .github/audit/ponytail.md >>"$prompt"
+            echo >>"$prompt"
+            cat "$RUNNER_TEMP/ponytail-audit.md" >>"$prompt"
+          fi
+          echo >>"$prompt"
+          cat .github/audit/output.md >>"$prompt"
+
+      - name: Run audit
+        # 渡すのは API キーだけ。GH_TOKEN は渡さない（job に書き込み権限もない）。
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: |
+          set -euo pipefail
+          # read・grep・find・ls だけを渡す（bash・edit・write は使えない）。
+          pi -p --no-session --no-context-files --tools read,grep,find,ls \
+            --model "$AUDIT_MODEL" --thinking high \
+            @"$RUNNER_TEMP/prompt.md" \
+            @"$RUNNER_TEMP/existing-issues.json" \
+            "添付の指示に従って監査し、最後に指定の JSON ブロックを出力してください。" \
+            | tee "$RUNNER_TEMP/report.md"
+
+      - name: Extract candidates
+        run: |
+          set -euo pipefail
+          python3 .github/audit/issues.py extract \
+            "$RUNNER_TEMP/report.md" \
+            "$RUNNER_TEMP/candidates-${{ matrix.audit }}.json"
+
+      - name: Upload candidates
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidates-${{ matrix.audit }}
+          path: ${{ runner.temp }}/candidates-${{ matrix.audit }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Append report to step summary
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -f "$RUNNER_TEMP/report.md" ]]; then
+            {
+              echo "## 監査レポート（${{ matrix.audit }} / ${{ needs.plan.outputs.range }}）"
+              echo
+              cat "$RUNNER_TEMP/report.md"
+            } >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+  file:
+    needs: [plan, audit]
+    # 片方の監査が失敗しても、成功した側の候補は起票する。dry run では job ごと動かない。
+    if: ${{ !cancelled() && !inputs.dry_run }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+
+      - name: Download candidates
+        uses: actions/download-artifact@v4
+        with:
+          pattern: candidates-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/candidates
+
+      - name: File issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          AUDIT_RANGE: ${{ needs.plan.outputs.range }}
+          AUDIT_FOCUS: ${{ needs.plan.outputs.focus }}
+          AUDIT_REF: ${{ env.AUDIT_REF }}
+          AUDIT_SHA: ${{ needs.plan.outputs.short_sha }}
+          AUDIT_MODEL: ${{ env.AUDIT_MODEL }}
+        run: |
+          set -euo pipefail
+          python3 .github/audit/issues.py file "$RUNNER_TEMP/candidates"

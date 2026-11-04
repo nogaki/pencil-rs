@@ -87,6 +87,7 @@ fn prepare_metadata<'a, T: IoElement + 'a, const N: usize, const M: usize>(
     comm: &CartesianCommunicator,
     path: &Path,
     operation: u64,
+    mpi_preflight: bool,
     count: usize,
     mut members: impl Iterator<Item = (&'a Pencil<N, M>, &'a ExtraShape, &'a [T])> + Clone,
 ) -> Result<Vec<usize>, CollectionIoError> {
@@ -109,18 +110,8 @@ fn prepare_metadata<'a, T: IoElement + 'a, const N: usize, const M: usize>(
             index: first_bad as usize,
         });
     }
-    let mpi_operation = matches!(
-        operation,
-        MPI_WRITE
-            | MPI_READ
-            | MPI_WRITE_OPTIONS
-            | MPI_READ_OPTIONS
-            | MPI_NAMED_WRITE_OPTIONS
-            | MPI_NAMED_APPEND_OPTIONS
-            | MPI_NAMED_READ_OPTIONS
-    );
     let dims = (|| {
-        let combined = if mpi_operation {
+        let combined = if mpi_preflight {
             let combined = data.len().checked_mul(count).ok_or(IoError::SizeLimit {
                 what: MPI_LOCAL_BYTE_LIMIT_WHAT,
             })?;
@@ -148,7 +139,7 @@ fn prepare_metadata<'a, T: IoElement + 'a, const N: usize, const M: usize>(
             })?;
         dims.push(count);
         dims.extend_from_slice(extra.dimensions());
-        if mpi_operation {
+        if mpi_preflight {
             build_layout(
                 first.global_shape(),
                 &dims,
@@ -160,7 +151,7 @@ fn prepare_metadata<'a, T: IoElement + 'a, const N: usize, const M: usize>(
         }
         Ok::<_, IoError>(dims)
     })();
-    let agreement = if mpi_operation {
+    let agreement = if mpi_preflight {
         agree_mpi_preparation(
             comm,
             dims.as_ref().err(),
@@ -170,7 +161,7 @@ fn prepare_metadata<'a, T: IoElement + 'a, const N: usize, const M: usize>(
         agree_phase(comm, dims.is_ok(), "collection descriptor allocation")
     };
     if let Err(agreement) = agreement {
-        let error = if mpi_operation {
+        let error = if mpi_preflight {
             mpi_preparation_error(dims.err(), agreement)
         } else {
             dims.err().unwrap_or(agreement)
@@ -198,12 +189,13 @@ fn prepare<'a, T: IoElement + 'a, const N: usize, const M: usize>(
     comm: &CartesianCommunicator,
     path: &Path,
     operation: u64,
+    mpi_preflight: bool,
     count: usize,
     members: impl Iterator<Item = (&'a Pencil<N, M>, &'a ExtraShape, &'a [T])> + Clone,
 ) -> Result<PencilArray<T, N, M>, CollectionIoError> {
     let all = members.clone();
     let (first, _, data) = members.clone().next().expect("nonempty collection");
-    let dims = prepare_metadata(comm, path, operation, count, members)?;
+    let dims = prepare_metadata(comm, path, operation, mpi_preflight, count, members)?;
     #[cfg(test)]
     STAGING_CALLS.with(|calls| calls.set(calls.get() + 1));
     let staged = (|| {
@@ -253,12 +245,14 @@ fn prepare_read<T: IoElement, const N: usize, const M: usize>(
     comm: &CartesianCommunicator,
     path: &Path,
     operation: u64,
+    mpi_preflight: bool,
     views: &[PencilArrayViewMut<'_, T, N, M>],
 ) -> Result<(Vec<usize>, usize, Vec<u8>), CollectionIoError> {
     let dims = prepare_metadata(
         comm,
         path,
         operation,
+        mpi_preflight,
         views.len(),
         views
             .iter()
@@ -313,6 +307,7 @@ fn mpi_write<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
         comm,
         path.as_ref(),
         operation,
+        true,
         views.len(),
         views
             .iter()
@@ -376,7 +371,7 @@ fn mpi_read<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
     if let Some(o) = options {
         agree_options(comm, o, &[])?;
     }
-    let (dims, len, staging) = prepare_read(comm, path.as_ref(), operation, views)?;
+    let (dims, len, staging) = prepare_read(comm, path.as_ref(), operation, true, views)?;
     let target = ReadTarget::collection(views, dims, len, staging);
     crate::mpi_io::read_mpi_target(path, target, options)?;
     Ok(())
@@ -419,12 +414,14 @@ fn named_prepare<T: IoElement, const N: usize, const M: usize>(
     comm: &CartesianCommunicator,
     path: &Path,
     operation: u64,
+    mpi_preflight: bool,
     views: &[PencilArrayView<'_, T, N, M>],
 ) -> Result<PencilArray<T, N, M>, CollectionIoError> {
     prepare(
         comm,
         path,
         operation,
+        mpi_preflight,
         views.len(),
         views
             .iter()
@@ -454,7 +451,7 @@ pub fn write_mpi_named_collection<
     header(comm, MPI_NAMED_WRITE_OPTIONS, views.len())?;
     agree_name(comm, name.as_ref())?;
     agree_options(comm, o, &[])?;
-    let a = named_prepare(comm, path.as_ref(), MPI_NAMED_WRITE_OPTIONS, views)?;
+    let a = named_prepare(comm, path.as_ref(), MPI_NAMED_WRITE_OPTIONS, true, views)?;
     crate::write_mpi_named_with_options(path, name, a.view(), o)?;
     Ok(())
 }
@@ -480,7 +477,7 @@ pub fn append_mpi_named_collection<
     header(comm, MPI_NAMED_APPEND_OPTIONS, views.len())?;
     agree_name(comm, name.as_ref())?;
     agree_options(comm, o, &[])?;
-    let a = named_prepare(comm, path.as_ref(), MPI_NAMED_APPEND_OPTIONS, views)?;
+    let a = named_prepare(comm, path.as_ref(), MPI_NAMED_APPEND_OPTIONS, true, views)?;
     crate::append_mpi_named_with_options(path, name, a.view(), o)?;
     Ok(())
 }
@@ -506,7 +503,8 @@ pub fn read_mpi_named_collection<
     header(comm, MPI_NAMED_READ_OPTIONS, views.len())?;
     agree_name(comm, name.as_ref())?;
     agree_options(comm, o, &[])?;
-    let (dims, len, staging) = prepare_read(comm, path.as_ref(), MPI_NAMED_READ_OPTIONS, views)?;
+    let (dims, len, staging) =
+        prepare_read(comm, path.as_ref(), MPI_NAMED_READ_OPTIONS, true, views)?;
     let target = ReadTarget::collection(views, dims, len, staging);
     crate::named_mpi::read_named_target(path.as_ref(), name.as_ref(), target, Some(o))?;
     Ok(())
@@ -528,6 +526,7 @@ pub fn write_hdf5_collection<P: AsRef<Path>, T: IoElement, const N: usize, const
         comm,
         path.as_ref(),
         HDF5_WRITE,
+        false,
         views.len(),
         views
             .iter()
@@ -565,6 +564,7 @@ pub fn write_hdf5_collection_with_options<
         comm,
         path.as_ref(),
         HDF5_WRITE_OPTIONS,
+        false,
         views.len(),
         views
             .iter()
@@ -585,7 +585,7 @@ pub fn read_hdf5_collection<P: AsRef<Path>, T: IoElement, const N: usize, const 
     views: &mut [PencilArrayViewMut<'_, T, N, M>],
 ) -> Result<(), CollectionIoError> {
     header(comm, HDF5_READ, views.len())?;
-    let (dims, len, staging) = prepare_read(comm, path.as_ref(), HDF5_READ, views)?;
+    let (dims, len, staging) = prepare_read(comm, path.as_ref(), HDF5_READ, false, views)?;
     let target = ReadTarget::collection(views, dims, len, staging);
     crate::hdf5_io::read_hdf5_target(path, target)?;
     Ok(())
@@ -615,7 +615,7 @@ pub fn read_hdf5_collection_with_options<
         N + first.extra_shape().dimensions().len() + 1,
         T::WIDTH,
     )?;
-    let (dims, len, staging) = prepare_read(comm, path.as_ref(), HDF5_READ_OPTIONS, views)?;
+    let (dims, len, staging) = prepare_read(comm, path.as_ref(), HDF5_READ_OPTIONS, false, views)?;
     let target = ReadTarget::collection(views, dims, len, staging);
     crate::hdf5_io::read_hdf5_target_options(path, target, o.settings())?;
     Ok(())
@@ -648,7 +648,7 @@ pub fn write_hdf5_named_collection<
         N + first.extra_shape().dimensions().len() + 1,
         T::WIDTH,
     )?;
-    let a = named_prepare(comm, path.as_ref(), HDF5_NAMED_WRITE_OPTIONS, views)?;
+    let a = named_prepare(comm, path.as_ref(), HDF5_NAMED_WRITE_OPTIONS, false, views)?;
     crate::write_hdf5_named_with_options(path, name, a.view(), o)?;
     Ok(())
 }
@@ -680,7 +680,7 @@ pub fn append_hdf5_named_collection<
         N + first.extra_shape().dimensions().len() + 1,
         T::WIDTH,
     )?;
-    let a = named_prepare(comm, path.as_ref(), HDF5_NAMED_APPEND_OPTIONS, views)?;
+    let a = named_prepare(comm, path.as_ref(), HDF5_NAMED_APPEND_OPTIONS, false, views)?;
     crate::append_hdf5_named_with_options(path, name, a.view(), o)?;
     Ok(())
 }
@@ -711,7 +711,8 @@ pub fn read_hdf5_named_collection<
         N + first.extra_shape().dimensions().len() + 1,
         T::WIDTH,
     )?;
-    let (dims, len, staging) = prepare_read(comm, path.as_ref(), HDF5_NAMED_READ_OPTIONS, views)?;
+    let (dims, len, staging) =
+        prepare_read(comm, path.as_ref(), HDF5_NAMED_READ_OPTIONS, false, views)?;
     let target = ReadTarget::collection(views, dims, len, staging);
     crate::hdf5_io::read_named_collection_with_options(
         path.as_ref(),

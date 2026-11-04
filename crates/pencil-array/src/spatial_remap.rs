@@ -23,12 +23,12 @@ use crate::{
         CheckedPartition, CheckedPartitionMut, DatatypePartition, DatatypePartitionMut,
     },
     geometry::{partition_range, row_major_offset},
+    preflight::agree_header,
 };
 
 const DESCRIPTOR_SCHEMA: u64 = 1;
 const OP_PREPARE: u64 = 0x3601;
 const OP_APPLY: u64 = 0x3602;
-const HEADER_WORDS: usize = 5;
 const DESCRIPTOR_CHUNK: usize = 64;
 
 /// Errors returned while preparing or applying a [`SpatialRemapPlan`].
@@ -407,14 +407,6 @@ where
 
 fn dimension_word(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
-}
-
-fn agree_header<C: CommunicatorCollectives>(comm: &C, header: [u64; HEADER_WORDS]) -> bool {
-    let mut minimum = [0u64; HEADER_WORDS];
-    let mut maximum = [0u64; HEADER_WORDS];
-    comm.all_reduce_into(&header[..], &mut minimum[..], SystemOperation::min());
-    comm.all_reduce_into(&header[..], &mut maximum[..], SystemOperation::max());
-    minimum == maximum
 }
 
 fn agree_stage<C, V>(comm: &C, local: Result<V, SpatialRemapError>) -> Result<V, SpatialRemapError>

@@ -87,10 +87,10 @@ impl<const N: usize, const M: usize> Pencil<N, M> {
         let global_len = checked_product(&global_shape).map_err(map_geometry_error)?;
         let decomposition =
             Decomposition::<N, M>::new(decomposition).map_err(PencilError::InvalidDecomposition)?;
-        let local_ranges = ranges_for(
+        let local_ranges = ranges_at_stored(
             &topology,
             global_shape,
-            &decomposition,
+            *decomposition.axes(),
             *topology.local_coords(),
         )?;
         let local_shape_logical = shape_from_ranges(&local_ranges);
@@ -171,14 +171,10 @@ impl<const N: usize, const M: usize> Pencil<N, M> {
 
     /// Computes logical ranges for arbitrary valid Cartesian process coordinates.
     pub fn ranges_at(&self, process_coords: [usize; M]) -> Result<[Range<usize>; N], PencilError> {
-        let decomposition = Decomposition::<N, M>::new(std::array::from_fn(|axis| {
-            self.decomposition[axis].index()
-        }))
-        .expect("stored decomposition is valid");
-        ranges_for(
+        ranges_at_stored(
             &self.topology,
             self.global_shape,
-            &decomposition,
+            self.decomposition,
             process_coords,
         )
     }
@@ -251,10 +247,11 @@ impl<const N: usize, const M: usize> Pencil<N, M> {
     }
 }
 
-fn ranges_for<const N: usize, const M: usize>(
+/// Computes ranges for an already validated ordered spatial decomposition.
+fn ranges_at_stored<const N: usize, const M: usize>(
     topology: &MpiTopology<M>,
     global_shape: [usize; N],
-    decomposition: &Decomposition<N, M>,
+    decomposition: [SpatialAxis; M],
     process_coords: [usize; M],
 ) -> Result<[Range<usize>; N], PencilError> {
     topology.rank_at(process_coords)?;
@@ -262,7 +259,7 @@ fn ranges_for<const N: usize, const M: usize>(
         global_shape,
         *topology.process_grid(),
         process_coords,
-        *decomposition.axes(),
+        decomposition,
     )
     .map_err(map_geometry_error)
 }

@@ -1310,7 +1310,7 @@ where
     /// must coordinate that failure before the next collective call.
     pub fn allocate_in_place(&self) -> Result<C2cInPlaceArray<R, N, M>, FftError> {
         let array = ManyPencilArray::from_elem(
-            registered_stage_pencils(&self.core.stages)?,
+            registered_pencils(self.core.stages.iter().map(|stage| &stage.output))?,
             0,
             self.core.extra_shape.clone(),
             zero_complex::<R>(),
@@ -1344,7 +1344,7 @@ where
         &self,
     ) -> Result<C2cOutOfPlaceWorkspace<R, N, M>, FftError> {
         let intermediate = ManyPencilArray::from_elem(
-            registered_stage_pencils(&self.core.stages)?,
+            registered_pencils(self.core.stages.iter().map(|stage| &stage.output))?,
             0,
             self.core.extra_shape.clone(),
             zero_complex::<R>(),
@@ -2179,24 +2179,23 @@ impl<R: FftReal, const N: usize, const M: usize> C2cInPlaceArray<R, N, M> {
     }
 }
 
-fn registered_stage_pencils<R: FftReal, const N: usize, const M: usize>(
-    stages: &[TransformStage<R, N, M>],
+fn registered_pencils<'a, const N: usize, const M: usize>(
+    pencils: impl ExactSizeIterator<Item = &'a Arc<Pencil<N, M>>>,
 ) -> Result<Box<[Arc<Pencil<N, M>>]>, FftError> {
-    let mut pencils = Vec::new();
-    pencils
-        .try_reserve_exact(stages.len())
-        .map_err(|_| FftError::AllocationFailed {
-            required: stages.len(),
-        })?;
-    for stage in stages {
-        if !pencils
+    let required = pencils.len();
+    let mut registered = Vec::new();
+    registered
+        .try_reserve_exact(required)
+        .map_err(|_| FftError::AllocationFailed { required })?;
+    for pencil in pencils {
+        if !registered
             .iter()
-            .any(|registered: &Arc<Pencil<N, M>>| registered.same_layout(stage.output.as_ref()))
+            .any(|other: &Arc<Pencil<N, M>>| other.same_layout(pencil))
         {
-            pencils.push(Arc::clone(&stage.output));
+            registered.push(Arc::clone(pencil));
         }
     }
-    Ok(pencils.into_boxed_slice())
+    Ok(registered.into_boxed_slice())
 }
 
 fn validate_input<const N: usize, const M: usize>(
@@ -2604,6 +2603,71 @@ fn strided_line_count(data_len: usize, line_len: usize, stride: usize) -> Result
     Ok(data_len / block)
 }
 
+/// Runs `transform` on each length-`line_len` strided line of `source` and writes
+/// the transformed line back to the same strided position in `destination`.
+///
+/// The caller owns the fast paths: `line_buffer`, `count` (from
+/// [`strided_line_count`]), the length checks, and the contiguous and empty
+/// cases. Nothing is allocated here.
+fn for_each_strided_line<T: Copy, E: From<FftError>>(
+    source: &[T],
+    destination: &mut [T],
+    line_buffer: &mut [T],
+    count: usize,
+    line_len: usize,
+    stride: usize,
+    mut transform: impl FnMut(&mut [T]) -> Result<(), E>,
+) -> Result<(), E> {
+    let block = line_len
+        .checked_mul(stride)
+        .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+    for outer in 0..count {
+        let base = outer
+            .checked_mul(block)
+            .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+        for inner in 0..stride {
+            for k in 0..line_len {
+                line_buffer[k] = source[base + k * stride + inner];
+            }
+            transform(&mut line_buffer[..line_len])?;
+            for k in 0..line_len {
+                destination[base + k * stride + inner] = line_buffer[k];
+            }
+        }
+    }
+    Ok(())
+}
+
+/// In-place variant of [`for_each_strided_line`]: the strided lines are gathered
+/// from `data` and the transformed line is written back to `data`.
+fn for_each_strided_line_in_place<T: Copy, E: From<FftError>>(
+    data: &mut [T],
+    line_buffer: &mut [T],
+    count: usize,
+    line_len: usize,
+    stride: usize,
+    mut transform: impl FnMut(&mut [T]) -> Result<(), E>,
+) -> Result<(), E> {
+    let block = line_len
+        .checked_mul(stride)
+        .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+    for outer in 0..count {
+        let base = outer
+            .checked_mul(block)
+            .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+        for inner in 0..stride {
+            for k in 0..line_len {
+                line_buffer[k] = data[base + k * stride + inner];
+            }
+            transform(&mut line_buffer[..line_len])?;
+            for k in 0..line_len {
+                data[base + k * stride + inner] = line_buffer[k];
+            }
+        }
+    }
+    Ok(())
+}
+
 fn strided_complex_line_len<R: FftReal, const N: usize, const M: usize>(
     stages: &[TransformStage<R, N, M>],
 ) -> Result<usize, FftError> {
@@ -2655,26 +2719,18 @@ fn execute_strided_complex_forward<R: FftReal, const N: usize, const M: usize>(
             .forward(source, destination, scratch)
             .map_err(FftError::LocalC2c);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = source[base + k * stride + inner];
-            }
-            plan.forward_in_place(&mut line_buffer[..plan.line_len()], scratch)
-                .map_err(FftError::LocalC2c)?;
-            for k in 0..plan.line_len() {
-                destination[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+    for_each_strided_line(
+        source,
+        destination,
+        line_buffer,
+        count,
+        plan.line_len(),
+        stride,
+        |line| {
+            plan.forward_in_place(line, scratch)
+                .map_err(FftError::LocalC2c)
+        },
+    )
 }
 
 fn execute_strided_complex_forward_in_place<R: FftReal, const N: usize, const M: usize>(
@@ -2698,26 +2754,10 @@ fn execute_strided_complex_forward_in_place<R: FftReal, const N: usize, const M:
             .forward_in_place(data, scratch)
             .map_err(FftError::LocalC2c);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = data[base + k * stride + inner];
-            }
-            plan.forward_in_place(&mut line_buffer[..plan.line_len()], scratch)
-                .map_err(FftError::LocalC2c)?;
-            for k in 0..plan.line_len() {
-                data[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+    for_each_strided_line_in_place(data, line_buffer, count, plan.line_len(), stride, |line| {
+        plan.forward_in_place(line, scratch)
+            .map_err(FftError::LocalC2c)
+    })
 }
 
 fn execute_strided_complex_reverse<R: FftReal, const N: usize, const M: usize>(
@@ -2752,30 +2792,22 @@ fn execute_strided_complex_reverse<R: FftReal, const N: usize, const M: usize>(
         }
         .map_err(FftError::LocalC2c);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = source[base + k * stride + inner];
-            }
+    for_each_strided_line(
+        source,
+        destination,
+        line_buffer,
+        count,
+        plan.line_len(),
+        stride,
+        |line| {
             if normalize {
-                plan.inverse_in_place(&mut line_buffer[..plan.line_len()], scratch)
+                plan.inverse_in_place(line, scratch)
             } else {
-                plan.backward_in_place(&mut line_buffer[..plan.line_len()], scratch)
+                plan.backward_in_place(line, scratch)
             }
-            .map_err(FftError::LocalC2c)?;
-            for k in 0..plan.line_len() {
-                destination[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+            .map_err(FftError::LocalC2c)
+        },
+    )
 }
 
 fn execute_strided_complex_reverse_in_place<R: FftReal, const N: usize, const M: usize>(
@@ -2806,30 +2838,14 @@ fn execute_strided_complex_reverse_in_place<R: FftReal, const N: usize, const M:
         }
         .map_err(FftError::LocalC2c);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = data[base + k * stride + inner];
-            }
-            if normalize {
-                plan.inverse_in_place(&mut line_buffer[..plan.line_len()], scratch)
-            } else {
-                plan.backward_in_place(&mut line_buffer[..plan.line_len()], scratch)
-            }
-            .map_err(FftError::LocalC2c)?;
-            for k in 0..plan.line_len() {
-                data[base + k * stride + inner] = line_buffer[k];
-            }
+    for_each_strided_line_in_place(data, line_buffer, count, plan.line_len(), stride, |line| {
+        if normalize {
+            plan.inverse_in_place(line, scratch)
+        } else {
+            plan.backward_in_place(line, scratch)
         }
-    }
-    Ok(())
+        .map_err(FftError::LocalC2c)
+    })
 }
 
 fn execute_complex_forward<R: FftReal, const N: usize, const M: usize>(
@@ -3881,6 +3897,385 @@ fn endpoint_chunk_buffers(length: usize) -> Result<[Vec<[f64; 4]>; 3], FftError>
         *buffer = initialized_vec(length, [0.0_f64; 4])?;
     }
     Ok(buffers)
+}
+
+/// The chunked endpoint statistics shared by the distributed R2C and mixed
+/// boundary checks.
+///
+/// Each implementation keeps its own coordinate walk, threshold values, and
+/// preparation checks. The accumulation, both reductions, the acceptance
+/// check, and the final agreement stay here so the collective sequence cannot
+/// diverge between the two plans.
+struct EndpointStatistics {
+    plane_count: usize,
+    relative: f64,
+    absolute: f64,
+    invalid: bool,
+    local: Vec<[f64; 4]>,
+    maxima: Vec<[f64; 4]>,
+    sums: Vec<[f64; 4]>,
+}
+
+impl EndpointStatistics {
+    /// Allocates every chunk buffer before the first collective call.
+    ///
+    /// A failure here belongs to the caller's agreed preparation result.
+    fn new(
+        batch_count: usize,
+        plane_count: usize,
+        relative: f64,
+        absolute: f64,
+    ) -> Result<Self, FftError> {
+        let [local, maxima, sums] = endpoint_chunk_buffers(batch_count.min(ENDPOINT_BATCH_CHUNK))?;
+        Ok(Self {
+            plane_count,
+            relative,
+            absolute,
+            invalid: false,
+            local,
+            maxima,
+            sums,
+        })
+    }
+
+    /// Reduces and checks every statistics chunk of one boundary.
+    ///
+    /// `walk` visits one batch and reports each constrained endpoint as
+    /// `(2 * plane, value)` through its visitor; the slot choice therefore
+    /// stays with each implementation. Every chunk runs the MAX reduction, the
+    /// scaled-square SUM reduction, and the acceptance check on every rank, and
+    /// a local numeric failure only marks the result invalid.
+    fn reduce_chunks<C, R, W>(
+        &mut self,
+        communicator: &C,
+        batch_count: usize,
+        data: &[Complex<R>],
+        local_len: usize,
+        mut walk: W,
+    ) where
+        C: CommunicatorCollectives,
+        R: FftReal,
+        W: FnMut(&[Complex<R>], &mut dyn FnMut(usize, Complex<R>)),
+    {
+        let plane_count = self.plane_count;
+        let relative = self.relative;
+        let absolute = self.absolute;
+        let Self {
+            invalid,
+            local: local_stats,
+            maxima: global_maxima,
+            sums: global_sums,
+            ..
+        } = self;
+        for chunk_index in 0..endpoint_chunk_count(batch_count) {
+            let chunk_start = chunk_index * ENDPOINT_BATCH_CHUNK;
+            let chunk = endpoint_chunk_len(batch_count, chunk_start);
+            let local = &mut local_stats[..chunk];
+            let maxima = &mut global_maxima[..chunk];
+            let sums = &mut global_sums[..chunk];
+
+            local.fill([0.0_f64; 4]);
+            for (batch_max, batch) in local.iter_mut().zip(chunk_start..chunk_start + chunk) {
+                let start = batch
+                    .checked_mul(local_len)
+                    .expect("validated boundary batch offset");
+                walk(&data[start..start + local_len], &mut |slot, value| {
+                    let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
+                    let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
+                    if !re.is_finite() || !im.is_finite() {
+                        *invalid = true;
+                        return;
+                    }
+                    batch_max[slot] = batch_max[slot].max(re.abs().max(im.abs()));
+                    batch_max[slot + 1] = batch_max[slot + 1].max(im.abs());
+                });
+            }
+            #[cfg(test)]
+            record_endpoint_reduction(EndpointReductionEvent::MaxReduction {
+                elements: 4 * chunk,
+            });
+            communicator.all_reduce_into(
+                local.as_flattened(),
+                maxima.as_flattened_mut(),
+                SystemOperation::max(),
+            );
+
+            local.fill([0.0_f64; 4]);
+            for (batch, (local_sum, global_max)) in local.iter_mut().zip(maxima.iter()).enumerate()
+            {
+                let start = (chunk_start + batch)
+                    .checked_mul(local_len)
+                    .expect("validated boundary batch offset");
+                walk(&data[start..start + local_len], &mut |slot, value| {
+                    let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
+                    let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
+                    if !re.is_finite() || !im.is_finite() {
+                        return;
+                    }
+                    let scale = global_max[slot];
+                    if scale != 0.0 && scale.is_finite() {
+                        let normalized_re = re / scale;
+                        let normalized_im = im / scale;
+                        local_sum[slot] += normalized_re * normalized_re;
+                        local_sum[slot + 1] += normalized_im * normalized_im;
+                    }
+                });
+            }
+            #[cfg(test)]
+            record_endpoint_reduction(EndpointReductionEvent::SumReduction {
+                elements: 4 * chunk,
+            });
+            communicator.all_reduce_into(
+                local.as_flattened(),
+                sums.as_flattened_mut(),
+                SystemOperation::sum(),
+            );
+
+            for batch in 0..chunk {
+                let global_max = maxima[batch];
+                let global_sum = sums[batch];
+                if global_max[..plane_count * 2]
+                    .iter()
+                    .any(|value| !value.is_finite())
+                    || global_sum[..plane_count * 2]
+                        .iter()
+                        .any(|value| !value.is_finite())
+                    || !relative.is_finite()
+                    || !absolute.is_finite()
+                {
+                    *invalid = true;
+                }
+                for plane in 0..plane_count {
+                    let slot = plane * 2;
+                    let absolute_ok = global_max[slot + 1] <= absolute;
+                    let relative_ok =
+                        global_sum[slot + 1].sqrt() <= relative * global_sum[slot].sqrt();
+                    if !(absolute_ok || relative_ok) {
+                        *invalid = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns whether every rank accepted the spectrum.
+    fn accepted<C: CommunicatorCollectives>(&self, communicator: &C) -> bool {
+        #[cfg(test)]
+        record_endpoint_reduction(EndpointReductionEvent::FinalAgreement);
+        collective_valid(communicator, !self.invalid)
+    }
+}
+
+/// Repacks strided real boundary lines in place into the compressed complex
+/// layout.
+///
+/// `real_source_line`, `complex_line`, `real_line`, and `scratch` are the
+/// plan's line and local transform buffers. The caller keeps array ownership,
+/// poison handling, and the no-rows case.
+#[allow(clippy::needless_range_loop)]
+fn convert_strided_real_forward<R, E>(
+    storage: &mut [Complex<R>],
+    plan: &LocalR2cPlan<R>,
+    rows: usize,
+    real_len: usize,
+    complex_len: usize,
+    stride: usize,
+    real_source_line: &mut [R],
+    complex_line: &mut [Complex<R>],
+    real_line: &mut [R],
+    scratch: &mut [Complex<R>],
+) -> Result<(), E>
+where
+    R: FftReal,
+    Complex<R>: Equivalence,
+    E: From<FftError> + From<LocalR2cError>,
+{
+    if stride <= 1 || !rows.is_multiple_of(stride) {
+        return Err(FftError::PreparationFailed.into());
+    }
+    let groups = rows / stride;
+    let source_span = groups
+        .checked_mul(real_len)
+        .and_then(|value| value.checked_mul(stride))
+        .ok_or(FftError::PreparationFailed)?;
+    let destination_span = groups
+        .checked_mul(complex_len)
+        .and_then(|value| value.checked_mul(stride))
+        .ok_or(FftError::PreparationFailed)?;
+    if source_span > storage.len() || destination_span > storage.len() {
+        return Err(FftError::StorageLayoutMismatch.into());
+    }
+    if real_source_line.len() < real_len
+        || complex_line.len() < complex_len
+        || real_line.len() < real_len
+    {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "real/complex line",
+            required: real_len.max(complex_len),
+            actual: real_source_line
+                .len()
+                .min(complex_line.len())
+                .min(real_line.len()),
+        }
+        .into());
+    }
+    for outer in 0..groups {
+        let source_base = outer
+            .checked_mul(real_len)
+            .and_then(|value| value.checked_mul(stride))
+            .ok_or(FftError::PreparationFailed)?;
+        let destination_base = outer
+            .checked_mul(complex_len)
+            .and_then(|value| value.checked_mul(stride))
+            .ok_or(FftError::PreparationFailed)?;
+        for inner in 0..stride {
+            for j in 0..real_len {
+                let index = source_base
+                    .checked_add(j.checked_mul(stride).ok_or(FftError::PreparationFailed)?)
+                    .and_then(|value| value.checked_add(inner))
+                    .ok_or(FftError::PreparationFailed)?;
+                real_source_line[j] = storage[index].re;
+            }
+            plan.forward(
+                &real_source_line[..real_len],
+                &mut complex_line[..complex_len],
+                real_line,
+                scratch,
+            )
+            .map_err(E::from)?;
+            for k in 0..complex_len {
+                let index = destination_base
+                    .checked_add(k.checked_mul(stride).ok_or(FftError::PreparationFailed)?)
+                    .and_then(|value| value.checked_add(inner))
+                    .ok_or(FftError::PreparationFailed)?;
+                storage[index] = complex_line[k];
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Repacks compressed complex boundary lines in place into the strided real
+/// layout.
+///
+/// `complex_source_line`, `real_line`, `complex_line`, and `scratch` are the
+/// plan's line and local transform buffers. The caller keeps array ownership,
+/// poison handling, and the no-rows case.
+#[allow(clippy::needless_range_loop)]
+fn convert_strided_complex_reverse<R, E>(
+    storage: &mut [Complex<R>],
+    plan: &LocalR2cPlan<R>,
+    rows: usize,
+    real_len: usize,
+    complex_len: usize,
+    stride: usize,
+    complex_source_line: &mut [Complex<R>],
+    real_line: &mut [R],
+    complex_line: &mut [Complex<R>],
+    scratch: &mut [Complex<R>],
+    normalize_inverse: bool,
+) -> Result<(), E>
+where
+    R: FftReal,
+    Complex<R>: Equivalence,
+    E: From<FftError> + From<LocalR2cError>,
+{
+    if stride <= 1 || !rows.is_multiple_of(stride) {
+        return Err(FftError::PreparationFailed.into());
+    }
+    let groups = rows / stride;
+    let source_span = groups
+        .checked_mul(complex_len)
+        .and_then(|value| value.checked_mul(stride))
+        .ok_or(FftError::PreparationFailed)?;
+    let destination_span = groups
+        .checked_mul(real_len)
+        .and_then(|value| value.checked_mul(stride))
+        .ok_or(FftError::PreparationFailed)?;
+    if source_span > storage.len() || destination_span > storage.len() {
+        return Err(FftError::StorageLayoutMismatch.into());
+    }
+
+    // Expand compressed outer blocks from the back.  Each move is overlap
+    // safe, and a later (smaller) q never overwrites a source block still to
+    // be moved.
+    for outer in (0..groups).rev() {
+        let source_start = outer
+            .checked_mul(complex_len)
+            .and_then(|value| value.checked_mul(stride))
+            .ok_or(FftError::PreparationFailed)?;
+        let source_end = source_start
+            .checked_add(
+                complex_len
+                    .checked_mul(stride)
+                    .ok_or(FftError::PreparationFailed)?,
+            )
+            .ok_or(FftError::PreparationFailed)?;
+        let destination_start = outer
+            .checked_mul(real_len)
+            .and_then(|value| value.checked_mul(stride))
+            .ok_or(FftError::PreparationFailed)?;
+        storage.copy_within(source_start..source_end, destination_start);
+    }
+
+    if complex_source_line.len() < complex_len
+        || complex_line.len() < complex_len
+        || real_line.len() < real_len
+    {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "complex/real line",
+            required: real_len.max(complex_len),
+            actual: complex_source_line
+                .len()
+                .min(complex_line.len())
+                .min(real_line.len()),
+        }
+        .into());
+    }
+    for outer in 0..groups {
+        let base = outer
+            .checked_mul(real_len)
+            .and_then(|value| value.checked_mul(stride))
+            .ok_or(FftError::PreparationFailed)?;
+        for inner in 0..stride {
+            for k in 0..complex_len {
+                let index = base
+                    .checked_add(k.checked_mul(stride).ok_or(FftError::PreparationFailed)?)
+                    .and_then(|value| value.checked_add(inner))
+                    .ok_or(FftError::PreparationFailed)?;
+                complex_source_line[k] = storage[index];
+            }
+            let result = if normalize_inverse {
+                plan.inverse(
+                    &complex_source_line[..complex_len],
+                    &mut real_line[..real_len],
+                    complex_line,
+                    scratch,
+                )
+            } else {
+                plan.backward(
+                    &complex_source_line[..complex_len],
+                    &mut real_line[..real_len],
+                    complex_line,
+                    scratch,
+                )
+            };
+            result.map_err(E::from)?;
+            // Store the C2R result in Complex::re slots.  Residues modulo S
+            // are disjoint, so every other inner line remains intact until it
+            // has been gathered.  The scalar projection out of Complex::re is
+            // left to the caller, which performs it once this function has
+            // consumed all source lines.
+            for j in 0..real_len {
+                let index = base
+                    .checked_add(j.checked_mul(stride).ok_or(FftError::PreparationFailed)?)
+                    .and_then(|value| value.checked_add(inner))
+                    .ok_or(FftError::PreparationFailed)?;
+                storage[index].re = real_line[j];
+            }
+        }
+    }
+    Ok(())
 }
 
 fn map_array_allocation(error: ArrayError) -> FftError {

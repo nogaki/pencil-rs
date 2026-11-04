@@ -235,51 +235,8 @@ where
     }
     let dataspace = resources.dataspace.expect("dataspace creation agreement");
 
-    if let Some(chunks) = settings.chunks {
-        let (dcpl, error) = local_handle_phase(
-            comm,
-            native::dcpl_create(),
-            "HDF5 dataset-create property list",
-        );
-        resources.dcpl = dcpl;
-        if let Some(error) = error {
-            return Err(cleanup_session(comm, resources, error));
-        }
-        let mut native_chunks = [0 as hsize_t; crate::MAX_PROTOCOL_RANK];
-        for (dst, &x) in native_chunks.iter_mut().zip(chunks) {
-            *dst = x as hsize_t;
-        }
-        if let Err(error) = phase_code(
-            comm,
-            native::dcpl_set_chunk(
-                resources.dcpl.expect("dcpl agreement"),
-                &native_chunks[..chunks.len()],
-            ),
-            "HDF5 chunk layout",
-        ) {
-            return Err(cleanup_session(comm, resources, error));
-        }
-        if settings.shuffle
-            && let Err(error) = phase_code(
-                comm,
-                native::plist_set_shuffle(resources.dcpl.expect("dcpl agreement")),
-                "HDF5 shuffle filter",
-            )
-        {
-            return Err(cleanup_session(comm, resources, error));
-        }
-        if let Some(level) = settings.deflate
-            && let Err(error) = phase_code(
-                comm,
-                native::plist_set_deflate(
-                    resources.dcpl.expect("dcpl agreement"),
-                    u32::from(level),
-                ),
-                "HDF5 deflate filter",
-            )
-        {
-            return Err(cleanup_session(comm, resources, error));
-        }
+    if let Err(error) = configure_chunks(comm, settings, &mut resources) {
+        return Err(cleanup_session(comm, resources, error));
     }
     let (xfer, error) = local_handle_phase(
         comm,

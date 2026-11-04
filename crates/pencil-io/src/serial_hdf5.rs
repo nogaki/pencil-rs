@@ -5,22 +5,18 @@ use std::{ffi::CStr, path::Path};
 use hdf5_metno::{Attribute, Dataset, Dataspace, Datatype, File};
 use hdf5_metno_sys::{h5a, h5d, h5p::H5P_DEFAULT, h5s::H5S_MAX_RANK, h5t};
 
+use crate::hdf5_schema::{
+    ATTR_COMMIT as COMMIT, ATTR_EXTRA as EXTRA, ATTR_EXTRA_RANK as EXTRA_RANK,
+    ATTR_GLOBAL as GLOBAL, ATTR_GRID as GRID, ATTR_N as N, ATTR_PERM as PERM, ATTR_TYPE as TYPE,
+    ATTR_VERSION as VERSION, ATTR_WIDTH as WIDTH, CommitState, commit_state, valid_permutation,
+    valid_writer_grid,
+};
 use crate::{
     COMMIT_MARKER, FORMAT_VERSION, INCOMPLETE_MARKER, IoElement, IoError, MAX_PROTOCOL_RANK,
     format::element_count,
 };
 
 const DATASET: &str = "/pencil_io_v1/data";
-const VERSION: &str = "pencil_io_version";
-const COMMIT: &str = "pencil_io_commit";
-const N: &str = "pencil_io_n";
-const TYPE: &str = "pencil_io_type";
-const WIDTH: &str = "pencil_io_width";
-const EXTRA_RANK: &str = "pencil_io_extra_rank";
-const EXTRA: &str = "pencil_io_extra_shape";
-const GLOBAL: &str = "pencil_io_global_shape";
-const GRID: &str = "pencil_io_writer_grid";
-const PERM: &str = "pencil_io_writer_permutation";
 
 /// Creates a serial HDF5 file from a full, canonical row-major slice.
 ///
@@ -71,20 +67,20 @@ pub fn write_hdf5_serial<P: AsRef<Path>, T: IoElement>(
             let extra: Vec<_> = extra_shape.iter().map(|&n| n as u64).collect();
             let permutation: Vec<_> = (0..global_shape.len() as u64).collect();
             for (name, values) in [
-                (c"pencil_io_version", &[FORMAT_VERSION][..]),
-                (c"pencil_io_commit", &[INCOMPLETE_MARKER][..]),
-                (c"pencil_io_n", &[global_shape.len() as u64][..]),
-                (c"pencil_io_type", &[T::CODE][..]),
-                (c"pencil_io_width", &[T::WIDTH as u64][..]),
-                (c"pencil_io_extra_rank", &[extra_shape.len() as u64][..]),
-                (c"pencil_io_global_shape", global.as_slice()),
-                (c"pencil_io_writer_grid", &[1][..]),
-                (c"pencil_io_writer_permutation", permutation.as_slice()),
+                (VERSION, &[FORMAT_VERSION][..]),
+                (COMMIT, &[INCOMPLETE_MARKER][..]),
+                (N, &[global_shape.len() as u64][..]),
+                (TYPE, &[T::CODE][..]),
+                (WIDTH, &[T::WIDTH as u64][..]),
+                (EXTRA_RANK, &[extra_shape.len() as u64][..]),
+                (GLOBAL, global.as_slice()),
+                (GRID, &[1][..]),
+                (PERM, permutation.as_slice()),
             ] {
                 write_attribute(&dataset, name, values)?;
             }
             if !extra.is_empty() {
-                write_attribute(&dataset, c"pencil_io_extra_shape", &extra)?;
+                write_attribute(&dataset, EXTRA, &extra)?;
             }
             native(file.flush(), "HDF5 serial initial metadata flush")?;
             if !packed.is_empty() {
@@ -109,7 +105,10 @@ pub fn write_hdf5_serial<P: AsRef<Path>, T: IoElement>(
             file.flush().map_err(|_| IoError::WriteIncomplete {
                 stage: "HDF5 serial payload flush",
             })?;
-            let commit = native(dataset.attr(COMMIT), "HDF5 serial commit attribute")?;
+            let commit = native(
+                dataset.attr(COMMIT.to_str().expect("HDF5 attribute name is ASCII")),
+                "HDF5 serial commit attribute",
+            )?;
             commit
                 .write_raw(&[COMMIT_MARKER])
                 .map_err(|_| IoError::CommitUncertain {
@@ -245,37 +244,24 @@ fn native<T>(result: hdf5_metno::Result<T>, operation: &'static str) -> Result<T
 // These helpers are private and always run under hdf5_metno's reentrant lock,
 // including when the installed serial HDF5 library was built without thread safety.
 fn datatype<T: IoElement>() -> Result<Datatype, IoError> {
-    use hdf5_metno::globals::*;
-    let scalar = match T::CODE {
-        1 => *H5T_STD_I8LE,
-        2 => *H5T_STD_U8LE,
-        3 => *H5T_STD_I16LE,
-        4 => *H5T_STD_U16LE,
-        5 => *H5T_STD_I32LE,
-        6 => *H5T_STD_U32LE,
-        7 => *H5T_STD_I64LE,
-        8 => *H5T_STD_U64LE,
-        9 | 11 => *H5T_IEEE_F32LE,
-        10 | 12 => *H5T_IEEE_F64LE,
-        _ => unreachable!("IoElement is sealed"),
-    };
+    let spec = crate::hdf5_schema::scalar_spec(T::CODE).expect("IoElement is sealed");
     // SAFETY: predefined scalar IDs are initialized by globals; both constructors
     // return a new owned datatype, immediately transferred to an RAII handle.
     let datatype: Datatype = native(
         unsafe {
-            hdf5_metno::from_id(if T::CODE <= 10 {
-                h5t::H5Tcopy(scalar)
+            hdf5_metno::from_id(if spec.complex {
+                h5t::H5Tcreate(h5t::H5T_class_t::H5T_COMPOUND, spec.width)
             } else {
-                h5t::H5Tcreate(h5t::H5T_class_t::H5T_COMPOUND, T::WIDTH)
+                h5t::H5Tcopy(spec.base)
             })
         },
         "HDF5 serial datatype create",
     )?;
-    if T::CODE > 10 {
-        for (name, offset) in [(c"r", 0), (c"i", T::WIDTH / 2)] {
+    if spec.complex {
+        for (name, offset) in [(c"r", 0), (c"i", spec.width / 2)] {
             // SAFETY: live compound/scalar IDs; the two fields exactly fill the
             // compound, with static NUL-terminated names and no padding.
-            if unsafe { h5t::H5Tinsert(datatype.id(), name.as_ptr(), offset, scalar) } < 0 {
+            if unsafe { h5t::H5Tinsert(datatype.id(), name.as_ptr(), offset, spec.base) } < 0 {
                 return Err(IoError::Native {
                     operation: "HDF5 serial complex datatype",
                     code: -1,
@@ -348,15 +334,17 @@ fn native_shape(space: &Dataspace) -> Result<Vec<usize>, IoError> {
 
 fn read_attribute(
     dataset: &Dataset,
-    name: &str,
+    name: &CStr,
     expected_len: Option<usize>,
 ) -> Result<Vec<u64>, IoError> {
     let malformed = || IoError::MetadataMismatch {
         field: "HDF5 attribute type or shape",
     };
-    let attribute = dataset.attr(name).map_err(|_| IoError::MetadataMismatch {
-        field: "missing HDF5 attribute",
-    })?;
+    let attribute = dataset
+        .attr(name.to_str().expect("HDF5 attribute name is ASCII"))
+        .map_err(|_| IoError::MetadataMismatch {
+            field: "missing HDF5 attribute",
+        })?;
     let space = native(attribute.space(), "HDF5 serial attribute space")?;
     let shape = native_shape(&space)?;
     let len = match shape.as_slice() {
@@ -371,6 +359,11 @@ fn read_attribute(
         return Err(malformed());
     }
     native(attribute.read_raw::<u64>(), "HDF5 serial attribute read")
+}
+
+fn valid_writer_provenance(grid: &[u64], permutation: &[u64], spatial_rank: usize) -> bool {
+    let mut seen = [false; MAX_PROTOCOL_RANK];
+    valid_writer_grid(grid, spatial_rank) && valid_permutation(permutation, spatial_rank, &mut seen)
 }
 
 fn validate_metadata<T: IoElement>(
@@ -389,10 +382,10 @@ fn validate_metadata<T: IoElement>(
             field: "version, rank, or type",
         });
     }
-    match scalar(COMMIT)? {
-        COMMIT_MARKER => {}
-        INCOMPLETE_MARKER => return Err(IoError::IncompleteFile),
-        _ => {
+    match commit_state(scalar(COMMIT)?) {
+        CommitState::Complete => {}
+        CommitState::Incomplete => return Err(IoError::IncompleteFile),
+        CommitState::Invalid => {
             return Err(IoError::InvalidFile {
                 reason: "HDF5 commit marker",
             });
@@ -400,7 +393,7 @@ fn validate_metadata<T: IoElement>(
     }
     if extra.is_empty() {
         // SAFETY: live dataset and static NUL-terminated attribute name.
-        match unsafe { h5a::H5Aexists(dataset.id(), c"pencil_io_extra_shape".as_ptr()) } {
+        match unsafe { h5a::H5Aexists(dataset.id(), EXTRA.as_ptr()) } {
             0 => {}
             code if code < 0 => {
                 return Err(IoError::Native {
@@ -430,17 +423,7 @@ fn validate_metadata<T: IoElement>(
         .iter()
         .copied()
         .eq(global.iter().map(|&n| n as u64))
-        || grid.is_empty()
-        || grid.len() > global.len()
-        || grid.contains(&0)
-        || grid
-            .iter()
-            .try_fold(1u64, |n, &x| n.checked_mul(x))
-            .is_none()
-        || perm
-            .iter()
-            .enumerate()
-            .any(|(i, &x)| x >= global.len() as u64 || perm[..i].contains(&x))
+        || !valid_writer_provenance(&grid, &perm, global.len())
     {
         return Err(IoError::MetadataMismatch {
             field: "shape or writer provenance",

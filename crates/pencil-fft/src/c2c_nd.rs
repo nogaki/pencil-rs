@@ -203,10 +203,7 @@ fn validate_shape<R: FftReal>(shape: &[usize]) -> Result<usize, LocalC2cNdError>
         .iter()
         .try_fold(1usize, |total, &dimension| total.checked_mul(dimension));
     let total_len = total_len.ok_or(LocalC2cNdError::SizeOverflow)?;
-    let bytes = total_len
-        .checked_mul(size_of::<Complex<R>>())
-        .ok_or(LocalC2cNdError::SizeOverflow)?;
-    if bytes > isize::MAX as usize {
+    if !crate::is_addressable(total_len, size_of::<Complex<R>>()) {
         return Err(LocalC2cNdError::SizeOverflow);
     }
     Ok(total_len)

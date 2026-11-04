@@ -194,37 +194,12 @@ impl Plan {
         if !left_pencil.same_layout(right_pencil) || !left_pencil.same_layout(output_pencil) {
             return Err(PointwiseError::IncompatiblePencils);
         }
-        let rank = output_dimensions.len();
-        let dims = [left_dimensions, right_dimensions];
-        for shape in dims {
-            if shape.len() != rank {
-                return Err(PointwiseError::ExtraRankMismatch {
-                    expected: rank,
-                    actual: shape.len(),
-                });
-            }
-            for (axis, (&input, &out)) in shape.iter().zip(output_dimensions).enumerate() {
-                if input != out && input != 1 {
-                    return Err(PointwiseError::ExtraExtentMismatch {
-                        axis,
-                        output: out,
-                        input,
-                    });
-                }
-            }
+        for shape in [left_dimensions, right_dimensions] {
+            validate_extents(shape, output_dimensions)?;
         }
-        let copy = |dims: &[usize]| -> Result<Vec<usize>, PointwiseError> {
-            let mut out = Vec::new();
-            out.try_reserve_exact(dims.len())
-                .map_err(|_| ArrayError::AllocationFailed {
-                    required: dims.len(),
-                })?;
-            out.extend_from_slice(dims);
-            Ok(out)
-        };
-        let output_dims = copy(output_dimensions)?;
-        let left_dims = copy(left_dimensions)?;
-        let right_dims = copy(right_dimensions)?;
+        let output_dims = copy_dims(output_dimensions)?;
+        let left_dims = copy_dims(left_dimensions)?;
+        let right_dims = copy_dims(right_dimensions)?;
         let spatial = left_pencil.local_len();
         let extra_count = checked_product(&output_dims).map_err(ArrayError::from)?;
         spatial
@@ -273,6 +248,27 @@ fn strides(dims: &[usize]) -> Result<Vec<usize>, PointwiseError> {
     }
     Ok(out)
 }
+
+/// Validates one input's extra dimensions against the output dimensions.
+fn validate_extents(input: &[usize], output: &[usize]) -> Result<(), PointwiseError> {
+    if input.len() != output.len() {
+        return Err(PointwiseError::ExtraRankMismatch {
+            expected: output.len(),
+            actual: input.len(),
+        });
+    }
+    for (axis, (&extent, &output_extent)) in input.iter().zip(output).enumerate() {
+        if extent != output_extent && extent != 1 {
+            return Err(PointwiseError::ExtraExtentMismatch {
+                axis,
+                output: output_extent,
+                input: extent,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn broadcast_linear(
     out: usize,
     output_dims: &[usize],
@@ -323,18 +319,90 @@ fn copy_dims(dims: &[usize]) -> Result<Vec<usize>, ArrayError> {
 
 type InputStrides = (Vec<usize>, Vec<usize>);
 
-fn copy_pair(dims: &[usize], strides: &[usize]) -> Result<InputStrides, ArrayError> {
-    Ok((copy_dims(dims)?, copy_dims(strides)?))
+/// The output side of a broadcast pointwise operation.
+///
+/// Every input shares the output dimensions and strides, so multi-input
+/// operations prepare them once; [`Self::input`] then only validates one input
+/// and returns its broadcast mapping.
+#[derive(Debug)]
+struct OutputPlan {
+    dims: Vec<usize>,
+    strides: Vec<usize>,
+    spatial: usize,
+    extra_count: usize,
+}
+
+impl OutputPlan {
+    /// Validates `first` before allocating the shared output metadata, so its
+    /// validation error keeps priority over an allocation failure. Returns the
+    /// prepared output side together with the first input's broadcast mapping.
+    fn new<A, const N: usize, const M: usize>(
+        first: &PencilArrayView<'_, A, N, M>,
+        output_pencil: &crate::Pencil<N, M>,
+        output_dimensions: &[usize],
+    ) -> Result<(Self, InputStrides), PointwiseError> {
+        if !first.pencil().same_layout(output_pencil) {
+            return Err(PointwiseError::IncompatiblePencils);
+        }
+        validate_extents(first.extra_shape().dimensions(), output_dimensions)?;
+        let dims = copy_dims(output_dimensions)?;
+        let first_dims = copy_dims(first.extra_shape().dimensions())?;
+        let spatial = output_pencil.local_len();
+        let extra_count = checked_product(&dims).map_err(ArrayError::from)?;
+        spatial
+            .checked_mul(extra_count)
+            .ok_or(ArrayError::AllocationFailed {
+                required: usize::MAX,
+            })?;
+        // No element is visited for an empty extra shape, so the stride
+        // products may overflow without affecting the operation.
+        let (strides, first_strides) = if extra_count == 0 {
+            (Vec::new(), Vec::new())
+        } else {
+            (strides(&dims)?, strides(&first_dims)?)
+        };
+        Ok((
+            Self {
+                dims,
+                strides,
+                spatial,
+                extra_count,
+            },
+            (first_dims, first_strides),
+        ))
+    }
+
+    /// Validates one input against the prepared output side and returns its
+    /// broadcast dimensions and strides.
+    fn input<A, const N: usize, const M: usize>(
+        &self,
+        output_pencil: &crate::Pencil<N, M>,
+        input: &PencilArrayView<'_, A, N, M>,
+    ) -> Result<InputStrides, PointwiseError> {
+        if !input.pencil().same_layout(output_pencil) {
+            return Err(PointwiseError::IncompatiblePencils);
+        }
+        let dimensions = input.extra_shape().dimensions();
+        validate_extents(dimensions, &self.dims)?;
+        let dims = copy_dims(dimensions)?;
+        let strides = if self.extra_count == 0 {
+            Vec::new()
+        } else {
+            strides(&dims)?
+        };
+        Ok((dims, strides))
+    }
 }
 
 fn many_plan<A, U, const N: usize, const M: usize>(
     inputs: &[PencilArrayView<'_, A, N, M>],
     output: &PencilArrayViewMut<'_, U, N, M>,
-) -> Result<(Plan, Vec<InputStrides>), MultiInputError> {
-    let first = inputs.first().ok_or(MultiInputError::EmptyInputs)?;
-    let plan = Plan::build(
-        first,
-        first,
+) -> Result<(OutputPlan, Vec<InputStrides>), MultiInputError> {
+    if inputs.is_empty() {
+        return Err(MultiInputError::EmptyInputs);
+    }
+    let (plan, first_strides) = OutputPlan::new(
+        &inputs[0],
         output.pencil(),
         output.extra_shape().dimensions(),
     )
@@ -345,18 +413,12 @@ fn many_plan<A, U, const N: usize, const M: usize>(
             required: inputs.len(),
         })
     })?;
-    strides.push(copy_pair(&plan.left_dims, &plan.left_strides).map_err(MultiInputError::Array)?);
+    strides.push(first_strides);
     for (index, input) in inputs.iter().enumerate().skip(1) {
-        let p = Plan::build_shapes(
-            input.pencil(),
-            input.extra_shape().dimensions(),
-            first.pencil(),
-            first.extra_shape().dimensions(),
-            output.pencil(),
-            output.extra_shape().dimensions(),
-        )
-        .map_err(|source| MultiInputError::Input { index, source })?;
-        strides.push((p.left_dims, p.left_strides));
+        strides.push(
+            plan.input(output.pencil(), input)
+                .map_err(|source| MultiInputError::Input { index, source })?,
+        );
     }
     Ok((plan, strides))
 }
@@ -389,13 +451,7 @@ where
         for k in 0..plan.spatial {
             refs.clear();
             for (input, (dims, strides)) in inputs.iter().zip(&input_strides) {
-                let linear = broadcast_linear(
-                    out_linear,
-                    &plan.output_dims,
-                    dims,
-                    strides,
-                    &plan.output_strides,
-                );
+                let linear = broadcast_linear(out_linear, &plan.dims, dims, strides, &plan.strides);
                 refs.push(&input.as_slice()[linear * plan.spatial + k]);
             }
             os[out_linear * plan.spatial + k] = f(&refs);
@@ -440,32 +496,21 @@ where
     if inputs.is_empty() {
         return Err(MultiInputError::EmptyInputs);
     }
-    let plan = Plan::build_shapes(
-        left.pencil(),
-        left.extra_shape().dimensions(),
-        inputs[0].pencil(),
-        inputs[0].extra_shape().dimensions(),
-        left.pencil(),
-        left.extra_shape().dimensions(),
-    )
-    .map_err(|source| MultiInputError::Input { index: 0, source })?;
+    let (plan, first_plan) =
+        OutputPlan::new(&inputs[0], left.pencil(), left.extra_shape().dimensions())
+            .map_err(|source| MultiInputError::Input { index: 0, source })?;
     let mut plans = Vec::new();
     plans.try_reserve_exact(inputs.len()).map_err(|_| {
         MultiInputError::Array(ArrayError::AllocationFailed {
             required: inputs.len(),
         })
     })?;
-    for (index, input) in inputs.iter().enumerate() {
-        let p = Plan::build_shapes(
-            left.pencil(),
-            left.extra_shape().dimensions(),
-            input.pencil(),
-            input.extra_shape().dimensions(),
-            left.pencil(),
-            left.extra_shape().dimensions(),
-        )
-        .map_err(|source| MultiInputError::Input { index, source })?;
-        plans.push((p.right_dims, p.right_strides));
+    plans.push(first_plan);
+    for (index, input) in inputs.iter().enumerate().skip(1) {
+        plans.push(
+            plan.input(left.pencil(), input)
+                .map_err(|source| MultiInputError::Input { index, source })?,
+        );
     }
     let mut refs = Vec::new();
     refs.try_reserve_exact(inputs.len()).map_err(|_| {
@@ -478,13 +523,7 @@ where
         for k in 0..plan.spatial {
             refs.clear();
             for (input, (dims, strides)) in inputs.iter().zip(&plans) {
-                let i = broadcast_linear(
-                    out_linear,
-                    &plan.output_dims,
-                    dims,
-                    strides,
-                    &plan.output_strides,
-                );
+                let i = broadcast_linear(out_linear, &plan.dims, dims, strides, &plan.strides);
                 refs.push(&input.as_slice()[i * plan.spatial + k]);
             }
             let i = out_linear * plan.spatial + k;
@@ -527,34 +566,17 @@ pub fn pointwise3_views<A, B, C, U, F, const N: usize, const M: usize>(
 where
     F: FnMut(&A, &B, &C) -> U,
 {
-    let p = Plan::build_shapes(
-        a.pencil(),
-        a.extra_shape().dimensions(),
-        a.pencil(),
-        a.extra_shape().dimensions(),
-        output.pencil(),
-        output.extra_shape().dimensions(),
-    )
-    .map_err(|source| MultiInputError::Input { index: 0, source })?;
-    let b_plan = Plan::build_shapes(
-        b.pencil(),
-        b.extra_shape().dimensions(),
-        a.pencil(),
-        a.extra_shape().dimensions(),
-        output.pencil(),
-        output.extra_shape().dimensions(),
-    )
-    .map_err(|source| MultiInputError::Input { index: 1, source })?;
-    let q = Plan::build_shapes(
-        c.pencil(),
-        c.extra_shape().dimensions(),
-        a.pencil(),
-        a.extra_shape().dimensions(),
-        output.pencil(),
-        output.extra_shape().dimensions(),
-    )
-    .map_err(|source| MultiInputError::Input { index: 2, source })?;
-    if p.spatial == 0 {
+    let (plan, first_plan) =
+        OutputPlan::new(&a, output.pencil(), output.extra_shape().dimensions())
+            .map_err(|source| MultiInputError::Input { index: 0, source })?;
+    let (a_dims, a_strides) = first_plan;
+    let (b_dims, b_strides) = plan
+        .input(output.pencil(), &b)
+        .map_err(|source| MultiInputError::Input { index: 1, source })?;
+    let (c_dims, c_strides) = plan
+        .input(output.pencil(), &c)
+        .map_err(|source| MultiInputError::Input { index: 2, source })?;
+    if plan.spatial == 0 {
         return Ok(());
     }
     let (as_, bs_, cs_, os) = (
@@ -563,33 +585,15 @@ where
         c.as_slice(),
         output.as_mut_slice(),
     );
-    for n in 0..p.extra_count {
-        let ai = broadcast_linear(
-            n,
-            &p.output_dims,
-            &p.left_dims,
-            &p.left_strides,
-            &p.output_strides,
-        );
-        let bi = broadcast_linear(
-            n,
-            &p.output_dims,
-            &b_plan.left_dims,
-            &b_plan.left_strides,
-            &p.output_strides,
-        );
-        let ci = broadcast_linear(
-            n,
-            &p.output_dims,
-            &q.left_dims,
-            &q.left_strides,
-            &p.output_strides,
-        );
-        for k in 0..p.spatial {
-            os[n * p.spatial + k] = f(
-                &as_[ai * p.spatial + k],
-                &bs_[bi * p.spatial + k],
-                &cs_[ci * p.spatial + k],
+    for n in 0..plan.extra_count {
+        let ai = broadcast_linear(n, &plan.dims, &a_dims, &a_strides, &plan.strides);
+        let bi = broadcast_linear(n, &plan.dims, &b_dims, &b_strides, &plan.strides);
+        let ci = broadcast_linear(n, &plan.dims, &c_dims, &c_strides, &plan.strides);
+        for k in 0..plan.spatial {
+            os[n * plan.spatial + k] = f(
+                &as_[ai * plan.spatial + k],
+                &bs_[bi * plan.spatial + k],
+                &cs_[ci * plan.spatial + k],
             );
         }
     }
@@ -620,24 +624,12 @@ pub fn pointwise3_in_place_views<A, B, C, F, const N: usize, const M: usize>(
 where
     F: FnMut(&A, &B, &C) -> A,
 {
-    let plan = Plan::build_shapes(
-        left.pencil(),
-        left.extra_shape().dimensions(),
-        b.pencil(),
-        b.extra_shape().dimensions(),
-        left.pencil(),
-        left.extra_shape().dimensions(),
-    )
-    .map_err(|source| MultiInputError::Input { index: 1, source })?;
-    let q = Plan::build_shapes(
-        c.pencil(),
-        c.extra_shape().dimensions(),
-        left.pencil(),
-        left.extra_shape().dimensions(),
-        left.pencil(),
-        left.extra_shape().dimensions(),
-    )
-    .map_err(|source| MultiInputError::Input { index: 2, source })?;
+    let (plan, first_plan) = OutputPlan::new(&b, left.pencil(), left.extra_shape().dimensions())
+        .map_err(|source| MultiInputError::Input { index: 1, source })?;
+    let (b_dims, b_strides) = first_plan;
+    let (c_dims, c_strides) = plan
+        .input(left.pencil(), &c)
+        .map_err(|source| MultiInputError::Input { index: 2, source })?;
     if plan.spatial == 0 {
         return Ok(());
     }
@@ -645,20 +637,8 @@ where
     let cs = c.as_slice();
     let os = left.as_mut_slice();
     for n in 0..plan.extra_count {
-        let bi = broadcast_linear(
-            n,
-            &plan.output_dims,
-            &plan.right_dims,
-            &plan.right_strides,
-            &plan.output_strides,
-        );
-        let ci = broadcast_linear(
-            n,
-            &plan.output_dims,
-            &q.left_dims,
-            &q.left_strides,
-            &plan.output_strides,
-        );
+        let bi = broadcast_linear(n, &plan.dims, &b_dims, &b_strides, &plan.strides);
+        let ci = broadcast_linear(n, &plan.dims, &c_dims, &c_strides, &plan.strides);
         for k in 0..plan.spatial {
             let i = n * plan.spatial + k;
             os[i] = f(

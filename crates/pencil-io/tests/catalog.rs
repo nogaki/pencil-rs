@@ -4,11 +4,11 @@ use mpi::collective::CommunicatorCollectives;
 use mpi::traits::Communicator;
 use num_complex::{Complex32, Complex64};
 use pencil_array::{ExtraShape, MpiTopology, Pencil, PencilArray};
+use pencil_io::{CatalogError, read_mpi_catalog, read_mpi_named, read_mpi_named_catalog};
 use pencil_io::{
     MpiFileSession, MpiIoOptions, ScalarType, append_mpi_named, write_mpi, write_mpi_collection,
     write_mpi_named,
 };
-use pencil_io::{read_mpi_catalog, read_mpi_named, read_mpi_named_catalog};
 
 mod support;
 use support::{cleanup_owned_temp_dir, owned_temp_dir};
@@ -401,6 +401,22 @@ fn catalog_integration() {
             "accepted bad {label}"
         );
     }
+    assert!(matches!(
+        read_mpi_catalog(dir.join("bad-reserved.pio"), comm),
+        Err(CatalogError::Malformed("tail"))
+    ));
+
+    // A payload-byte count that does not match the file is a tail error, not a
+    // shape/grid/permutation error reached through the header arrays.
+    let mut bad_payload = std::fs::read(&p).unwrap();
+    let payload_bytes = u64_at(&bad_payload, 72);
+    bad_payload[72..80].copy_from_slice(&(payload_bytes + 8).to_le_bytes());
+    let bad_payload_path = dir.join("bad-payload-bytes.pio");
+    barrier_file(comm, &bad_payload_path, &bad_payload);
+    assert!(matches!(
+        read_mpi_catalog(&bad_payload_path, comm),
+        Err(CatalogError::Malformed("tail"))
+    ));
 
     // An incomplete or malformed final named record must not be silently dropped.
     for (suffix, tail) in [("incomplete", vec![0u8; 1]), ("header-tail", vec![0u8; 72])] {

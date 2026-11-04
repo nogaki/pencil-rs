@@ -282,7 +282,7 @@ impl<R: FftReal> LocalR2cPlan<R> {
         let mut planner = RealFftPlanner::<R>::new();
         let forward = planner.plan_fft_forward(real_len);
         let inverse = planner.plan_fft_inverse(real_len);
-        Self::from_plans(
+        Ok(Self::from_plans(
             real_len,
             complex_len,
             forward,
@@ -290,7 +290,7 @@ impl<R: FftReal> LocalR2cPlan<R> {
             super::BackendKind::RustFft,
             #[cfg(feature = "fftw")]
             None,
-        )
+        ))
     }
 
     fn from_plans(
@@ -300,9 +300,9 @@ impl<R: FftReal> LocalR2cPlan<R> {
         inverse: Arc<dyn ComplexToReal<R>>,
         backend: super::BackendKind,
         #[cfg(feature = "fftw")] backend_options: Option<super::PlanOptions>,
-    ) -> Result<Self, LocalR2cError> {
+    ) -> Self {
         let scratch_len = forward.get_scratch_len().max(inverse.get_scratch_len());
-        Ok(Self {
+        Self {
             real_len,
             complex_len,
             scratch_len,
@@ -311,7 +311,7 @@ impl<R: FftReal> LocalR2cPlan<R> {
             backend,
             #[cfg(feature = "fftw")]
             backend_options,
-        })
+        }
     }
 
     /// Builds a plan using the runtime-loaded FFTW backend.
@@ -329,15 +329,14 @@ impl<R: FftReal> LocalR2cPlan<R> {
             pencil_fftw::plan_r2c(real_len, options).map_err(super::BackendInitError::Native)?;
         let inverse =
             pencil_fftw::plan_c2r(real_len, options).map_err(super::BackendInitError::Native)?;
-        Self::from_plans(
+        Ok(Self::from_plans(
             real_len,
             complex_len,
             forward,
             inverse,
             super::BackendKind::Fftw,
             Some(options),
-        )
-        .map_err(super::BackendInitError::Local)
+        ))
     }
 
     /// Returns the selected backend.
@@ -384,13 +383,7 @@ impl<R: FftReal> LocalR2cPlan<R> {
         batch_count: usize,
     ) -> Result<LocalR2cInPlaceArray<R>, LocalR2cError> {
         let (_, complex_values) = self.checked_in_place_lengths(batch_count)?;
-        let mut storage = Vec::new();
-        storage
-            .try_reserve_exact(complex_values)
-            .map_err(|_| LocalR2cError::AllocationFailed {
-                required: complex_values,
-            })?;
-        storage.resize(complex_values, Complex::new(R::zero(), R::zero()));
+        let storage = initialized_vec(complex_values, Complex::new(R::zero(), R::zero()))?;
         Ok(LocalR2cInPlaceArray {
             storage,
             real_len: self.real_len,
@@ -872,13 +865,11 @@ fn validate_lengths<R: FftReal>(real_len: usize) -> Result<usize, LocalR2cError>
 }
 
 fn validate_addressable(length: usize, element_size: usize) -> Result<(), LocalR2cError> {
-    let bytes = length
-        .checked_mul(element_size)
-        .ok_or(LocalR2cError::LengthOverflow)?;
-    if bytes > isize::MAX as usize {
-        return Err(LocalR2cError::LengthOverflow);
+    if super::is_addressable(length, element_size) {
+        Ok(())
+    } else {
+        Err(LocalR2cError::LengthOverflow)
     }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 use super::*;
 use crate::catalog::{DatasetInfo, ScalarType};
+use crate::hdf5_schema::valid_shape_bytes_from_width;
 use std::collections::BTreeSet;
 
 impl Hdf5FileSession<'_> {
@@ -185,11 +186,11 @@ fn leaf(
     agree_phase(
         comm,
         version == [FORMAT_VERSION]
-            && commit == [COMMIT_MARKER]
+            && commit_state(commit[0]) == CommitState::Complete
             && n > 0
-            && n <= MAX_PROTOCOL_RANK as u64
-            && er <= MAX_PROTOCOL_RANK as u64
-            && n + er <= MAX_PROTOCOL_RANK as u64
+            && rank_in_range(n)
+            && rank_in_range(er)
+            && combined_rank_in_range(n, er)
             && scalar.is_some(),
         "session catalog scalar metadata",
     )?;
@@ -206,19 +207,10 @@ fn leaf(
     let global = attr!(ATTR_GLOBAL, Some(n), n);
     let grid = attr!(ATTR_GRID, None, MAX_PROTOCOL_RANK);
     let perm = attr!(ATTR_PERM, Some(n), n);
-    let size = global
-        .iter()
-        .chain(&extra)
-        .try_fold(width, |n, &x| n.checked_mul(x));
-    let ranks = grid.iter().try_fold(1u64, |n, &x| n.checked_mul(x));
     agree_phase(
         comm,
-        size.is_some()
-            && !grid.is_empty()
-            && grid.len() <= n
-            && grid.iter().all(|&x| x > 0)
-            && ranks.is_some()
-            && is_permutation(&perm, n),
+        valid_shape_bytes_from_width(&global, &extra, width)
+            && valid_writer_provenance(&grid, &perm, n),
         "session catalog shape and provenance",
     )?;
     let (space, error) = local_handle_phase(

@@ -17,6 +17,7 @@ use thiserror::Error;
 use crate::{
     ArrayError, AxisPermutation, ExtraShape, ManyPencilArray, Pencil, PencilArrayView,
     PencilArrayViewMut, checked::checked_product, geometry::row_major_offset,
+    preflight::agree_header,
 };
 
 const DESCRIPTOR_SCHEMA: u64 = 1;
@@ -36,7 +37,6 @@ const OPERATION_ALLTOALLV_TIMED_VIEWS: u64 = 0x10004;
 const OPERATION_ALLTOALLV_TIMED_IN_PLACE: u64 = 0x10005;
 const OPERATION_POINT_TO_POINT_CALLBACK_IN_PLACE: u64 = 0x10006;
 const INVALID_AXIS: u64 = u64::MAX;
-const HEADER_WORDS: usize = 5;
 pub(crate) const POINT_TO_POINT_RESERVED_TAG: mpi::Tag = 0x5054;
 
 /// The private transport selection used by the checked transpose plans.
@@ -1184,14 +1184,6 @@ fn append_shape(descriptor: &mut Vec<u64>, shape: &ExtraShape) {
 fn append_type_name(descriptor: &mut Vec<u64>, name: &str) {
     descriptor.push(name.len() as u64);
     descriptor.extend(name.as_bytes().iter().copied().map(u64::from));
-}
-
-fn agree_header<C: CommunicatorCollectives>(comm: &C, header: [u64; HEADER_WORDS]) -> bool {
-    let mut minimum = [0u64; HEADER_WORDS];
-    let mut maximum = [0u64; HEADER_WORDS];
-    comm.all_reduce_into(&header[..], &mut minimum[..], SystemOperation::min());
-    comm.all_reduce_into(&header[..], &mut maximum[..], SystemOperation::max());
-    minimum == maximum
 }
 
 /// Agrees only success, preserving a local error or returning `peer_error`.

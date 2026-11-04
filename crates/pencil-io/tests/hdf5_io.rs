@@ -6,7 +6,10 @@ use hdf5_metno::{File, H5Type};
 use mpi::traits::*;
 use num_complex::Complex;
 use pencil_array::{AxisPermutation, ExtraShape, MpiTopology, Pencil, PencilArray};
-use pencil_io::{IoError, read_hdf5, read_hdf5_serial, write_hdf5, write_hdf5_serial};
+use pencil_io::{
+    CatalogError, IoError, ScalarType, read_hdf5, read_hdf5_catalog, read_hdf5_serial, write_hdf5,
+    write_hdf5_serial,
+};
 
 mod support;
 use support::{
@@ -235,6 +238,56 @@ fn parallel_hdf5_preserves_logical_order_and_rejects_bad_files() {
     });
     world.barrier();
     let case_path = directory.join("case.h5");
+
+    let huge_global = [1u64 << 61, 0];
+    let catalog_topology = MpiTopology::<2>::new(&world, [1, size]).unwrap();
+
+    // The catalog multiplies the shape product before the width, so a zero
+    // extent after a huge axis is valid even though width * 2^61 overflows.
+    // The axis itself only fits in a 64-bit usize.
+    #[cfg(target_pointer_width = "64")]
+    {
+        prepare_case(&world, &baseline_path, &case_path, |case| {
+            recreate_dataset(
+                case,
+                size,
+                &[1usize << 61, 0],
+                DatasetKind::F64,
+                ScalarType::F64.code(),
+                8,
+                &[],
+                &huge_global,
+            )
+        });
+        let huge = read_hdf5_catalog(&case_path, catalog_topology.communicator()).unwrap();
+        assert_eq!(huge[0].scalar_type(), ScalarType::F64);
+        assert_eq!(huge[0].global_shape(), &huge_global);
+        assert_eq!(huge[0].extra_shape(), &[]);
+        world.barrier();
+    }
+
+    // The same metadata with a different on-disk extent must reach the dataset
+    // shape check rather than failing the earlier byte-count validation.
+    prepare_case(&world, &baseline_path, &case_path, |case| {
+        recreate_dataset(
+            case,
+            size,
+            &[0, 0],
+            DatasetKind::F64,
+            ScalarType::F64.code(),
+            8,
+            &[],
+            &huge_global,
+        )
+    });
+    let error = read_hdf5_catalog(&case_path, catalog_topology.communicator()).unwrap_err();
+    assert!(matches!(
+        error,
+        CatalogError::Io(IoError::CollectivePrecondition {
+            phase: "HDF5 catalog dataset shape"
+        })
+    ));
+    world.barrier();
 
     prepare_case(&world, &baseline_path, &case_path, |case| {
         let file = h5(File::open_rw(case))?;

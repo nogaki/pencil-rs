@@ -43,8 +43,8 @@ use super::{
     R2rError, RouteCandidate, StagePreparation, TransformStage, TransformTiming, TransposeMethod,
     agree_execution_descriptor_ref, agree_header, agree_result, build_route, build_transitions,
     collective_descriptor, collective_valid, descriptor_len, execute_transition,
-    execute_transition_timed, initialized_vec, map_array_allocation, validate_input,
-    validate_workspace_lengths_values,
+    execute_transition_timed, initialized_vec, map_array_allocation, registered_pencils,
+    validate_input, validate_workspace_lengths_values,
 };
 #[cfg(feature = "fftw")]
 use crate::PlanOptions;
@@ -509,78 +509,27 @@ where
 
     /// Allocates a zero-initialized local input array.
     pub fn allocate_input(&self) -> Result<PencilArray<T, N, M>, R2rError> {
-        PencilArray::from_fn(
-            Arc::clone(self.input_pencil()),
-            self.core.extra_shape.clone(),
-            crate::r2r::r2r_zero::<T>,
-        )
-        .map_err(FftError::Array)
-        .map_err(Into::into)
+        self.core.allocate_array(self.input_pencil())
     }
 
     /// Allocates a zero-initialized local output array.
     pub fn allocate_output(&self) -> Result<PencilArray<T, N, M>, R2rError> {
-        PencilArray::from_fn(
-            Arc::clone(self.output_pencil()),
-            self.core.extra_shape.clone(),
-            crate::r2r::r2r_zero::<T>,
-        )
-        .map_err(FftError::Array)
-        .map_err(Into::into)
+        self.core.allocate_array(self.output_pencil())
     }
 
     /// Allocates reusable out-of-place workspace.
     pub fn allocate_workspace(&self) -> Result<R2rWorkspace<T, N, M>, R2rError> {
-        let intermediate = ManyPencilArray::from_elem(
-            registered_stage_pencils(&self.core.stages)?,
-            0,
-            self.core.extra_shape.clone(),
-            crate::r2r::r2r_zero::<T>(),
-        )
-        .map_err(map_array_allocation)
-        .map_err(R2rError::Fft)?;
-        Ok(R2rWorkspace {
-            core: Arc::clone(&self.core),
-            intermediate,
-            transpose: TransposeWorkspace::from_vecs(
-                initialized_vec(self.core.transpose_send_len, crate::r2r::r2r_zero::<T>())?,
-                initialized_vec(self.core.transpose_receive_len, crate::r2r::r2r_zero::<T>())?,
-            ),
-            embedding_line: initialized_vec(self.core.embedding_len, zero_complex::<T::Real>())?,
-            fft_scratch: initialized_vec(self.core.fft_scratch_len, zero_complex::<T::Real>())?,
-            line_buffer: initialized_vec(self.core.strided_line_len, crate::r2r::r2r_zero::<T>())?,
-        })
+        R2rWorkspace::new(Arc::clone(&self.core))
     }
 
     /// Allocates an opaque canonical input array for in-place execution.
     pub fn allocate_in_place(&self) -> Result<R2rInPlaceArray<T, N, M>, R2rError> {
-        let array = ManyPencilArray::from_elem(
-            registered_stage_pencils(&self.core.stages)?,
-            0,
-            self.core.extra_shape.clone(),
-            crate::r2r::r2r_zero::<T>(),
-        )
-        .map_err(map_array_allocation)
-        .map_err(R2rError::Fft)?;
-        Ok(R2rInPlaceArray {
-            core: Arc::clone(&self.core),
-            array,
-            state: super::R2rState::Input,
-        })
+        R2rInPlaceArray::new(Arc::clone(&self.core))
     }
 
     /// Allocates reusable in-place workspace.
     pub fn allocate_in_place_workspace(&self) -> Result<R2rInPlaceWorkspace<T, N, M>, R2rError> {
-        Ok(R2rInPlaceWorkspace {
-            core: Arc::clone(&self.core),
-            transpose: TransposeWorkspace::from_vecs(
-                initialized_vec(self.core.transpose_send_len, crate::r2r::r2r_zero::<T>())?,
-                initialized_vec(self.core.transpose_receive_len, crate::r2r::r2r_zero::<T>())?,
-            ),
-            embedding_line: initialized_vec(self.core.embedding_len, zero_complex::<T::Real>())?,
-            fft_scratch: initialized_vec(self.core.fft_scratch_len, zero_complex::<T::Real>())?,
-            line_buffer: initialized_vec(self.core.strided_line_len, crate::r2r::r2r_zero::<T>())?,
-        })
+        R2rInPlaceWorkspace::new(Arc::clone(&self.core))
     }
 
     /// Computes the selected unnormalized Hartley transforms.
@@ -1029,6 +978,80 @@ struct R2rCore<T: R2rScalar, const N: usize, const M: usize> {
     strict_array_identity: bool,
 }
 
+impl<T: R2rScalar, const N: usize, const M: usize> R2rCore<T, N, M> {
+    fn allocate_array(&self, pencil: &Arc<Pencil<N, M>>) -> Result<PencilArray<T, N, M>, R2rError> {
+        PencilArray::from_fn(
+            Arc::clone(pencil),
+            self.extra_shape.clone(),
+            crate::r2r::r2r_zero::<T>,
+        )
+        .map_err(FftError::Array)
+        .map_err(Into::into)
+    }
+
+    fn allocate_many(&self) -> Result<ManyPencilArray<T, N, M>, R2rError> {
+        ManyPencilArray::from_elem(
+            registered_pencils(self.stages.iter().map(|stage| &stage.output))?,
+            0,
+            self.extra_shape.clone(),
+            crate::r2r::r2r_zero::<T>(),
+        )
+        .map_err(map_array_allocation)
+        .map_err(Into::into)
+    }
+}
+
+impl<T: R2rScalar, const N: usize, const M: usize> R2rWorkspace<T, N, M> {
+    fn new(core: Arc<R2rCore<T, N, M>>) -> Result<Self, R2rError> {
+        let intermediate = core.allocate_many()?;
+        let transpose = TransposeWorkspace::from_vecs(
+            initialized_vec(core.transpose_send_len, crate::r2r::r2r_zero::<T>())?,
+            initialized_vec(core.transpose_receive_len, crate::r2r::r2r_zero::<T>())?,
+        );
+        let embedding_line = initialized_vec(core.embedding_len, zero_complex::<T::Real>())?;
+        let fft_scratch = initialized_vec(core.fft_scratch_len, zero_complex::<T::Real>())?;
+        let line_buffer = initialized_vec(core.strided_line_len, crate::r2r::r2r_zero::<T>())?;
+        Ok(Self {
+            core,
+            intermediate,
+            transpose,
+            embedding_line,
+            fft_scratch,
+            line_buffer,
+        })
+    }
+}
+
+impl<T: R2rScalar, const N: usize, const M: usize> R2rInPlaceArray<T, N, M> {
+    fn new(core: Arc<R2rCore<T, N, M>>) -> Result<Self, R2rError> {
+        let array = core.allocate_many()?;
+        Ok(Self {
+            core,
+            array,
+            state: super::R2rState::Input,
+        })
+    }
+}
+
+impl<T: R2rScalar, const N: usize, const M: usize> R2rInPlaceWorkspace<T, N, M> {
+    fn new(core: Arc<R2rCore<T, N, M>>) -> Result<Self, R2rError> {
+        let transpose = TransposeWorkspace::from_vecs(
+            initialized_vec(core.transpose_send_len, crate::r2r::r2r_zero::<T>())?,
+            initialized_vec(core.transpose_receive_len, crate::r2r::r2r_zero::<T>())?,
+        );
+        let embedding_line = initialized_vec(core.embedding_len, zero_complex::<T::Real>())?;
+        let fft_scratch = initialized_vec(core.fft_scratch_len, zero_complex::<T::Real>())?;
+        let line_buffer = initialized_vec(core.strided_line_len, crate::r2r::r2r_zero::<T>())?;
+        Ok(Self {
+            core,
+            transpose,
+            embedding_line,
+            fft_scratch,
+            line_buffer,
+        })
+    }
+}
+
 impl<T: R2rScalar, const N: usize, const M: usize> R2rPlan<T, N, M>
 where
     T: Equivalence,
@@ -1289,78 +1312,27 @@ where
 
     /// Allocates a zero-initialized local input array.
     pub fn allocate_input(&self) -> Result<PencilArray<T, N, M>, R2rError> {
-        PencilArray::from_fn(
-            Arc::clone(self.input_pencil()),
-            self.core.extra_shape.clone(),
-            crate::r2r::r2r_zero::<T>,
-        )
-        .map_err(FftError::Array)
-        .map_err(R2rError::from)
+        self.core.allocate_array(self.input_pencil())
     }
 
     /// Allocates a zero-initialized local output array.
     pub fn allocate_output(&self) -> Result<PencilArray<T, N, M>, R2rError> {
-        PencilArray::from_fn(
-            Arc::clone(self.output_pencil()),
-            self.core.extra_shape.clone(),
-            crate::r2r::r2r_zero::<T>,
-        )
-        .map_err(FftError::Array)
-        .map_err(R2rError::from)
+        self.core.allocate_array(self.output_pencil())
     }
 
     /// Allocates reusable out-of-place workspace.
     pub fn allocate_workspace(&self) -> Result<R2rWorkspace<T, N, M>, R2rError> {
-        let intermediate = ManyPencilArray::from_elem(
-            registered_stage_pencils(&self.core.stages)?,
-            0,
-            self.core.extra_shape.clone(),
-            crate::r2r::r2r_zero::<T>(),
-        )
-        .map_err(map_array_allocation)
-        .map_err(R2rError::from)?;
-        Ok(R2rWorkspace {
-            core: Arc::clone(&self.core),
-            intermediate,
-            transpose: TransposeWorkspace::from_vecs(
-                initialized_vec(self.core.transpose_send_len, crate::r2r::r2r_zero::<T>())?,
-                initialized_vec(self.core.transpose_receive_len, crate::r2r::r2r_zero::<T>())?,
-            ),
-            embedding_line: initialized_vec(self.core.embedding_len, zero_complex::<T::Real>())?,
-            fft_scratch: initialized_vec(self.core.fft_scratch_len, zero_complex::<T::Real>())?,
-            line_buffer: initialized_vec(self.core.strided_line_len, crate::r2r::r2r_zero::<T>())?,
-        })
+        R2rWorkspace::new(Arc::clone(&self.core))
     }
 
     /// Allocates an opaque canonical input array for in-place execution.
     pub fn allocate_in_place(&self) -> Result<R2rInPlaceArray<T, N, M>, R2rError> {
-        let array = ManyPencilArray::from_elem(
-            registered_stage_pencils(&self.core.stages)?,
-            0,
-            self.core.extra_shape.clone(),
-            crate::r2r::r2r_zero::<T>(),
-        )
-        .map_err(map_array_allocation)
-        .map_err(R2rError::from)?;
-        Ok(R2rInPlaceArray {
-            core: Arc::clone(&self.core),
-            array,
-            state: super::R2rState::Input,
-        })
+        R2rInPlaceArray::new(Arc::clone(&self.core))
     }
 
     /// Allocates reusable in-place workspace.
     pub fn allocate_in_place_workspace(&self) -> Result<R2rInPlaceWorkspace<T, N, M>, R2rError> {
-        Ok(R2rInPlaceWorkspace {
-            core: Arc::clone(&self.core),
-            transpose: TransposeWorkspace::from_vecs(
-                initialized_vec(self.core.transpose_send_len, crate::r2r::r2r_zero::<T>())?,
-                initialized_vec(self.core.transpose_receive_len, crate::r2r::r2r_zero::<T>())?,
-            ),
-            embedding_line: initialized_vec(self.core.embedding_len, zero_complex::<T::Real>())?,
-            fft_scratch: initialized_vec(self.core.fft_scratch_len, zero_complex::<T::Real>())?,
-            line_buffer: initialized_vec(self.core.strided_line_len, crate::r2r::r2r_zero::<T>())?,
-        })
+        R2rInPlaceWorkspace::new(Arc::clone(&self.core))
     }
 
     /// Computes the selected raw forward transforms, preserving `source`.
@@ -2064,26 +2036,6 @@ struct R2rStagePreparation<T: R2rScalar, const N: usize, const M: usize> {
     fft_scratch_len: usize,
 }
 
-fn registered_stage_pencils<T: R2rScalar, const N: usize, const M: usize>(
-    stages: &[R2rStage<T, N, M>],
-) -> Result<Box<[Arc<Pencil<N, M>>]>, R2rError> {
-    let mut pencils = Vec::new();
-    pencils.try_reserve_exact(stages.len()).map_err(|_| {
-        R2rError::Fft(FftError::AllocationFailed {
-            required: stages.len(),
-        })
-    })?;
-    for stage in stages {
-        if !pencils
-            .iter()
-            .any(|registered: &Arc<Pencil<N, M>>| registered.same_layout(stage.output.as_ref()))
-        {
-            pencils.push(Arc::clone(&stage.output));
-        }
-    }
-    Ok(pencils.into_boxed_slice())
-}
-
 fn build_r2r_descriptor<T: R2rScalar, const N: usize, const M: usize>(
     topology: &MpiTopology<M>,
     global_shape: [usize; N],
@@ -2585,30 +2537,18 @@ fn execute_strided_r2r_forward<T: R2rScalar, const N: usize, const M: usize>(
             .forward(source, destination, embedding_line, fft_scratch)
             .map_err(R2rError::LocalR2r);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = source[base + k * stride + inner];
-            }
-            plan.forward_in_place(
-                &mut line_buffer[..plan.line_len()],
-                embedding_line,
-                fft_scratch,
-            )
-            .map_err(R2rError::LocalR2r)?;
-            for k in 0..plan.line_len() {
-                destination[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+    super::for_each_strided_line(
+        source,
+        destination,
+        line_buffer,
+        count,
+        plan.line_len(),
+        stride,
+        |line| {
+            plan.forward_in_place(line, embedding_line, fft_scratch)
+                .map_err(R2rError::LocalR2r)
+        },
+    )
 }
 
 fn execute_strided_r2r_forward_in_place<T: R2rScalar, const N: usize, const M: usize>(
@@ -2641,30 +2581,17 @@ fn execute_strided_r2r_forward_in_place<T: R2rScalar, const N: usize, const M: u
             .forward_in_place(data, embedding_line, fft_scratch)
             .map_err(R2rError::LocalR2r);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = data[base + k * stride + inner];
-            }
-            plan.forward_in_place(
-                &mut line_buffer[..plan.line_len()],
-                embedding_line,
-                fft_scratch,
-            )
-            .map_err(R2rError::LocalR2r)?;
-            for k in 0..plan.line_len() {
-                data[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+    super::for_each_strided_line_in_place(
+        data,
+        line_buffer,
+        count,
+        plan.line_len(),
+        stride,
+        |line| {
+            plan.forward_in_place(line, embedding_line, fft_scratch)
+                .map_err(R2rError::LocalR2r)
+        },
+    )
 }
 
 fn execute_strided_r2r_reverse<T: R2rScalar, const N: usize, const M: usize>(
@@ -2708,38 +2635,22 @@ fn execute_strided_r2r_reverse<T: R2rScalar, const N: usize, const M: usize>(
         }
         .map_err(R2rError::LocalR2r);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = source[base + k * stride + inner];
-            }
+    super::for_each_strided_line(
+        source,
+        destination,
+        line_buffer,
+        count,
+        plan.line_len(),
+        stride,
+        |line| {
             if normalize {
-                plan.inverse_in_place(
-                    &mut line_buffer[..plan.line_len()],
-                    embedding_line,
-                    fft_scratch,
-                )
+                plan.inverse_in_place(line, embedding_line, fft_scratch)
             } else {
-                plan.backward_in_place(
-                    &mut line_buffer[..plan.line_len()],
-                    embedding_line,
-                    fft_scratch,
-                )
+                plan.backward_in_place(line, embedding_line, fft_scratch)
             }
-            .map_err(R2rError::LocalR2r)?;
-            for k in 0..plan.line_len() {
-                destination[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+            .map_err(R2rError::LocalR2r)
+        },
+    )
 }
 
 fn execute_strided_r2r_reverse_in_place<T: R2rScalar, const N: usize, const M: usize>(
@@ -2779,38 +2690,21 @@ fn execute_strided_r2r_reverse_in_place<T: R2rScalar, const N: usize, const M: u
         }
         .map_err(R2rError::LocalR2r);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = data[base + k * stride + inner];
-            }
+    super::for_each_strided_line_in_place(
+        data,
+        line_buffer,
+        count,
+        plan.line_len(),
+        stride,
+        |line| {
             if normalize {
-                plan.inverse_in_place(
-                    &mut line_buffer[..plan.line_len()],
-                    embedding_line,
-                    fft_scratch,
-                )
+                plan.inverse_in_place(line, embedding_line, fft_scratch)
             } else {
-                plan.backward_in_place(
-                    &mut line_buffer[..plan.line_len()],
-                    embedding_line,
-                    fft_scratch,
-                )
+                plan.backward_in_place(line, embedding_line, fft_scratch)
             }
-            .map_err(R2rError::LocalR2r)?;
-            for k in 0..plan.line_len() {
-                data[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+            .map_err(R2rError::LocalR2r)
+        },
+    )
 }
 
 // ponytail: DHT is self-paired; forward and raw backward both use normalize=false.
@@ -2855,38 +2749,22 @@ fn execute_strided_dht_reverse<T: R2rScalar, const N: usize, const M: usize>(
         }
         .map_err(R2rError::LocalR2r);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = source[base + k * stride + inner];
-            }
+    super::for_each_strided_line(
+        source,
+        destination,
+        line_buffer,
+        count,
+        plan.line_len(),
+        stride,
+        |line| {
             if normalize {
-                plan.inverse_in_place(
-                    &mut line_buffer[..plan.line_len()],
-                    embedding_line,
-                    fft_scratch,
-                )
+                plan.inverse_in_place(line, embedding_line, fft_scratch)
             } else {
-                plan.backward_in_place(
-                    &mut line_buffer[..plan.line_len()],
-                    embedding_line,
-                    fft_scratch,
-                )
+                plan.backward_in_place(line, embedding_line, fft_scratch)
             }
-            .map_err(R2rError::LocalR2r)?;
-            for k in 0..plan.line_len() {
-                destination[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+            .map_err(R2rError::LocalR2r)
+        },
+    )
 }
 
 fn execute_strided_dht_reverse_in_place<T: R2rScalar, const N: usize, const M: usize>(
@@ -2926,38 +2804,21 @@ fn execute_strided_dht_reverse_in_place<T: R2rScalar, const N: usize, const M: u
         }
         .map_err(R2rError::LocalR2r);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = data[base + k * stride + inner];
-            }
+    super::for_each_strided_line_in_place(
+        data,
+        line_buffer,
+        count,
+        plan.line_len(),
+        stride,
+        |line| {
             if normalize {
-                plan.inverse_in_place(
-                    &mut line_buffer[..plan.line_len()],
-                    embedding_line,
-                    fft_scratch,
-                )
+                plan.inverse_in_place(line, embedding_line, fft_scratch)
             } else {
-                plan.backward_in_place(
-                    &mut line_buffer[..plan.line_len()],
-                    embedding_line,
-                    fft_scratch,
-                )
+                plan.backward_in_place(line, embedding_line, fft_scratch)
             }
-            .map_err(R2rError::LocalR2r)?;
-            for k in 0..plan.line_len() {
-                data[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+            .map_err(R2rError::LocalR2r)
+        },
+    )
 }
 
 fn execute_local_forward<T: R2rScalar, const N: usize, const M: usize>(
