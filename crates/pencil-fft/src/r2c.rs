@@ -698,7 +698,7 @@ impl<R: FftReal> LocalR2cPlan<R> {
         if workspace.real_len != self.real_len || workspace.complex_len != self.complex_len {
             return Err(LocalR2cError::WorkspaceMismatch);
         }
-        let (_, complex_values) = self.checked_in_place_lengths(array.batch_count)?;
+        let (real_values, complex_values) = self.checked_in_place_lengths(array.batch_count)?;
         if array.storage.len() != complex_values {
             return Err(LocalR2cError::StorageLengthMismatch {
                 required: complex_values,
@@ -706,41 +706,45 @@ impl<R: FftReal> LocalR2cPlan<R> {
             });
         }
         let storage = cast_real_slice(&array.storage)?;
-        let real_values = self
-            .real_len
-            .checked_mul(array.batch_count)
-            .ok_or(LocalR2cError::LengthOverflow)?;
         if storage.len() < real_values {
             return Err(LocalR2cError::StorageLayoutMismatch);
         }
-        if workspace.real_line.len() < self.real_len {
-            return Err(LocalR2cError::RealLineTooSmall {
-                required: self.real_len,
-                actual: workspace.real_line.len(),
-            });
-        }
-        if workspace.complex_line.len() < self.complex_len {
-            return Err(LocalR2cError::ComplexLineTooSmall {
-                required: self.complex_len,
-                actual: workspace.complex_line.len(),
-            });
-        }
-        self.validate_scratch(workspace.scratch.len())?;
+        self.validate_line_buffers(
+            real_values,
+            complex_values,
+            true,
+            workspace.real_line.len(),
+            workspace.complex_line.len(),
+            workspace.scratch.len(),
+        )?;
         if expected_state == R2cState::ComplexOutput {
             self.validate_endpoints(&array.storage[..complex_values])?;
         }
         Ok(array.batch_count)
     }
 
-    fn validate_forward(
+    /// Checks batch counts, line buffers, and scratch in that order.
+    ///
+    /// `source_line_is_real` selects the line kind whose length determines the
+    /// source batch count; the destination uses the other kind. Out-of-place
+    /// callers pass the plan's required length for the line buffer they do not
+    /// have, so it never fails.
+    fn validate_line_buffers(
         &self,
         source_len: usize,
         destination_len: usize,
+        source_line_is_real: bool,
         real_line_len: usize,
+        complex_line_len: usize,
         scratch_len: usize,
     ) -> Result<(), LocalR2cError> {
-        let source_batches = batch_count(source_len, self.real_len)?;
-        let destination_batches = batch_count(destination_len, self.complex_len)?;
+        let (source_required, destination_required) = if source_line_is_real {
+            (self.real_len, self.complex_len)
+        } else {
+            (self.complex_len, self.real_len)
+        };
+        let source_batches = batch_count(source_len, source_required)?;
+        let destination_batches = batch_count(destination_len, destination_required)?;
         if source_batches != destination_batches {
             return Err(LocalR2cError::BatchCountMismatch {
                 source_count: source_batches,
@@ -753,8 +757,30 @@ impl<R: FftReal> LocalR2cPlan<R> {
                 actual: real_line_len,
             });
         }
-        self.validate_scratch(scratch_len)?;
-        Ok(())
+        if complex_line_len < self.complex_len {
+            return Err(LocalR2cError::ComplexLineTooSmall {
+                required: self.complex_len,
+                actual: complex_line_len,
+            });
+        }
+        self.validate_scratch(scratch_len)
+    }
+
+    fn validate_forward(
+        &self,
+        source_len: usize,
+        destination_len: usize,
+        real_line_len: usize,
+        scratch_len: usize,
+    ) -> Result<(), LocalR2cError> {
+        self.validate_line_buffers(
+            source_len,
+            destination_len,
+            true,
+            real_line_len,
+            self.complex_len,
+            scratch_len,
+        )
     }
 
     fn validate_inverse(
@@ -764,22 +790,14 @@ impl<R: FftReal> LocalR2cPlan<R> {
         complex_line_len: usize,
         scratch_len: usize,
     ) -> Result<(), LocalR2cError> {
-        let source_batches = batch_count(source_len, self.complex_len)?;
-        let destination_batches = batch_count(destination_len, self.real_len)?;
-        if source_batches != destination_batches {
-            return Err(LocalR2cError::BatchCountMismatch {
-                source_count: source_batches,
-                destination_count: destination_batches,
-            });
-        }
-        if complex_line_len < self.complex_len {
-            return Err(LocalR2cError::ComplexLineTooSmall {
-                required: self.complex_len,
-                actual: complex_line_len,
-            });
-        }
-        self.validate_scratch(scratch_len)?;
-        Ok(())
+        self.validate_line_buffers(
+            source_len,
+            destination_len,
+            false,
+            self.real_len,
+            complex_line_len,
+            scratch_len,
+        )
     }
 
     fn validate_scratch(&self, actual: usize) -> Result<(), LocalR2cError> {
