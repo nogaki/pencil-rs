@@ -10,10 +10,9 @@
 use std::{mem::size_of, sync::Arc, time::Instant};
 
 use bytemuck::{try_cast_slice, try_cast_vec};
-use mpi::{
-    collective::{CommunicatorCollectives, SystemOperation},
-    datatype::Equivalence,
-};
+#[cfg(test)]
+use mpi::collective::CommunicatorCollectives;
+use mpi::datatype::Equivalence;
 use pencil_array::{
     ArrayError, ExtraShape, ManyPencilArray, MpiTopology, OverlapError, OverwriteError, Pencil,
     PencilArray, PencilArrayView, PencilArrayViewMut, TransposeWorkspace,
@@ -45,8 +44,8 @@ use super::{
     OPERATION_MIXED_R2C_INVERSE_IN_PLACE, RouteCandidate, StagePreparation, TransformStage,
     TransformTiming, TransposeMethod, VALUE_KIND_C2C, VALUE_KIND_R2C,
     agree_execution_descriptor_ref, agree_header, agree_result, build_route, build_transitions,
-    collective_descriptor, collective_valid, endpoint_chunk_buffers, endpoint_chunk_count,
-    endpoint_chunk_len, initialized_vec, map_array_allocation, memory_stride,
+    collective_descriptor, collective_valid, convert_strided_complex_reverse,
+    convert_strided_real_forward, initialized_vec, map_array_allocation, memory_stride,
     r2c::validate_recast_capacity, strided_line_count, validate_input,
     validate_workspace_lengths_values, zero_complex,
 };
@@ -5826,13 +5825,7 @@ struct MixedEndpointStatistics<'a, R: FftReal> {
     stride: usize,
     line_count: usize,
     line_block: usize,
-    plane_count: usize,
-    relative: f64,
-    absolute: f64,
-    invalid: bool,
-    local_stats: Vec<[f64; 4]>,
-    global_maxima: Vec<[f64; 4]>,
-    global_sums: Vec<[f64; 4]>,
+    statistics: super::EndpointStatistics,
 }
 
 fn validate_mixed_boundary_data<R: FftReal, const N: usize, const M: usize>(
@@ -5845,7 +5838,6 @@ where
 {
     let communicator = core.stages[0].input.topology().communicator();
     let batch_count = core.extra_shape.element_count();
-    let chunk_len = batch_count.min(super::ENDPOINT_BATCH_CHUNK);
     // Index preparation, allocation, and ownership checks are agreed as one
     // result before the first statistics reduction. Afterwards every rank runs
     // the same chunks, so a local numeric failure must not return early.
@@ -5898,20 +5890,16 @@ where
                 return Err(MixedError::Fft(FftError::PreparationFailed));
             }
         }
-        let [local_stats, global_maxima, global_sums] = endpoint_chunk_buffers(chunk_len)?;
+        let mut statistics =
+            super::EndpointStatistics::new(batch_count, plane_count, relative, absolute)?;
+        statistics.invalid = !relative.is_finite() || !absolute.is_finite();
         Ok(MixedEndpointStatistics {
             data,
             local_len,
             stride,
             line_count,
             line_block,
-            plane_count,
-            relative,
-            absolute,
-            invalid: !relative.is_finite() || !absolute.is_finite(),
-            local_stats,
-            global_maxima,
-            global_sums,
+            statistics,
         })
     })();
     #[cfg(test)]
@@ -5922,35 +5910,24 @@ where
         stride,
         line_count,
         line_block,
-        plane_count,
-        relative,
-        absolute,
-        mut invalid,
-        mut local_stats,
-        mut global_maxima,
-        mut global_sums,
+        mut statistics,
     } = agree_result(communicator, preparation)?;
+    let plane_count = statistics.plane_count;
+    let complex_len = core.complex_len;
 
-    for chunk_index in 0..endpoint_chunk_count(batch_count) {
-        let chunk_start = chunk_index * super::ENDPOINT_BATCH_CHUNK;
-        let chunk = endpoint_chunk_len(batch_count, chunk_start);
-        let local = &mut local_stats[..chunk];
-        let maxima = &mut global_maxima[..chunk];
-        let sums = &mut global_sums[..chunk];
-
-        local.fill([0.0_f64; 4]);
-        for (batch_max, batch) in local.iter_mut().zip(chunk_start..chunk_start + chunk) {
-            let start = batch
-                .checked_mul(local_len)
-                .expect("validated mixed boundary batch offset");
-            let values = &data[start..start + local_len];
+    statistics.reduce_chunks(
+        communicator,
+        batch_count,
+        data,
+        local_len,
+        |values, visit| {
             for outer in 0..line_count {
                 let base = outer
                     .checked_mul(line_block)
                     .expect("validated mixed boundary line offset");
                 for inner in 0..stride {
                     for plane in 0..plane_count {
-                        let k = if plane == 0 { 0 } else { core.complex_len - 1 };
+                        let k = if plane == 0 { 0 } else { complex_len - 1 };
                         let index = base
                             .checked_add(
                                 k.checked_mul(stride)
@@ -5958,103 +5935,13 @@ where
                             )
                             .and_then(|value| value.checked_add(inner))
                             .expect("validated mixed boundary endpoint index");
-                        let value = values[index];
-                        let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
-                        let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
-                        if !re.is_finite() || !im.is_finite() {
-                            invalid = true;
-                            continue;
-                        }
-                        let slot = plane * 2;
-                        batch_max[slot] = batch_max[slot].max(re.abs().max(im.abs()));
-                        batch_max[slot + 1] = batch_max[slot + 1].max(im.abs());
+                        visit(plane * 2, values[index]);
                     }
                 }
             }
-        }
-        #[cfg(test)]
-        record_endpoint_reduction(EndpointReductionEvent::MaxReduction {
-            elements: 4 * chunk,
-        });
-        communicator.all_reduce_into(
-            local.as_flattened(),
-            maxima.as_flattened_mut(),
-            SystemOperation::max(),
-        );
-
-        local.fill([0.0_f64; 4]);
-        for (batch, (local_sum, global_max)) in local.iter_mut().zip(maxima.iter()).enumerate() {
-            let start = (chunk_start + batch)
-                .checked_mul(local_len)
-                .expect("validated mixed boundary batch offset");
-            let values = &data[start..start + local_len];
-            for outer in 0..line_count {
-                let base = outer
-                    .checked_mul(line_block)
-                    .expect("validated mixed boundary line offset");
-                for inner in 0..stride {
-                    for plane in 0..plane_count {
-                        let k = if plane == 0 { 0 } else { core.complex_len - 1 };
-                        let index = base
-                            .checked_add(
-                                k.checked_mul(stride)
-                                    .expect("validated mixed boundary plane offset"),
-                            )
-                            .and_then(|value| value.checked_add(inner))
-                            .expect("validated mixed boundary endpoint index");
-                        let value = values[index];
-                        let re = <R as crate::private::Sealed>::pencil_fft_as_f64(value.re);
-                        let im = <R as crate::private::Sealed>::pencil_fft_as_f64(value.im);
-                        if !re.is_finite() || !im.is_finite() {
-                            continue;
-                        }
-                        let slot = plane * 2;
-                        let scale = global_max[slot];
-                        if scale != 0.0 && scale.is_finite() {
-                            let re = re / scale;
-                            let im = im / scale;
-                            local_sum[slot] += re * re;
-                            local_sum[slot + 1] += im * im;
-                        }
-                    }
-                }
-            }
-        }
-        #[cfg(test)]
-        record_endpoint_reduction(EndpointReductionEvent::SumReduction {
-            elements: 4 * chunk,
-        });
-        communicator.all_reduce_into(
-            local.as_flattened(),
-            sums.as_flattened_mut(),
-            SystemOperation::sum(),
-        );
-
-        for batch in 0..chunk {
-            let global_max = maxima[batch];
-            let global_sum = sums[batch];
-            if global_max[..plane_count * 2]
-                .iter()
-                .any(|value| !value.is_finite())
-                || global_sum[..plane_count * 2]
-                    .iter()
-                    .any(|value| !value.is_finite())
-            {
-                invalid = true;
-            }
-            for plane in 0..plane_count {
-                let slot = plane * 2;
-                let absolute_ok = global_max[slot + 1] <= absolute;
-                let relative_ok = global_sum[slot + 1].sqrt() <= relative * global_sum[slot].sqrt();
-                if !(absolute_ok || relative_ok) {
-                    invalid = true;
-                }
-            }
-        }
-    }
-    #[cfg(test)]
-    record_endpoint_reduction(EndpointReductionEvent::FinalAgreement);
-    if !collective_valid(communicator, !invalid) {
+        },
+    );
+    if !statistics.accepted(communicator) {
         return Err(MixedError::InvalidSpectrum);
     }
     Ok(())
@@ -6397,88 +6284,6 @@ fn mixed_fail_real_reverse<R: FftReal, const N: usize, const M: usize>(
     cause
 }
 
-fn mixed_convert_strided_real_forward<R: FftReal, const N: usize, const M: usize>(
-    core: &MixedR2cCore<R, N, M>,
-    plan: &LocalR2cPlan<R>,
-    rows: usize,
-    stride: usize,
-    storage: &mut [Complex<R>],
-    workspace: &mut MixedR2cInPlaceWorkspace<R, N, M>,
-) -> Result<(), MixedError>
-where
-    Complex<R>: Equivalence,
-{
-    if stride <= 1 || !rows.is_multiple_of(stride) {
-        return Err(MixedError::Fft(FftError::PreparationFailed));
-    }
-    let groups = rows / stride;
-    let source_span = groups
-        .checked_mul(core.real_len)
-        .and_then(|value| value.checked_mul(stride))
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-    let destination_span = groups
-        .checked_mul(core.complex_len)
-        .and_then(|value| value.checked_mul(stride))
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-    if source_span > storage.len() || destination_span > storage.len() {
-        return Err(MixedError::Fft(FftError::StorageLayoutMismatch));
-    }
-    if workspace.real_source_line.len() < core.real_len
-        || workspace.complex_line.len() < core.complex_len
-        || workspace.real_line.len() < core.real_len
-    {
-        return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
-            kind: "real/complex line",
-            required: core.real_len.max(core.complex_len),
-            actual: workspace
-                .real_source_line
-                .len()
-                .min(workspace.complex_line.len())
-                .min(workspace.real_line.len()),
-        }));
-    }
-    for outer in 0..groups {
-        let source_base = outer
-            .checked_mul(core.real_len)
-            .and_then(|value| value.checked_mul(stride))
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        let destination_base = outer
-            .checked_mul(core.complex_len)
-            .and_then(|value| value.checked_mul(stride))
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        for inner in 0..stride {
-            for k in 0..core.real_len {
-                let index = source_base
-                    .checked_add(
-                        k.checked_mul(stride)
-                            .ok_or(MixedError::Fft(FftError::PreparationFailed))?,
-                    )
-                    .and_then(|value| value.checked_add(inner))
-                    .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-                workspace.real_source_line[k] = storage[index].re;
-            }
-            plan.forward(
-                &workspace.real_source_line[..core.real_len],
-                &mut workspace.complex_line[..core.complex_len],
-                &mut workspace.real_line,
-                &mut workspace.fft_scratch,
-            )
-            .map_err(MixedError::LocalR2c)?;
-            for k in 0..core.complex_len {
-                let index = destination_base
-                    .checked_add(
-                        k.checked_mul(stride)
-                            .ok_or(MixedError::Fft(FftError::PreparationFailed))?,
-                    )
-                    .and_then(|value| value.checked_add(inner))
-                    .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-                storage[index] = workspace.complex_line[k];
-            }
-        }
-    }
-    Ok(())
-}
-
 fn mixed_convert_real_to_complex<R: FftReal, const N: usize, const M: usize>(
     core: &Arc<MixedR2cCore<R, N, M>>,
     array: &mut MixedR2cInPlaceArray<R, N, M>,
@@ -6599,13 +6404,17 @@ where
             };
             complex_storage[i] = Complex::new(value, R::zero());
         }
-        if let Err(error) = mixed_convert_strided_real_forward(
-            core,
+        if let Err(error) = convert_strided_real_forward(
+            &mut complex_storage,
             plan,
             rows,
+            core.real_len,
+            core.complex_len,
             stride,
-            &mut complex_storage,
-            workspace,
+            &mut workspace.real_source_line,
+            &mut workspace.complex_line,
+            &mut workspace.real_line,
+            &mut workspace.fft_scratch,
         ) {
             return Err(mixed_fail_complex_forward(
                 array,
@@ -6736,112 +6545,6 @@ where
     }
 }
 
-fn mixed_convert_strided_complex_reverse<R: FftReal, const N: usize, const M: usize>(
-    core: &MixedR2cCore<R, N, M>,
-    plan: &LocalR2cPlan<R>,
-    rows: usize,
-    stride: usize,
-    storage: &mut [Complex<R>],
-    workspace: &mut MixedR2cInPlaceWorkspace<R, N, M>,
-    normalize: bool,
-) -> Result<(), MixedError>
-where
-    Complex<R>: Equivalence,
-{
-    if stride <= 1 || !rows.is_multiple_of(stride) {
-        return Err(MixedError::Fft(FftError::PreparationFailed));
-    }
-    let groups = rows / stride;
-    let source_span = groups
-        .checked_mul(core.complex_len)
-        .and_then(|value| value.checked_mul(stride))
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-    let destination_span = groups
-        .checked_mul(core.real_len)
-        .and_then(|value| value.checked_mul(stride))
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-    if source_span > storage.len() || destination_span > storage.len() {
-        return Err(MixedError::Fft(FftError::StorageLayoutMismatch));
-    }
-    for outer in (0..groups).rev() {
-        let source_start = outer
-            .checked_mul(core.complex_len)
-            .and_then(|value| value.checked_mul(stride))
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        let source_end = source_start
-            .checked_add(
-                core.complex_len
-                    .checked_mul(stride)
-                    .ok_or(MixedError::Fft(FftError::PreparationFailed))?,
-            )
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        let destination_start = outer
-            .checked_mul(core.real_len)
-            .and_then(|value| value.checked_mul(stride))
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        storage.copy_within(source_start..source_end, destination_start);
-    }
-    if workspace.complex_source_line.len() < core.complex_len
-        || workspace.complex_line.len() < core.complex_len
-        || workspace.real_line.len() < core.real_len
-    {
-        return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
-            kind: "complex/real line",
-            required: core.real_len.max(core.complex_len),
-            actual: workspace
-                .complex_source_line
-                .len()
-                .min(workspace.complex_line.len())
-                .min(workspace.real_line.len()),
-        }));
-    }
-    for outer in 0..groups {
-        let base = outer
-            .checked_mul(core.real_len)
-            .and_then(|value| value.checked_mul(stride))
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        for inner in 0..stride {
-            for k in 0..core.complex_len {
-                let index = base
-                    .checked_add(
-                        k.checked_mul(stride)
-                            .ok_or(MixedError::Fft(FftError::PreparationFailed))?,
-                    )
-                    .and_then(|value| value.checked_add(inner))
-                    .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-                workspace.complex_source_line[k] = storage[index];
-            }
-            let result = if normalize {
-                plan.inverse(
-                    &workspace.complex_source_line[..core.complex_len],
-                    &mut workspace.real_line[..core.real_len],
-                    &mut workspace.complex_line,
-                    &mut workspace.fft_scratch,
-                )
-            } else {
-                plan.backward(
-                    &workspace.complex_source_line[..core.complex_len],
-                    &mut workspace.real_line[..core.real_len],
-                    &mut workspace.complex_line,
-                    &mut workspace.fft_scratch,
-                )
-            };
-            result.map_err(MixedError::LocalR2c)?;
-            for k in 0..core.real_len {
-                let index = base
-                    .checked_add(
-                        k.checked_mul(stride)
-                            .ok_or(MixedError::Fft(FftError::PreparationFailed))?,
-                    )
-                    .and_then(|value| value.checked_add(inner))
-                    .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-                storage[index].re = workspace.real_line[k];
-            }
-        }
-    }
-    Ok(())
-}
-
 fn mixed_convert_complex_to_real<R: FftReal, const N: usize, const M: usize>(
     core: &Arc<MixedR2cCore<R, N, M>>,
     array: &mut MixedR2cInPlaceArray<R, N, M>,
@@ -6908,13 +6611,17 @@ where
         ));
     };
     if stride > 1 {
-        if let Err(error) = mixed_convert_strided_complex_reverse(
-            core,
+        if let Err(error) = convert_strided_complex_reverse(
+            &mut storage,
             plan,
             rows,
+            core.real_len,
+            core.complex_len,
             stride,
-            &mut storage,
-            workspace,
+            &mut workspace.complex_source_line,
+            &mut workspace.real_line,
+            &mut workspace.complex_line,
+            &mut workspace.fft_scratch,
             normalize,
         ) {
             return Err(mixed_fail_complex_reverse(
@@ -8153,8 +7860,9 @@ mod reverse_overlap_tests {
     }
 
     use super::super::{
-        ENDPOINT_BATCH_CHUNK, EndpointReductionEvent, endpoint_reduction_log,
-        endpoint_ulp_neighbors, force_endpoint_allocation_failure, reset_endpoint_reduction_log,
+        ENDPOINT_BATCH_CHUNK, EndpointReductionEvent, endpoint_chunk_count, endpoint_chunk_len,
+        endpoint_reduction_log, endpoint_ulp_neighbors, force_endpoint_allocation_failure,
+        reset_endpoint_reduction_log,
     };
 
     fn chunk_plan<R: FftReal>(
