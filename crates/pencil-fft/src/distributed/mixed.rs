@@ -47,7 +47,8 @@ use super::{
     collective_descriptor, collective_valid, convert_strided_complex_reverse,
     convert_strided_real_forward, for_each_strided_line, for_each_strided_line_in_place,
     initialized_vec, map_array_allocation, memory_stride, r2c::validate_recast_capacity,
-    strided_line_count, validate_input, validate_workspace_lengths_values, zero_complex,
+    registered_pencils, strided_line_count, validate_input, validate_workspace_lengths_values,
+    zero_complex,
 };
 
 #[cfg(test)]
@@ -1182,7 +1183,10 @@ where
         }
         let (stages, embedding_len, fft_scratch_len, strided_line_len) =
             prepared.expect("collective backend preflight accepted");
-        let registered_pencils = agree_result(communicator, mixed_c2c_stage_pencils(&stages))?;
+        let registered_pencils = agree_result(
+            communicator,
+            registered_pencils(stages.iter().map(|stage| &stage.output)).map_err(MixedError::from),
+        )?;
         let layout_stages = agree_result(communicator, mixed_layout_stages(&stages))?;
         let stage_prep = StagePreparation {
             stages: layout_stages,
@@ -1687,26 +1691,6 @@ fn mixed_r2r_local<T: R2rScalar>(
                 .map_err(|error| error.map_local(MixedError::LocalR2r))?,
         )),
     }
-}
-
-fn mixed_c2c_stage_pencils<R: FftReal, const N: usize, const M: usize>(
-    stages: &[MixedC2cStage<R, N, M>],
-) -> Result<Box<[Arc<Pencil<N, M>>]>, MixedError> {
-    let mut pencils = Vec::new();
-    pencils.try_reserve_exact(stages.len()).map_err(|_| {
-        MixedError::Fft(FftError::AllocationFailed {
-            required: stages.len(),
-        })
-    })?;
-    for stage in stages {
-        if !pencils
-            .iter()
-            .any(|registered: &Arc<Pencil<N, M>>| registered.same_layout(stage.output.as_ref()))
-        {
-            pencils.push(Arc::clone(&stage.output));
-        }
-    }
-    Ok(pencils.into_boxed_slice())
 }
 
 fn validate_exact_pencil_list<const N: usize, const M: usize>(

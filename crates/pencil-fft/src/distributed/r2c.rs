@@ -37,7 +37,7 @@ use super::{
     VALUE_KIND_R2C, agree_execution_descriptor_ref, agree_header, agree_result, build_descriptor,
     build_route, build_transitions, collective_valid, convert_strided_complex_reverse,
     convert_strided_real_forward, descriptor_len, initialized_vec, map_array_allocation,
-    prepare_complex_stage_for_backend, registered_stage_pencils, strided_complex_line_len,
+    prepare_complex_stage_for_backend, registered_pencils, strided_complex_line_len,
     validate_out_of_place, validate_workspace_lengths_values, zero_complex,
 };
 
@@ -705,7 +705,11 @@ where
             .expect("R2C core has a real boundary stage");
         let (real_len, complex_len) = r2c_lengths(&self.core);
         let intermediate = ManyPencilArray::from_elem(
-            registered_stage_pencils(&self.core.stages[boundary..])?,
+            registered_pencils(
+                self.core.stages[boundary..]
+                    .iter()
+                    .map(|stage| &stage.output),
+            )?,
             0,
             self.core.extra_shape.clone(),
             zero_complex::<R>(),
@@ -777,7 +781,11 @@ where
             .real_stage_index
             .ok_or(FftError::PreparationFailed)?;
         let real_pencils = registered_real_stage_pencils(&self.core.stages, boundary)?;
-        let complex_pencils = registered_stage_pencils(&self.core.stages[boundary..])?;
+        let complex_pencils = registered_pencils(
+            self.core.stages[boundary..]
+                .iter()
+                .map(|stage| &stage.output),
+        )?;
         let (real_storage_len, complex_storage_len, storage_bytes, complex_capacity) =
             in_place_storage_requirements(&self.core)?;
 

@@ -1310,7 +1310,7 @@ where
     /// must coordinate that failure before the next collective call.
     pub fn allocate_in_place(&self) -> Result<C2cInPlaceArray<R, N, M>, FftError> {
         let array = ManyPencilArray::from_elem(
-            registered_stage_pencils(&self.core.stages)?,
+            registered_pencils(self.core.stages.iter().map(|stage| &stage.output))?,
             0,
             self.core.extra_shape.clone(),
             zero_complex::<R>(),
@@ -1344,7 +1344,7 @@ where
         &self,
     ) -> Result<C2cOutOfPlaceWorkspace<R, N, M>, FftError> {
         let intermediate = ManyPencilArray::from_elem(
-            registered_stage_pencils(&self.core.stages)?,
+            registered_pencils(self.core.stages.iter().map(|stage| &stage.output))?,
             0,
             self.core.extra_shape.clone(),
             zero_complex::<R>(),
@@ -2179,24 +2179,23 @@ impl<R: FftReal, const N: usize, const M: usize> C2cInPlaceArray<R, N, M> {
     }
 }
 
-fn registered_stage_pencils<R: FftReal, const N: usize, const M: usize>(
-    stages: &[TransformStage<R, N, M>],
+fn registered_pencils<'a, const N: usize, const M: usize>(
+    pencils: impl ExactSizeIterator<Item = &'a Arc<Pencil<N, M>>>,
 ) -> Result<Box<[Arc<Pencil<N, M>>]>, FftError> {
-    let mut pencils = Vec::new();
-    pencils
-        .try_reserve_exact(stages.len())
-        .map_err(|_| FftError::AllocationFailed {
-            required: stages.len(),
-        })?;
-    for stage in stages {
-        if !pencils
+    let required = pencils.len();
+    let mut registered = Vec::new();
+    registered
+        .try_reserve_exact(required)
+        .map_err(|_| FftError::AllocationFailed { required })?;
+    for pencil in pencils {
+        if !registered
             .iter()
-            .any(|registered: &Arc<Pencil<N, M>>| registered.same_layout(stage.output.as_ref()))
+            .any(|other: &Arc<Pencil<N, M>>| other.same_layout(pencil))
         {
-            pencils.push(Arc::clone(&stage.output));
+            registered.push(Arc::clone(pencil));
         }
     }
-    Ok(pencils.into_boxed_slice())
+    Ok(registered.into_boxed_slice())
 }
 
 fn validate_input<const N: usize, const M: usize>(
