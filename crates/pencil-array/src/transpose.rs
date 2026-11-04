@@ -201,7 +201,7 @@ pub struct TransposeTiming {
     pub receive_wait: Duration,
     /// Time spent in the Alltoallv collective.
     pub collective_wait: Duration,
-    /// Time spent unpacking received data.
+    /// Time spent unpacking received data and copying the self region.
     pub unpack: Duration,
     /// Time spent waiting for point-to-point sends.
     pub send_wait: Duration,
@@ -371,6 +371,14 @@ impl<const N: usize, const M: usize> TransposePlanCore<N, M> {
 
     pub(crate) fn peers(&self) -> &[PeerMetadata<N>] {
         &self.peers
+    }
+
+    pub(crate) fn self_peer(&self) -> &PeerMetadata<N> {
+        let coordinate = self.source.topology().local_coords()[self.changed_topology_axis];
+        self.peers
+            .iter()
+            .find(|peer| peer.peer_coordinate == coordinate)
+            .expect("peer metadata contains the calling rank")
     }
 
     pub(crate) fn changed_topology_axis(&self) -> usize {
@@ -1103,12 +1111,32 @@ fn pack_source_regions<T: Copy, const N: usize>(
     send_len: usize,
     extra_count: usize,
 ) {
+    pack_source_regions_skipping(
+        peers,
+        None,
+        layout,
+        source_storage,
+        send_buffer,
+        send_len,
+        extra_count,
+    );
+}
+
+fn pack_source_regions_skipping<T: Copy, const N: usize>(
+    peers: &[PeerMetadata<N>],
+    skip_peer_coordinate: Option<usize>,
+    layout: &LocalLayout<'_, N>,
+    source_storage: &[T],
+    send_buffer: &mut [T],
+    send_len: usize,
+    extra_count: usize,
+) {
     debug_assert_eq!(send_buffer.len(), send_len);
     if extra_count == 0 {
         return;
     }
     for peer in peers {
-        if peer.send_spatial_len == 0 {
+        if skip_peer_coordinate == Some(peer.peer_coordinate) || peer.send_spatial_len == 0 {
             continue;
         }
         let walk = region_walk(layout, &peer.send_region)
@@ -1164,8 +1192,46 @@ pub(crate) fn pack_source<T: Copy, const N: usize, const M: usize>(
     );
 }
 
+pub(crate) fn pack_source_except_self<T: Copy, const N: usize, const M: usize>(
+    peers: &[PeerMetadata<N>],
+    self_coordinate: usize,
+    source_pencil: &Pencil<N, M>,
+    source_storage: &[T],
+    send_buffer: &mut [T],
+    send_len: usize,
+    extra_count: usize,
+) {
+    pack_source_regions_skipping(
+        peers,
+        Some(self_coordinate),
+        &LocalLayout::new(source_pencil),
+        source_storage,
+        send_buffer,
+        send_len,
+        extra_count,
+    );
+}
+
 fn unpack_destination_regions<T: Copy, const N: usize>(
     peers: &[PeerMetadata<N>],
+    layout: &LocalLayout<'_, N>,
+    destination_storage: &mut [T],
+    receive_buffer: &[T],
+    extra_count: usize,
+) {
+    unpack_destination_regions_skipping(
+        peers,
+        None,
+        layout,
+        destination_storage,
+        receive_buffer,
+        extra_count,
+    );
+}
+
+fn unpack_destination_regions_skipping<T: Copy, const N: usize>(
+    peers: &[PeerMetadata<N>],
+    skip_peer_coordinate: Option<usize>,
     layout: &LocalLayout<'_, N>,
     destination_storage: &mut [T],
     receive_buffer: &[T],
@@ -1175,7 +1241,7 @@ fn unpack_destination_regions<T: Copy, const N: usize>(
         return;
     }
     for peer in peers {
-        if peer.receive_spatial_len == 0 {
+        if skip_peer_coordinate == Some(peer.peer_coordinate) || peer.receive_spatial_len == 0 {
             continue;
         }
         let walk = region_walk(layout, &peer.receive_region)
@@ -1225,6 +1291,125 @@ pub(crate) fn unpack_destination<T: Copy, const N: usize, const M: usize>(
         &LocalLayout::new(destination_pencil),
         destination_storage,
         receive_buffer,
+        extra_count,
+    );
+}
+
+pub(crate) fn unpack_destination_except_self<T: Copy, const N: usize, const M: usize>(
+    peers: &[PeerMetadata<N>],
+    self_coordinate: usize,
+    destination_pencil: &Pencil<N, M>,
+    destination_storage: &mut [T],
+    receive_buffer: &[T],
+    extra_count: usize,
+) {
+    unpack_destination_regions_skipping(
+        peers,
+        Some(self_coordinate),
+        &LocalLayout::new(destination_pencil),
+        destination_storage,
+        receive_buffer,
+        extra_count,
+    );
+}
+
+/// Copies one region between two pencil layouts in global row-major order.
+fn copy_region_between<T: Copy, const N: usize>(
+    source_walk: &RegionWalk<N>,
+    destination_walk: &RegionWalk<N>,
+    source_storage: &[T],
+    destination_storage: &mut [T],
+) {
+    if source_walk.run_len == 0 {
+        return;
+    }
+    debug_assert_eq!(source_walk.outer_len, destination_walk.outer_len);
+    debug_assert_eq!(source_walk.run_len, destination_walk.run_len);
+    let mut source_counter = [0usize; N];
+    let mut destination_counter = [0usize; N];
+    let mut source_offset = source_walk.start;
+    let mut destination_offset = destination_walk.start;
+    for position in 0..source_walk.outer_len {
+        if source_walk.run_stride == 1 && destination_walk.run_stride == 1 {
+            destination_storage[destination_offset..destination_offset + destination_walk.run_len]
+                .copy_from_slice(
+                    &source_storage[source_offset..source_offset + source_walk.run_len],
+                );
+        } else {
+            for index in 0..source_walk.run_len {
+                destination_storage[destination_offset + index * destination_walk.run_stride] =
+                    source_storage[source_offset + index * source_walk.run_stride];
+            }
+        }
+        if position + 1 == source_walk.outer_len {
+            break;
+        }
+        advance_region(source_walk, &mut source_counter, &mut source_offset);
+        advance_region(
+            destination_walk,
+            &mut destination_counter,
+            &mut destination_offset,
+        );
+    }
+}
+
+fn copy_self_region_regions<T: Copy, const N: usize>(
+    source_layout: &LocalLayout<'_, N>,
+    source_region: &[Range<usize>; N],
+    source_storage: &[T],
+    destination_layout: &LocalLayout<'_, N>,
+    destination_region: &[Range<usize>; N],
+    destination_storage: &mut [T],
+    extra_count: usize,
+) {
+    if extra_count == 0 {
+        return;
+    }
+    let spatial_len = region_spatial_len(source_region)
+        .expect("checked exchange preflight validated self send region");
+    if spatial_len == 0 {
+        return;
+    }
+    let source_walk = region_walk(source_layout, source_region)
+        .expect("checked exchange preflight validated self send region");
+    let destination_walk = region_walk(destination_layout, destination_region)
+        .expect("checked exchange preflight validated self receive region");
+    debug_assert_eq!(source_walk.outer_len * source_walk.run_len, spatial_len);
+    debug_assert_eq!(
+        destination_walk.outer_len * destination_walk.run_len,
+        spatial_len
+    );
+    for extra_linear in 0..extra_count {
+        let source_extra_offset = extra_linear
+            .checked_mul(source_layout.local_len)
+            .expect("checked exchange preflight validated source offset");
+        let destination_extra_offset = extra_linear
+            .checked_mul(destination_layout.local_len)
+            .expect("checked exchange preflight validated destination offset");
+        copy_region_between(
+            &source_walk,
+            &destination_walk,
+            &source_storage[source_extra_offset..],
+            &mut destination_storage[destination_extra_offset..],
+        );
+    }
+}
+
+pub(crate) fn copy_self_region<T: Copy, const N: usize, const M: usize>(
+    peer: &PeerMetadata<N>,
+    source_pencil: &Pencil<N, M>,
+    source_storage: &[T],
+    destination_pencil: &Pencil<N, M>,
+    destination_storage: &mut [T],
+    extra_count: usize,
+) {
+    copy_self_region_regions(
+        &LocalLayout::new(source_pencil),
+        &peer.send_region,
+        source_storage,
+        &LocalLayout::new(destination_pencil),
+        &peer.receive_region,
+        destination_storage,
         extra_count,
     );
 }
@@ -1967,6 +2152,77 @@ mod tests {
                     "unpack permutation {:?}, extra_count {extra_count}",
                     permutation.axes(),
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn self_region_copy_matches_elementwise_reference() {
+        let local_ranges: [Range<usize>; 3] = [1..4, 2..6, 0..3];
+        let logical_shape: [usize; 3] =
+            std::array::from_fn(|axis| local_ranges[axis].end - local_ranges[axis].start);
+        let local_len = logical_shape.iter().product::<usize>();
+        // The self peer's send and receive regions are the same global region.
+        let region: [Range<usize>; 3] = [2..4, 2..5, 1..3];
+
+        for source_permutation in all_permutations::<3>() {
+            let source_shape_memory = source_permutation.permute(logical_shape);
+            let source_layout = LocalLayout {
+                local_ranges: &local_ranges,
+                shape_memory: source_shape_memory,
+                permutation: &source_permutation,
+                local_len,
+            };
+            for destination_permutation in all_permutations::<3>() {
+                let destination_shape_memory = destination_permutation.permute(logical_shape);
+                let destination_layout = LocalLayout {
+                    local_ranges: &local_ranges,
+                    shape_memory: destination_shape_memory,
+                    permutation: &destination_permutation,
+                    local_len,
+                };
+                for extra_count in [1usize, 3] {
+                    let source: Vec<u32> =
+                        (0..u32::try_from(local_len * extra_count).unwrap()).collect();
+                    let mut destination = vec![u32::MAX; local_len * extra_count];
+                    let mut expected = vec![u32::MAX; local_len * extra_count];
+                    let source_offsets = reference_region_offsets(
+                        &local_ranges,
+                        &source_shape_memory,
+                        &source_permutation,
+                        &region,
+                    );
+                    let destination_offsets = reference_region_offsets(
+                        &local_ranges,
+                        &destination_shape_memory,
+                        &destination_permutation,
+                        &region,
+                    );
+                    for extra_linear in 0..extra_count {
+                        for (&source_offset, &destination_offset) in
+                            source_offsets.iter().zip(&destination_offsets)
+                        {
+                            expected[extra_linear * local_len + destination_offset] =
+                                source[extra_linear * local_len + source_offset];
+                        }
+                    }
+                    copy_self_region_regions(
+                        &source_layout,
+                        &region,
+                        &source,
+                        &destination_layout,
+                        &region,
+                        &mut destination,
+                        extra_count,
+                    );
+                    assert_eq!(
+                        destination,
+                        expected,
+                        "self copy source {:?}, destination {:?}, extra_count {extra_count}",
+                        source_permutation.axes(),
+                        destination_permutation.axes(),
+                    );
+                }
             }
         }
     }

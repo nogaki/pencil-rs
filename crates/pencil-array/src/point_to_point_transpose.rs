@@ -32,8 +32,9 @@ use crate::{
     transpose::{
         CommunicationMode, OverlapError, POINT_TO_POINT_RESERVED_TAG, PreparedExchange,
         TransposeError, TransposePlanCore, TransposeTiming, TransposeWorkspace,
-        TransposeWorkspaceRequirements, agree_preflight, collective_valid, finish_in_place,
-        pack_source, prepare_in_place, unpack_destination,
+        TransposeWorkspaceRequirements, agree_preflight, collective_valid, copy_self_region,
+        finish_in_place, pack_source, pack_source_except_self, prepare_in_place,
+        unpack_destination, unpack_destination_except_self,
     },
 };
 
@@ -72,7 +73,10 @@ use crate::{
 /// all request slots and agrees that reservation succeeded on every Cartesian
 /// rank. It then posts every nonzero receive before any send, waits for every
 /// request, and returns only after all requests and their borrowed segments are
-/// complete. For in-place execution, the scope ends before the array is marked
+/// complete. View execution copies the calling rank's own segment directly
+/// instead of posting a self request; in-place execution keeps the MPI self
+/// request so it cannot overwrite unread source storage.
+/// For in-place execution, the scope ends before the array is marked
 /// `Poisoned`, the destination prefix is unpacked, and the destination layout is
 /// committed.
 /// `mpi::request::scope` may abort the process if it exits with unfinished
@@ -162,15 +166,25 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
 
         execute_point_to_point_exchange(
             &self.core,
-            communicator,
             source.as_slice(),
             &prepared,
             workspace,
             extra_count,
+            true,
         )?;
 
-        unpack_destination(
+        let self_peer = self.core.self_peer();
+        copy_self_region(
+            self_peer,
+            self.core.source().as_ref(),
+            source.as_slice(),
+            self.core.destination().as_ref(),
+            destination.as_mut_slice(),
+            extra_count,
+        );
+        unpack_destination_except_self(
             self.core.peers(),
+            self_peer.peer_coordinate,
             self.core.destination().as_ref(),
             destination.as_mut_slice(),
             &workspace.receive_buffer[..prepared.requirements.receive_len],
@@ -208,16 +222,26 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
         let mut timing = TransposeTiming::default();
         execute_point_to_point_exchange_timed(
             &self.core,
-            communicator,
             source.as_slice(),
             &prepared,
             workspace,
             extra_count,
             &mut timing,
+            true,
         )?;
         let unpack = Instant::now();
-        unpack_destination(
+        let self_peer = self.core.self_peer();
+        copy_self_region(
+            self_peer,
+            self.core.source().as_ref(),
+            source.as_slice(),
+            self.core.destination().as_ref(),
+            destination.as_mut_slice(),
+            extra_count,
+        );
+        unpack_destination_except_self(
             self.core.peers(),
+            self_peer.peer_coordinate,
             self.core.destination().as_ref(),
             destination.as_mut_slice(),
             &workspace.receive_buffer[..prepared.requirements.receive_len],
@@ -263,13 +287,14 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
         let extra_count = source.extra_shape().element_count();
         execute_point_to_point_exchange_callback(
             &self.core,
-            communicator,
             &prepared,
             workspace,
             extra_count,
+            true,
             |send_buffer| {
-                pack_source(
+                pack_source_except_self(
                     self.core.peers(),
+                    self.core.self_peer().peer_coordinate,
                     self.core.source().as_ref(),
                     source.as_slice(),
                     send_buffer,
@@ -278,8 +303,18 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
                 );
             },
             |receive_buffer| {
-                unpack_destination(
+                let self_peer = self.core.self_peer();
+                copy_self_region(
+                    self_peer,
+                    self.core.source().as_ref(),
+                    source.as_slice(),
+                    self.core.destination().as_ref(),
+                    destination.as_mut_slice(),
+                    extra_count,
+                );
+                unpack_destination_except_self(
                     self.core.peers(),
+                    self_peer.peer_coordinate,
                     self.core.destination().as_ref(),
                     destination.as_mut_slice(),
                     receive_buffer,
@@ -329,10 +364,10 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
         let guard_cell = std::cell::RefCell::new(None);
         let result = execute_point_to_point_exchange_callback(
             &self.core,
-            communicator,
             &prepared.exchange,
             workspace,
             extra_count,
+            false,
             |send_buffer| {
                 let mut guard = array
                     .begin_in_place_write()
@@ -418,11 +453,11 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
                 .expect("collective in-place preflight validated the active source");
             execute_point_to_point_exchange(
                 &self.core,
-                communicator,
                 source.as_slice(),
                 &prepared.exchange,
                 workspace,
                 extra_count,
+                false,
             )?;
         }
         finish_in_place(
@@ -465,12 +500,12 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
             let source = array.active_view().expect("validated active source");
             execute_point_to_point_exchange_timed(
                 &self.core,
-                communicator,
                 source.as_slice(),
                 &prepared.exchange,
                 workspace,
                 extra_count,
                 &mut timing,
+                false,
             )?;
         }
         let unpack = Instant::now();
@@ -488,40 +523,38 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
     }
 }
 
-fn execute_point_to_point_exchange<C, T, const N: usize, const M: usize>(
+fn execute_point_to_point_exchange<T, const N: usize, const M: usize>(
     plan: &TransposePlanCore<N, M>,
-    communicator: &C,
     source_storage: &[T],
     prepared: &PreparedExchange,
     workspace: &mut TransposeWorkspace<T>,
     extra_count: usize,
+    skip_self: bool,
 ) -> Result<(), TransposeError>
 where
-    C: CommunicatorCollectives,
     T: Equivalence + Copy,
 {
     execute_point_to_point_exchange_timed(
         plan,
-        communicator,
         source_storage,
         prepared,
         workspace,
         extra_count,
         &mut TransposeTiming::default(),
+        skip_self,
     )
 }
 
-fn execute_point_to_point_exchange_callback<C, T, P, F, E, const N: usize, const M: usize>(
+fn execute_point_to_point_exchange_callback<T, P, F, E, const N: usize, const M: usize>(
     plan: &TransposePlanCore<N, M>,
-    communicator: &C,
     prepared: &PreparedExchange,
     workspace: &mut TransposeWorkspace<T>,
     extra_count: usize,
+    skip_self: bool,
     pack: P,
     callback: F,
 ) -> Result<(), OverlapError<E>>
 where
-    C: CommunicatorCollectives,
     T: Equivalence + Copy,
     P: FnOnce(&mut [T]),
     F: FnOnce(&mut [T]) -> Result<(), E>,
@@ -534,6 +567,7 @@ where
         .source()
         .topology()
         .subcommunicator(plan.changed_topology_axis());
+    let self_coordinate = plan.self_peer().peer_coordinate;
 
     let callback_result = scope(|send_scope| {
         let mut sends = Vec::new();
@@ -542,7 +576,10 @@ where
             let mut receives = Vec::new();
             let receive_reserved = receives.try_reserve(receive_slots).is_ok();
             let send_reserved = sends.try_reserve(send_slots).is_ok();
-            if !collective_valid(communicator, receive_reserved && send_reserved) {
+            if !collective_valid(
+                plan.source().topology().cartesian(),
+                receive_reserved && send_reserved,
+            ) {
                 return Err(OverlapError::CollectivePreconditionFailed);
             }
             pack(send_buffer);
@@ -557,6 +594,9 @@ where
                 }
                 let (segment, rest) = receive_tail.split_at_mut(count);
                 receive_tail = rest;
+                if skip_self && peer.peer_coordinate == self_coordinate {
+                    continue;
+                }
                 receives.push(
                     sub.process_at_rank(peer.peer_rank)
                         .immediate_receive_into_with_tag(
@@ -577,6 +617,9 @@ where
                 }
                 let (segment, rest) = send_tail.split_at(count);
                 send_tail = rest;
+                if skip_self && peer.peer_coordinate == self_coordinate {
+                    continue;
+                }
                 sends.push(sub.process_at_rank(peer.peer_rank).immediate_send_with_tag(
                     send_scope,
                     segment,
@@ -602,7 +645,7 @@ where
         Err(_) => 2,
     };
     let mut status = 0i32;
-    communicator.all_reduce_into(
+    plan.source().topology().cartesian().all_reduce_into(
         &local_status,
         &mut status,
         mpi::collective::SystemOperation::max(),
@@ -616,27 +659,27 @@ where
     }
 }
 
-fn execute_point_to_point_exchange_timed<C, T, const N: usize, const M: usize>(
+fn execute_point_to_point_exchange_timed<T, const N: usize, const M: usize>(
     plan: &TransposePlanCore<N, M>,
-    communicator: &C,
     source_storage: &[T],
     prepared: &PreparedExchange,
     workspace: &mut TransposeWorkspace<T>,
     extra_count: usize,
     timing: &mut TransposeTiming,
+    skip_self: bool,
 ) -> Result<(), TransposeError>
 where
-    C: CommunicatorCollectives,
     T: Equivalence + Copy,
 {
     let (receive_slots, send_slots) = plan.request_counts(prepared);
+    let self_coordinate = plan.self_peer().peer_coordinate;
     scope(|scope| {
         let mut receive_requests = Vec::new();
         let mut send_requests = Vec::new();
         let receive_reserved = receive_requests.try_reserve(receive_slots).is_ok();
         let send_reserved = send_requests.try_reserve(send_slots).is_ok();
         let reserved = receive_reserved && send_reserved;
-        if !collective_valid(communicator, reserved) {
+        if !collective_valid(plan.source().topology().cartesian(), reserved) {
             return if reserved {
                 Err(TransposeError::CollectivePreconditionFailed)
             } else {
@@ -645,14 +688,26 @@ where
         }
 
         let started = Instant::now();
-        pack_source(
-            plan.peers(),
-            plan.source().as_ref(),
-            source_storage,
-            &mut workspace.send_buffer[..prepared.requirements.send_len],
-            prepared.requirements.send_len,
-            extra_count,
-        );
+        if skip_self {
+            pack_source_except_self(
+                plan.peers(),
+                self_coordinate,
+                plan.source().as_ref(),
+                source_storage,
+                &mut workspace.send_buffer[..prepared.requirements.send_len],
+                prepared.requirements.send_len,
+                extra_count,
+            );
+        } else {
+            pack_source(
+                plan.peers(),
+                plan.source().as_ref(),
+                source_storage,
+                &mut workspace.send_buffer[..prepared.requirements.send_len],
+                prepared.requirements.send_len,
+                extra_count,
+            );
+        }
         timing.pack = started.elapsed();
         let started = Instant::now();
 
@@ -671,6 +726,9 @@ where
             }
             let (segment, rest) = receive_tail.split_at_mut(count);
             receive_tail = rest;
+            if skip_self && peer.peer_coordinate == self_coordinate {
+                continue;
+            }
             let request = subcommunicator
                 .process_at_rank(peer.peer_rank)
                 .immediate_receive_into_with_tag(scope, segment, POINT_TO_POINT_RESERVED_TAG);
@@ -690,6 +748,9 @@ where
             }
             let (segment, rest) = send_tail.split_at(count);
             send_tail = rest;
+            if skip_self && peer.peer_coordinate == self_coordinate {
+                continue;
+            }
             let request = subcommunicator
                 .process_at_rank(peer.peer_rank)
                 .immediate_send_with_tag(scope, segment, POINT_TO_POINT_RESERVED_TAG);
