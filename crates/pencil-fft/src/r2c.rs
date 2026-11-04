@@ -525,12 +525,6 @@ impl<R: FftReal> LocalR2cPlan<R> {
     ) -> Result<(), LocalR2cError> {
         let batch_count = self.validate_in_place(array, workspace, R2cState::RealInput)?;
         let native_scratch_len = self.forward.get_scratch_len();
-        if native_scratch_len > workspace.scratch.len() {
-            return Err(LocalR2cError::ScratchTooSmall {
-                required: native_scratch_len,
-                actual: workspace.scratch.len(),
-            });
-        }
         array.state = R2cState::Poisoned;
         for batch in (0..batch_count).rev() {
             let source_start = batch * self.real_len;
@@ -590,21 +584,8 @@ impl<R: FftReal> LocalR2cPlan<R> {
         normalize: bool,
     ) -> Result<(), LocalR2cError> {
         let batch_count = self.validate_in_place(array, workspace, R2cState::ComplexOutput)?;
-        let scale = if normalize {
-            Some(
-                R::one()
-                    / R::from_usize(self.real_len).expect("f32/f64 represent the validated length"),
-            )
-        } else {
-            None
-        };
+        let scale = self.inverse_scale(normalize);
         let native_scratch_len = self.inverse.get_scratch_len();
-        if native_scratch_len > workspace.scratch.len() {
-            return Err(LocalR2cError::ScratchTooSmall {
-                required: native_scratch_len,
-                actual: workspace.scratch.len(),
-            });
-        }
         array.state = R2cState::Poisoned;
         for batch in 0..batch_count {
             let source_start = batch * self.complex_len;
@@ -653,14 +634,7 @@ impl<R: FftReal> LocalR2cPlan<R> {
         }
 
         let native_scratch_len = self.inverse.get_scratch_len();
-        let scale = if normalize {
-            Some(
-                R::one()
-                    / R::from_usize(self.real_len).expect("f32/f64 represent the validated length"),
-            )
-        } else {
-            None
-        };
+        let scale = self.inverse_scale(normalize);
         for (source_line, destination_line) in src
             .chunks_exact(self.complex_len)
             .zip(dst.chunks_exact_mut(self.real_len))
@@ -680,6 +654,14 @@ impl<R: FftReal> LocalR2cPlan<R> {
             }
         }
         Ok(())
+    }
+
+    /// Returns the normalized inverse scale, or `None` for the raw backward
+    /// transform.
+    fn inverse_scale(&self, normalize: bool) -> Option<R> {
+        normalize.then(|| {
+            R::one() / R::from_usize(self.real_len).expect("f32/f64 represent the validated length")
+        })
     }
 
     fn checked_in_place_lengths(
