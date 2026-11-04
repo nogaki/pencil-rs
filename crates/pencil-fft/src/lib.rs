@@ -38,8 +38,8 @@
 //! kinds, while `DhtPlan` separately handles selected-axis self-paired Hartley
 //! transforms. Both support real and complex `f32`/`f64`, checked transports,
 //! raw paired backward, normalized inverse, and the poisoned in-place state
-//! contract. Profiling methods return [`TransformTiming`] with per-stage
-//! [`StageTiming`] measurements and call counters. All distributed plans
+//! contract. Profiling methods return `TransformTiming` with per-stage
+//! `StageTiming` measurements and call counters. All distributed plans
 //! support `N >= 2`, `1 <= M < N`, and checked
 //! Alltoallv or
 //! receive-before-send point-to-point transitions; legacy constructors default
