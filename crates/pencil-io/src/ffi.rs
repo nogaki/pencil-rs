@@ -1244,28 +1244,14 @@ pub(crate) mod hdf5 {
         width: usize,
         abort_comm: ffi::MPI_Comm,
     ) -> Result<Hid, i32> {
-        let base = match (code, width) {
-            (1, 1) => *hdf5_metno::globals::H5T_STD_I8LE,
-            (2, 1) => *hdf5_metno::globals::H5T_STD_U8LE,
-            (3, 2) => *hdf5_metno::globals::H5T_STD_I16LE,
-            (4, 2) => *hdf5_metno::globals::H5T_STD_U16LE,
-            (5, 4) => *hdf5_metno::globals::H5T_STD_I32LE,
-            (6, 4) => *hdf5_metno::globals::H5T_STD_U32LE,
-            (7, 8) => *hdf5_metno::globals::H5T_STD_I64LE,
-            (8, 8) => *hdf5_metno::globals::H5T_STD_U64LE,
-            (9, 4) => *hdf5_metno::globals::H5T_IEEE_F32LE,
-            (10, 8) => *hdf5_metno::globals::H5T_IEEE_F64LE,
-            (11, 8) | (12, 16) => {
-                let scalar = if code == 11 {
-                    *hdf5_metno::globals::H5T_IEEE_F32LE
-                } else {
-                    *hdf5_metno::globals::H5T_IEEE_F64LE
-                };
-                return type_create_compound(width, scalar, abort_comm);
-            }
-            _ => return Err(-1),
-        };
-        type_copy(base)
+        let spec = crate::hdf5_schema::scalar_spec(code)
+            .filter(|spec| spec.width == width)
+            .ok_or(-1)?;
+        if spec.complex {
+            type_create_compound(width, spec.base, abort_comm)
+        } else {
+            type_copy(spec.base)
+        }
     }
 
     pub(crate) fn type_matches(
@@ -1282,68 +1268,49 @@ pub(crate) mod hdf5 {
                 if h5::h5t::H5Tget_size(type_id) != width {
                     return Ok(false);
                 }
-                match code {
-                    1..=10 => {
-                        let canonical = match (code, width) {
-                            (1, 1) => *hdf5_metno::globals::H5T_STD_I8LE,
-                            (2, 1) => *hdf5_metno::globals::H5T_STD_U8LE,
-                            (3, 2) => *hdf5_metno::globals::H5T_STD_I16LE,
-                            (4, 2) => *hdf5_metno::globals::H5T_STD_U16LE,
-                            (5, 4) => *hdf5_metno::globals::H5T_STD_I32LE,
-                            (6, 4) => *hdf5_metno::globals::H5T_STD_U32LE,
-                            (7, 8) => *hdf5_metno::globals::H5T_STD_I64LE,
-                            (8, 8) => *hdf5_metno::globals::H5T_STD_U64LE,
-                            (9, 4) => *hdf5_metno::globals::H5T_IEEE_F32LE,
-                            (10, 8) => *hdf5_metno::globals::H5T_IEEE_F64LE,
-                            _ => return Ok(false),
-                        };
-                        Ok(h5::h5t::H5Tequal(type_id, canonical) > 0)
-                    }
-                    11 | 12 => {
-                        if class != h5::h5t::H5T_class_t::H5T_COMPOUND
-                            || h5::h5t::H5Tget_nmembers(type_id) != 2
-                        {
-                            return Ok(false);
-                        }
-                        let expected_scalar = if code == 11 {
-                            *hdf5_metno::globals::H5T_IEEE_F32LE
-                        } else {
-                            *hdf5_metno::globals::H5T_IEEE_F64LE
-                        };
-                        let expected_scalar_width = width / 2;
-                        for (index, expected_name, expected_offset) in [
-                            (0u32, b"r".as_slice(), 0usize),
-                            (1u32, b"i".as_slice(), expected_scalar_width),
-                        ] {
-                            let name = h5::h5t::H5Tget_member_name(type_id, index);
-                            if name.is_null() {
-                                return Ok(false);
-                            }
-                            let actual_name = CStr::from_ptr(name).to_bytes();
-                            let member_type = h5::h5t::H5Tget_member_type(type_id, index);
-                            let valid = actual_name == expected_name
-                                && h5::h5t::H5Tget_member_offset(type_id, index) == expected_offset
-                                && !hdf5_invalid(member_type)
-                                && expected_scalar_width == h5::h5t::H5Tget_size(member_type)
-                                && h5::h5t::H5Tequal(member_type, expected_scalar) > 0;
-                            let free_code = h5::h5::H5free_memory(name.cast());
-                            if free_code < 0 {
-                                super::abort_fail_stop(abort_comm);
-                            }
-                            if !hdf5_invalid(member_type) {
-                                let close_code = h5::h5t::H5Tclose(member_type);
-                                if close_code < 0 {
-                                    super::abort_fail_stop(abort_comm);
-                                }
-                            }
-                            if !valid {
-                                return Ok(false);
-                            }
-                        }
-                        Ok(true)
-                    }
-                    _ => Ok(false),
+                let Some(spec) = crate::hdf5_schema::scalar_spec(code) else {
+                    return Ok(false);
+                };
+                if !spec.complex {
+                    return Ok(h5::h5t::H5Tequal(type_id, spec.base) > 0);
                 }
+                if class != h5::h5t::H5T_class_t::H5T_COMPOUND
+                    || h5::h5t::H5Tget_nmembers(type_id) != 2
+                {
+                    return Ok(false);
+                }
+                let expected_scalar = spec.base;
+                let expected_scalar_width = width / 2;
+                for (index, expected_name, expected_offset) in [
+                    (0u32, b"r".as_slice(), 0usize),
+                    (1u32, b"i".as_slice(), expected_scalar_width),
+                ] {
+                    let name = h5::h5t::H5Tget_member_name(type_id, index);
+                    if name.is_null() {
+                        return Ok(false);
+                    }
+                    let actual_name = CStr::from_ptr(name).to_bytes();
+                    let member_type = h5::h5t::H5Tget_member_type(type_id, index);
+                    let valid = actual_name == expected_name
+                        && h5::h5t::H5Tget_member_offset(type_id, index) == expected_offset
+                        && !hdf5_invalid(member_type)
+                        && expected_scalar_width == h5::h5t::H5Tget_size(member_type)
+                        && h5::h5t::H5Tequal(member_type, expected_scalar) > 0;
+                    let free_code = h5::h5::H5free_memory(name.cast());
+                    if free_code < 0 {
+                        super::abort_fail_stop(abort_comm);
+                    }
+                    if !hdf5_invalid(member_type) {
+                        let close_code = h5::h5t::H5Tclose(member_type);
+                        if close_code < 0 {
+                            super::abort_fail_stop(abort_comm);
+                        }
+                    }
+                    if !valid {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }
         })
     }

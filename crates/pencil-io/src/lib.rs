@@ -120,6 +120,8 @@ mod chunked;
 #[cfg(feature = "mpi")]
 mod collections;
 mod format;
+#[cfg(feature = "hdf5")]
+mod hdf5_schema;
 #[cfg(feature = "mpi")]
 mod mpi_io;
 #[cfg(feature = "mpi")]

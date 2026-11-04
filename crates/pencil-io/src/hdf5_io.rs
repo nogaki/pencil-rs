@@ -11,10 +11,14 @@ use pencil_array::{PencilArrayView, PencilArrayViewMut};
 use crate::ffi;
 use crate::ffi::hdf5 as native;
 use crate::format::{IoElement, ReadTarget, pack_view};
+use crate::hdf5_schema::{
+    ATTR_COMMIT, ATTR_EXTRA, ATTR_EXTRA_RANK, ATTR_GLOBAL, ATTR_GRID, ATTR_N, ATTR_PERM, ATTR_TYPE,
+    ATTR_VERSION, ATTR_WIDTH, CommitState, combined_rank_in_range, commit_state, rank_in_range,
+    valid_global_shape, valid_permutation, valid_shape_bytes, valid_writer_grid,
+};
 use crate::mpi_io::{
     CommGuard, abort_unrecoverable, aggregate_cleanup_result, agree_phase, cleanup_result,
-    collective_state, descriptor_agreement, duplicate_comm, first_error2, is_permutation,
-    try_u64_values, valid_dimensions, valid_extents,
+    collective_state, descriptor_agreement, duplicate_comm, first_error2, try_u64_values,
 };
 use crate::{
     COMMIT_MARKER, FORMAT_VERSION, INCOMPLETE_MARKER, IoError, MAX_PROTOCOL_RANK, NamedIoError,
@@ -131,16 +135,6 @@ const GROUP_NAME: &[u8] = b"/pencil_io_v1\0";
 const DATASET_NAME: &[u8] = b"data\0";
 const NAMED_GROUP: &[u8] = b"/pencil_io_named_v1\0";
 const NAME_ATTR: &[u8] = b"pencil_io_original_name\0";
-const ATTR_VERSION: &[u8] = b"pencil_io_version\0";
-const ATTR_COMMIT: &[u8] = b"pencil_io_commit\0";
-const ATTR_N: &[u8] = b"pencil_io_n\0";
-const ATTR_TYPE: &[u8] = b"pencil_io_type\0";
-const ATTR_WIDTH: &[u8] = b"pencil_io_width\0";
-const ATTR_EXTRA_RANK: &[u8] = b"pencil_io_extra_rank\0";
-const ATTR_EXTRA: &[u8] = b"pencil_io_extra_shape\0";
-const ATTR_GLOBAL: &[u8] = b"pencil_io_global_shape\0";
-const ATTR_GRID: &[u8] = b"pencil_io_writer_grid\0";
-const ATTR_PERM: &[u8] = b"pencil_io_writer_permutation\0";
 
 /// Writes one view collectively with the optional parallel HDF5 backend.
 ///
@@ -293,51 +287,8 @@ where
     }
     let dataspace = resources.dataspace.expect("dataspace creation agreement");
 
-    if let Some(chunks) = settings.chunks {
-        let (dcpl, error) = local_handle_phase(
-            comm,
-            native::dcpl_create(),
-            "HDF5 dataset-create property list",
-        );
-        resources.dcpl = dcpl;
-        if let Some(error) = error {
-            return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-        }
-        let mut native_chunks = [0 as hsize_t; crate::MAX_PROTOCOL_RANK];
-        for (dst, &x) in native_chunks.iter_mut().zip(chunks) {
-            *dst = x as hsize_t;
-        }
-        if let Err(error) = phase_code(
-            comm,
-            native::dcpl_set_chunk(
-                resources.dcpl.expect("dcpl agreement"),
-                &native_chunks[..chunks.len()],
-            ),
-            "HDF5 chunk layout",
-        ) {
-            return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-        }
-        if settings.shuffle
-            && let Err(error) = phase_code(
-                comm,
-                native::plist_set_shuffle(resources.dcpl.expect("dcpl agreement")),
-                "HDF5 shuffle filter",
-            )
-        {
-            return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-        }
-        if let Some(level) = settings.deflate
-            && let Err(error) = phase_code(
-                comm,
-                native::plist_set_deflate(
-                    resources.dcpl.expect("dcpl agreement"),
-                    u32::from(level),
-                ),
-                "HDF5 deflate filter",
-            )
-        {
-            return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-        }
+    if let Err(error) = configure_chunks(comm, settings, &mut resources) {
+        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
     }
     let dataset = match collective_handle_phase(
         comm,
@@ -1342,6 +1293,64 @@ struct Hdf5Resources {
     dcpl: Option<native::Hid>,
 }
 
+fn valid_writer_provenance(grid: &[u64], permutation: &[u64], spatial_rank: usize) -> bool {
+    if !valid_writer_grid(grid, spatial_rank) || permutation.len() != spatial_rank {
+        return false;
+    }
+    let mut seen = Vec::new();
+    if seen.try_reserve_exact(spatial_rank).is_err() {
+        return false;
+    }
+    seen.resize(spatial_rank, false);
+    valid_permutation(permutation, spatial_rank, &mut seen)
+}
+
+fn configure_chunks(
+    comm: &mpi::topology::CartesianCommunicator,
+    settings: Hdf5Settings<'_>,
+    resources: &mut Hdf5Resources,
+) -> Result<(), IoError> {
+    let Some(chunks) = settings.chunks else {
+        return Ok(());
+    };
+    let (dcpl, error) = local_handle_phase(
+        comm,
+        native::dcpl_create(),
+        "HDF5 dataset-create property list",
+    );
+    resources.dcpl = dcpl;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    let mut native_chunks = [0 as hsize_t; crate::MAX_PROTOCOL_RANK];
+    for (dst, &x) in native_chunks.iter_mut().zip(chunks) {
+        *dst = x as hsize_t;
+    }
+    phase_code(
+        comm,
+        native::dcpl_set_chunk(
+            resources.dcpl.expect("dcpl agreement"),
+            &native_chunks[..chunks.len()],
+        ),
+        "HDF5 chunk layout",
+    )?;
+    if settings.shuffle {
+        phase_code(
+            comm,
+            native::plist_set_shuffle(resources.dcpl.expect("dcpl agreement")),
+            "HDF5 shuffle filter",
+        )?;
+    }
+    if let Some(level) = settings.deflate {
+        phase_code(
+            comm,
+            native::plist_set_deflate(resources.dcpl.expect("dcpl agreement"), u32::from(level)),
+            "HDF5 deflate filter",
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_options(
     comm: &mpi::topology::CartesianCommunicator,
     settings: Hdf5Settings<'_>,
@@ -1848,7 +1857,7 @@ fn read_original_name(
 fn attr_phase(
     comm: &mpi::topology::CartesianCommunicator,
     object: native::Hid,
-    name: &[u8],
+    name: &CStr,
     values: &[u64],
     phase: &'static str,
 ) -> Result<(), IoError> {
@@ -1858,7 +1867,7 @@ fn attr_phase(
 fn write_attr_u64(
     comm: &mpi::topology::CartesianCommunicator,
     object: native::Hid,
-    name: &[u8],
+    name: &CStr,
     values: &[u64],
     phase: &'static str,
 ) -> Result<(), IoError> {
@@ -1894,7 +1903,7 @@ fn write_attr_u64(
 
     let attr = match collective_handle_phase(
         comm,
-        native::attr_create(object, cstr(name), datatype, space),
+        native::attr_create(object, name, datatype, space),
         phase,
     ) {
         Ok(attr) => attr,
@@ -1947,13 +1956,13 @@ fn write_attr_u64(
 fn write_existing_attr(
     comm: &mpi::topology::CartesianCommunicator,
     object: native::Hid,
-    name: &[u8],
+    name: &CStr,
     value: u64,
 ) -> Result<(), IoError> {
     let mut handles = AttrHandles::default();
     let (attr, error) = local_handle_phase(
         comm,
-        native::attr_open(object, cstr(name)),
+        native::attr_open(object, name),
         "HDF5 commit marker open",
     );
     handles.attr = attr;
@@ -2056,24 +2065,22 @@ fn validate_read_metadata<T: IoElement, const N: usize, const M: usize>(
         && type_code == [T::CODE]
         && width == [T::WIDTH as u64]
         && usize::try_from(extra_rank[0]).ok() == Some(extra_dims.len())
-        && extra_rank[0] <= MAX_PROTOCOL_RANK as u64;
-    let commit_state = if commit == [COMMIT_MARKER] {
-        Ok(())
-    } else if commit == [INCOMPLETE_MARKER] {
-        Err(IoError::IncompleteFile)
-    } else {
-        Err(IoError::InvalidFile {
+        && rank_in_range(extra_rank[0]);
+    let commit_result = match commit_state(commit[0]) {
+        CommitState::Complete => Ok(()),
+        CommitState::Incomplete => Err(IoError::IncompleteFile),
+        CommitState::Invalid => Err(IoError::InvalidFile {
             reason: "HDF5 commit marker",
-        })
+        }),
     };
-    let scalar_ok = metadata_ok && commit_state.is_ok();
+    let scalar_ok = metadata_ok && commit_result.is_ok();
     if let Err(agreement) = agree_phase(comm, scalar_ok, "HDF5 scalar metadata validation") {
         return Err(if !metadata_ok {
             IoError::MetadataMismatch {
                 field: "version, rank, or type",
             }
         } else {
-            commit_state.err().unwrap_or(agreement)
+            commit_result.err().unwrap_or(agreement)
         });
     }
 
@@ -2100,7 +2107,7 @@ fn validate_read_metadata<T: IoElement, const N: usize, const M: usize>(
         "HDF5 writer grid metadata",
     )?;
     let writer_perm = read_attr(ATTR_PERM, Some(N), N, "HDF5 writer permutation metadata")?;
-    let metadata_ok = valid_dimensions(&global)
+    let metadata_ok = valid_global_shape(&global)
         && global
             .iter()
             .copied()
@@ -2109,9 +2116,7 @@ fn validate_read_metadata<T: IoElement, const N: usize, const M: usize>(
             .iter()
             .copied()
             .eq(extra_dims.iter().map(|&v| v as u64))
-        && valid_extents(&writer_grid)
-        && writer_grid.len() <= N
-        && is_permutation(&writer_perm, N);
+        && valid_writer_provenance(&writer_grid, &writer_perm, N);
     if let Err(agreement) = agree_phase(comm, metadata_ok, "HDF5 shape metadata validation") {
         return Err(if metadata_ok {
             agreement
@@ -2128,12 +2133,12 @@ fn read_attr_phase(
     comm: &mpi::topology::CartesianCommunicator,
     duplicate: ffi::MPI_Comm,
     object: native::Hid,
-    name: &[u8],
+    name: &CStr,
     expected_len: Option<usize>,
     max_len: usize,
     phase: &'static str,
 ) -> Result<Vec<u64>, IoError> {
-    let exists_result = native::attr_exists(object, cstr(name));
+    let exists_result = native::attr_exists(object, name);
     if let Err(agreement) = agree_phase(comm, exists_result.is_ok(), phase) {
         return Err(exists_result
             .err()
@@ -2149,7 +2154,7 @@ fn read_attr_phase(
     }
 
     let mut handles = AttrHandles::default();
-    let (attr, error) = local_handle_phase(comm, native::attr_open(object, cstr(name)), phase);
+    let (attr, error) = local_handle_phase(comm, native::attr_open(object, name), phase);
     handles.attr = attr;
     if let Some(error) = error {
         return Err(attr_error(comm, handles, error));
@@ -2292,10 +2297,10 @@ fn read_attr_phase(
 fn attribute_exists_phase(
     comm: &mpi::topology::CartesianCommunicator,
     object: native::Hid,
-    name: &[u8],
+    name: &CStr,
     phase: &'static str,
 ) -> Result<bool, IoError> {
-    let result = native::attr_exists(object, cstr(name));
+    let result = native::attr_exists(object, name);
     if let Err(agreement) = agree_phase(comm, result.is_ok(), phase) {
         return Err(result
             .err()
@@ -2742,11 +2747,11 @@ pub(crate) fn inspect_catalog(
                 catalog_valid(
                     comm,
                     version == [FORMAT_VERSION]
-                        && commit == [COMMIT_MARKER]
+                        && commit_state(commit[0]) == CommitState::Complete
                         && n > 0
-                        && n <= MAX_PROTOCOL_RANK
-                        && er <= MAX_PROTOCOL_RANK
-                        && n.checked_add(er).is_some_and(|x| x <= MAX_PROTOCOL_RANK),
+                        && rank_in_range(nvals[0])
+                        && rank_in_range(erank[0])
+                        && combined_rank_in_range(nvals[0], erank[0]),
                     "HDF5 catalog metadata",
                 )?;
                 let extra = if er == 0 {
@@ -2765,20 +2770,10 @@ pub(crate) fn inspect_catalog(
                 let global = attr!(ATTR_GLOBAL, Some(n), n);
                 let grid = attr!(ATTR_GRID, None, MAX_PROTOCOL_RANK);
                 let perm = attr!(ATTR_PERM, Some(n), n);
-                let product = global
-                    .iter()
-                    .chain(extra.iter())
-                    .try_fold(1u64, |p, &x| p.checked_mul(x));
-                let bytes_product = product.and_then(|x| x.checked_mul(scalar.width() as u64));
-                let grid_product = grid.iter().try_fold(1u64, |p, &x| p.checked_mul(x));
                 let shape_ok = !global.is_empty()
-                    && !grid.is_empty()
-                    && grid.len() <= n
-                    && global.len() + extra.len() <= MAX_PROTOCOL_RANK
-                    && bytes_product.is_some()
-                    && grid.iter().all(|&x| x > 0)
-                    && grid_product.is_some()
-                    && is_permutation(&perm, n);
+                    && combined_rank_in_range(global.len() as u64, extra.len() as u64)
+                    && valid_shape_bytes(&global, &extra, scalar.width() as u64)
+                    && valid_writer_provenance(&grid, &perm, n);
                 catalog_valid(comm, shape_ok, "HDF5 catalog shape or provenance")?;
                 let expected_result: Result<Vec<hsize_t>, _> = extra
                     .iter()
