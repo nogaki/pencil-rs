@@ -778,7 +778,7 @@ where
     F: FnMut(&[&T]) -> U,
     R: FnMut(U, U) -> U,
 {
-    let plan = prepare_map_reduce_many(
+    let mut plan = prepare_map_reduce_many(
         communicator,
         inputs,
         neutral,
@@ -803,7 +803,7 @@ where
     }
     partials.resize(size, neutral);
     let mut local = neutral;
-    for_each_many(inputs, &plan, &mut refs, |values| {
+    for_each_many(inputs, &mut plan, &mut refs, |values| {
         local = reduce(local, map(values))
     });
     communicator.all_gather_into(&local, &mut partials[..]);
@@ -825,7 +825,7 @@ where
     U: SupportedScalar,
     F: FnMut(&[&T]) -> U,
 {
-    let plan = prepare_map_reduce_many(
+    let mut plan = prepare_map_reduce_many(
         communicator,
         inputs,
         U::zero(),
@@ -836,7 +836,7 @@ where
     let mut refs = prepare_many_refs(communicator, inputs.len())?;
     let mut local = Ok(U::zero());
     let mut flags = [0_u32; 6];
-    for_each_many(inputs, &plan, &mut refs, |values| {
+    for_each_many(inputs, &mut plan, &mut refs, |values| {
         accumulate_mapped_sum(&mut local, &mut flags, f(values));
     });
     finish_sum_prepared(communicator, local, flags, &mut partials)
@@ -856,7 +856,7 @@ where
     U: SupportedScalar,
     F: FnMut(&[&T]) -> U,
 {
-    let plan = prepare_map_reduce_many(
+    let mut plan = prepare_map_reduce_many(
         communicator,
         inputs,
         U::zero(),
@@ -865,7 +865,7 @@ where
     )?;
     let mut refs = prepare_many_refs(communicator, inputs.len())?;
     let mut state = NormState::default();
-    for_each_many(inputs, &plan, &mut refs, |values| state.push(f(values)));
+    for_each_many(inputs, &mut plan, &mut refs, |values| state.push(f(values)));
     Ok(state.finish(communicator, plan.global_count))
 }
 
@@ -915,12 +915,12 @@ where
     U: OrderedScalar,
     F: FnMut(&[&T]) -> U,
 {
-    let plan =
+    let mut plan =
         prepare_map_reduce_many(communicator, inputs, U::zero(), type_name::<F>(), operation)?;
     let mut refs = prepare_many_refs(communicator, inputs.len())?;
     let mut local = U::local_extreme(&[], minimum);
     let mut flags = [0_u32; 6];
-    for_each_many(inputs, &plan, &mut refs, |values| {
+    for_each_many(inputs, &mut plan, &mut refs, |values| {
         let value = f(values);
         local = U::local_extreme(&[local, value], minimum);
         flags = merge_flags(flags, value.nonfinite_flags());
@@ -1307,6 +1307,8 @@ struct ManyPlan {
     spatial: usize,
     extra: usize,
     global_count: usize,
+    /// Per-input base offset, reusing the input-count-sized length buffer.
+    offsets: Vec<usize>,
 }
 
 fn prepare_map_reduce3<A, B, D, U, const N: usize, const M: usize>(
@@ -1559,10 +1561,10 @@ where
         descriptor
             .try_reserve_exact(expected)
             .map_err(|_| CollectiveError::AllocationFailed { elements: expected })?;
-        for (input, length) in inputs.iter().zip(lengths) {
+        for (input, length) in inputs.iter().zip(&lengths) {
             let words = build_descriptor::<_, T, U, N, M>(input, operation, 0, callback)
                 .map_err(|_| CollectiveError::PreparationFailed)?;
-            if words.len() != length {
+            if words.len() != *length {
                 return Err(CollectiveError::PreparationFailed);
             }
             descriptor.extend(words);
@@ -1623,6 +1625,7 @@ where
             spatial,
             extra,
             global_count,
+            lengths,
         ))
     })();
     let ready = prepared.is_ok();
@@ -1631,8 +1634,17 @@ where
             .err()
             .unwrap_or(CollectiveError::CollectivePreconditionFailed));
     }
-    let (descriptor, expected, shape, strides, output_strides, spatial, extra, global_count) =
-        prepared.expect("collective many preparation succeeded");
+    let (
+        descriptor,
+        expected,
+        shape,
+        strides,
+        output_strides,
+        spatial,
+        extra,
+        global_count,
+        offsets,
+    ) = prepared.expect("collective many preparation succeeded");
     let length = u64::try_from(expected).unwrap_or(INVALID_WORD);
     let mut minimum = length;
     let mut maximum = length;
@@ -1659,12 +1671,13 @@ where
         spatial,
         extra,
         global_count,
+        offsets,
     })
 }
 
 fn for_each_many<'v, T, F, const N: usize, const M: usize>(
     inputs: &'v [PencilArrayView<'v, T, N, M>],
-    p: &ManyPlan,
+    p: &mut ManyPlan,
     refs: &mut Vec<&'v T>,
     mut f: F,
 ) where
@@ -1674,7 +1687,9 @@ fn for_each_many<'v, T, F, const N: usize, const M: usize>(
         return;
     }
     for linear in 0..p.extra {
-        refs.clear();
+        // The broadcast index does not depend on the spatial index, so each
+        // input's base offset is computed once and the inner loop only adds.
+        p.offsets.clear();
         for (q, input) in inputs.iter().enumerate() {
             let mut i = 0;
             for axis in 0..p.shape.len() {
@@ -1683,18 +1698,12 @@ fn for_each_many<'v, T, F, const N: usize, const M: usize>(
                     i += x * p.strides[q][axis];
                 }
             }
-            refs.push(&input.as_slice()[i * p.spatial]);
+            p.offsets.push(i * p.spatial);
         }
         for k in 0..p.spatial {
-            for (q, input) in inputs.iter().enumerate() {
-                let mut i = 0;
-                for axis in 0..p.shape.len() {
-                    let x = (linear / p.output_strides[axis]) % p.shape[axis];
-                    if input.extra_shape().dimensions()[axis] != 1 {
-                        i += x * p.strides[q][axis];
-                    }
-                }
-                refs[q] = &input.as_slice()[i * p.spatial + k];
+            refs.clear();
+            for (offset, input) in p.offsets.iter().zip(inputs) {
+                refs.push(&input.as_slice()[offset + k]);
             }
             f(refs);
         }
