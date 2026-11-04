@@ -154,7 +154,7 @@ impl<R: FftReal> LocalR2cInPlaceArray<R> {
     /// Borrows the initialized packed real prefix in [`R2cState::RealInput`].
     pub fn real_view(&self) -> Result<&[R], LocalR2cError> {
         self.ensure_state(R2cState::RealInput)?;
-        let length = self.validate_shape()?.0;
+        let length = self.checked_lengths()?.0;
         let storage = cast_real_slice(&self.storage)?;
         Ok(&storage[..length])
     }
@@ -163,7 +163,7 @@ impl<R: FftReal> LocalR2cInPlaceArray<R> {
     /// [`R2cState::RealInput`].
     pub fn real_view_mut(&mut self) -> Result<&mut [R], LocalR2cError> {
         self.ensure_state(R2cState::RealInput)?;
-        let length = self.validate_shape()?.0;
+        let length = self.checked_lengths()?.0;
         let storage = cast_real_slice_mut(&mut self.storage)?;
         Ok(&mut storage[..length])
     }
@@ -171,7 +171,7 @@ impl<R: FftReal> LocalR2cInPlaceArray<R> {
     /// Borrows the initialized complex prefix in [`R2cState::ComplexOutput`].
     pub fn complex_view(&self) -> Result<&[Complex<R>], LocalR2cError> {
         self.ensure_state(R2cState::ComplexOutput)?;
-        let length = self.validate_shape()?.1;
+        let length = self.checked_lengths()?.1;
         Ok(&self.storage[..length])
     }
 
@@ -179,7 +179,7 @@ impl<R: FftReal> LocalR2cInPlaceArray<R> {
     /// [`R2cState::ComplexOutput`].
     pub fn complex_view_mut(&mut self) -> Result<&mut [Complex<R>], LocalR2cError> {
         self.ensure_state(R2cState::ComplexOutput)?;
-        let length = self.validate_shape()?.1;
+        let length = self.checked_lengths()?.1;
         Ok(&mut self.storage[..length])
     }
 
@@ -191,22 +191,20 @@ impl<R: FftReal> LocalR2cInPlaceArray<R> {
         }
     }
 
-    fn validate_shape(&self) -> Result<(usize, usize), LocalR2cError> {
-        let complex_len = self.real_len / 2 + 1;
-        let real_values = self
-            .real_len
-            .checked_mul(self.batch_count)
-            .ok_or(LocalR2cError::LengthOverflow)?;
-        let complex_values = complex_len
-            .checked_mul(self.batch_count)
-            .ok_or(LocalR2cError::LengthOverflow)?;
+    /// Derives the packed value counts and checks that the backing storage
+    /// holds exactly the complex count and can be viewed as real scalars.
+    fn checked_lengths(&self) -> Result<(usize, usize), LocalR2cError> {
+        let (real_values, complex_values) = in_place_lengths(self.real_len, self.batch_count)?;
         if self.storage.len() != complex_values {
             return Err(LocalR2cError::StorageLengthMismatch {
                 required: complex_values,
                 actual: self.storage.len(),
             });
         }
-        let _ = cast_real_slice(&self.storage)?;
+        let storage = cast_real_slice(&self.storage)?;
+        if storage.len() < real_values {
+            return Err(LocalR2cError::StorageLayoutMismatch);
+        }
         Ok((real_values, complex_values))
     }
 }
@@ -382,7 +380,7 @@ impl<R: FftReal> LocalR2cPlan<R> {
         &self,
         batch_count: usize,
     ) -> Result<LocalR2cInPlaceArray<R>, LocalR2cError> {
-        let (_, complex_values) = self.checked_in_place_lengths(batch_count)?;
+        let (_, complex_values) = checked_in_place_lengths::<R>(self.real_len, batch_count)?;
         let storage = initialized_vec(complex_values, Complex::new(R::zero(), R::zero()))?;
         Ok(LocalR2cInPlaceArray {
             storage,
@@ -664,51 +662,21 @@ impl<R: FftReal> LocalR2cPlan<R> {
         })
     }
 
-    fn checked_in_place_lengths(
-        &self,
-        batch_count: usize,
-    ) -> Result<(usize, usize), LocalR2cError> {
-        let real_values = self
-            .real_len
-            .checked_mul(batch_count)
-            .ok_or(LocalR2cError::LengthOverflow)?;
-        let complex_values = self
-            .complex_len
-            .checked_mul(batch_count)
-            .ok_or(LocalR2cError::LengthOverflow)?;
-        validate_addressable(real_values, size_of::<R>())?;
-        validate_addressable(complex_values, size_of::<Complex<R>>())?;
-        Ok((real_values, complex_values))
-    }
-
     fn validate_in_place(
         &self,
         array: &LocalR2cInPlaceArray<R>,
         workspace: &LocalR2cInPlaceWorkspace<R>,
         expected_state: R2cState,
     ) -> Result<usize, LocalR2cError> {
-        match array.state {
-            R2cState::Poisoned => return Err(LocalR2cError::Poisoned),
-            state if state != expected_state => return Err(LocalR2cError::WrongState),
-            _ => {}
-        }
+        array.ensure_state(expected_state)?;
         if array.real_len != self.real_len {
             return Err(LocalR2cError::ArrayMismatch);
         }
         if workspace.real_len != self.real_len || workspace.complex_len != self.complex_len {
             return Err(LocalR2cError::WorkspaceMismatch);
         }
-        let (real_values, complex_values) = self.checked_in_place_lengths(array.batch_count)?;
-        if array.storage.len() != complex_values {
-            return Err(LocalR2cError::StorageLengthMismatch {
-                required: complex_values,
-                actual: array.storage.len(),
-            });
-        }
-        let storage = cast_real_slice(&array.storage)?;
-        if storage.len() < real_values {
-            return Err(LocalR2cError::StorageLayoutMismatch);
-        }
+        checked_in_place_lengths::<R>(array.real_len, array.batch_count)?;
+        let (real_values, complex_values) = array.checked_lengths()?;
         self.validate_line_buffers(
             real_values,
             complex_values,
@@ -862,6 +830,32 @@ fn validate_lengths<R: FftReal>(real_len: usize) -> Result<usize, LocalR2cError>
         validate_addressable(real_len, size_of::<Complex<R>>())?;
     }
     Ok(complex_len)
+}
+
+/// Returns the packed real and complex value counts for `batch_count` lines of
+/// `real_len` values, or [`LocalR2cError::LengthOverflow`] when either product
+/// is not representable.
+fn in_place_lengths(real_len: usize, batch_count: usize) -> Result<(usize, usize), LocalR2cError> {
+    let complex_len = real_len / 2 + 1;
+    let real_values = real_len
+        .checked_mul(batch_count)
+        .ok_or(LocalR2cError::LengthOverflow)?;
+    let complex_values = complex_len
+        .checked_mul(batch_count)
+        .ok_or(LocalR2cError::LengthOverflow)?;
+    Ok((real_values, complex_values))
+}
+
+/// Derives the packed value counts and rejects counts that are not addressable
+/// as real or complex values.
+fn checked_in_place_lengths<R: FftReal>(
+    real_len: usize,
+    batch_count: usize,
+) -> Result<(usize, usize), LocalR2cError> {
+    let (real_values, complex_values) = in_place_lengths(real_len, batch_count)?;
+    validate_addressable(real_values, size_of::<R>())?;
+    validate_addressable(complex_values, size_of::<Complex<R>>())?;
+    Ok((real_values, complex_values))
 }
 
 fn validate_addressable(length: usize, element_size: usize) -> Result<(), LocalR2cError> {
@@ -1810,6 +1804,34 @@ mod tests {
                 exercise_in_place::<f64>(real_len, batch_count);
             }
         }
+    }
+
+    #[test]
+    fn in_place_views_and_plan_keep_their_length_check_order() {
+        let batch_count = isize::MAX as usize / 16 + 1;
+        let mut array = LocalR2cInPlaceArray::<f64> {
+            storage: Vec::new(),
+            real_len: 1,
+            batch_count,
+            state: R2cState::RealInput,
+        };
+        let storage_mismatch = || LocalR2cError::StorageLengthMismatch {
+            required: batch_count,
+            actual: 0,
+        };
+        assert_eq!(array.real_view(), Err(storage_mismatch()));
+        assert_eq!(array.real_view_mut(), Err(storage_mismatch()));
+        array.state = R2cState::ComplexOutput;
+        assert_eq!(array.complex_view(), Err(storage_mismatch()));
+        assert_eq!(array.complex_view_mut(), Err(storage_mismatch()));
+
+        let plan = LocalR2cPlan::<f64>::new(1).unwrap();
+        let mut workspace = plan.allocate_in_place_workspace().unwrap();
+        array.state = R2cState::RealInput;
+        assert_eq!(
+            plan.forward_in_place(&mut array, &mut workspace),
+            Err(LocalR2cError::LengthOverflow)
+        );
     }
 
     #[test]
