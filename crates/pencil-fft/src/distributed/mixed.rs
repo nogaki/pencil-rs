@@ -45,9 +45,9 @@ use super::{
     TransformTiming, TransposeMethod, VALUE_KIND_C2C, VALUE_KIND_R2C,
     agree_execution_descriptor_ref, agree_header, agree_result, build_route, build_transitions,
     collective_descriptor, collective_valid, convert_strided_complex_reverse,
-    convert_strided_real_forward, initialized_vec, map_array_allocation, memory_stride,
-    r2c::validate_recast_capacity, strided_line_count, validate_input,
-    validate_workspace_lengths_values, zero_complex,
+    convert_strided_real_forward, for_each_strided_line, for_each_strided_line_in_place,
+    initialized_vec, map_array_allocation, memory_stride, r2c::validate_recast_capacity,
+    strided_line_count, validate_input, validate_workspace_lengths_values, zero_complex,
 };
 
 #[cfg(test)]
@@ -1910,31 +1910,22 @@ fn mixed_r2r_forward<T: R2rScalar, const N: usize, const M: usize>(
     if destination.len() != source.len() {
         return Err(MixedError::Fft(FftError::PreparationFailed));
     }
-    let block = line_len
-        .checked_mul(stride)
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        for inner in 0..stride {
-            for k in 0..line_len {
-                line[k] = source[base + k * stride + inner];
-            }
-            match plan {
-                MixedR2rLocal::Transform(plan) => plan
-                    .forward_in_place(&mut line[..line_len], embedding, scratch)
-                    .map_err(MixedError::LocalR2r)?,
-                MixedR2rLocal::Hartley(plan) => plan
-                    .forward_in_place(&mut line[..line_len], embedding, scratch)
-                    .map_err(MixedError::LocalR2r)?,
-            }
-            for k in 0..line_len {
-                destination[base + k * stride + inner] = line[k];
-            }
-        }
-    }
-    Ok(())
+    for_each_strided_line(
+        source,
+        destination,
+        line,
+        count,
+        line_len,
+        stride,
+        |buffer| match plan {
+            MixedR2rLocal::Transform(plan) => plan
+                .forward_in_place(buffer, embedding, scratch)
+                .map_err(MixedError::LocalR2r),
+            MixedR2rLocal::Hartley(plan) => plan
+                .forward_in_place(buffer, embedding, scratch)
+                .map_err(MixedError::LocalR2r),
+        },
+    )
 }
 
 fn mixed_r2r_forward_in_place<T: R2rScalar, const N: usize, const M: usize>(
@@ -1969,31 +1960,14 @@ fn mixed_r2r_forward_in_place<T: R2rScalar, const N: usize, const M: usize>(
         }));
     }
     let count = strided_line_count(data.len(), line_len, stride)?;
-    let block = line_len
-        .checked_mul(stride)
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        for inner in 0..stride {
-            for k in 0..line_len {
-                line[k] = data[base + k * stride + inner];
-            }
-            match plan {
-                MixedR2rLocal::Transform(plan) => plan
-                    .forward_in_place(&mut line[..line_len], embedding, scratch)
-                    .map_err(MixedError::LocalR2r)?,
-                MixedR2rLocal::Hartley(plan) => plan
-                    .forward_in_place(&mut line[..line_len], embedding, scratch)
-                    .map_err(MixedError::LocalR2r)?,
-            }
-            for k in 0..line_len {
-                data[base + k * stride + inner] = line[k];
-            }
-        }
-    }
-    Ok(())
+    for_each_strided_line_in_place(data, line, count, line_len, stride, |buffer| match plan {
+        MixedR2rLocal::Transform(plan) => plan
+            .forward_in_place(buffer, embedding, scratch)
+            .map_err(MixedError::LocalR2r),
+        MixedR2rLocal::Hartley(plan) => plan
+            .forward_in_place(buffer, embedding, scratch)
+            .map_err(MixedError::LocalR2r),
+    })
 }
 
 fn mixed_r2r_reverse<T: R2rScalar, const N: usize, const M: usize>(
@@ -2039,37 +2013,28 @@ fn mixed_r2r_reverse<T: R2rScalar, const N: usize, const M: usize>(
     if destination.len() != source.len() {
         return Err(MixedError::Fft(FftError::PreparationFailed));
     }
-    let block = line_len
-        .checked_mul(stride)
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        for inner in 0..stride {
-            for k in 0..line_len {
-                line[k] = source[base + k * stride + inner];
-            }
-            match plan {
-                MixedR2rLocal::Transform(plan) if normalize => plan
-                    .inverse_in_place(&mut line[..line_len], embedding, scratch)
-                    .map_err(MixedError::LocalR2r)?,
-                MixedR2rLocal::Transform(plan) => plan
-                    .backward_in_place(&mut line[..line_len], embedding, scratch)
-                    .map_err(MixedError::LocalR2r)?,
-                MixedR2rLocal::Hartley(plan) if normalize => plan
-                    .inverse_in_place(&mut line[..line_len], embedding, scratch)
-                    .map_err(MixedError::LocalR2r)?,
-                MixedR2rLocal::Hartley(plan) => plan
-                    .backward_in_place(&mut line[..line_len], embedding, scratch)
-                    .map_err(MixedError::LocalR2r)?,
-            }
-            for k in 0..line_len {
-                destination[base + k * stride + inner] = line[k];
-            }
-        }
-    }
-    Ok(())
+    for_each_strided_line(
+        source,
+        destination,
+        line,
+        count,
+        line_len,
+        stride,
+        |buffer| match plan {
+            MixedR2rLocal::Transform(plan) if normalize => plan
+                .inverse_in_place(buffer, embedding, scratch)
+                .map_err(MixedError::LocalR2r),
+            MixedR2rLocal::Transform(plan) => plan
+                .backward_in_place(buffer, embedding, scratch)
+                .map_err(MixedError::LocalR2r),
+            MixedR2rLocal::Hartley(plan) if normalize => plan
+                .inverse_in_place(buffer, embedding, scratch)
+                .map_err(MixedError::LocalR2r),
+            MixedR2rLocal::Hartley(plan) => plan
+                .backward_in_place(buffer, embedding, scratch)
+                .map_err(MixedError::LocalR2r),
+        },
+    )
 }
 
 fn mixed_r2r_reverse_in_place<T: R2rScalar, const N: usize, const M: usize>(
@@ -2111,37 +2076,20 @@ fn mixed_r2r_reverse_in_place<T: R2rScalar, const N: usize, const M: usize>(
         }));
     }
     let count = strided_line_count(data.len(), line_len, stride)?;
-    let block = line_len
-        .checked_mul(stride)
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        for inner in 0..stride {
-            for k in 0..line_len {
-                line[k] = data[base + k * stride + inner];
-            }
-            match plan {
-                MixedR2rLocal::Transform(plan) if normalize => plan
-                    .inverse_in_place(&mut line[..line_len], embedding, scratch)
-                    .map_err(MixedError::LocalR2r)?,
-                MixedR2rLocal::Transform(plan) => plan
-                    .backward_in_place(&mut line[..line_len], embedding, scratch)
-                    .map_err(MixedError::LocalR2r)?,
-                MixedR2rLocal::Hartley(plan) if normalize => plan
-                    .inverse_in_place(&mut line[..line_len], embedding, scratch)
-                    .map_err(MixedError::LocalR2r)?,
-                MixedR2rLocal::Hartley(plan) => plan
-                    .backward_in_place(&mut line[..line_len], embedding, scratch)
-                    .map_err(MixedError::LocalR2r)?,
-            }
-            for k in 0..line_len {
-                data[base + k * stride + inner] = line[k];
-            }
-        }
-    }
-    Ok(())
+    for_each_strided_line_in_place(data, line, count, line_len, stride, |buffer| match plan {
+        MixedR2rLocal::Transform(plan) if normalize => plan
+            .inverse_in_place(buffer, embedding, scratch)
+            .map_err(MixedError::LocalR2r),
+        MixedR2rLocal::Transform(plan) => plan
+            .backward_in_place(buffer, embedding, scratch)
+            .map_err(MixedError::LocalR2r),
+        MixedR2rLocal::Hartley(plan) if normalize => plan
+            .inverse_in_place(buffer, embedding, scratch)
+            .map_err(MixedError::LocalR2r),
+        MixedR2rLocal::Hartley(plan) => plan
+            .backward_in_place(buffer, embedding, scratch)
+            .map_err(MixedError::LocalR2r),
+    })
 }
 
 fn mixed_complex_forward<R: FftReal, const N: usize, const M: usize>(

@@ -2604,6 +2604,71 @@ fn strided_line_count(data_len: usize, line_len: usize, stride: usize) -> Result
     Ok(data_len / block)
 }
 
+/// Runs `transform` on each length-`line_len` strided line of `source` and writes
+/// the transformed line back to the same strided position in `destination`.
+///
+/// The caller owns the fast paths: `line_buffer`, `count` (from
+/// [`strided_line_count`]), the length checks, and the contiguous and empty
+/// cases. Nothing is allocated here.
+fn for_each_strided_line<T: Copy, E: From<FftError>>(
+    source: &[T],
+    destination: &mut [T],
+    line_buffer: &mut [T],
+    count: usize,
+    line_len: usize,
+    stride: usize,
+    mut transform: impl FnMut(&mut [T]) -> Result<(), E>,
+) -> Result<(), E> {
+    let block = line_len
+        .checked_mul(stride)
+        .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+    for outer in 0..count {
+        let base = outer
+            .checked_mul(block)
+            .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+        for inner in 0..stride {
+            for k in 0..line_len {
+                line_buffer[k] = source[base + k * stride + inner];
+            }
+            transform(&mut line_buffer[..line_len])?;
+            for k in 0..line_len {
+                destination[base + k * stride + inner] = line_buffer[k];
+            }
+        }
+    }
+    Ok(())
+}
+
+/// In-place variant of [`for_each_strided_line`]: the strided lines are gathered
+/// from `data` and the transformed line is written back to `data`.
+fn for_each_strided_line_in_place<T: Copy, E: From<FftError>>(
+    data: &mut [T],
+    line_buffer: &mut [T],
+    count: usize,
+    line_len: usize,
+    stride: usize,
+    mut transform: impl FnMut(&mut [T]) -> Result<(), E>,
+) -> Result<(), E> {
+    let block = line_len
+        .checked_mul(stride)
+        .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+    for outer in 0..count {
+        let base = outer
+            .checked_mul(block)
+            .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+        for inner in 0..stride {
+            for k in 0..line_len {
+                line_buffer[k] = data[base + k * stride + inner];
+            }
+            transform(&mut line_buffer[..line_len])?;
+            for k in 0..line_len {
+                data[base + k * stride + inner] = line_buffer[k];
+            }
+        }
+    }
+    Ok(())
+}
+
 fn strided_complex_line_len<R: FftReal, const N: usize, const M: usize>(
     stages: &[TransformStage<R, N, M>],
 ) -> Result<usize, FftError> {
@@ -2655,26 +2720,18 @@ fn execute_strided_complex_forward<R: FftReal, const N: usize, const M: usize>(
             .forward(source, destination, scratch)
             .map_err(FftError::LocalC2c);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = source[base + k * stride + inner];
-            }
-            plan.forward_in_place(&mut line_buffer[..plan.line_len()], scratch)
-                .map_err(FftError::LocalC2c)?;
-            for k in 0..plan.line_len() {
-                destination[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+    for_each_strided_line(
+        source,
+        destination,
+        line_buffer,
+        count,
+        plan.line_len(),
+        stride,
+        |line| {
+            plan.forward_in_place(line, scratch)
+                .map_err(FftError::LocalC2c)
+        },
+    )
 }
 
 fn execute_strided_complex_forward_in_place<R: FftReal, const N: usize, const M: usize>(
@@ -2698,26 +2755,10 @@ fn execute_strided_complex_forward_in_place<R: FftReal, const N: usize, const M:
             .forward_in_place(data, scratch)
             .map_err(FftError::LocalC2c);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = data[base + k * stride + inner];
-            }
-            plan.forward_in_place(&mut line_buffer[..plan.line_len()], scratch)
-                .map_err(FftError::LocalC2c)?;
-            for k in 0..plan.line_len() {
-                data[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+    for_each_strided_line_in_place(data, line_buffer, count, plan.line_len(), stride, |line| {
+        plan.forward_in_place(line, scratch)
+            .map_err(FftError::LocalC2c)
+    })
 }
 
 fn execute_strided_complex_reverse<R: FftReal, const N: usize, const M: usize>(
@@ -2752,30 +2793,22 @@ fn execute_strided_complex_reverse<R: FftReal, const N: usize, const M: usize>(
         }
         .map_err(FftError::LocalC2c);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = source[base + k * stride + inner];
-            }
+    for_each_strided_line(
+        source,
+        destination,
+        line_buffer,
+        count,
+        plan.line_len(),
+        stride,
+        |line| {
             if normalize {
-                plan.inverse_in_place(&mut line_buffer[..plan.line_len()], scratch)
+                plan.inverse_in_place(line, scratch)
             } else {
-                plan.backward_in_place(&mut line_buffer[..plan.line_len()], scratch)
+                plan.backward_in_place(line, scratch)
             }
-            .map_err(FftError::LocalC2c)?;
-            for k in 0..plan.line_len() {
-                destination[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+            .map_err(FftError::LocalC2c)
+        },
+    )
 }
 
 fn execute_strided_complex_reverse_in_place<R: FftReal, const N: usize, const M: usize>(
@@ -2806,30 +2839,14 @@ fn execute_strided_complex_reverse_in_place<R: FftReal, const N: usize, const M:
         }
         .map_err(FftError::LocalC2c);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = data[base + k * stride + inner];
-            }
-            if normalize {
-                plan.inverse_in_place(&mut line_buffer[..plan.line_len()], scratch)
-            } else {
-                plan.backward_in_place(&mut line_buffer[..plan.line_len()], scratch)
-            }
-            .map_err(FftError::LocalC2c)?;
-            for k in 0..plan.line_len() {
-                data[base + k * stride + inner] = line_buffer[k];
-            }
+    for_each_strided_line_in_place(data, line_buffer, count, plan.line_len(), stride, |line| {
+        if normalize {
+            plan.inverse_in_place(line, scratch)
+        } else {
+            plan.backward_in_place(line, scratch)
         }
-    }
-    Ok(())
+        .map_err(FftError::LocalC2c)
+    })
 }
 
 fn execute_complex_forward<R: FftReal, const N: usize, const M: usize>(

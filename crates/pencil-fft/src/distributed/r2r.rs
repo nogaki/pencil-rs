@@ -2585,30 +2585,18 @@ fn execute_strided_r2r_forward<T: R2rScalar, const N: usize, const M: usize>(
             .forward(source, destination, embedding_line, fft_scratch)
             .map_err(R2rError::LocalR2r);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = source[base + k * stride + inner];
-            }
-            plan.forward_in_place(
-                &mut line_buffer[..plan.line_len()],
-                embedding_line,
-                fft_scratch,
-            )
-            .map_err(R2rError::LocalR2r)?;
-            for k in 0..plan.line_len() {
-                destination[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+    super::for_each_strided_line(
+        source,
+        destination,
+        line_buffer,
+        count,
+        plan.line_len(),
+        stride,
+        |line| {
+            plan.forward_in_place(line, embedding_line, fft_scratch)
+                .map_err(R2rError::LocalR2r)
+        },
+    )
 }
 
 fn execute_strided_r2r_forward_in_place<T: R2rScalar, const N: usize, const M: usize>(
@@ -2641,30 +2629,17 @@ fn execute_strided_r2r_forward_in_place<T: R2rScalar, const N: usize, const M: u
             .forward_in_place(data, embedding_line, fft_scratch)
             .map_err(R2rError::LocalR2r);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = data[base + k * stride + inner];
-            }
-            plan.forward_in_place(
-                &mut line_buffer[..plan.line_len()],
-                embedding_line,
-                fft_scratch,
-            )
-            .map_err(R2rError::LocalR2r)?;
-            for k in 0..plan.line_len() {
-                data[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+    super::for_each_strided_line_in_place(
+        data,
+        line_buffer,
+        count,
+        plan.line_len(),
+        stride,
+        |line| {
+            plan.forward_in_place(line, embedding_line, fft_scratch)
+                .map_err(R2rError::LocalR2r)
+        },
+    )
 }
 
 fn execute_strided_r2r_reverse<T: R2rScalar, const N: usize, const M: usize>(
@@ -2708,38 +2683,22 @@ fn execute_strided_r2r_reverse<T: R2rScalar, const N: usize, const M: usize>(
         }
         .map_err(R2rError::LocalR2r);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = source[base + k * stride + inner];
-            }
+    super::for_each_strided_line(
+        source,
+        destination,
+        line_buffer,
+        count,
+        plan.line_len(),
+        stride,
+        |line| {
             if normalize {
-                plan.inverse_in_place(
-                    &mut line_buffer[..plan.line_len()],
-                    embedding_line,
-                    fft_scratch,
-                )
+                plan.inverse_in_place(line, embedding_line, fft_scratch)
             } else {
-                plan.backward_in_place(
-                    &mut line_buffer[..plan.line_len()],
-                    embedding_line,
-                    fft_scratch,
-                )
+                plan.backward_in_place(line, embedding_line, fft_scratch)
             }
-            .map_err(R2rError::LocalR2r)?;
-            for k in 0..plan.line_len() {
-                destination[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+            .map_err(R2rError::LocalR2r)
+        },
+    )
 }
 
 fn execute_strided_r2r_reverse_in_place<T: R2rScalar, const N: usize, const M: usize>(
@@ -2779,38 +2738,21 @@ fn execute_strided_r2r_reverse_in_place<T: R2rScalar, const N: usize, const M: u
         }
         .map_err(R2rError::LocalR2r);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = data[base + k * stride + inner];
-            }
+    super::for_each_strided_line_in_place(
+        data,
+        line_buffer,
+        count,
+        plan.line_len(),
+        stride,
+        |line| {
             if normalize {
-                plan.inverse_in_place(
-                    &mut line_buffer[..plan.line_len()],
-                    embedding_line,
-                    fft_scratch,
-                )
+                plan.inverse_in_place(line, embedding_line, fft_scratch)
             } else {
-                plan.backward_in_place(
-                    &mut line_buffer[..plan.line_len()],
-                    embedding_line,
-                    fft_scratch,
-                )
+                plan.backward_in_place(line, embedding_line, fft_scratch)
             }
-            .map_err(R2rError::LocalR2r)?;
-            for k in 0..plan.line_len() {
-                data[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+            .map_err(R2rError::LocalR2r)
+        },
+    )
 }
 
 // ponytail: DHT is self-paired; forward and raw backward both use normalize=false.
@@ -2855,38 +2797,22 @@ fn execute_strided_dht_reverse<T: R2rScalar, const N: usize, const M: usize>(
         }
         .map_err(R2rError::LocalR2r);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = source[base + k * stride + inner];
-            }
+    super::for_each_strided_line(
+        source,
+        destination,
+        line_buffer,
+        count,
+        plan.line_len(),
+        stride,
+        |line| {
             if normalize {
-                plan.inverse_in_place(
-                    &mut line_buffer[..plan.line_len()],
-                    embedding_line,
-                    fft_scratch,
-                )
+                plan.inverse_in_place(line, embedding_line, fft_scratch)
             } else {
-                plan.backward_in_place(
-                    &mut line_buffer[..plan.line_len()],
-                    embedding_line,
-                    fft_scratch,
-                )
+                plan.backward_in_place(line, embedding_line, fft_scratch)
             }
-            .map_err(R2rError::LocalR2r)?;
-            for k in 0..plan.line_len() {
-                destination[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+            .map_err(R2rError::LocalR2r)
+        },
+    )
 }
 
 fn execute_strided_dht_reverse_in_place<T: R2rScalar, const N: usize, const M: usize>(
@@ -2926,38 +2852,21 @@ fn execute_strided_dht_reverse_in_place<T: R2rScalar, const N: usize, const M: u
         }
         .map_err(R2rError::LocalR2r);
     }
-    let block = plan
-        .line_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let base = outer
-            .checked_mul(block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.line_len() {
-                line_buffer[k] = data[base + k * stride + inner];
-            }
+    super::for_each_strided_line_in_place(
+        data,
+        line_buffer,
+        count,
+        plan.line_len(),
+        stride,
+        |line| {
             if normalize {
-                plan.inverse_in_place(
-                    &mut line_buffer[..plan.line_len()],
-                    embedding_line,
-                    fft_scratch,
-                )
+                plan.inverse_in_place(line, embedding_line, fft_scratch)
             } else {
-                plan.backward_in_place(
-                    &mut line_buffer[..plan.line_len()],
-                    embedding_line,
-                    fft_scratch,
-                )
+                plan.backward_in_place(line, embedding_line, fft_scratch)
             }
-            .map_err(R2rError::LocalR2r)?;
-            for k in 0..plan.line_len() {
-                data[base + k * stride + inner] = line_buffer[k];
-            }
-        }
-    }
-    Ok(())
+            .map_err(R2rError::LocalR2r)
+        },
+    )
 }
 
 fn execute_local_forward<T: R2rScalar, const N: usize, const M: usize>(
