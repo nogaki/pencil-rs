@@ -3626,11 +3626,21 @@ fn append_usizes(descriptor: &mut Vec<u64>, values: &[usize]) -> Result<(), ()> 
 }
 
 fn agree_header<C: CommunicatorCollectives>(comm: &C, header: [u64; HEADER_WORDS]) -> bool {
-    let mut minimum = [0u64; HEADER_WORDS];
-    let mut maximum = [0u64; HEADER_WORDS];
-    comm.all_reduce_into(&header[..], &mut minimum[..], SystemOperation::min());
-    comm.all_reduce_into(&header[..], &mut maximum[..], SystemOperation::max());
-    minimum == maximum
+    let mut paired = [0u64; 2 * HEADER_WORDS];
+    let mut reduced = [0u64; 2 * HEADER_WORDS];
+    let (top, bottom) = paired.split_at_mut(HEADER_WORDS);
+    top.copy_from_slice(&header);
+    for (destination, &value) in bottom.iter_mut().zip(header.iter()) {
+        *destination = !value;
+    }
+    comm.all_reduce_into(&paired[..], &mut reduced[..], SystemOperation::max());
+    // The second half is the complement of the global minimum, so comparing it
+    // with the maximum half is the same exact agreement as min == max.
+    let (maximum, complemented_minimum) = reduced.split_at(HEADER_WORDS);
+    maximum
+        .iter()
+        .zip(complemented_minimum)
+        .all(|(&maximum, &complemented_minimum)| maximum == !complemented_minimum)
 }
 
 fn agree_execution_descriptor_ref<const N: usize, const M: usize>(

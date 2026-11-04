@@ -127,60 +127,6 @@ fn agree_bytes(comm: &CartesianCommunicator, bytes: &[u8]) -> Result<(), IoError
     )
 }
 
-// Controls have already passed the existing bounded validation/agreement.
-fn agree_settings(comm: &CartesianCommunicator, settings: Hdf5Settings<'_>) -> Result<(), IoError> {
-    let mut bytes = [0u8; (MAX_PROTOCOL_RANK + 5) * 8];
-    let chunks = settings.chunks.unwrap_or(&[]);
-    let words = [
-        u64::from(settings.collective),
-        u64::from(settings.shuffle),
-        settings.deflate.map_or(0, |v| u64::from(v) + 1),
-        chunks.len() as u64,
-        settings.hints.len() as u64,
-    ];
-    for (dst, value) in bytes
-        .as_chunks_mut::<8>()
-        .0
-        .iter_mut()
-        .zip(words.into_iter().chain(chunks.iter().map(|&x| x as u64)))
-    {
-        dst.copy_from_slice(&value.to_le_bytes());
-    }
-    agree_bytes(comm, &bytes[..(5 + chunks.len()) * 8])?;
-    for (key, value) in settings.hints {
-        agree_bytes(comm, key.as_bytes())?;
-        agree_bytes(comm, value.as_bytes())?;
-    }
-    Ok(())
-}
-fn agree_member<const N: usize, const M: usize>(
-    comm: &CartesianCommunicator,
-    pencil: &pencil_array::Pencil<N, M>,
-    extra: &[usize],
-    code: u64,
-    width: usize,
-) -> Result<(), IoError> {
-    let len = 5 + 2 * N + 2 * M + extra.len();
-    agree_phase(
-        comm,
-        len <= crate::MAX_DESCRIPTOR_BYTES / 8,
-        "session member bound",
-    )?;
-    let mut bytes = [0u8; crate::MAX_DESCRIPTOR_BYTES];
-    let header = [N as u64, M as u64, extra.len() as u64, code, width as u64];
-    let words = header
-        .into_iter()
-        .chain(pencil.global_shape().iter().map(|&x| x as u64))
-        .chain(extra.iter().map(|&x| x as u64))
-        .chain(pencil.topology().process_grid().iter().map(|&x| x as u64))
-        .chain(pencil.permutation().axes().iter().map(|x| x.index() as u64))
-        .chain(pencil.decomposition().iter().map(|x| x.index() as u64));
-    for (dst, value) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(words) {
-        dst.copy_from_slice(&value.to_le_bytes());
-    }
-    agree_bytes(comm, &bytes[..len * 8])
-}
-
 fn valid_path(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= MAX_PATH
@@ -258,14 +204,6 @@ impl<'c> Hdf5FileSession<'c> {
         agree_bytes(comm, bytes)?;
         let path = path_cstring(path, comm)?;
         crate::options::agree_controls(comm, options.mode, &options.hints, &[])?;
-        agree_settings(
-            comm,
-            Hdf5Settings {
-                collective: options.mode == crate::MpiIoMode::Collective,
-                hints: &options.hints,
-                ..Hdf5Settings::default()
-            },
-        )?;
         let mut hints = Vec::new();
         agree_phase(
             comm,
@@ -327,6 +265,12 @@ impl<'c> Hdf5FileSession<'c> {
         Ok(session)
     }
     fn entry(&self, op: u64, path: &str) -> Result<(), Hdf5SessionError> {
+        self.entry_without_path(op)?;
+        Ok(agree_bytes(self.comm, path.as_bytes())?)
+    }
+    // Descriptor operations already agree the member path in
+    // descriptor_agreement, so they skip the separate path agreement.
+    fn entry_without_path(&self, op: u64) -> Result<(), Hdf5SessionError> {
         entry_header(self.comm, op)?;
         let local = [
             self.id,
@@ -338,7 +282,6 @@ impl<'c> Hdf5FileSession<'c> {
         self.comm.process_at_rank(0).broadcast_into(&mut root);
         agree_phase(self.comm, root == local, "session identity and state")?;
         agree_bytes(self.comm, self.path.as_bytes())?;
-        agree_bytes(self.comm, path.as_bytes())?;
         if op != 0x708 && (self.file.is_none() || self.poisoned) {
             return Err(Hdf5SessionError::Invalid("closed or poisoned"));
         }

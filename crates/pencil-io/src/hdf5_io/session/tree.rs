@@ -112,10 +112,7 @@ impl Hdf5FileSession<'_> {
                     path,
                     &mut resources,
                 );
-                let cleanup = data::finish_session(self.comm, resources);
-                if let Some(e) = cleanup {
-                    return Err(e.into());
-                }
+                data::finish_session(self.comm, resources);
                 let info = result?;
                 *bytes +=
                     (info.global_shape.len() + info.extra_shape.len()) * 8 + info.provenance.len();

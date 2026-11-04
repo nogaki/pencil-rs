@@ -2275,7 +2275,7 @@ where
     L: LocalArrayLayout<T, N, M>,
 {
     let communicator = layout.pencil().topology().communicator();
-    // Keep the five-word MIN/MAX header ahead of all descriptor allocation.
+    // Keep the paired five-word header ahead of all descriptor allocation.
     let expected_len = descriptor_len::<T, U, N, M>(layout, root_word, callback_name).ok();
     let header = [
         DESCRIPTOR_SCHEMA,
