@@ -869,6 +869,9 @@ fn validate_region_offsets<const N: usize>(
     Ok(())
 }
 
+// The pack and unpack walks no longer map elements individually; only the
+// test-only elementwise references below use this linear index mapping.
+#[cfg(test)]
 fn region_index<const N: usize>(
     region: &[Range<usize>; N],
     mut linear: usize,
@@ -891,28 +894,210 @@ fn region_index<const N: usize>(
     Ok(index)
 }
 
-fn local_spatial_offset<const N: usize, const M: usize>(
-    pencil: &Pencil<N, M>,
-    global: [usize; N],
-) -> Result<usize, TransposeError> {
-    let mut local = [0usize; N];
-    for axis in 0..N {
-        let range = &pencil.local_ranges()[axis];
-        if global[axis] < range.start || global[axis] >= range.end {
-            return Err(TransposeError::PreparationFailed);
-        }
-        local[axis] = global[axis] - range.start;
-    }
-    let memory = pencil.permutation().permute(local);
-    row_major_offset(&pencil.local_shape_memory(), &memory)
-        .map_err(|_| TransposeError::PreparationFailed)
+/// The local pencil metadata that the region walk needs. It is a plain slice
+/// of the pencil's published layout so that the walk can be compared against an
+/// elementwise reference without an MPI topology.
+struct LocalLayout<'a, const N: usize> {
+    local_ranges: &'a [Range<usize>; N],
+    shape_memory: [usize; N],
+    permutation: &'a AxisPermutation<N>,
+    local_len: usize,
 }
 
-// ponytail: pack/unpack stays the element-by-element reference mapping;
-// add no index table or unmeasured optimization.
-pub(crate) fn pack_source<T: Copy, const N: usize, const M: usize>(
+impl<'a, const N: usize> LocalLayout<'a, N> {
+    fn new<const M: usize>(pencil: &'a Pencil<N, M>) -> Self {
+        Self {
+            local_ranges: pencil.local_ranges(),
+            shape_memory: pencil.local_shape_memory(),
+            permutation: pencil.permutation(),
+            local_len: pencil.local_len(),
+        }
+    }
+}
+
+/// Precomputed memory walk for one peer region.
+///
+/// The payload order is the global row-major order of the region, so the walk
+/// carries an odometer over the outer global axes and copies the last global
+/// axis as a single run.
+struct RegionWalk<const N: usize> {
+    /// Memory offset of the region's start corner inside one extra block.
+    start: usize,
+    /// Memory stride of each global axis.
+    stride: [usize; N],
+    /// Region extent along each global axis.
+    extent: [usize; N],
+    /// Number of odometer positions over all axes but the last one.
+    outer_len: usize,
+    /// Number of elements along the last global axis.
+    run_len: usize,
+    /// Memory stride of the last global axis.
+    run_stride: usize,
+    /// Largest memory offset the walk reaches inside one extra block.
+    max_offset: usize,
+}
+
+fn region_walk<const N: usize>(
+    layout: &LocalLayout<'_, N>,
+    region: &[Range<usize>; N],
+) -> Result<RegionWalk<N>, TransposeError> {
+    // The pencil publishes the local length as the checked product of the
+    // memory shape, so these partial products cannot overflow.
+    let mut stride = [0usize; N];
+    let mut running = 1usize;
+    for position in (0..N).rev() {
+        let axis = layout.permutation.axes()[position].index();
+        stride[axis] = running;
+        running *= layout.shape_memory[position];
+    }
+
+    let mut extent = [0usize; N];
+    let mut start = 0usize;
+    let mut offset_span = 0usize;
+    let mut outer_len = 1usize;
+    let mut run_len = 0usize;
+    let mut run_stride = 0usize;
+    for axis in 0..N {
+        let local = &layout.local_ranges[axis];
+        let requested = &region[axis];
+        if requested.start < local.start || requested.end > local.end {
+            return Err(TransposeError::PreparationFailed);
+        }
+        let length = requested
+            .end
+            .checked_sub(requested.start)
+            .ok_or(TransposeError::PreparationFailed)?;
+        // Callers skip empty regions, so a zero extent here breaks preflight.
+        if length == 0 {
+            return Err(TransposeError::PreparationFailed);
+        }
+        extent[axis] = length;
+        start = start
+            .checked_add(
+                (requested.start - local.start)
+                    .checked_mul(stride[axis])
+                    .ok_or(TransposeError::PreparationFailed)?,
+            )
+            .ok_or(TransposeError::PreparationFailed)?;
+        offset_span = offset_span
+            .checked_add(
+                (length - 1)
+                    .checked_mul(stride[axis])
+                    .ok_or(TransposeError::PreparationFailed)?,
+            )
+            .ok_or(TransposeError::PreparationFailed)?;
+        if axis + 1 < N {
+            outer_len = outer_len
+                .checked_mul(length)
+                .ok_or(TransposeError::PreparationFailed)?;
+        } else {
+            run_len = length;
+            run_stride = stride[axis];
+        }
+    }
+
+    Ok(RegionWalk {
+        start,
+        stride,
+        extent,
+        outer_len,
+        run_len,
+        run_stride,
+        max_offset: start
+            .checked_add(offset_span)
+            .ok_or(TransposeError::PreparationFailed)?,
+    })
+}
+
+/// Advances the odometer over the outer global axes to the next payload
+/// position. The payload order is global row-major, so only the storage offset
+/// needs carrying.
+///
+/// A wrapping axis first gives back the advance it already accumulated
+/// (`counter * stride`) rather than adding its stride and subtracting the whole
+/// extent afterwards. The stride of a length-1 axis is not bounded by
+/// `max_offset` (that axis contributes `0 * stride` to the span), so the
+/// add-first form can overflow `usize` even though every visited offset is
+/// inside the region.
+fn advance_region<const N: usize>(
+    walk: &RegionWalk<N>,
+    counter: &mut [usize; N],
+    offset: &mut usize,
+) {
+    for axis in (0..N.saturating_sub(1)).rev() {
+        if counter[axis] + 1 < walk.extent[axis] {
+            counter[axis] += 1;
+            *offset += walk.stride[axis];
+            return;
+        }
+        *offset -= counter[axis] * walk.stride[axis];
+        counter[axis] = 0;
+    }
+}
+
+/// Copies one region from pencil storage into payload order.
+fn copy_region_to_payload<T: Copy, const N: usize>(
+    walk: &RegionWalk<N>,
+    storage: &[T],
+    payload: &mut [T],
+) {
+    if walk.run_len == 0 {
+        return;
+    }
+    let mut counter = [0usize; N];
+    let mut offset = walk.start;
+    let mut payload_offset = 0usize;
+    for position in 0..walk.outer_len {
+        let payload_end = payload_offset + walk.run_len;
+        if walk.run_stride == 1 {
+            payload[payload_offset..payload_end]
+                .copy_from_slice(&storage[offset..offset + walk.run_len]);
+        } else {
+            for index in 0..walk.run_len {
+                payload[payload_offset + index] = storage[offset + index * walk.run_stride];
+            }
+        }
+        payload_offset = payload_end;
+        if position + 1 == walk.outer_len {
+            break;
+        }
+        advance_region(walk, &mut counter, &mut offset);
+    }
+}
+
+/// Copies one region from payload order into pencil storage.
+fn copy_region_from_payload<T: Copy, const N: usize>(
+    walk: &RegionWalk<N>,
+    payload: &[T],
+    storage: &mut [T],
+) {
+    if walk.run_len == 0 {
+        return;
+    }
+    let mut counter = [0usize; N];
+    let mut offset = walk.start;
+    let mut payload_offset = 0usize;
+    for position in 0..walk.outer_len {
+        let payload_end = payload_offset + walk.run_len;
+        if walk.run_stride == 1 {
+            storage[offset..offset + walk.run_len]
+                .copy_from_slice(&payload[payload_offset..payload_end]);
+        } else {
+            for index in 0..walk.run_len {
+                storage[offset + index * walk.run_stride] = payload[payload_offset + index];
+            }
+        }
+        payload_offset = payload_end;
+        if position + 1 == walk.outer_len {
+            break;
+        }
+        advance_region(walk, &mut counter, &mut offset);
+    }
+}
+
+fn pack_source_regions<T: Copy, const N: usize>(
     peers: &[PeerMetadata<N>],
-    source_pencil: &Pencil<N, M>,
+    layout: &LocalLayout<'_, N>,
     source_storage: &[T],
     send_buffer: &mut [T],
     send_len: usize,
@@ -926,13 +1111,21 @@ pub(crate) fn pack_source<T: Copy, const N: usize, const M: usize>(
         if peer.send_spatial_len == 0 {
             continue;
         }
+        let walk = region_walk(layout, &peer.send_region)
+            .expect("checked exchange preflight validated send region");
+        debug_assert_eq!(walk.outer_len * walk.run_len, peer.send_spatial_len);
+        let max_offset = (extra_count - 1)
+            .checked_mul(layout.local_len)
+            .and_then(|extra_offset| extra_offset.checked_add(walk.max_offset))
+            .expect("checked exchange preflight validated source offset");
+        debug_assert!(max_offset < layout.local_len.saturating_mul(extra_count));
         let segment_start = peer
             .send_spatial_displacement
             .checked_mul(extra_count)
             .expect("checked exchange preflight validated send displacement");
         for extra_linear in 0..extra_count {
             let source_extra_offset = extra_linear
-                .checked_mul(source_pencil.local_len())
+                .checked_mul(layout.local_len)
                 .expect("checked exchange preflight validated source offset");
             let payload_offset = segment_start
                 .checked_add(
@@ -941,27 +1134,39 @@ pub(crate) fn pack_source<T: Copy, const N: usize, const M: usize>(
                         .expect("checked exchange preflight validated send segment"),
                 )
                 .expect("checked exchange preflight validated send payload");
-            for linear in 0..peer.send_spatial_len {
-                let global = region_index(&peer.send_region, linear)
-                    .expect("checked exchange preflight validated send region");
-                let source_offset = source_extra_offset
-                    .checked_add(
-                        local_spatial_offset(source_pencil, global)
-                            .expect("checked exchange preflight validated source mapping"),
-                    )
-                    .expect("checked exchange preflight validated source offset");
-                let payload_index = payload_offset
-                    .checked_add(linear)
-                    .expect("checked exchange preflight validated send index");
-                send_buffer[payload_index] = source_storage[source_offset];
-            }
+            let payload_end = payload_offset
+                .checked_add(peer.send_spatial_len)
+                .expect("checked exchange preflight validated send index");
+            copy_region_to_payload(
+                &walk,
+                &source_storage[source_extra_offset..],
+                &mut send_buffer[payload_offset..payload_end],
+            );
         }
     }
 }
 
-pub(crate) fn unpack_destination<T: Copy, const N: usize, const M: usize>(
+pub(crate) fn pack_source<T: Copy, const N: usize, const M: usize>(
     peers: &[PeerMetadata<N>],
-    destination_pencil: &Pencil<N, M>,
+    source_pencil: &Pencil<N, M>,
+    source_storage: &[T],
+    send_buffer: &mut [T],
+    send_len: usize,
+    extra_count: usize,
+) {
+    pack_source_regions(
+        peers,
+        &LocalLayout::new(source_pencil),
+        source_storage,
+        send_buffer,
+        send_len,
+        extra_count,
+    );
+}
+
+fn unpack_destination_regions<T: Copy, const N: usize>(
+    peers: &[PeerMetadata<N>],
+    layout: &LocalLayout<'_, N>,
     destination_storage: &mut [T],
     receive_buffer: &[T],
     extra_count: usize,
@@ -973,13 +1178,21 @@ pub(crate) fn unpack_destination<T: Copy, const N: usize, const M: usize>(
         if peer.receive_spatial_len == 0 {
             continue;
         }
+        let walk = region_walk(layout, &peer.receive_region)
+            .expect("checked exchange preflight validated receive region");
+        debug_assert_eq!(walk.outer_len * walk.run_len, peer.receive_spatial_len);
+        let max_offset = (extra_count - 1)
+            .checked_mul(layout.local_len)
+            .and_then(|extra_offset| extra_offset.checked_add(walk.max_offset))
+            .expect("checked exchange preflight validated destination offset");
+        debug_assert!(max_offset < layout.local_len.saturating_mul(extra_count));
         let segment_start = peer
             .receive_spatial_displacement
             .checked_mul(extra_count)
             .expect("checked exchange preflight validated receive displacement");
         for extra_linear in 0..extra_count {
             let destination_extra_offset = extra_linear
-                .checked_mul(destination_pencil.local_len())
+                .checked_mul(layout.local_len)
                 .expect("checked exchange preflight validated destination offset");
             let payload_offset = segment_start
                 .checked_add(
@@ -988,22 +1201,32 @@ pub(crate) fn unpack_destination<T: Copy, const N: usize, const M: usize>(
                         .expect("checked exchange preflight validated receive segment"),
                 )
                 .expect("checked exchange preflight validated receive payload");
-            for linear in 0..peer.receive_spatial_len {
-                let global = region_index(&peer.receive_region, linear)
-                    .expect("checked exchange preflight validated receive region");
-                let destination_offset = destination_extra_offset
-                    .checked_add(
-                        local_spatial_offset(destination_pencil, global)
-                            .expect("checked exchange preflight validated destination mapping"),
-                    )
-                    .expect("checked exchange preflight validated destination offset");
-                let payload_index = payload_offset
-                    .checked_add(linear)
-                    .expect("checked exchange preflight validated receive index");
-                destination_storage[destination_offset] = receive_buffer[payload_index];
-            }
+            let payload_end = payload_offset
+                .checked_add(peer.receive_spatial_len)
+                .expect("checked exchange preflight validated receive index");
+            copy_region_from_payload(
+                &walk,
+                &receive_buffer[payload_offset..payload_end],
+                &mut destination_storage[destination_extra_offset..],
+            );
         }
     }
+}
+
+pub(crate) fn unpack_destination<T: Copy, const N: usize, const M: usize>(
+    peers: &[PeerMetadata<N>],
+    destination_pencil: &Pencil<N, M>,
+    destination_storage: &mut [T],
+    receive_buffer: &[T],
+    extra_count: usize,
+) {
+    unpack_destination_regions(
+        peers,
+        &LocalLayout::new(destination_pencil),
+        destination_storage,
+        receive_buffer,
+        extra_count,
+    );
 }
 
 fn plan_descriptor_len<const N: usize, const M: usize>() -> Result<usize, ()> {
@@ -1586,6 +1809,203 @@ mod tests {
             ),
             Ok(()),
         );
+    }
+
+    /// Element-by-element copy of the pre-optimisation pack mapping. It stays
+    /// test-only so the odometer walk can be checked against the mapping it
+    /// replaced.
+    fn reference_region_offsets<const N: usize>(
+        local_ranges: &[Range<usize>; N],
+        shape_memory: &[usize; N],
+        permutation: &AxisPermutation<N>,
+        region: &[Range<usize>; N],
+    ) -> Vec<usize> {
+        let spatial_len = region_spatial_len(region).expect("valid region");
+        (0..spatial_len)
+            .map(|linear| {
+                let global = region_index(region, linear).expect("valid region index");
+                let mut local = [0usize; N];
+                for axis in 0..N {
+                    let range = &local_ranges[axis];
+                    assert!(range.contains(&global[axis]), "region inside the pencil");
+                    local[axis] = global[axis] - range.start;
+                }
+                let memory = permutation.permute(local);
+                row_major_offset(shape_memory, &memory).expect("valid memory index")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pack_and_unpack_match_elementwise_reference() {
+        let local_ranges: [Range<usize>; 3] = [1..4, 1..3, 2..5];
+        let logical_shape: [usize; 3] =
+            std::array::from_fn(|axis| local_ranges[axis].end - local_ranges[axis].start);
+        let local_len = logical_shape.iter().product::<usize>();
+
+        // Regions start at non-zero global offsets and include a length-1 last
+        // axis and empty regions, which pack and unpack skip.
+        let send_regions = [
+            [1..4, 1..3, 2..5],
+            [2..4, 1..3, 2..4],
+            [1..2, 2..3, 3..4],
+            [2..3, 1..2, 2..2],
+        ];
+        let receive_regions = [
+            [1..3, 1..3, 2..5],
+            [2..4, 2..3, 3..5],
+            [1..4, 1..2, 3..4],
+            [1..3, 1..3, 4..4],
+        ];
+
+        let mut peers = Vec::new();
+        let mut send_displacement = 0usize;
+        let mut receive_displacement = 0usize;
+        for (index, (send_region, receive_region)) in
+            send_regions.iter().zip(&receive_regions).enumerate()
+        {
+            let send_spatial_len = region_spatial_len(send_region).expect("valid region");
+            let receive_spatial_len = region_spatial_len(receive_region).expect("valid region");
+            peers.push(PeerMetadata {
+                peer_rank: Count::try_from(index).expect("peer rank fits an MPI count"),
+                peer_coordinate: index,
+                send_region: send_region.clone(),
+                receive_region: receive_region.clone(),
+                send_spatial_len,
+                receive_spatial_len,
+                send_spatial_displacement: send_displacement,
+                receive_spatial_displacement: receive_displacement,
+            });
+            send_displacement += send_spatial_len;
+            receive_displacement += receive_spatial_len;
+        }
+
+        for permutation in all_permutations::<3>() {
+            let shape_memory = permutation.permute(logical_shape);
+            let layout = LocalLayout {
+                local_ranges: &local_ranges,
+                shape_memory,
+                permutation: &permutation,
+                local_len,
+            };
+            for extra_count in [1usize, 3] {
+                let source: Vec<u32> =
+                    (0..u32::try_from(local_len * extra_count).unwrap()).collect();
+                let send_len = send_displacement * extra_count;
+                let mut send_buffer = vec![0u32; send_len];
+                let mut expected_send = vec![0u32; send_len];
+                for peer in &peers {
+                    if peer.send_spatial_len == 0 {
+                        continue;
+                    }
+                    let offsets = reference_region_offsets(
+                        &local_ranges,
+                        &shape_memory,
+                        &permutation,
+                        &peer.send_region,
+                    );
+                    for extra_linear in 0..extra_count {
+                        for (linear, &offset) in offsets.iter().enumerate() {
+                            let payload = peer.send_spatial_displacement * extra_count
+                                + extra_linear * peer.send_spatial_len
+                                + linear;
+                            expected_send[payload] = source[extra_linear * local_len + offset];
+                        }
+                    }
+                }
+                pack_source_regions(
+                    &peers,
+                    &layout,
+                    &source,
+                    &mut send_buffer,
+                    send_len,
+                    extra_count,
+                );
+                assert_eq!(
+                    send_buffer,
+                    expected_send,
+                    "pack permutation {:?}, extra_count {extra_count}",
+                    permutation.axes(),
+                );
+
+                let receive_len = receive_displacement * extra_count;
+                let receive_buffer: Vec<u32> = (0..u32::try_from(receive_len).unwrap())
+                    .map(|value| 1000 + value)
+                    .collect();
+                let mut storage = vec![0u32; local_len * extra_count];
+                let mut expected_storage = vec![0u32; local_len * extra_count];
+                for peer in &peers {
+                    if peer.receive_spatial_len == 0 {
+                        continue;
+                    }
+                    let offsets = reference_region_offsets(
+                        &local_ranges,
+                        &shape_memory,
+                        &permutation,
+                        &peer.receive_region,
+                    );
+                    for extra_linear in 0..extra_count {
+                        for (linear, &offset) in offsets.iter().enumerate() {
+                            let payload = peer.receive_spatial_displacement * extra_count
+                                + extra_linear * peer.receive_spatial_len
+                                + linear;
+                            expected_storage[extra_linear * local_len + offset] =
+                                receive_buffer[payload];
+                        }
+                    }
+                }
+                unpack_destination_regions(
+                    &peers,
+                    &layout,
+                    &mut storage,
+                    &receive_buffer,
+                    extra_count,
+                );
+                assert_eq!(
+                    storage,
+                    expected_storage,
+                    "unpack permutation {:?}, extra_count {extra_count}",
+                    permutation.axes(),
+                );
+            }
+        }
+    }
+
+    /// A length-1 axis contributes `0 * stride` to the region's span, so its
+    /// stride is not bounded by `max_offset`. Wrapping that axis must not add
+    /// the stride to an offset that is already near `usize::MAX`; the old
+    /// add-then-subtract order overflowed here. A zero-sized element type keeps
+    /// the huge extent free.
+    #[test]
+    fn region_walk_wraps_length_one_axis_without_overflow() {
+        let huge = 3 * (1usize << (usize::BITS - 2));
+        let local_ranges: [Range<usize>; 3] = [0..huge, 0..1, 0..1];
+        let shape_memory = [1, huge, 1];
+        let permutation = AxisPermutation::new([1, 0, 2]).expect("valid permutation");
+        let layout = LocalLayout {
+            local_ranges: &local_ranges,
+            shape_memory,
+            permutation: &permutation,
+            local_len: huge,
+        };
+        // The region stops one element short of the pencil's end, so
+        // max_offset is `huge - 1` while the length-1 axis 1 has stride
+        // `huge`. Advancing across that axis adds to `huge - 2`.
+        let start = huge - 2;
+        let region = [start..huge, 0..1, 0..1];
+        let peer = PeerMetadata {
+            peer_rank: Count::try_from(0).expect("peer rank fits an MPI count"),
+            peer_coordinate: 0,
+            send_region: region.clone(),
+            receive_region: region,
+            send_spatial_len: 2,
+            receive_spatial_len: 2,
+            send_spatial_displacement: 0,
+            receive_spatial_displacement: 0,
+        };
+        let storage = vec![(); huge];
+        let mut send_buffer = vec![(); 2];
+        pack_source_regions(&[peer], &layout, &storage, &mut send_buffer, 2, 1);
     }
 
     #[test]
