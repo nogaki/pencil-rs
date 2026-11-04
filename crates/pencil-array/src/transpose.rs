@@ -16,8 +16,10 @@ use thiserror::Error;
 
 use crate::{
     ArrayError, AxisPermutation, ExtraShape, ManyPencilArray, Pencil, PencilArrayView,
-    PencilArrayViewMut, checked::checked_product, geometry::row_major_offset,
-    preflight::agree_header,
+    PencilArrayViewMut,
+    checked::checked_product,
+    geometry::row_major_offset,
+    preflight::{agree_header, expand_for_max},
 };
 
 const DESCRIPTOR_SCHEMA: u64 = 1;
@@ -1620,16 +1622,22 @@ fn collective_descriptor<C: CommunicatorCollectives>(
     local_descriptor: Option<Vec<u64>>,
     expected_len: Option<usize>,
 ) -> Result<Vec<u64>, TransposeError> {
-    let mut minimum: Option<Vec<u64>> = None;
-    let mut maximum: Option<Vec<u64>> = None;
+    let mut paired: Option<Vec<u64>> = None;
+    let mut reduced: Option<Vec<u64>> = None;
+    let mut length = 0usize;
     let mut ready = false;
     if let (Some(descriptor), Some(expected_len)) = (&local_descriptor, expected_len) {
-        ready = descriptor.len() == expected_len && checked_count_len(expected_len).is_ok();
+        let doubled = expected_len.checked_mul(2);
+        ready = descriptor.len() == expected_len
+            && doubled.is_some_and(|len| checked_count_len(len).is_ok());
         if ready {
-            minimum = zeroed_vec(expected_len).ok();
-            maximum = zeroed_vec(expected_len).ok();
-            if minimum.is_none() || maximum.is_none() {
+            let doubled = doubled.expect("ready descriptor length fits twice");
+            paired = zeroed_vec(doubled).ok();
+            reduced = zeroed_vec(doubled).ok();
+            if paired.is_none() || reduced.is_none() {
                 ready = false;
+            } else {
+                length = expected_len;
             }
         }
     }
@@ -1640,21 +1648,22 @@ fn collective_descriptor<C: CommunicatorCollectives>(
     }
 
     let descriptor = local_descriptor.expect("ready descriptors have a value");
-    let mut minimum = minimum.expect("ready descriptors have a minimum buffer");
-    let mut maximum = maximum.expect("ready descriptors have a maximum buffer");
+    let mut paired = paired.expect("ready descriptors have a paired buffer");
+    let mut reduced = reduced.expect("ready descriptors have a reduction buffer");
+    expand_for_max(&descriptor, &mut paired);
     comm.all_reduce_into(
-        descriptor.as_slice(),
-        minimum.as_mut_slice(),
-        SystemOperation::min(),
-    );
-    comm.all_reduce_into(
-        descriptor.as_slice(),
-        maximum.as_mut_slice(),
+        paired.as_slice(),
+        reduced.as_mut_slice(),
         SystemOperation::max(),
     );
     // ponytail: exact native word comparison replaces a full all-rank gather;
-    // keep only the two descriptor-sized reduction buffers.
-    if minimum != maximum {
+    // the second half is the complement of the global minimum.
+    let (maximum, complemented_minimum) = reduced.split_at(length);
+    if maximum
+        .iter()
+        .zip(complemented_minimum)
+        .any(|(&maximum, &complemented_minimum)| maximum != !complemented_minimum)
+    {
         return Err(TransposeError::CollectiveDescriptorMismatch);
     }
     Ok(descriptor)

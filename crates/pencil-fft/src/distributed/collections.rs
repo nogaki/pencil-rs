@@ -1,18 +1,20 @@
 //! Sequential array collections with one reusable workspace.
 //!
-//! All ranks first agree two five-word MIN/MAX reductions, then the complete
-//! existing plan descriptor (including backend and Fourier directions). The
-//! descriptor plus member count specifies the expected metadata of every member;
-//! each member is checked against that plan on every rank before any execution.
-//! Rank-local extents are validated locally, not compared across uneven ranks.
-//! Empty collections are collectively rejected. Preflight errors change neither
-//! arrays nor workspace. Execution errors carry a member index: earlier outputs
-//! may already be changed and there is no collection-wide rollback. Out-of-place
-//! sources remain unchanged. Existing ownership and poison contracts apply:
-//! poisoned opaque arrays/workspaces must be reallocated, not retried.
-//! An arbitrary member-execution panic is fail-stop: after Rust unwinds owned
-//! guards, the collection aborts its MPI communicator. No recovery collective is
-//! safe at an unknown single-member MPI phase; global panic recovery is not promised.
+//! All ranks first agree one MAX all-reduce over 10 words, the five-word header
+//! extended to `[header, !header]` so the complemented half yields the minimum.
+//! Then the complete existing plan descriptor (including backend and Fourier
+//! directions) is agreed. The descriptor plus member count specifies the expected
+//! metadata of every member; each member is checked against that plan on every
+//! rank before any execution. Rank-local extents are validated locally, not
+//! compared across uneven ranks. Empty collections are collectively rejected.
+//! Preflight errors change neither arrays nor workspace. Execution errors carry a
+//! member index: earlier outputs may already be changed and there is no
+//! collection-wide rollback. Out-of-place sources remain unchanged. Existing
+//! ownership and poison contracts apply: poisoned opaque arrays/workspaces must
+//! be reallocated, not retried. An arbitrary member-execution panic is fail-stop:
+//! after Rust unwinds owned guards, the collection aborts its MPI communicator. No
+//! recovery collective is safe at an unknown single-member MPI phase; global panic
+//! recovery is not promised.
 
 use super::mixed::{
     MixedC2cInPlaceArray, MixedC2cInPlaceWorkspace, MixedC2cPlan, MixedC2cWorkspace, MixedError,
