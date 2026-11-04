@@ -237,21 +237,22 @@ mod private {
     impl DistributedReal for f64 {}
 
     pub trait Sealed: rustfft::FftNum + bytemuck::Pod {
-        fn normalize_inverse(values: &mut [Complex<Self>], line_len: usize);
+        fn normalize_inverse(values: &mut [Complex<Self>], line_len: usize) {
+            let scale = Self::one()
+                / Self::from_usize(line_len)
+                    .expect("f32 and f64 can represent every validated line length");
+            for value in values {
+                value.re = value.re * scale;
+                value.im = value.im * scale;
+            }
+        }
+
         fn pencil_fft_as_f64(self) -> f64;
         fn pencil_fft_epsilon_f64() -> f64;
         fn pencil_fft_min_subnormal_f64() -> f64;
     }
 
     impl Sealed for f32 {
-        fn normalize_inverse(values: &mut [Complex<Self>], line_len: usize) {
-            let scale = 1.0 / line_len as f32;
-            for value in values {
-                value.re *= scale;
-                value.im *= scale;
-            }
-        }
-
         fn pencil_fft_as_f64(self) -> f64 {
             self as f64
         }
@@ -266,14 +267,6 @@ mod private {
     }
 
     impl Sealed for f64 {
-        fn normalize_inverse(values: &mut [Complex<Self>], line_len: usize) {
-            let scale = 1.0 / line_len as f64;
-            for value in values {
-                value.re *= scale;
-                value.im *= scale;
-            }
-        }
-
         fn pencil_fft_as_f64(self) -> f64 {
             self
         }
@@ -375,9 +368,7 @@ pub struct LocalC2cPlan<R: FftReal> {
     line_len: usize,
     scratch_len: usize,
     forward: Arc<dyn Fft<R>>,
-    inverse: Arc<dyn Fft<R>>,
-    /// Whether the public forward operation uses the positive exponent.
-    positive_forward: bool,
+    backward: Arc<dyn Fft<R>>,
     backend: BackendKind,
     #[cfg(feature = "fftw")]
     backend_options: Option<PlanOptions>,
@@ -411,22 +402,26 @@ impl<R: FftReal> LocalC2cPlan<R> {
         inverse: Arc<dyn Fft<R>>,
         backend: BackendKind,
         #[cfg(feature = "fftw")] backend_options: Option<PlanOptions>,
-    ) -> Result<Self, LocalC2cError> {
+    ) -> Self {
+        let (forward, backward) = if positive_forward {
+            (inverse, forward)
+        } else {
+            (forward, inverse)
+        };
         let scratch_len = forward
             .get_immutable_scratch_len()
             .max(forward.get_inplace_scratch_len())
-            .max(inverse.get_immutable_scratch_len())
-            .max(inverse.get_inplace_scratch_len());
-        Ok(Self {
+            .max(backward.get_immutable_scratch_len())
+            .max(backward.get_inplace_scratch_len());
+        Self {
             line_len,
             scratch_len,
             forward,
-            inverse,
-            positive_forward,
+            backward,
             backend,
             #[cfg(feature = "fftw")]
             backend_options,
-        })
+        }
     }
 
     pub(crate) fn new_with_sign(
@@ -438,7 +433,7 @@ impl<R: FftReal> LocalC2cPlan<R> {
         let mut planner = FftPlanner::<R>::new();
         let forward = planner.plan_fft_forward(line_len);
         let inverse = planner.plan_fft_inverse(line_len);
-        Self::from_plans(
+        Ok(Self::from_plans(
             line_len,
             positive_forward,
             forward,
@@ -446,7 +441,7 @@ impl<R: FftReal> LocalC2cPlan<R> {
             BackendKind::RustFft,
             #[cfg(feature = "fftw")]
             None,
-        )
+        ))
     }
 
     /// Builds a plan using the runtime-loaded FFTW backend.
@@ -469,15 +464,14 @@ impl<R: FftReal> LocalC2cPlan<R> {
             .map_err(BackendInitError::Native)?;
         let inverse = backend::c2c(line_len, rustfft::FftDirection::Inverse, options)
             .map_err(BackendInitError::Native)?;
-        Self::from_plans(
+        Ok(Self::from_plans(
             line_len,
             positive_forward,
             forward,
             inverse,
             BackendKind::Fftw,
             Some(options),
-        )
-        .map_err(BackendInitError::Local)
+        ))
     }
 
     /// Returns the selected backend.
@@ -520,11 +514,7 @@ impl<R: FftReal> LocalC2cPlan<R> {
             return Ok(());
         }
 
-        let fft = if self.positive_forward {
-            &self.inverse
-        } else {
-            &self.forward
-        };
+        let fft = &self.forward;
         fft.process_immutable_with_scratch(src, dst, scratch);
         Ok(())
     }
@@ -546,11 +536,7 @@ impl<R: FftReal> LocalC2cPlan<R> {
             return Ok(());
         }
 
-        let fft = if self.positive_forward {
-            &self.forward
-        } else {
-            &self.inverse
-        };
+        let fft = &self.backward;
         fft.process_immutable_with_scratch(src, dst, scratch);
         Ok(())
     }
@@ -588,11 +574,7 @@ impl<R: FftReal> LocalC2cPlan<R> {
             return Ok(());
         }
 
-        let fft = if self.positive_forward {
-            &self.inverse
-        } else {
-            &self.forward
-        };
+        let fft = &self.forward;
         fft.process_with_scratch(data, scratch);
         Ok(())
     }
@@ -612,11 +594,7 @@ impl<R: FftReal> LocalC2cPlan<R> {
             return Ok(());
         }
 
-        let fft = if self.positive_forward {
-            &self.forward
-        } else {
-            &self.inverse
-        };
+        let fft = &self.backward;
         fft.process_with_scratch(data, scratch);
         Ok(())
     }
@@ -677,15 +655,18 @@ fn validate_line_len<R: FftReal>(line_len: usize) -> Result<(), LocalC2cError> {
     if line_len == 0 {
         return Err(LocalC2cError::InvalidLength);
     }
-
-    let bytes = line_len
-        .checked_mul(size_of::<Complex<R>>())
-        .ok_or(LocalC2cError::LengthOverflow)?;
-    if bytes > isize::MAX as usize {
+    if !is_addressable(line_len, size_of::<Complex<R>>()) {
         return Err(LocalC2cError::LengthOverflow);
     }
 
     Ok(())
+}
+
+/// Returns whether `length` elements of `element_size` bytes fit a slice.
+pub(crate) fn is_addressable(length: usize, element_size: usize) -> bool {
+    length
+        .checked_mul(element_size)
+        .is_some_and(|bytes| bytes <= isize::MAX as usize)
 }
 
 #[cfg(test)]

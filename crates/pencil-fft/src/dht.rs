@@ -6,7 +6,10 @@ use std::sync::Arc;
 
 use rustfft::FftPlanner;
 
-use super::r2r::{LocalR2rError, R2rKernel, R2rScalar, r2r_from_complex, r2r_to_complex};
+use super::r2r::{
+    LocalR2rError, R2rKernel, R2rScalar, r2r_from_complex, r2r_to_complex, validate_addressable,
+    validate_r2r_in_place, validate_r2r_out_of_place,
+};
 #[cfg(feature = "fftw")]
 use super::r2r::{native_r2r_line, native_r2r_output};
 use super::{Complex, FftReal};
@@ -210,7 +213,15 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
         scratch: &mut [Complex<T::Real>],
         normalize: bool,
     ) -> Result<(), LocalR2rError> {
-        self.validate_out_of_place(src.len(), dst.len(), embedding_line.len(), scratch.len())?;
+        validate_r2r_out_of_place(
+            self.line_len,
+            self.embedding_len,
+            self.scratch_len,
+            src.len(),
+            dst.len(),
+            embedding_line.len(),
+            scratch.len(),
+        )?;
         if src.is_empty() {
             return Ok(());
         }
@@ -241,7 +252,14 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
         scratch: &mut [Complex<T::Real>],
         normalize: bool,
     ) -> Result<(), LocalR2rError> {
-        self.validate_in_place(data.len(), embedding_line.len(), scratch.len())?;
+        validate_r2r_in_place(
+            self.line_len,
+            self.embedding_len,
+            self.scratch_len,
+            data.len(),
+            embedding_line.len(),
+            scratch.len(),
+        )?;
         if data.is_empty() || self.line_len == 1 {
             return Ok(());
         }
@@ -329,43 +347,6 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
             *destination = r2r_from_complex(value);
         }
     }
-
-    fn validate_out_of_place(
-        &self,
-        source_len: usize,
-        destination_len: usize,
-        embedding_len: usize,
-        scratch_len: usize,
-    ) -> Result<(), LocalR2rError> {
-        if source_len != destination_len {
-            return Err(LocalR2rError::BufferLengthMismatch);
-        }
-        self.validate_in_place(source_len, embedding_len, scratch_len)
-    }
-
-    fn validate_in_place(
-        &self,
-        data_len: usize,
-        embedding_len: usize,
-        scratch_len: usize,
-    ) -> Result<(), LocalR2rError> {
-        if !data_len.is_multiple_of(self.line_len) {
-            return Err(LocalR2rError::NonIntegralBatch);
-        }
-        if embedding_len < self.embedding_len {
-            return Err(LocalR2rError::ComplexLineTooSmall {
-                required: self.embedding_len,
-                actual: embedding_len,
-            });
-        }
-        if scratch_len < self.scratch_len {
-            return Err(LocalR2rError::ScratchTooSmall {
-                required: self.scratch_len,
-                actual: scratch_len,
-            });
-        }
-        Ok(())
-    }
 }
 
 fn validate_lengths<T: R2rScalar>(line_len: usize) -> Result<(), LocalR2rError> {
@@ -374,16 +355,6 @@ fn validate_lengths<T: R2rScalar>(line_len: usize) -> Result<(), LocalR2rError> 
     }
     validate_addressable(line_len, size_of::<T>())?;
     validate_addressable(line_len, size_of::<Complex<T::Real>>())?;
-    Ok(())
-}
-
-fn validate_addressable(length: usize, element_size: usize) -> Result<(), LocalR2rError> {
-    let bytes = length
-        .checked_mul(element_size)
-        .ok_or(LocalR2rError::LengthOverflow)?;
-    if bytes > isize::MAX as usize {
-        return Err(LocalR2rError::LengthOverflow);
-    }
     Ok(())
 }
 

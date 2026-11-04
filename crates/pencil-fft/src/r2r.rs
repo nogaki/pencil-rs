@@ -485,25 +485,7 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         embedding_line: &mut [Complex<T::Real>],
         scratch: &mut [Complex<T::Real>],
     ) -> Result<(), LocalR2rError> {
-        self.validate_out_of_place(src.len(), dst.len(), embedding_line.len(), scratch.len())?;
-        if src.is_empty() {
-            return Ok(());
-        }
-
-        for (source_line, destination_line) in src
-            .chunks_exact(self.line_len)
-            .zip(dst.chunks_exact_mut(self.line_len))
-        {
-            self.execute_out_of_place_line(
-                self.kind,
-                source_line,
-                destination_line,
-                embedding_line,
-                scratch,
-                None,
-            );
-        }
-        Ok(())
+        self.execute_out_of_place(self.kind, None, src, dst, embedding_line, scratch)
     }
 
     /// Computes the raw paired inverse transform for every source line.
@@ -518,25 +500,14 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         embedding_line: &mut [Complex<T::Real>],
         scratch: &mut [Complex<T::Real>],
     ) -> Result<(), LocalR2rError> {
-        self.validate_out_of_place(src.len(), dst.len(), embedding_line.len(), scratch.len())?;
-        if src.is_empty() {
-            return Ok(());
-        }
-
-        for (source_line, destination_line) in src
-            .chunks_exact(self.line_len)
-            .zip(dst.chunks_exact_mut(self.line_len))
-        {
-            self.execute_out_of_place_line(
-                self.backward_kind(),
-                source_line,
-                destination_line,
-                embedding_line,
-                scratch,
-                None,
-            );
-        }
-        Ok(())
+        self.execute_out_of_place(
+            self.backward_kind(),
+            None,
+            src,
+            dst,
+            embedding_line,
+            scratch,
+        )
     }
 
     /// Computes the normalized paired inverse transform for every source line.
@@ -551,26 +522,14 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         embedding_line: &mut [Complex<T::Real>],
         scratch: &mut [Complex<T::Real>],
     ) -> Result<(), LocalR2rError> {
-        self.validate_out_of_place(src.len(), dst.len(), embedding_line.len(), scratch.len())?;
-        if src.is_empty() {
-            return Ok(());
-        }
-        let scale = self.normalization_scale();
-
-        for (source_line, destination_line) in src
-            .chunks_exact(self.line_len)
-            .zip(dst.chunks_exact_mut(self.line_len))
-        {
-            self.execute_out_of_place_line(
-                self.backward_kind(),
-                source_line,
-                destination_line,
-                embedding_line,
-                scratch,
-                Some(scale),
-            );
-        }
-        Ok(())
+        self.execute_out_of_place(
+            self.backward_kind(),
+            Some(self.normalization_scale()),
+            src,
+            dst,
+            embedding_line,
+            scratch,
+        )
     }
 
     /// Computes the selected unnormalized transform in place.
@@ -585,15 +544,7 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         embedding_line: &mut [Complex<T::Real>],
         scratch: &mut [Complex<T::Real>],
     ) -> Result<(), LocalR2rError> {
-        self.validate_in_place(data.len(), embedding_line.len(), scratch.len())?;
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        for data_line in data.chunks_exact_mut(self.line_len) {
-            self.execute_in_place_line(self.kind, data_line, embedding_line, scratch, None);
-        }
-        Ok(())
+        self.execute_in_place(self.kind, None, data, embedding_line, scratch)
     }
 
     /// Computes the raw paired inverse transform in place.
@@ -605,21 +556,7 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         embedding_line: &mut [Complex<T::Real>],
         scratch: &mut [Complex<T::Real>],
     ) -> Result<(), LocalR2rError> {
-        self.validate_in_place(data.len(), embedding_line.len(), scratch.len())?;
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        for data_line in data.chunks_exact_mut(self.line_len) {
-            self.execute_in_place_line(
-                self.backward_kind(),
-                data_line,
-                embedding_line,
-                scratch,
-                None,
-            );
-        }
-        Ok(())
+        self.execute_in_place(self.backward_kind(), None, data, embedding_line, scratch)
     }
 
     /// Computes the normalized paired inverse transform in place.
@@ -632,57 +569,75 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         embedding_line: &mut [Complex<T::Real>],
         scratch: &mut [Complex<T::Real>],
     ) -> Result<(), LocalR2rError> {
-        self.validate_in_place(data.len(), embedding_line.len(), scratch.len())?;
-        if data.is_empty() {
+        self.execute_in_place(
+            self.backward_kind(),
+            Some(self.normalization_scale()),
+            data,
+            embedding_line,
+            scratch,
+        )
+    }
+
+    fn execute_out_of_place(
+        &self,
+        kind: R2rKind,
+        scale: Option<T::Real>,
+        src: &[T],
+        dst: &mut [T],
+        embedding_line: &mut [Complex<T::Real>],
+        scratch: &mut [Complex<T::Real>],
+    ) -> Result<(), LocalR2rError> {
+        validate_r2r_out_of_place(
+            self.line_len,
+            self.embedding_len,
+            self.scratch_len,
+            src.len(),
+            dst.len(),
+            embedding_line.len(),
+            scratch.len(),
+        )?;
+        if src.is_empty() {
             return Ok(());
         }
-        let scale = self.normalization_scale();
 
-        for data_line in data.chunks_exact_mut(self.line_len) {
-            self.execute_in_place_line(
-                self.backward_kind(),
-                data_line,
+        for (source_line, destination_line) in src
+            .chunks_exact(self.line_len)
+            .zip(dst.chunks_exact_mut(self.line_len))
+        {
+            self.execute_out_of_place_line(
+                kind,
+                source_line,
+                destination_line,
                 embedding_line,
                 scratch,
-                Some(scale),
+                scale,
             );
         }
         Ok(())
     }
 
-    fn validate_out_of_place(
+    fn execute_in_place(
         &self,
-        source_len: usize,
-        destination_len: usize,
-        embedding_len: usize,
-        scratch_len: usize,
+        kind: R2rKind,
+        scale: Option<T::Real>,
+        data: &mut [T],
+        embedding_line: &mut [Complex<T::Real>],
+        scratch: &mut [Complex<T::Real>],
     ) -> Result<(), LocalR2rError> {
-        if source_len != destination_len {
-            return Err(LocalR2rError::BufferLengthMismatch);
+        validate_r2r_in_place(
+            self.line_len,
+            self.embedding_len,
+            self.scratch_len,
+            data.len(),
+            embedding_line.len(),
+            scratch.len(),
+        )?;
+        if data.is_empty() {
+            return Ok(());
         }
-        self.validate_in_place(source_len, embedding_len, scratch_len)
-    }
 
-    fn validate_in_place(
-        &self,
-        data_len: usize,
-        embedding_len: usize,
-        scratch_len: usize,
-    ) -> Result<(), LocalR2rError> {
-        if !data_len.is_multiple_of(self.line_len) {
-            return Err(LocalR2rError::NonIntegralBatch);
-        }
-        if embedding_len < self.embedding_len {
-            return Err(LocalR2rError::ComplexLineTooSmall {
-                required: self.embedding_len,
-                actual: embedding_len,
-            });
-        }
-        if scratch_len < self.scratch_len {
-            return Err(LocalR2rError::ScratchTooSmall {
-                required: self.scratch_len,
-                actual: scratch_len,
-            });
+        for data_line in data.chunks_exact_mut(self.line_len) {
+            self.execute_in_place_line(kind, data_line, embedding_line, scratch, scale);
         }
         Ok(())
     }
@@ -907,12 +862,61 @@ fn validate_lengths<T: R2rScalar>(
     Ok((embedding_len, normalization_factor))
 }
 
-fn validate_addressable(length: usize, element_size: usize) -> Result<(), LocalR2rError> {
-    let bytes = length
-        .checked_mul(element_size)
-        .ok_or(LocalR2rError::LengthOverflow)?;
-    if bytes > isize::MAX as usize {
-        return Err(LocalR2rError::LengthOverflow);
+pub(crate) fn validate_addressable(
+    length: usize,
+    element_size: usize,
+) -> Result<(), LocalR2rError> {
+    if crate::is_addressable(length, element_size) {
+        Ok(())
+    } else {
+        Err(LocalR2rError::LengthOverflow)
+    }
+}
+
+pub(crate) fn validate_r2r_out_of_place(
+    line_len: usize,
+    required_embedding_len: usize,
+    required_scratch_len: usize,
+    source_len: usize,
+    destination_len: usize,
+    embedding_len: usize,
+    scratch_len: usize,
+) -> Result<(), LocalR2rError> {
+    if source_len != destination_len {
+        return Err(LocalR2rError::BufferLengthMismatch);
+    }
+    validate_r2r_in_place(
+        line_len,
+        required_embedding_len,
+        required_scratch_len,
+        source_len,
+        embedding_len,
+        scratch_len,
+    )
+}
+
+pub(crate) fn validate_r2r_in_place(
+    line_len: usize,
+    required_embedding_len: usize,
+    required_scratch_len: usize,
+    data_len: usize,
+    embedding_len: usize,
+    scratch_len: usize,
+) -> Result<(), LocalR2rError> {
+    if !data_len.is_multiple_of(line_len) {
+        return Err(LocalR2rError::NonIntegralBatch);
+    }
+    if embedding_len < required_embedding_len {
+        return Err(LocalR2rError::ComplexLineTooSmall {
+            required: required_embedding_len,
+            actual: embedding_len,
+        });
+    }
+    if scratch_len < required_scratch_len {
+        return Err(LocalR2rError::ScratchTooSmall {
+            required: required_scratch_len,
+            actual: scratch_len,
+        });
     }
     Ok(())
 }
