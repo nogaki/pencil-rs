@@ -399,6 +399,16 @@ impl<R: Real> RealToComplex<R> for RealPlan<R> {
         Vec::new()
     }
 }
+/// Returns whether the DC imaginary part and, for even `n`, the Nyquist
+/// imaginary part are non-zero. This is the real-spectrum endpoint rule also
+/// used by pencil-fft's local inverse preflight when the `fftw` feature is
+/// enabled.
+#[doc(hidden)]
+pub fn endpoint_imaginary<R: Real>(input: &[Complex<R>], n: usize) -> (bool, bool) {
+    let first = input[0].im != R::zero();
+    let last = n.is_multiple_of(2) && input[n / 2].im != R::zero();
+    (first, last)
+}
 impl<R: Real> ComplexToReal<R> for RealPlan<R> {
     fn process(&self, i: &mut [Complex<R>], o: &mut [R]) -> Result<(), FftError> {
         ComplexToReal::process_with_scratch(self, i, o, &mut [])
@@ -410,8 +420,7 @@ impl<R: Real> ComplexToReal<R> for RealPlan<R> {
         _: &mut [Complex<R>],
     ) -> Result<(), FftError> {
         preflight(i.len(), o.len(), self.n / 2 + 1, self.n)?;
-        let first = i[0].im != R::zero();
-        let last = self.n.is_multiple_of(2) && i[self.n / 2].im != R::zero();
+        let (first, last) = endpoint_imaginary(i, self.n);
         self.plan.inverse(i, o);
         if first || last {
             Err(FftError::InputValues(first, last))

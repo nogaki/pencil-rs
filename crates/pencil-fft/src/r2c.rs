@@ -3,6 +3,8 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use bytemuck::{try_cast_slice, try_cast_slice_mut};
+#[cfg(feature = "fftw")]
+use pencil_fftw::endpoint_imaginary;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
 use super::{Complex, FftReal};
@@ -473,13 +475,17 @@ impl<R: FftReal> LocalR2cPlan<R> {
     /// the final complex value is not constrained; for `real_len == 1`, it is
     /// DC and remains constrained. Signed zero is accepted and NaN is not;
     /// interior bins are not constrained. These endpoint checks cover every
-    /// batch before any destination, line buffer, or scratch write. An invalid
-    /// endpoint therefore leaves all caller buffers unchanged.
+    /// batch before any destination, line buffer, or scratch write. An endpoint
+    /// rejected by this preflight therefore leaves all caller buffers
+    /// unchanged.
     ///
-    /// Ordinary validation errors and endpoint errors preserve `src`, `dst`,
-    /// both workspaces, and all input values. After native execution begins,
-    /// backend errors, resource failures, and panics are not converted and do
-    /// not have an output-atomicity guarantee.
+    /// Ordinary validation errors and preflight endpoint errors preserve
+    /// `src`, `dst`, both workspaces, and all input values. A backend endpoint
+    /// rejection after preflight is converted to
+    /// [`LocalR2cError::InvalidSpectrumEndpoint`], but native execution has
+    /// already begun, so it does not preserve the destination or workspaces.
+    /// Other backend errors, resource failures, and panics are not converted
+    /// and do not have an output-atomicity guarantee.
     pub fn inverse(
         &self,
         src: &[Complex<R>],
@@ -551,8 +557,9 @@ impl<R: FftReal> LocalR2cPlan<R> {
     ///
     /// The array must be in [`R2cState::ComplexOutput`]. Every DC endpoint,
     /// and every Nyquist endpoint for an even line length, is checked before
-    /// any array, state, or workspace mutation. The result is divided by
-    /// exactly [`Self::real_len`].
+    /// any array, state, or workspace mutation. A backend endpoint rejection
+    /// after that preflight leaves the array poisoned. The result is divided
+    /// by exactly [`Self::real_len`].
     pub fn inverse_in_place(
         &self,
         array: &mut LocalR2cInPlaceArray<R>,
@@ -596,13 +603,13 @@ impl<R: FftReal> LocalR2cPlan<R> {
             {
                 let storage = cast_real_slice_mut(&mut array.storage)
                     .expect("validated in-place storage must have a real view");
-                self.inverse
-                    .process_with_scratch(
-                        &mut workspace.complex_line[..self.complex_len],
-                        &mut storage[destination_start..destination_end],
-                        &mut workspace.scratch[..native_scratch_len],
-                    )
-                    .expect("validated RealFFT inverse buffers must be accepted");
+                if let Err(error) = self.inverse.process_with_scratch(
+                    &mut workspace.complex_line[..self.complex_len],
+                    &mut storage[destination_start..destination_end],
+                    &mut workspace.scratch[..native_scratch_len],
+                ) {
+                    return Err(self.convert_inverse_error(batch, error));
+                }
             }
             if let Some(scale) = scale {
                 let storage = cast_real_slice_mut(&mut array.storage)
@@ -633,18 +640,19 @@ impl<R: FftReal> LocalR2cPlan<R> {
 
         let native_scratch_len = self.inverse.get_scratch_len();
         let scale = self.inverse_scale(normalize);
-        for (source_line, destination_line) in src
+        for (batch, (source_line, destination_line)) in src
             .chunks_exact(self.complex_len)
             .zip(dst.chunks_exact_mut(self.real_len))
+            .enumerate()
         {
             complex_line[..self.complex_len].copy_from_slice(source_line);
-            self.inverse
-                .process_with_scratch(
-                    &mut complex_line[..self.complex_len],
-                    destination_line,
-                    &mut scratch[..native_scratch_len],
-                )
-                .expect("validated RealFFT inverse buffers must be accepted");
+            if let Err(error) = self.inverse.process_with_scratch(
+                &mut complex_line[..self.complex_len],
+                destination_line,
+                &mut scratch[..native_scratch_len],
+            ) {
+                return Err(self.convert_inverse_error(batch, error));
+            }
             if let Some(scale) = scale {
                 for value in destination_line {
                     *value = *value * scale;
@@ -652,6 +660,20 @@ impl<R: FftReal> LocalR2cPlan<R> {
             }
         }
         Ok(())
+    }
+
+    /// Converts a backend inverse error for `batch` into the preflight endpoint
+    /// error. Other backend errors keep the previous panic handling.
+    fn convert_inverse_error(&self, batch: usize, error: realfft::FftError) -> LocalR2cError {
+        match error {
+            realfft::FftError::InputValues(first, _) => LocalR2cError::InvalidSpectrumEndpoint {
+                batch,
+                // InputValues sets at least one flag; DC takes priority as in
+                // `validate_endpoints`, otherwise the rejection is Nyquist.
+                index: if first { 0 } else { self.complex_len - 1 },
+            },
+            error => panic!("validated RealFFT inverse buffers must be accepted: {error:?}"),
+        }
     }
 
     /// Returns the normalized inverse scale, or `None` for the raw backward
@@ -780,10 +802,11 @@ impl<R: FftReal> LocalR2cPlan<R> {
 
     fn validate_endpoints(&self, source: &[Complex<R>]) -> Result<(), LocalR2cError> {
         for (batch, line) in source.chunks_exact(self.complex_len).enumerate() {
-            if line[0].im != R::zero() {
+            let (first, last) = endpoint_imaginary(line, self.real_len);
+            if first {
                 return Err(LocalR2cError::InvalidSpectrumEndpoint { batch, index: 0 });
             }
-            if self.real_len.is_multiple_of(2) && line[self.complex_len - 1].im != R::zero() {
+            if last {
                 return Err(LocalR2cError::InvalidSpectrumEndpoint {
                     batch,
                     index: self.complex_len - 1,
@@ -792,6 +815,19 @@ impl<R: FftReal> LocalR2cPlan<R> {
         }
         Ok(())
     }
+}
+
+/// Returns whether the DC imaginary part and, for even `real_len`, the Nyquist
+/// imaginary part are non-zero.
+///
+/// The `fftw` build uses `pencil_fftw::endpoint_imaginary`. The default build
+/// cannot depend on the optional adapter, so it keeps this copy, which must
+/// match the backend predicate.
+#[cfg(not(feature = "fftw"))]
+fn endpoint_imaginary<R: FftReal>(line: &[Complex<R>], real_len: usize) -> (bool, bool) {
+    let first = line[0].im != R::zero();
+    let last = real_len.is_multiple_of(2) && line[real_len / 2].im != R::zero();
+    (first, last)
 }
 
 fn cast_real_slice<R: FftReal>(storage: &[Complex<R>]) -> Result<&[R], LocalR2cError> {
@@ -871,6 +907,7 @@ mod tests {
     use super::*;
     use crate::LocalC2cPlan;
     use std::f64::consts::TAU;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     trait TestReal: FftReal {
         fn convert(value: f64) -> Self;
@@ -1978,6 +2015,87 @@ mod tests {
         }
     }
 
+    /// Delegates to the real backend, then reports its endpoint rejection on
+    /// the `reject_at`-th call after writing the output like the native plan.
+    struct RejectingInverse {
+        inner: Arc<dyn ComplexToReal<f64>>,
+        reject_at: usize,
+        first: bool,
+        last: bool,
+        calls: AtomicUsize,
+    }
+
+    impl ComplexToReal<f64> for RejectingInverse {
+        fn process(
+            &self,
+            input: &mut [Complex<f64>],
+            output: &mut [f64],
+        ) -> Result<(), realfft::FftError> {
+            self.process_with_scratch(input, output, &mut [])
+        }
+
+        fn process_with_scratch(
+            &self,
+            input: &mut [Complex<f64>],
+            output: &mut [f64],
+            scratch: &mut [Complex<f64>],
+        ) -> Result<(), realfft::FftError> {
+            self.inner.process_with_scratch(input, output, scratch)?;
+            if self.calls.fetch_add(1, Ordering::Relaxed) == self.reject_at {
+                Err(realfft::FftError::InputValues(self.first, self.last))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn get_scratch_len(&self) -> usize {
+            self.inner.get_scratch_len()
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn make_input_vec(&self) -> Vec<Complex<f64>> {
+            self.inner.make_input_vec()
+        }
+
+        fn make_output_vec(&self) -> Vec<f64> {
+            self.inner.make_output_vec()
+        }
+
+        fn make_scratch_vec(&self) -> Vec<Complex<f64>> {
+            self.inner.make_scratch_vec()
+        }
+    }
+
+    fn plan_with_rejecting_inverse(
+        real_len: usize,
+        reject_at: usize,
+        first: bool,
+        last: bool,
+    ) -> LocalR2cPlan<f64> {
+        let mut plan = LocalR2cPlan::<f64>::new(real_len).unwrap();
+        let inner = Arc::clone(&plan.inverse);
+        plan.inverse = Arc::new(RejectingInverse {
+            inner,
+            reject_at,
+            first,
+            last,
+            calls: AtomicUsize::new(0),
+        });
+        plan
+    }
+
+    fn endpoint_rejection_cases(real_len: usize) -> Vec<(bool, bool, usize)> {
+        let mut cases = vec![(true, false, 0)];
+        if real_len.is_multiple_of(2) {
+            cases.push((false, true, real_len / 2));
+            cases.push((true, true, 0));
+        }
+        cases
+    }
+
     fn assert_poisoned_views_and_retries(
         plan: &LocalR2cPlan<f64>,
         array: &mut LocalR2cInPlaceArray<f64>,
@@ -2038,6 +2156,58 @@ mod tests {
         }));
         assert!(panic.is_err());
         assert_poisoned_views_and_retries(&plan, &mut array, &mut workspace);
+    }
+
+    #[test]
+    fn backend_endpoint_rejection_after_preflight_is_an_invalid_endpoint_error() {
+        for real_len in [6, 5] {
+            for backward in [false, true] {
+                for (first, last, index) in endpoint_rejection_cases(real_len) {
+                    let plan = plan_with_rejecting_inverse(real_len, 1, first, last);
+                    let source = vec![Complex::new(0.0, 0.0); plan.complex_len() * 3];
+                    let mut destination = vec![0.0; plan.real_len() * 3];
+                    let mut line = vec![Complex::new(0.0, 0.0); plan.complex_len()];
+                    let mut scratch = vec![Complex::new(0.0, 0.0); plan.scratch_len()];
+                    let result = if backward {
+                        plan.backward(&source, &mut destination, &mut line, &mut scratch)
+                    } else {
+                        plan.inverse(&source, &mut destination, &mut line, &mut scratch)
+                    };
+                    assert_eq!(
+                        result,
+                        Err(LocalR2cError::InvalidSpectrumEndpoint { batch: 1, index })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn in_place_backend_endpoint_rejection_returns_the_error_and_poisons() {
+        for real_len in [6, 5] {
+            for backward in [false, true] {
+                for (first, last, index) in endpoint_rejection_cases(real_len) {
+                    let plan = plan_with_rejecting_inverse(real_len, 1, first, last);
+                    let mut array = plan.allocate_in_place(3).unwrap();
+                    array
+                        .real_view_mut()
+                        .unwrap()
+                        .copy_from_slice(&real_input::<f64>(real_len, 3));
+                    let mut workspace = plan.allocate_in_place_workspace().unwrap();
+                    plan.forward_in_place(&mut array, &mut workspace).unwrap();
+                    let result = if backward {
+                        plan.backward_in_place(&mut array, &mut workspace)
+                    } else {
+                        plan.inverse_in_place(&mut array, &mut workspace)
+                    };
+                    assert_eq!(
+                        result,
+                        Err(LocalR2cError::InvalidSpectrumEndpoint { batch: 1, index })
+                    );
+                    assert_poisoned_views_and_retries(&plan, &mut array, &mut workspace);
+                }
+            }
+        }
     }
 
     #[test]
