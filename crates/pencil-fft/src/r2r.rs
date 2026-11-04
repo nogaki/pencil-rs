@@ -587,33 +587,18 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         embedding_line: &mut [Complex<T::Real>],
         scratch: &mut [Complex<T::Real>],
     ) -> Result<(), LocalR2rError> {
-        validate_r2r_out_of_place(
-            self.line_len,
-            self.embedding_len,
-            self.scratch_len,
-            src.len(),
-            dst.len(),
-            embedding_line.len(),
-            scratch.len(),
-        )?;
-        if src.is_empty() {
-            return Ok(());
-        }
-
-        for (source_line, destination_line) in src
-            .chunks_exact(self.line_len)
-            .zip(dst.chunks_exact_mut(self.line_len))
-        {
-            self.execute_out_of_place_line(
-                kind,
-                source_line,
-                destination_line,
-                embedding_line,
-                scratch,
-                scale,
-            );
-        }
-        Ok(())
+        for_each_out_of_place_line(
+            (self.line_len, self.embedding_len, self.scratch_len),
+            src,
+            dst,
+            embedding_line,
+            scratch,
+            |_, _| false,
+            |source_line, destination_line, embedding_line, scratch| {
+                self.transform_line(kind, source_line, embedding_line, scratch);
+                self.write_output(kind, destination_line, embedding_line, scale);
+            },
+        )
     }
 
     fn execute_in_place(
@@ -624,53 +609,23 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         embedding_line: &mut [Complex<T::Real>],
         scratch: &mut [Complex<T::Real>],
     ) -> Result<(), LocalR2rError> {
-        validate_r2r_in_place(
-            self.line_len,
-            self.embedding_len,
-            self.scratch_len,
-            data.len(),
-            embedding_line.len(),
-            scratch.len(),
-        )?;
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        for data_line in data.chunks_exact_mut(self.line_len) {
-            self.execute_in_place_line(kind, data_line, embedding_line, scratch, scale);
-        }
-        Ok(())
+        for_each_in_place_line(
+            (self.line_len, self.embedding_len, self.scratch_len),
+            data,
+            embedding_line,
+            scratch,
+            |_| false,
+            |data_line, embedding_line, scratch| {
+                self.transform_line(kind, data_line, embedding_line, scratch);
+                self.write_output(kind, data_line, embedding_line, scale);
+            },
+        )
     }
 
     fn normalization_scale(&self) -> T::Real {
         T::Real::one()
             / T::Real::from_usize(self.normalization_factor)
                 .expect("f32 and f64 can represent every validated normalization factor")
-    }
-
-    fn execute_out_of_place_line(
-        &self,
-        kind: R2rKind,
-        source: &[T],
-        destination: &mut [T],
-        embedding_line: &mut [Complex<T::Real>],
-        scratch: &mut [Complex<T::Real>],
-        scale: Option<T::Real>,
-    ) {
-        self.transform_line(kind, source, embedding_line, scratch);
-        self.write_output(kind, destination, embedding_line, scale);
-    }
-
-    fn execute_in_place_line(
-        &self,
-        kind: R2rKind,
-        data: &mut [T],
-        embedding_line: &mut [Complex<T::Real>],
-        scratch: &mut [Complex<T::Real>],
-        scale: Option<T::Real>,
-    ) {
-        self.transform_line(kind, data, embedding_line, scratch);
-        self.write_output(kind, data, embedding_line, scale);
     }
 
     fn transform_line(
@@ -917,6 +872,80 @@ pub(crate) fn validate_r2r_in_place(
             required: required_scratch_len,
             actual: scratch_len,
         });
+    }
+    Ok(())
+}
+
+/// Validates a batched out-of-place call, handles an empty batch, tries the
+/// whole-batch `shortcut`, and otherwise runs `line` on every contiguous
+/// `line_len` slice of `source` and `destination`.
+///
+/// `sizes` is `(line_len, embedding_len, scratch_len)`. The source
+/// and oversized workspace tails are preserved. A valid empty batch is a
+/// checked no-op. `shortcut` returns `true` when it handled the whole batch.
+/// Nothing is allocated here.
+pub(crate) fn for_each_out_of_place_line<T: R2rScalar>(
+    sizes: (usize, usize, usize),
+    source: &[T],
+    destination: &mut [T],
+    embedding_line: &mut [Complex<T::Real>],
+    scratch: &mut [Complex<T::Real>],
+    shortcut: impl FnOnce(&[T], &mut [T]) -> bool,
+    mut line: impl FnMut(&[T], &mut [T], &mut [Complex<T::Real>], &mut [Complex<T::Real>]),
+) -> Result<(), LocalR2rError> {
+    let (line_len, embedding_len, scratch_len) = sizes;
+    validate_r2r_out_of_place(
+        line_len,
+        embedding_len,
+        scratch_len,
+        source.len(),
+        destination.len(),
+        embedding_line.len(),
+        scratch.len(),
+    )?;
+    if source.is_empty() {
+        return Ok(());
+    }
+    if shortcut(source, destination) {
+        return Ok(());
+    }
+    for (source_line, destination_line) in source
+        .chunks_exact(line_len)
+        .zip(destination.chunks_exact_mut(line_len))
+    {
+        line(source_line, destination_line, embedding_line, scratch);
+    }
+    Ok(())
+}
+
+/// In-place variant of [`for_each_out_of_place_line`]: validation, empty-batch
+/// handling, and the `shortcut` position are the same, and `line` receives each
+/// contiguous `line_len` slice of `data`.
+pub(crate) fn for_each_in_place_line<T: R2rScalar>(
+    sizes: (usize, usize, usize),
+    data: &mut [T],
+    embedding_line: &mut [Complex<T::Real>],
+    scratch: &mut [Complex<T::Real>],
+    shortcut: impl FnOnce(&mut [T]) -> bool,
+    mut line: impl FnMut(&mut [T], &mut [Complex<T::Real>], &mut [Complex<T::Real>]),
+) -> Result<(), LocalR2rError> {
+    let (line_len, embedding_len, scratch_len) = sizes;
+    validate_r2r_in_place(
+        line_len,
+        embedding_len,
+        scratch_len,
+        data.len(),
+        embedding_line.len(),
+        scratch.len(),
+    )?;
+    if data.is_empty() {
+        return Ok(());
+    }
+    if shortcut(data) {
+        return Ok(());
+    }
+    for data_line in data.chunks_exact_mut(line_len) {
+        line(data_line, embedding_line, scratch);
     }
     Ok(())
 }

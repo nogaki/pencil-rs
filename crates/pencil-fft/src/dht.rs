@@ -7,8 +7,8 @@ use std::sync::Arc;
 use rustfft::FftPlanner;
 
 use super::r2r::{
-    LocalR2rError, R2rKernel, R2rScalar, r2r_from_complex, r2r_to_complex, validate_addressable,
-    validate_r2r_in_place, validate_r2r_out_of_place,
+    LocalR2rError, R2rKernel, R2rScalar, for_each_in_place_line, for_each_out_of_place_line,
+    r2r_from_complex, r2r_to_complex, validate_addressable,
 };
 #[cfg(feature = "fftw")]
 use super::r2r::{native_r2r_line, native_r2r_output};
@@ -213,36 +213,27 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
         scratch: &mut [Complex<T::Real>],
         normalize: bool,
     ) -> Result<(), LocalR2rError> {
-        validate_r2r_out_of_place(
-            self.line_len,
-            self.embedding_len,
-            self.scratch_len,
-            src.len(),
-            dst.len(),
-            embedding_line.len(),
-            scratch.len(),
-        )?;
-        if src.is_empty() {
-            return Ok(());
-        }
-        if self.line_len == 1 {
-            dst.copy_from_slice(src);
-            return Ok(());
-        }
-
-        for (source_line, destination_line) in src
-            .chunks_exact(self.line_len)
-            .zip(dst.chunks_exact_mut(self.line_len))
-        {
-            self.execute_line(
-                source_line,
-                destination_line,
-                embedding_line,
-                scratch,
-                normalize,
-            );
-        }
-        Ok(())
+        for_each_out_of_place_line(
+            (self.line_len, self.embedding_len, self.scratch_len),
+            src,
+            dst,
+            embedding_line,
+            scratch,
+            |src, dst| {
+                if self.line_len == 1 {
+                    // The length-one DHT is the identity; copying the batch directly
+                    // also preserves the exact bits of -0.0 and NaN payloads.
+                    dst.copy_from_slice(src);
+                    true
+                } else {
+                    false
+                }
+            },
+            |source_line, destination_line, embedding_line, scratch| {
+                self.fill_and_fft(source_line, embedding_line, scratch);
+                self.write_line(destination_line, embedding_line, normalize);
+            },
+        )
     }
 
     fn execute_in_place(
@@ -252,45 +243,18 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
         scratch: &mut [Complex<T::Real>],
         normalize: bool,
     ) -> Result<(), LocalR2rError> {
-        validate_r2r_in_place(
-            self.line_len,
-            self.embedding_len,
-            self.scratch_len,
-            data.len(),
-            embedding_line.len(),
-            scratch.len(),
-        )?;
-        if data.is_empty() || self.line_len == 1 {
-            return Ok(());
-        }
-
-        for data_line in data.chunks_exact_mut(self.line_len) {
-            self.execute_in_place_line(data_line, embedding_line, scratch, normalize);
-        }
-        Ok(())
-    }
-
-    fn execute_line(
-        &self,
-        source: &[T],
-        destination: &mut [T],
-        embedding_line: &mut [Complex<T::Real>],
-        scratch: &mut [Complex<T::Real>],
-        normalize: bool,
-    ) {
-        self.fill_and_fft(source, embedding_line, scratch);
-        self.write_line(destination, embedding_line, normalize);
-    }
-
-    fn execute_in_place_line(
-        &self,
-        data: &mut [T],
-        embedding_line: &mut [Complex<T::Real>],
-        scratch: &mut [Complex<T::Real>],
-        normalize: bool,
-    ) {
-        self.fill_and_fft(data, embedding_line, scratch);
-        self.write_line(data, embedding_line, normalize);
+        for_each_in_place_line(
+            (self.line_len, self.embedding_len, self.scratch_len),
+            data,
+            embedding_line,
+            scratch,
+            // The length-one in-place DHT is the identity: leave `data` untouched.
+            |_| self.line_len == 1,
+            |data_line, embedding_line, scratch| {
+                self.fill_and_fft(data_line, embedding_line, scratch);
+                self.write_line(data_line, embedding_line, normalize);
+            },
+        )
     }
 
     fn fill_and_fft(
