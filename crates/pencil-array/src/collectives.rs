@@ -33,7 +33,8 @@ use num_complex::{Complex32, Complex64};
 
 use crate::{
     CollectiveError, ExtraShape, Pencil, PencilArray, PencilArrayView, checked::checked_product,
-    error::ArrayError, transpose::collective_valid, view::LocalArrayLayout,
+    error::ArrayError, preflight::agree_header, transpose::collective_valid,
+    view::LocalArrayLayout,
 };
 
 const DESCRIPTOR_SCHEMA: u64 = 3;
@@ -61,7 +62,6 @@ const OP_MAPPED_MAX: u64 = OPERATION_NAMESPACE + 13;
 const OP_ZIP_SUM_BY: u64 = OPERATION_NAMESPACE + 14;
 const OP_ZIP_NORM_BY: u64 = OPERATION_NAMESPACE + 15;
 const INVALID_WORD: u64 = u64::MAX;
-const HEADER_WORDS: usize = 5;
 const GATHER_SEED_TAG: mpi::Tag = 0x4741;
 const GATHER_PAYLOAD_TAG: mpi::Tag = 0x4742;
 
@@ -686,11 +686,7 @@ where
     let mut local = Ok(U::zero());
     let mut flags = [0_u32; 6];
     for_each_pair(left, right, &plan, |a, b| {
-        let value = f(a, b);
-        flags = merge_flags(flags, value.nonfinite_flags());
-        if let Ok(sum) = local.as_ref() {
-            local = U::local_sum(&[*sum, value]);
-        }
+        accumulate_mapped_sum(&mut local, &mut flags, f(a, b));
     });
     finish_sum_prepared(communicator, local, flags, &mut partials)
 }
@@ -841,11 +837,7 @@ where
     let mut local = Ok(U::zero());
     let mut flags = [0_u32; 6];
     for_each_many(inputs, &plan, &mut refs, |values| {
-        let value = f(values);
-        flags = merge_flags(flags, value.nonfinite_flags());
-        if let Ok(sum) = local.as_ref() {
-            local = U::local_sum(&[*sum, value]);
-        }
+        accumulate_mapped_sum(&mut local, &mut flags, f(values));
     });
     finish_sum_prepared(communicator, local, flags, &mut partials)
 }
@@ -884,35 +876,14 @@ where
 pub fn min_many_by<T, U, F, const N: usize, const M: usize>(
     communicator: &CartesianCommunicator,
     inputs: &[PencilArrayView<'_, T, N, M>],
-    mut f: F,
+    f: F,
 ) -> Result<Option<U>, CollectiveError>
 where
     T: 'static,
     U: OrderedScalar,
     F: FnMut(&[&T]) -> U,
 {
-    let plan = prepare_map_reduce_many(
-        communicator,
-        inputs,
-        U::zero(),
-        type_name::<F>(),
-        OP_MIN_MANY,
-    )?;
-    let mut refs = prepare_many_refs(communicator, inputs.len())?;
-    let mut local = U::local_extreme(&[], true);
-    let mut flags = [0_u32; 6];
-    for_each_many(inputs, &plan, &mut refs, |values| {
-        let value = f(values);
-        local = U::local_extreme(&[local, value], true);
-        flags = merge_flags(flags, value.nonfinite_flags());
-    });
-    let result = U::collective_extreme(communicator, local, true);
-    let flags = collective_flags(communicator, flags);
-    Ok((plan.global_count != 0).then_some(if flags[0] != 0 {
-        U::nan_value()
-    } else {
-        result
-    }))
+    mapped_extreme_many(communicator, inputs, OP_MIN_MANY, true, f)
 }
 
 /// Computes the maximum after mapping each tuple of homogeneous inputs.
@@ -922,6 +893,21 @@ where
 pub fn max_many_by<T, U, F, const N: usize, const M: usize>(
     communicator: &CartesianCommunicator,
     inputs: &[PencilArrayView<'_, T, N, M>],
+    f: F,
+) -> Result<Option<U>, CollectiveError>
+where
+    T: 'static,
+    U: OrderedScalar,
+    F: FnMut(&[&T]) -> U,
+{
+    mapped_extreme_many(communicator, inputs, OP_MAX_MANY, false, f)
+}
+
+fn mapped_extreme_many<T, U, F, const N: usize, const M: usize>(
+    communicator: &CartesianCommunicator,
+    inputs: &[PencilArrayView<'_, T, N, M>],
+    operation: u64,
+    minimum: bool,
     mut f: F,
 ) -> Result<Option<U>, CollectiveError>
 where
@@ -929,22 +915,17 @@ where
     U: OrderedScalar,
     F: FnMut(&[&T]) -> U,
 {
-    let plan = prepare_map_reduce_many(
-        communicator,
-        inputs,
-        U::zero(),
-        type_name::<F>(),
-        OP_MAX_MANY,
-    )?;
+    let plan =
+        prepare_map_reduce_many(communicator, inputs, U::zero(), type_name::<F>(), operation)?;
     let mut refs = prepare_many_refs(communicator, inputs.len())?;
-    let mut local = U::local_extreme(&[], false);
+    let mut local = U::local_extreme(&[], minimum);
     let mut flags = [0_u32; 6];
     for_each_many(inputs, &plan, &mut refs, |values| {
         let value = f(values);
-        local = U::local_extreme(&[local, value], false);
+        local = U::local_extreme(&[local, value], minimum);
         flags = merge_flags(flags, value.nonfinite_flags());
     });
-    let result = U::collective_extreme(communicator, local, false);
+    let result = U::collective_extreme(communicator, local, minimum);
     let flags = collective_flags(communicator, flags);
     Ok((plan.global_count != 0).then_some(if flags[0] != 0 {
         U::nan_value()
@@ -2065,15 +2046,24 @@ where
     let mut local = Ok(U::zero());
     let mut flags = [0_u32; 6];
     for value in layout.as_slice() {
-        let mapped = f(value);
-        flags = merge_flags(flags, mapped.nonfinite_flags());
-        // local_sum([sum, value]) is one checked step; sum starts at +0.0 and
-        // never becomes -0.0, so the leading +0.0 leaves non-NaN partials unchanged.
-        if let Ok(sum) = local.as_ref() {
-            local = U::local_sum(&[*sum, mapped]);
-        }
+        accumulate_mapped_sum(&mut local, &mut flags, f(value));
     }
     finish_sum_prepared(communicator, local, flags, &mut partials)
+}
+
+/// Folds one mapped value into a running checked sum and merges its non-finite
+/// flags. Additions stop after the first failure, but flags keep updating.
+fn accumulate_mapped_sum<T: SupportedScalar>(
+    local: &mut Result<T, CollectiveError>,
+    flags: &mut [u32; 6],
+    value: T,
+) {
+    *flags = merge_flags(*flags, value.nonfinite_flags());
+    // local_sum([sum, value]) is one checked step; sum starts at +0.0 and
+    // never becomes -0.0, so the leading +0.0 leaves non-NaN partials unchanged.
+    if let Ok(sum) = local.as_ref() {
+        *local = T::local_sum(&[*sum, value]);
+    }
 }
 
 fn mapped_extreme_layout<L, T, U, F, const N: usize, const M: usize>(
@@ -2402,18 +2392,6 @@ fn append_type_name(words: &mut Vec<u32>, name: &str) -> Result<(), ()> {
         append_word(words, u64::from(byte));
     }
     Ok(())
-}
-
-fn agree_header<C: CommunicatorCollectives>(communicator: &C, header: [u64; HEADER_WORDS]) -> bool {
-    // This fixed five-word exchange is shared by the transpose and FFT
-    // protocols. Do not turn it into per-word scalar reductions: a rank may be
-    // entering a different checked API, and MPI collective count/order must
-    // still match while that mismatch is reported.
-    let mut minimum = [0u64; HEADER_WORDS];
-    let mut maximum = [0u64; HEADER_WORDS];
-    communicator.all_reduce_into(&header[..], &mut minimum[..], SystemOperation::min());
-    communicator.all_reduce_into(&header[..], &mut maximum[..], SystemOperation::max());
-    minimum == maximum
 }
 
 fn collective_descriptor<C: CommunicatorCollectives>(

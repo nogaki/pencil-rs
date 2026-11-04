@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use mpi::{
     collective::CommunicatorCollectives,
@@ -6,7 +9,7 @@ use mpi::{
 };
 
 use crate::{
-    ExtraShape, ManyPencilArray, Pencil, PencilArrayView, PencilArrayViewMut,
+    ExtraShape, ManyPencilArray, Pencil, PencilArrayView, PencilArrayViewMut, TransposeTiming,
     checked_partition::{CheckedPartition, CheckedPartitionMut},
     transpose::{
         CommunicationMode, PreparedExchange, TransposeError, TransposePlanCore, TransposeWorkspace,
@@ -104,45 +107,19 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
     pub fn execute_views<T>(
         &self,
         source: PencilArrayView<'_, T, N, M>,
-        mut destination: PencilArrayViewMut<'_, T, N, M>,
+        destination: PencilArrayViewMut<'_, T, N, M>,
         workspace: &mut TransposeWorkspace<T>,
     ) -> Result<(), TransposeError>
     where
         T: Equivalence + Copy,
     {
-        let communicator = self.core.source().topology().cartesian();
-        agree_execute_descriptor::<_, T, N, M>(
-            &self.core,
-            communicator,
-            source.extra_shape(),
-            destination.extra_shape(),
+        self.execute_views_impl(
+            source,
+            destination,
+            workspace,
             CommunicationMode::AllToAllv.views_operation(),
-        )?;
-
-        let prepared = agree_preflight(
-            communicator,
-            self.core
-                .prepare_execution(&source, &destination, workspace),
-            TransposeError::CollectivePreconditionFailed,
-        )?;
-        let extra_count = source.extra_shape().element_count();
-        pack_source(
-            self.core.peers(),
-            self.core.source().as_ref(),
-            source.as_slice(),
-            &mut workspace.send_buffer[..prepared.requirements.send_len],
-            prepared.requirements.send_len,
-            extra_count,
-        );
-        execute_exchange(&self.core, &prepared, workspace);
-        unpack_destination(
-            self.core.peers(),
-            self.core.destination().as_ref(),
-            destination.as_mut_slice(),
-            &workspace.receive_buffer[..prepared.requirements.receive_len],
-            extra_count,
-        );
-        Ok(())
+            None,
+        )
     }
 
     /// Executes the transpose and returns local pack, collective wait, unpack,
@@ -150,51 +127,21 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
     pub fn execute_views_with_timing<T>(
         &self,
         source: PencilArrayView<'_, T, N, M>,
-        mut destination: PencilArrayViewMut<'_, T, N, M>,
+        destination: PencilArrayViewMut<'_, T, N, M>,
         workspace: &mut TransposeWorkspace<T>,
-    ) -> Result<crate::TransposeTiming, TransposeError>
+    ) -> Result<TransposeTiming, TransposeError>
     where
         T: Equivalence + Copy,
     {
         let total = Instant::now();
-        let communicator = self.core.source().topology().cartesian();
-        agree_execute_descriptor::<_, T, N, M>(
-            &self.core,
-            communicator,
-            source.extra_shape(),
-            destination.extra_shape(),
+        let mut timing = TransposeTiming::default();
+        self.execute_views_impl(
+            source,
+            destination,
+            workspace,
             CommunicationMode::AllToAllv.timed_views_operation(),
+            Some(&mut timing),
         )?;
-        let prepared = agree_preflight(
-            communicator,
-            self.core
-                .prepare_execution(&source, &destination, workspace),
-            TransposeError::CollectivePreconditionFailed,
-        )?;
-        let extra_count = source.extra_shape().element_count();
-        let mut timing = crate::TransposeTiming::default();
-        let started = Instant::now();
-        pack_source(
-            self.core.peers(),
-            self.core.source().as_ref(),
-            source.as_slice(),
-            &mut workspace.send_buffer[..prepared.requirements.send_len],
-            prepared.requirements.send_len,
-            extra_count,
-        );
-        timing.pack = started.elapsed();
-        let started = Instant::now();
-        execute_exchange(&self.core, &prepared, workspace);
-        timing.collective_wait = started.elapsed();
-        let started = Instant::now();
-        unpack_destination(
-            self.core.peers(),
-            self.core.destination().as_ref(),
-            destination.as_mut_slice(),
-            &workspace.receive_buffer[..prepared.requirements.receive_len],
-            extra_count,
-        );
-        timing.unpack = started.elapsed();
         timing.total = total.elapsed();
         Ok(timing)
     }
@@ -222,22 +169,118 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
     where
         T: Equivalence + Copy,
     {
+        self.execute_in_place_impl(
+            array,
+            workspace,
+            CommunicationMode::AllToAllv.in_place_operation(),
+            None,
+        )
+    }
+
+    /// Executes the in-place transpose and returns local phase timings.
+    pub fn execute_in_place_with_timing<T>(
+        &self,
+        array: &mut ManyPencilArray<T, N, M>,
+        workspace: &mut TransposeWorkspace<T>,
+    ) -> Result<TransposeTiming, TransposeError>
+    where
+        T: Equivalence + Copy,
+    {
+        let total = Instant::now();
+        let mut timing = TransposeTiming::default();
+        self.execute_in_place_impl(
+            array,
+            workspace,
+            CommunicationMode::AllToAllv.timed_in_place_operation(),
+            Some(&mut timing),
+        )?;
+        timing.total = total.elapsed();
+        Ok(timing)
+    }
+
+    /// Execution body shared by [`Self::execute_views`] and its timed variant.
+    /// The operation word keeps their operation IDs distinct; a `None` timing
+    /// sink leaves every clock unread.
+    fn execute_views_impl<T>(
+        &self,
+        source: PencilArrayView<'_, T, N, M>,
+        mut destination: PencilArrayViewMut<'_, T, N, M>,
+        workspace: &mut TransposeWorkspace<T>,
+        operation: u64,
+        mut timing: Option<&mut TransposeTiming>,
+    ) -> Result<(), TransposeError>
+    where
+        T: Equivalence + Copy,
+    {
+        let communicator = self.core.source().topology().cartesian();
+        agree_execute_descriptor::<_, T, N, M>(
+            &self.core,
+            communicator,
+            source.extra_shape(),
+            destination.extra_shape(),
+            operation,
+        )?;
+
+        let prepared = agree_preflight(
+            communicator,
+            self.core
+                .prepare_execution(&source, &destination, workspace),
+            TransposeError::CollectivePreconditionFailed,
+        )?;
+        let extra_count = source.extra_shape().element_count();
+        timed(timing.as_mut().map(|t| &mut t.pack), || {
+            pack_source(
+                self.core.peers(),
+                self.core.source().as_ref(),
+                source.as_slice(),
+                &mut workspace.send_buffer[..prepared.requirements.send_len],
+                prepared.requirements.send_len,
+                extra_count,
+            );
+        });
+        timed(timing.as_mut().map(|t| &mut t.collective_wait), || {
+            execute_exchange(&self.core, &prepared, workspace);
+        });
+        timed(timing.as_mut().map(|t| &mut t.unpack), || {
+            unpack_destination(
+                self.core.peers(),
+                self.core.destination().as_ref(),
+                destination.as_mut_slice(),
+                &workspace.receive_buffer[..prepared.requirements.receive_len],
+                extra_count,
+            );
+        });
+        Ok(())
+    }
+
+    /// Execution body shared by [`Self::execute_in_place`] and its timed
+    /// variant. The operation word keeps their operation IDs distinct; a `None`
+    /// timing sink leaves every clock unread.
+    fn execute_in_place_impl<T>(
+        &self,
+        array: &mut ManyPencilArray<T, N, M>,
+        workspace: &mut TransposeWorkspace<T>,
+        operation: u64,
+        mut timing: Option<&mut TransposeTiming>,
+    ) -> Result<(), TransposeError>
+    where
+        T: Equivalence + Copy,
+    {
         let communicator = self.core.source().topology().cartesian();
         agree_execute_descriptor::<_, T, N, M>(
             &self.core,
             communicator,
             array.extra_shape(),
             array.extra_shape(),
-            CommunicationMode::AllToAllv.in_place_operation(),
+            operation,
         )?;
-
         let prepared = agree_preflight(
             communicator,
             prepare_in_place(&self.core, array, workspace),
             TransposeError::CollectivePreconditionFailed,
         )?;
         let extra_count = array.extra_shape().element_count();
-        {
+        timed(timing.as_mut().map(|t| &mut t.pack), || {
             let source = array
                 .active_view()
                 .expect("collective in-place preflight validated the active source");
@@ -249,73 +292,33 @@ impl<const N: usize, const M: usize> AllToAllvTransposePlan<N, M> {
                 prepared.exchange.requirements.send_len,
                 extra_count,
             );
-        }
-        execute_exchange(&self.core, &prepared.exchange, workspace);
-        finish_in_place(
-            &self.core,
-            array,
-            prepared.destination_index,
-            &prepared.exchange,
-            &workspace.receive_buffer[..prepared.exchange.requirements.receive_len],
-            extra_count,
-        );
-        Ok(())
-    }
-
-    /// Executes the in-place transpose and returns local phase timings.
-    pub fn execute_in_place_with_timing<T>(
-        &self,
-        array: &mut ManyPencilArray<T, N, M>,
-        workspace: &mut TransposeWorkspace<T>,
-    ) -> Result<crate::TransposeTiming, TransposeError>
-    where
-        T: Equivalence + Copy,
-    {
-        let total = Instant::now();
-        let communicator = self.core.source().topology().cartesian();
-        agree_execute_descriptor::<_, T, N, M>(
-            &self.core,
-            communicator,
-            array.extra_shape(),
-            array.extra_shape(),
-            CommunicationMode::AllToAllv.timed_in_place_operation(),
-        )?;
-        let prepared = agree_preflight(
-            communicator,
-            prepare_in_place(&self.core, array, workspace),
-            TransposeError::CollectivePreconditionFailed,
-        )?;
-        let extra_count = array.extra_shape().element_count();
-        let mut timing = crate::TransposeTiming::default();
-        let started = Instant::now();
-        {
-            let source = array.active_view().expect("validated active source");
-            pack_source(
-                self.core.peers(),
-                self.core.source().as_ref(),
-                source.as_slice(),
-                &mut workspace.send_buffer[..prepared.exchange.requirements.send_len],
-                prepared.exchange.requirements.send_len,
+        });
+        timed(timing.as_mut().map(|t| &mut t.collective_wait), || {
+            execute_exchange(&self.core, &prepared.exchange, workspace);
+        });
+        timed(timing.as_mut().map(|t| &mut t.unpack), || {
+            finish_in_place(
+                &self.core,
+                array,
+                prepared.destination_index,
+                &prepared.exchange,
+                &workspace.receive_buffer[..prepared.exchange.requirements.receive_len],
                 extra_count,
             );
-        }
-        timing.pack = started.elapsed();
-        let started = Instant::now();
-        execute_exchange(&self.core, &prepared.exchange, workspace);
-        timing.collective_wait = started.elapsed();
-        let started = Instant::now();
-        finish_in_place(
-            &self.core,
-            array,
-            prepared.destination_index,
-            &prepared.exchange,
-            &workspace.receive_buffer[..prepared.exchange.requirements.receive_len],
-            extra_count,
-        );
-        timing.unpack = started.elapsed();
-        timing.total = total.elapsed();
-        Ok(timing)
+        });
+        Ok(())
     }
+}
+
+/// Runs one local execution phase, recording its wall-clock duration in `sink`.
+/// Without a sink the clock is not read at all.
+fn timed(sink: Option<&mut Duration>, phase: impl FnOnce()) {
+    let Some(sink) = sink else {
+        return phase();
+    };
+    let started = Instant::now();
+    phase();
+    *sink = started.elapsed();
 }
 
 fn execute_exchange<T, const N: usize, const M: usize>(
