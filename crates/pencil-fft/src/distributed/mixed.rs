@@ -4330,11 +4330,12 @@ fn ceil_log2_len(length: usize) -> f64 {
     }
 }
 
-fn mixed_raw_threshold<R: FftReal, const N: usize, const M: usize>(
+// Shared error-model walk over the stages after the real boundary, so the
+// construction-time raw threshold and the runtime endpoint policy stay in sync.
+fn mixed_depth_normalization<R: FftReal, const N: usize, const M: usize>(
     stages: &[MixedR2cStage<R, N, M>],
-    _extra: &ExtraShape,
     boundary: usize,
-) -> Result<f64, MixedError> {
+) -> Result<(f64, f64), MixedError> {
     let mut depth = 1.0;
     let mut normalization = 1.0;
     for stage in &stages[boundary + 1..] {
@@ -4357,11 +4358,21 @@ fn mixed_raw_threshold<R: FftReal, const N: usize, const M: usize>(
         };
         depth += ceil_log2_len(native_len) + allowance;
         normalization *= factor;
-        if !depth.is_finite() || depth <= 0.0 || !normalization.is_finite() || normalization <= 0.0
-        {
-            return Err(MixedError::Fft(FftError::PreparationFailed));
-        }
     }
+    // depth only grows and normalization is a running product of positive
+    // factors, so one check after the loop matches a per-stage check.
+    if !depth.is_finite() || depth <= 0.0 || !normalization.is_finite() || normalization <= 0.0 {
+        return Err(MixedError::Fft(FftError::PreparationFailed));
+    }
+    Ok((depth, normalization))
+}
+
+fn mixed_raw_threshold<R: FftReal, const N: usize, const M: usize>(
+    stages: &[MixedR2cStage<R, N, M>],
+    _extra: &ExtraShape,
+    boundary: usize,
+) -> Result<f64, MixedError> {
+    let (depth, normalization) = mixed_depth_normalization(stages, boundary)?;
     let absolute = 128.0
         * <R as crate::private::Sealed>::pencil_fft_min_subnormal_f64()
         * depth
@@ -5702,33 +5713,7 @@ fn validate_mixed_r2c_reverse<R: FftReal, const N: usize, const M: usize>(
 fn mixed_endpoint_policy<R: FftReal, const N: usize, const M: usize>(
     core: &MixedR2cCore<R, N, M>,
 ) -> Result<(f64, f64), MixedError> {
-    let mut depth = 1.0;
-    let mut normalization = 1.0;
-    for stage in &core.stages[core.real_stage_index + 1..] {
-        let (native_len, factor, allowance) = match &stage.local {
-            MixedR2cStageLocal::Complex(MixedComplexLocal::Identity) => continue,
-            MixedR2cStageLocal::Complex(MixedComplexLocal::Fft(plan)) => {
-                (plan.line_len(), plan.line_len() as f64, 0.0)
-            }
-            MixedR2cStageLocal::Complex(MixedComplexLocal::R2r(MixedR2rLocal::Transform(plan))) => {
-                (
-                    plan.error_model_len(),
-                    plan.normalization_factor() as f64,
-                    2.0,
-                )
-            }
-            MixedR2cStageLocal::Complex(MixedComplexLocal::R2r(MixedR2rLocal::Hartley(plan))) => {
-                (plan.line_len(), plan.normalization_factor() as f64, 2.0)
-            }
-            MixedR2cStageLocal::Real(_) => continue,
-        };
-        depth += ceil_log2_len(native_len) + allowance;
-        normalization *= factor;
-    }
-    if !depth.is_finite() || depth <= 0.0 || !normalization.is_finite() || normalization <= 0.0 {
-        return Err(MixedError::Fft(FftError::PreparationFailed));
-    }
-    Ok((depth, normalization))
+    mixed_depth_normalization(&core.stages, core.real_stage_index)
 }
 
 fn validate_mixed_boundary<R: FftReal, const N: usize, const M: usize>(
