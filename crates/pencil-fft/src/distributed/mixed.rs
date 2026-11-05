@@ -4720,6 +4720,65 @@ where
     Ok(())
 }
 
+fn execute_mixed_boundary_real_forward<R: FftReal, const N: usize, const M: usize>(
+    stage: &MixedR2cStage<R, N, M>,
+    source: &[R],
+    destination: &mut [Complex<R>],
+    real_source_line: &mut [R],
+    real_line: &mut [R],
+    complex_line: &mut [Complex<R>],
+    scratch: &mut [Complex<R>],
+) -> Result<(), MixedError>
+where
+    Complex<R>: Equivalence,
+{
+    let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(plan)) = &stage.local else {
+        return Err(MixedError::Fft(FftError::PreparationFailed));
+    };
+    mixed_rfft_forward(
+        plan,
+        stage.input.as_ref(),
+        stage.axis,
+        source,
+        destination,
+        real_source_line,
+        real_line,
+        complex_line,
+        scratch,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_mixed_boundary_real_reverse<R: FftReal, const N: usize, const M: usize>(
+    stage: &MixedR2cStage<R, N, M>,
+    source: &[Complex<R>],
+    destination: &mut [R],
+    complex_source_line: &mut [Complex<R>],
+    complex_line: &mut [Complex<R>],
+    real_line: &mut [R],
+    scratch: &mut [Complex<R>],
+    normalize: bool,
+) -> Result<(), MixedError>
+where
+    Complex<R>: Equivalence,
+{
+    let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(plan)) = &stage.local else {
+        return Err(MixedError::Fft(FftError::PreparationFailed));
+    };
+    mixed_rfft_reverse(
+        plan,
+        stage.output.as_ref(),
+        stage.axis,
+        source,
+        destination,
+        complex_source_line,
+        complex_line,
+        real_line,
+        scratch,
+        normalize,
+    )
+}
+
 fn execute_mixed_r2c_forward<R: FftReal, const N: usize, const M: usize>(
     core: &Arc<MixedR2cCore<R, N, M>>,
     source: &PencilArray<R, N, M>,
@@ -4735,17 +4794,12 @@ where
     let source_view = source.view();
     if boundary == 0 {
         let stage = &core.stages[0];
-        let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(plan)) = &stage.local else {
-            return Err(MixedError::Fft(FftError::PreparationFailed));
-        };
         let fft_started = Instant::now();
         let overwrite_result = workspace
             .intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
-                mixed_rfft_forward(
-                    plan,
-                    stage.input.as_ref(),
-                    stage.axis,
+                execute_mixed_boundary_real_forward(
+                    stage,
                     source_view.as_slice(),
                     target.as_mut_slice(),
                     &mut workspace.real_source_line,
@@ -4799,17 +4853,12 @@ where
             if index + 1 == boundary {
                 let active = real.active_view().map_err(FftError::Array)?;
                 let stage = &core.stages[boundary];
-                let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(plan)) = &stage.local else {
-                    return Err(MixedError::Fft(FftError::PreparationFailed));
-                };
                 let fft_started = Instant::now();
                 let overwrite_result = workspace
                     .intermediate
                     .overwrite_with(stage.output.as_ref(), |mut target| {
-                        mixed_rfft_forward(
-                            plan,
-                            stage.input.as_ref(),
-                            stage.axis,
+                        execute_mixed_boundary_real_forward(
+                            stage,
                             active.as_slice(),
                             target.as_mut_slice(),
                             &mut workspace.real_source_line,
@@ -4886,9 +4935,6 @@ where
         zero_mixed_boundary(core, &mut workspace.intermediate),
     )?;
     let stage = &core.stages[boundary];
-    let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(plan)) = &stage.local else {
-        return Err(MixedError::Fft(FftError::PreparationFailed));
-    };
     let active = workspace
         .intermediate
         .active_view()
@@ -4897,10 +4943,8 @@ where
         let fft_started = Instant::now();
         let result = {
             let mut target = destination.view_mut();
-            mixed_rfft_reverse(
-                plan,
-                stage.output.as_ref(),
-                stage.axis,
+            execute_mixed_boundary_real_reverse(
+                stage,
                 active.as_slice(),
                 target.as_mut_slice(),
                 &mut workspace.complex_source_line,
@@ -4921,10 +4965,8 @@ where
     let fft_started = Instant::now();
     let overwrite_result = real
         .overwrite_with(stage.input.as_ref(), |mut target| {
-            mixed_rfft_reverse(
-                plan,
-                stage.output.as_ref(),
-                stage.axis,
+            execute_mixed_boundary_real_reverse(
+                stage,
                 active.as_slice(),
                 target.as_mut_slice(),
                 &mut workspace.complex_source_line,
@@ -5008,17 +5050,12 @@ where
     let boundary = core.real_stage_index;
     if boundary == 0 {
         let stage = &core.stages[0];
-        let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(plan)) = &stage.local else {
-            return Err(MixedError::Fft(FftError::PreparationFailed).into());
-        };
         let source_view = source.view();
         let result = workspace
             .intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
-                mixed_rfft_forward(
-                    plan,
-                    stage.input.as_ref(),
-                    stage.axis,
+                execute_mixed_boundary_real_forward(
+                    stage,
                     source_view.as_slice(),
                     target.as_mut_slice(),
                     &mut workspace.real_source_line,
@@ -5070,17 +5107,12 @@ where
                 .map_err(MixedError::Fft)?;
                 let stage = &core.stages[index + 1];
                 if index + 1 == boundary {
-                    let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(rfft)) = &stage.local else {
-                        return Err(MixedError::Fft(FftError::PreparationFailed).into());
-                    };
                     let active = real.active_view().map_err(FftError::Array)?;
                     workspace
                         .intermediate
                         .overwrite_with(stage.output.as_ref(), |mut out| {
-                            mixed_rfft_forward(
-                                rfft,
-                                stage.input.as_ref(),
-                                stage.axis,
+                            execute_mixed_boundary_real_forward(
+                                stage,
                                 active.as_slice(),
                                 out.as_mut_slice(),
                                 &mut workspace.real_source_line,
@@ -5112,17 +5144,12 @@ where
             };
             if index + 1 == boundary {
                 let stage = &core.stages[boundary];
-                let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(rfft)) = &stage.local else {
-                    return Err(MixedError::Fft(FftError::PreparationFailed).into());
-                };
                 let callback = |data: &mut [R]| {
                     workspace
                         .intermediate
                         .overwrite_with(stage.output.as_ref(), |mut out| {
-                            mixed_rfft_forward(
-                                rfft,
-                                stage.input.as_ref(),
-                                stage.axis,
+                            execute_mixed_boundary_real_forward(
+                                stage,
                                 data,
                                 out.as_mut_slice(),
                                 &mut workspace.real_source_line,
@@ -5325,9 +5352,6 @@ where
         }
     }
     let stage = &core.stages[boundary];
-    let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(rfft)) = &stage.local else {
-        return Err(MixedError::Fft(FftError::PreparationFailed).into());
-    };
     let mut convert = |data: &mut [Complex<R>]| {
         validate_mixed_boundary_data(core, Ok((stage.output.as_ref(), data)), normalize)?;
         zero_mixed_boundary_data(
@@ -5337,10 +5361,8 @@ where
             data,
         )?;
         let mut transform = |out: &mut [R]| {
-            mixed_rfft_reverse(
-                rfft,
-                stage.output.as_ref(),
-                stage.axis,
+            execute_mixed_boundary_real_reverse(
+                stage,
                 data,
                 out,
                 &mut workspace.complex_source_line,

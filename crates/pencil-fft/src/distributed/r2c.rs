@@ -2518,6 +2518,31 @@ fn validate_line_resources<R: FftReal, const N: usize, const M: usize>(
     Ok(())
 }
 
+fn execute_boundary_real_forward<R: FftReal, const N: usize, const M: usize>(
+    stage: &TransformStage<R, N, M>,
+    source: &[R],
+    destination: &mut [Complex<R>],
+    real_source_line: &mut [R],
+    real_line: &mut [R],
+    complex_line: &mut [Complex<R>],
+    scratch: &mut [Complex<R>],
+) -> Result<(), R2cError>
+where
+    Complex<R>: Equivalence,
+{
+    execute_strided_real_forward(
+        stage.local.real_complex(),
+        stage.input.as_ref(),
+        stage.axis,
+        source,
+        destination,
+        real_source_line,
+        real_line,
+        complex_line,
+        scratch,
+    )
+}
+
 fn execute_forward<R: FftReal, const N: usize, const M: usize>(
     core: &Arc<TransformPlanCore<R, N, M>>,
     source: &PencilArray<R, N, M>,
@@ -2549,31 +2574,16 @@ where
         workspace
             .intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
-                if stride > 1 {
-                    execute_strided_real_forward(
-                        stage.local.real_complex(),
-                        stage.input.as_ref(),
-                        stage.axis,
-                        source_view.as_slice(),
-                        target.as_mut_slice(),
-                        real_source_line,
-                        real_line,
-                        complex_line,
-                        fft_scratch,
-                    )
-                    .expect("distributed R2C strided forward was preflighted");
-                } else {
-                    stage
-                        .local
-                        .real_complex()
-                        .forward(
-                            source_view.as_slice(),
-                            target.as_mut_slice(),
-                            real_line,
-                            fft_scratch,
-                        )
-                        .expect("distributed R2C forward preflight validated real stage");
-                }
+                execute_boundary_real_forward(
+                    stage,
+                    source_view.as_slice(),
+                    target.as_mut_slice(),
+                    real_source_line,
+                    real_line,
+                    complex_line,
+                    fft_scratch,
+                )
+                .expect("distributed R2C boundary forward was preflighted");
                 Ok::<_, ()>(())
             })
             .expect("distributed R2C stage-zero overwrite was preflighted");
@@ -2628,31 +2638,16 @@ where
         workspace
             .intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
-                if stride > 1 {
-                    execute_strided_real_forward(
-                        stage.local.real_complex(),
-                        stage.input.as_ref(),
-                        stage.axis,
-                        active.as_slice(),
-                        target.as_mut_slice(),
-                        real_source_line,
-                        real_line,
-                        complex_line,
-                        fft_scratch,
-                    )
-                    .expect("distributed R2C strided forward was preflighted");
-                } else {
-                    stage
-                        .local
-                        .real_complex()
-                        .forward(
-                            active.as_slice(),
-                            target.as_mut_slice(),
-                            real_line,
-                            fft_scratch,
-                        )
-                        .expect("distributed R2C forward real boundary was preflighted");
-                }
+                execute_boundary_real_forward(
+                    stage,
+                    active.as_slice(),
+                    target.as_mut_slice(),
+                    real_source_line,
+                    real_line,
+                    complex_line,
+                    fft_scratch,
+                )
+                .expect("distributed R2C boundary forward was preflighted");
                 Ok::<_, ()>(())
             })
             .expect("distributed R2C boundary overwrite was preflighted");
@@ -2771,25 +2766,15 @@ where
                 intermediate
                     .overwrite_with(stage.output.as_ref(), |mut target| {
                         let callback = |data: &mut [R]| {
-                            if stride > 1 {
-                                execute_strided_real_forward(
-                                    stage.local.real_complex(),
-                                    stage.input.as_ref(),
-                                    stage.axis,
-                                    data,
-                                    target.as_mut_slice(),
-                                    real_source_line,
-                                    real_line,
-                                    complex_line,
-                                    fft_scratch,
-                                )
-                            } else {
-                                stage
-                                    .local
-                                    .real_complex()
-                                    .forward(data, target.as_mut_slice(), real_line, fft_scratch)
-                                    .map_err(R2cError::LocalR2c)
-                            }
+                            execute_boundary_real_forward(
+                                stage,
+                                data,
+                                target.as_mut_slice(),
+                                real_source_line,
+                                real_line,
+                                complex_line,
+                                fft_scratch,
+                            )
                         };
                         plan.execute_in_place_with_callback(real, rt, callback)
                             .map_err(map_r2c_overlap)
@@ -2820,30 +2805,15 @@ where
                 workspace
                     .intermediate
                     .overwrite_with(stage.output.as_ref(), |mut target| {
-                        if stride > 1 {
-                            execute_strided_real_forward(
-                                stage.local.real_complex(),
-                                stage.input.as_ref(),
-                                stage.axis,
-                                active.as_slice(),
-                                target.as_mut_slice(),
-                                real_source_line,
-                                real_line,
-                                complex_line,
-                                fft_scratch,
-                            )
-                        } else {
-                            stage
-                                .local
-                                .real_complex()
-                                .forward(
-                                    active.as_slice(),
-                                    target.as_mut_slice(),
-                                    real_line,
-                                    fft_scratch,
-                                )
-                                .map_err(R2cError::LocalR2c)
-                        }
+                        execute_boundary_real_forward(
+                            stage,
+                            active.as_slice(),
+                            target.as_mut_slice(),
+                            real_source_line,
+                            real_line,
+                            complex_line,
+                            fft_scratch,
+                        )
                     })
                     .map_err(|error| match error {
                         OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
@@ -2870,10 +2840,8 @@ where
         workspace
             .intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
-                execute_strided_real_forward(
-                    stage.local.real_complex(),
-                    stage.input.as_ref(),
-                    stage.axis,
+                execute_boundary_real_forward(
+                    stage,
                     view.as_slice(),
                     target.as_mut_slice(),
                     real_source_line,
@@ -3316,38 +3284,22 @@ where
         .intermediate
         .active_view()
         .expect("distributed R2C boundary active layout was validated");
-    let stride = super::memory_stride(stage.output.as_ref(), stage.axis)?;
+    // The local transform re-checks the stride; keep that failure on the old
+    // side of the timer.
+    super::memory_stride(stage.output.as_ref(), stage.axis)?;
     if boundary == 0 {
         let mut destination_view = destination.view_mut();
         let fft_started = Instant::now();
-        if stride > 1 {
-            execute_strided_real_reverse(
-                stage.local.real_complex(),
-                stage.output.as_ref(),
-                stage.axis,
-                active.as_slice(),
-                destination_view.as_mut_slice(),
-                &mut workspace.complex_strided_line,
-                &mut workspace.complex_line,
-                &mut workspace.real_line,
-                &mut workspace.fft_scratch,
-                normalize_inverse,
-            )?;
-        } else if normalize_inverse {
-            stage.local.real_complex().inverse(
-                active.as_slice(),
-                destination_view.as_mut_slice(),
-                &mut workspace.complex_line,
-                &mut workspace.fft_scratch,
-            )?;
-        } else {
-            stage.local.real_complex().backward(
-                active.as_slice(),
-                destination_view.as_mut_slice(),
-                &mut workspace.complex_line,
-                &mut workspace.fft_scratch,
-            )?;
-        }
+        execute_boundary_real_reverse(
+            stage,
+            active.as_slice(),
+            destination_view.as_mut_slice(),
+            &mut workspace.complex_strided_line,
+            &mut workspace.complex_line,
+            &mut workspace.real_line,
+            &mut workspace.fft_scratch,
+            normalize_inverse,
+        )?;
         super::record_fft_timing(&mut report, boundary, fft_started);
         return Ok(());
     }
@@ -3359,35 +3311,16 @@ where
     let fft_started = Instant::now();
     real_intermediate
         .overwrite_with(stage.input.as_ref(), |mut target| {
-            if stride > 1 {
-                execute_strided_real_reverse(
-                    stage.local.real_complex(),
-                    stage.output.as_ref(),
-                    stage.axis,
-                    active.as_slice(),
-                    target.as_mut_slice(),
-                    &mut workspace.complex_strided_line,
-                    &mut workspace.complex_line,
-                    &mut workspace.real_line,
-                    &mut workspace.fft_scratch,
-                    normalize_inverse,
-                )?;
-            } else if normalize_inverse {
-                stage.local.real_complex().inverse(
-                    active.as_slice(),
-                    target.as_mut_slice(),
-                    &mut workspace.complex_line,
-                    &mut workspace.fft_scratch,
-                )?;
-            } else {
-                stage.local.real_complex().backward(
-                    active.as_slice(),
-                    target.as_mut_slice(),
-                    &mut workspace.complex_line,
-                    &mut workspace.fft_scratch,
-                )?;
-            }
-            Ok::<_, R2cError>(())
+            execute_boundary_real_reverse(
+                stage,
+                active.as_slice(),
+                target.as_mut_slice(),
+                &mut workspace.complex_strided_line,
+                &mut workspace.complex_line,
+                &mut workspace.real_line,
+                &mut workspace.fft_scratch,
+                normalize_inverse,
+            )
         })
         .map_err(|error| match error {
             OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
