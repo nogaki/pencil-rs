@@ -605,47 +605,22 @@ where
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
     ) -> Result<(), FftOverlapError<R2rError>> {
-        let communicator = self.input_pencil().topology().communicator();
-        let operation = match direction {
-            Direction::Forward => OPERATION_DHT_FORWARD_OVERLAP,
-            Direction::Inverse => OPERATION_DHT_INVERSE_OVERLAP,
-            Direction::Backward => OPERATION_DHT_BACKWARD_OVERLAP,
-        };
-        agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
-        let preflight = self.collection_preflight(direction, source, destination, workspace);
-        if !collective_valid(communicator, preflight.is_ok()) {
-            return Err(preflight
-                .err()
-                .unwrap_or(R2rError::Fft(FftError::CollectivePreconditionFailed))
-                .into());
-        }
-        let supported = self.core.transitions.iter().all(|transition| {
-            matches!(
-                transition.forward,
-                super::C2cTransition::Identity
-                    | super::C2cTransition::Local(_)
-                    | super::C2cTransition::PointToPoint(_)
-            ) && matches!(
-                transition.backward,
-                super::C2cTransition::Identity
-                    | super::C2cTransition::Local(_)
-                    | super::C2cTransition::PointToPoint(_)
-            )
-        });
-        if !collective_valid(communicator, supported) {
-            return Err(FftOverlapError::UnsupportedTransport);
-        }
-        match direction {
-            Direction::Forward => {
-                execute_r2r_forward_overlap(&self.core, source, destination, workspace)
-            }
-            Direction::Inverse => {
-                execute_r2r_reverse_overlap(&self.core, source, destination, workspace, true)
-            }
-            Direction::Backward => {
-                execute_r2r_reverse_overlap(&self.core, source, destination, workspace, false)
-            }
-        }
+        execute_r2r_overlap(
+            &self.core,
+            self.input_pencil().topology().communicator(),
+            [
+                OPERATION_DHT_FORWARD_OVERLAP,
+                OPERATION_DHT_INVERSE_OVERLAP,
+                OPERATION_DHT_BACKWARD_OVERLAP,
+            ],
+            direction,
+            |direction, source, destination, workspace| {
+                self.collection_preflight(direction, source, destination, workspace)
+            },
+            source,
+            destination,
+            workspace,
+        )
     }
 
     pub(super) fn collection_preflight(
@@ -734,11 +709,7 @@ where
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
     ) -> Result<TransformTiming<N>, R2rError> {
-        let started = Instant::now();
-        let mut timing = TransformTiming::default();
-        self.execute(direction, source, destination, workspace, Some(&mut timing))?;
-        timing.total = started.elapsed();
-        Ok(timing)
+        timed_r2r::<N, _>(|report| self.execute(direction, source, destination, workspace, report))
     }
 
     fn execute(
@@ -749,51 +720,31 @@ where
         workspace: &mut R2rWorkspace<T, N, M>,
         report: Option<&mut TransformTiming<N>>,
     ) -> Result<(), R2rError> {
-        let communicator = self.input_pencil().topology().communicator();
-        let operation = match direction {
-            Direction::Forward => {
-                if report.is_some() {
-                    OPERATION_DHT_FORWARD_TIMED
-                } else {
-                    super::OPERATION_DHT_FORWARD
-                }
-            }
-            Direction::Inverse => {
-                if report.is_some() {
-                    OPERATION_DHT_INVERSE_TIMED
-                } else {
-                    super::OPERATION_DHT_INVERSE
-                }
-            }
-            Direction::Backward => {
-                if report.is_some() {
-                    OPERATION_DHT_BACKWARD_TIMED
-                } else {
-                    super::OPERATION_DHT_BACKWARD
-                }
-            }
-        };
-        agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
-        let preflight = self.collection_preflight(direction, source, destination, workspace);
-        if !collective_valid(communicator, preflight.is_ok()) {
-            return Err(preflight
-                .err()
-                .unwrap_or(R2rError::Fft(FftError::CollectivePreconditionFailed)));
-        }
-        preflight.expect("distributed DHT out-of-place preflight succeeded");
-        match direction {
-            Direction::Forward => {
-                execute_forward(&self.core, source, destination, workspace, report)
-            }
-            Direction::Inverse | Direction::Backward => execute_reverse(
-                &self.core,
-                source,
-                destination,
-                workspace,
-                matches!(direction, Direction::Inverse),
-                report,
-            ),
-        }
+        let operations = [
+            [
+                super::OPERATION_DHT_FORWARD,
+                super::OPERATION_DHT_INVERSE,
+                super::OPERATION_DHT_BACKWARD,
+            ],
+            [
+                OPERATION_DHT_FORWARD_TIMED,
+                OPERATION_DHT_INVERSE_TIMED,
+                OPERATION_DHT_BACKWARD_TIMED,
+            ],
+        ];
+        execute_r2r_out_of_place(
+            &self.core,
+            self.input_pencil().topology().communicator(),
+            operations,
+            direction,
+            |direction, source, destination, workspace| {
+                self.collection_preflight(direction, source, destination, workspace)
+            },
+            source,
+            destination,
+            workspace,
+            report,
+        )
     }
 
     /// Computes the forward transform in place and returns timing information.
@@ -829,11 +780,7 @@ where
         array: &mut R2rInPlaceArray<T, N, M>,
         workspace: &mut R2rInPlaceWorkspace<T, N, M>,
     ) -> Result<TransformTiming<N>, R2rError> {
-        let started = Instant::now();
-        let mut timing = TransformTiming::default();
-        self.execute_in_place(direction, array, workspace, Some(&mut timing))?;
-        timing.total = started.elapsed();
-        Ok(timing)
+        timed_r2r::<N, _>(|report| self.execute_in_place(direction, array, workspace, report))
     }
 
     fn execute_in_place(
@@ -841,60 +788,31 @@ where
         direction: Direction,
         array: &mut R2rInPlaceArray<T, N, M>,
         workspace: &mut R2rInPlaceWorkspace<T, N, M>,
-        mut report: Option<&mut TransformTiming<N>>,
+        report: Option<&mut TransformTiming<N>>,
     ) -> Result<(), R2rError> {
-        let communicator = self.input_pencil().topology().communicator();
-        let operation = match direction {
-            Direction::Forward => {
-                if report.is_some() {
-                    OPERATION_DHT_FORWARD_IN_PLACE_TIMED
-                } else {
-                    super::OPERATION_DHT_FORWARD_IN_PLACE
-                }
-            }
-            Direction::Inverse => {
-                if report.is_some() {
-                    OPERATION_DHT_INVERSE_IN_PLACE_TIMED
-                } else {
-                    super::OPERATION_DHT_INVERSE_IN_PLACE
-                }
-            }
-            Direction::Backward => {
-                if report.is_some() {
-                    OPERATION_DHT_BACKWARD_IN_PLACE_TIMED
-                } else {
-                    super::OPERATION_DHT_BACKWARD_IN_PLACE
-                }
-            }
-        };
-        agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
-        let preflight = self.collection_preflight_in_place(direction, array, workspace);
-        if !collective_valid(communicator, preflight.is_ok()) {
-            return Err(preflight
-                .err()
-                .unwrap_or(R2rError::Fft(FftError::CollectivePreconditionFailed)));
-        }
-        preflight.expect("distributed DHT in-place preflight succeeded");
-        let target = match direction {
-            Direction::Forward => super::R2rState::Output,
-            Direction::Inverse | Direction::Backward => super::R2rState::Input,
-        };
-        run_r2r_in_place_transaction(
+        let operations = [
+            [
+                super::OPERATION_DHT_FORWARD_IN_PLACE,
+                super::OPERATION_DHT_INVERSE_IN_PLACE,
+                super::OPERATION_DHT_BACKWARD_IN_PLACE,
+            ],
+            [
+                OPERATION_DHT_FORWARD_IN_PLACE_TIMED,
+                OPERATION_DHT_INVERSE_IN_PLACE_TIMED,
+                OPERATION_DHT_BACKWARD_IN_PLACE_TIMED,
+            ],
+        ];
+        execute_r2r_in_place(
+            &self.core,
+            self.input_pencil().topology().communicator(),
+            operations,
+            direction,
+            |direction, array, workspace| {
+                self.collection_preflight_in_place(direction, array, workspace)
+            },
             array,
             workspace,
-            target,
-            |array, workspace| match direction {
-                Direction::Forward => {
-                    execute_forward_in_place(&self.core, array, workspace, report.as_deref_mut())
-                }
-                Direction::Inverse | Direction::Backward => execute_reverse_in_place(
-                    &self.core,
-                    array,
-                    workspace,
-                    matches!(direction, Direction::Inverse),
-                    report,
-                ),
-            },
+            report,
         )
     }
 }
@@ -1405,47 +1323,22 @@ where
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
     ) -> Result<(), FftOverlapError<R2rError>> {
-        let communicator = self.input_pencil().topology().communicator();
-        let operation = match direction {
-            Direction::Forward => OPERATION_R2R_FORWARD_OVERLAP,
-            Direction::Inverse => OPERATION_R2R_INVERSE_OVERLAP,
-            Direction::Backward => OPERATION_R2R_BACKWARD_OVERLAP,
-        };
-        agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
-        let preflight = self.preflight(direction, source, destination, workspace);
-        if !collective_valid(communicator, preflight.is_ok()) {
-            return Err(preflight
-                .err()
-                .unwrap_or(R2rError::Fft(FftError::CollectivePreconditionFailed))
-                .into());
-        }
-        let supported = self.core.transitions.iter().all(|transition| {
-            matches!(
-                transition.forward,
-                super::C2cTransition::Identity
-                    | super::C2cTransition::Local(_)
-                    | super::C2cTransition::PointToPoint(_)
-            ) && matches!(
-                transition.backward,
-                super::C2cTransition::Identity
-                    | super::C2cTransition::Local(_)
-                    | super::C2cTransition::PointToPoint(_)
-            )
-        });
-        if !collective_valid(communicator, supported) {
-            return Err(FftOverlapError::UnsupportedTransport);
-        }
-        match direction {
-            Direction::Forward => {
-                execute_r2r_forward_overlap(&self.core, source, destination, workspace)
-            }
-            Direction::Inverse => {
-                execute_r2r_reverse_overlap(&self.core, source, destination, workspace, true)
-            }
-            Direction::Backward => {
-                execute_r2r_reverse_overlap(&self.core, source, destination, workspace, false)
-            }
-        }
+        execute_r2r_overlap(
+            &self.core,
+            self.input_pencil().topology().communicator(),
+            [
+                OPERATION_R2R_FORWARD_OVERLAP,
+                OPERATION_R2R_INVERSE_OVERLAP,
+                OPERATION_R2R_BACKWARD_OVERLAP,
+            ],
+            direction,
+            |direction, source, destination, workspace| {
+                self.preflight(direction, source, destination, workspace)
+            },
+            source,
+            destination,
+            workspace,
+        )
     }
 
     /// Computes the selected raw forward transforms in one state-checked buffer.
@@ -1487,11 +1380,7 @@ where
         destination: &mut PencilArray<T, N, M>,
         workspace: &mut R2rWorkspace<T, N, M>,
     ) -> Result<TransformTiming<N>, R2rError> {
-        let started = Instant::now();
-        let mut timing = TransformTiming::default();
-        self.execute(direction, source, destination, workspace, Some(&mut timing))?;
-        timing.total = started.elapsed();
-        Ok(timing)
+        timed_r2r::<N, _>(|report| self.execute(direction, source, destination, workspace, report))
     }
 
     /// Computes the selected raw forward transforms in one state-checked buffer.
@@ -1557,11 +1446,7 @@ where
         array: &mut R2rInPlaceArray<T, N, M>,
         workspace: &mut R2rInPlaceWorkspace<T, N, M>,
     ) -> Result<TransformTiming<N>, R2rError> {
-        let started = Instant::now();
-        let mut timing = TransformTiming::default();
-        self.execute_in_place(direction, array, workspace, Some(&mut timing))?;
-        timing.total = started.elapsed();
-        Ok(timing)
+        timed_r2r::<N, _>(|report| self.execute_in_place(direction, array, workspace, report))
     }
 
     fn construct(
@@ -1745,51 +1630,31 @@ where
         workspace: &mut R2rWorkspace<T, N, M>,
         report: Option<&mut TransformTiming<N>>,
     ) -> Result<(), R2rError> {
-        let communicator = self.input_pencil().topology().communicator();
-        let operation = match direction {
-            Direction::Forward => {
-                if report.is_some() {
-                    OPERATION_R2R_FORWARD_TIMED
-                } else {
-                    OPERATION_R2R_FORWARD
-                }
-            }
-            Direction::Inverse => {
-                if report.is_some() {
-                    OPERATION_R2R_INVERSE_TIMED
-                } else {
-                    OPERATION_R2R_INVERSE
-                }
-            }
-            Direction::Backward => {
-                if report.is_some() {
-                    OPERATION_R2R_BACKWARD_TIMED
-                } else {
-                    OPERATION_R2R_BACKWARD
-                }
-            }
-        };
-        agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
-        let preflight = self.preflight(direction, source, destination, workspace);
-        if !collective_valid(communicator, preflight.is_ok()) {
-            return Err(preflight
-                .err()
-                .unwrap_or(R2rError::Fft(FftError::CollectivePreconditionFailed)));
-        }
-        preflight.expect("distributed R2R out-of-place preflight succeeded");
-        match direction {
-            Direction::Forward => {
-                execute_forward(&self.core, source, destination, workspace, report)
-            }
-            Direction::Inverse | Direction::Backward => execute_reverse(
-                &self.core,
-                source,
-                destination,
-                workspace,
-                matches!(direction, Direction::Inverse),
-                report,
-            ),
-        }
+        let operations = [
+            [
+                OPERATION_R2R_FORWARD,
+                OPERATION_R2R_INVERSE,
+                OPERATION_R2R_BACKWARD,
+            ],
+            [
+                OPERATION_R2R_FORWARD_TIMED,
+                OPERATION_R2R_INVERSE_TIMED,
+                OPERATION_R2R_BACKWARD_TIMED,
+            ],
+        ];
+        execute_r2r_out_of_place(
+            &self.core,
+            self.input_pencil().topology().communicator(),
+            operations,
+            direction,
+            |direction, source, destination, workspace| {
+                self.preflight(direction, source, destination, workspace)
+            },
+            source,
+            destination,
+            workspace,
+            report,
+        )
     }
 
     pub(super) fn collection_preflight(
@@ -1826,60 +1691,29 @@ where
         direction: Direction,
         array: &mut R2rInPlaceArray<T, N, M>,
         workspace: &mut R2rInPlaceWorkspace<T, N, M>,
-        mut report: Option<&mut TransformTiming<N>>,
+        report: Option<&mut TransformTiming<N>>,
     ) -> Result<(), R2rError> {
-        let communicator = self.input_pencil().topology().communicator();
-        let operation = match direction {
-            Direction::Forward => {
-                if report.is_some() {
-                    OPERATION_R2R_FORWARD_IN_PLACE_TIMED
-                } else {
-                    OPERATION_R2R_FORWARD_IN_PLACE
-                }
-            }
-            Direction::Inverse => {
-                if report.is_some() {
-                    OPERATION_R2R_INVERSE_IN_PLACE_TIMED
-                } else {
-                    OPERATION_R2R_INVERSE_IN_PLACE
-                }
-            }
-            Direction::Backward => {
-                if report.is_some() {
-                    OPERATION_R2R_BACKWARD_IN_PLACE_TIMED
-                } else {
-                    OPERATION_R2R_BACKWARD_IN_PLACE
-                }
-            }
-        };
-        agree_execution_descriptor_ref::<N, M>(communicator, operation, &self.core.descriptor)?;
-        let preflight = self.preflight_in_place(direction, array, workspace);
-        if !collective_valid(communicator, preflight.is_ok()) {
-            return Err(preflight
-                .err()
-                .unwrap_or(R2rError::Fft(FftError::CollectivePreconditionFailed)));
-        }
-        preflight.expect("distributed R2R in-place preflight succeeded");
-        let target = match direction {
-            Direction::Forward => super::R2rState::Output,
-            Direction::Inverse | Direction::Backward => super::R2rState::Input,
-        };
-        run_r2r_in_place_transaction(
+        let operations = [
+            [
+                OPERATION_R2R_FORWARD_IN_PLACE,
+                OPERATION_R2R_INVERSE_IN_PLACE,
+                OPERATION_R2R_BACKWARD_IN_PLACE,
+            ],
+            [
+                OPERATION_R2R_FORWARD_IN_PLACE_TIMED,
+                OPERATION_R2R_INVERSE_IN_PLACE_TIMED,
+                OPERATION_R2R_BACKWARD_IN_PLACE_TIMED,
+            ],
+        ];
+        execute_r2r_in_place(
+            &self.core,
+            self.input_pencil().topology().communicator(),
+            operations,
+            direction,
+            |direction, array, workspace| self.preflight_in_place(direction, array, workspace),
             array,
             workspace,
-            target,
-            |array, workspace| match direction {
-                Direction::Forward => {
-                    execute_forward_in_place(&self.core, array, workspace, report.as_deref_mut())
-                }
-                Direction::Inverse | Direction::Backward => execute_reverse_in_place(
-                    &self.core,
-                    array,
-                    workspace,
-                    matches!(direction, Direction::Inverse),
-                    report,
-                ),
-            },
+            report,
         )
     }
 
@@ -1925,6 +1759,164 @@ impl<T: R2rScalar, const N: usize, const M: usize> R2rInPlaceArray<T, N, M> {
             }
         }
     }
+}
+
+// Operation arrays are [untimed, timed] x [forward, inverse, backward].
+fn r2r_operation(operations: [[u64; 3]; 2], direction: Direction, timed: bool) -> u64 {
+    let slot = match direction {
+        Direction::Forward => 0,
+        Direction::Inverse => 1,
+        Direction::Backward => 2,
+    };
+    operations[usize::from(timed)][slot]
+}
+
+fn execute_r2r_checked<T: R2rScalar, const N: usize, const M: usize>(
+    core: &Arc<R2rCore<T, N, M>>,
+    communicator: &mpi::topology::CartesianCommunicator,
+    operation: u64,
+    preflight: impl FnOnce() -> Result<(), R2rError>,
+) -> Result<(), R2rError> {
+    agree_execution_descriptor_ref::<N, M>(communicator, operation, &core.descriptor)?;
+    agree_result(communicator, preflight())
+}
+
+fn execute_r2r_out_of_place<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
+    core: &Arc<R2rCore<T, N, M>>,
+    communicator: &mpi::topology::CartesianCommunicator,
+    operations: [[u64; 3]; 2],
+    direction: Direction,
+    preflight: impl FnOnce(
+        Direction,
+        &PencilArray<T, N, M>,
+        &PencilArray<T, N, M>,
+        &R2rWorkspace<T, N, M>,
+    ) -> Result<(), R2rError>,
+    source: &PencilArray<T, N, M>,
+    destination: &mut PencilArray<T, N, M>,
+    workspace: &mut R2rWorkspace<T, N, M>,
+    report: Option<&mut TransformTiming<N>>,
+) -> Result<(), R2rError> {
+    execute_r2r_checked(
+        core,
+        communicator,
+        r2r_operation(operations, direction, report.is_some()),
+        || preflight(direction, source, destination, workspace),
+    )?;
+    match direction {
+        Direction::Forward => execute_forward(core, source, destination, workspace, report),
+        Direction::Inverse | Direction::Backward => execute_reverse(
+            core,
+            source,
+            destination,
+            workspace,
+            matches!(direction, Direction::Inverse),
+            report,
+        ),
+    }
+}
+
+fn execute_r2r_in_place<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
+    core: &Arc<R2rCore<T, N, M>>,
+    communicator: &mpi::topology::CartesianCommunicator,
+    operations: [[u64; 3]; 2],
+    direction: Direction,
+    preflight: impl FnOnce(
+        Direction,
+        &R2rInPlaceArray<T, N, M>,
+        &R2rInPlaceWorkspace<T, N, M>,
+    ) -> Result<(), R2rError>,
+    array: &mut R2rInPlaceArray<T, N, M>,
+    workspace: &mut R2rInPlaceWorkspace<T, N, M>,
+    mut report: Option<&mut TransformTiming<N>>,
+) -> Result<(), R2rError> {
+    execute_r2r_checked(
+        core,
+        communicator,
+        r2r_operation(operations, direction, report.is_some()),
+        || preflight(direction, array, workspace),
+    )?;
+    let target = match direction {
+        Direction::Forward => super::R2rState::Output,
+        Direction::Inverse | Direction::Backward => super::R2rState::Input,
+    };
+    run_r2r_in_place_transaction(
+        array,
+        workspace,
+        target,
+        |array, workspace| match direction {
+            Direction::Forward => {
+                execute_forward_in_place(core, array, workspace, report.as_deref_mut())
+            }
+            Direction::Inverse | Direction::Backward => execute_reverse_in_place(
+                core,
+                array,
+                workspace,
+                matches!(direction, Direction::Inverse),
+                report,
+            ),
+        },
+    )
+}
+
+fn execute_r2r_overlap<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
+    core: &Arc<R2rCore<T, N, M>>,
+    communicator: &mpi::topology::CartesianCommunicator,
+    operations: [u64; 3],
+    direction: Direction,
+    preflight: impl FnOnce(
+        Direction,
+        &PencilArray<T, N, M>,
+        &PencilArray<T, N, M>,
+        &R2rWorkspace<T, N, M>,
+    ) -> Result<(), R2rError>,
+    source: &PencilArray<T, N, M>,
+    destination: &mut PencilArray<T, N, M>,
+    workspace: &mut R2rWorkspace<T, N, M>,
+) -> Result<(), FftOverlapError<R2rError>> {
+    execute_r2r_checked(
+        core,
+        communicator,
+        r2r_operation([operations; 2], direction, false),
+        || preflight(direction, source, destination, workspace),
+    )
+    .map_err(FftOverlapError::Operation)?;
+    let supported = core.transitions.iter().all(|transition| {
+        matches!(
+            transition.forward,
+            super::C2cTransition::Identity
+                | super::C2cTransition::Local(_)
+                | super::C2cTransition::PointToPoint(_)
+        ) && matches!(
+            transition.backward,
+            super::C2cTransition::Identity
+                | super::C2cTransition::Local(_)
+                | super::C2cTransition::PointToPoint(_)
+        )
+    });
+    if !collective_valid(communicator, supported) {
+        return Err(FftOverlapError::UnsupportedTransport);
+    }
+    match direction {
+        Direction::Forward => execute_r2r_forward_overlap(core, source, destination, workspace),
+        Direction::Inverse => {
+            execute_r2r_reverse_overlap(core, source, destination, workspace, true)
+        }
+        Direction::Backward => {
+            execute_r2r_reverse_overlap(core, source, destination, workspace, false)
+        }
+    }
+}
+
+fn timed_r2r<const N: usize, F>(run: F) -> Result<TransformTiming<N>, R2rError>
+where
+    F: FnOnce(Option<&mut TransformTiming<N>>) -> Result<(), R2rError>,
+{
+    let started = Instant::now();
+    let mut timing = TransformTiming::default();
+    run(Some(&mut timing))?;
+    timing.total = started.elapsed();
+    Ok(timing)
 }
 
 fn run_r2r_in_place_transaction<T: R2rScalar, const N: usize, const M: usize, F>(
@@ -3111,15 +3103,12 @@ fn validate_r2r_out_of_place<T: R2rScalar, const N: usize, const M: usize>(
     if source.extra_shape() != &core.extra_shape || destination.extra_shape() != &core.extra_shape {
         return Err(FftError::ExtraShapeMismatch.into());
     }
-    validate_workspace_lengths_values(
+    validate_workspace_resources(
+        core,
         workspace.fft_scratch.len(),
-        core.fft_scratch_len,
-        workspace.transpose.send_len(),
-        core.transpose_send_len,
-        workspace.transpose.receive_len(),
-        core.transpose_receive_len,
+        &workspace.transpose,
+        workspace.embedding_line.len(),
     )?;
-    validate_embedding_len(workspace.embedding_line.len(), core.embedding_len)?;
     if workspace.intermediate.extra_shape() != &core.extra_shape {
         return Err(FftError::WorkspaceMismatch.into());
     }
@@ -3134,14 +3123,7 @@ fn validate_r2r_out_of_place<T: R2rScalar, const N: usize, const M: usize>(
     {
         return Err(FftError::WorkspaceMismatch.into());
     }
-    if workspace.line_buffer.len() < core.strided_line_len {
-        return Err(FftError::WorkspaceTooSmall {
-            kind: "real line",
-            required: core.strided_line_len,
-            actual: workspace.line_buffer.len(),
-        }
-        .into());
-    }
+    validate_line_buffer_len(workspace.line_buffer.len(), core.strided_line_len)?;
     Ok(())
 }
 
@@ -3189,20 +3171,39 @@ fn validate_r2r_in_place<T: R2rScalar, const N: usize, const M: usize>(
     {
         return Err(FftError::InputLayoutMismatch.into());
     }
-    validate_workspace_lengths_values(
+    validate_workspace_resources(
+        core,
         workspace.fft_scratch.len(),
+        &workspace.transpose,
+        workspace.embedding_line.len(),
+    )?;
+    validate_line_buffer_len(workspace.line_buffer.len(), core.strided_line_len)?;
+    Ok(())
+}
+
+fn validate_workspace_resources<T: R2rScalar, const N: usize, const M: usize>(
+    core: &R2rCore<T, N, M>,
+    fft_scratch_len: usize,
+    transpose: &TransposeWorkspace<T>,
+    embedding_line_len: usize,
+) -> Result<(), R2rError> {
+    validate_workspace_lengths_values(
+        fft_scratch_len,
         core.fft_scratch_len,
-        workspace.transpose.send_len(),
+        transpose.send_len(),
         core.transpose_send_len,
-        workspace.transpose.receive_len(),
+        transpose.receive_len(),
         core.transpose_receive_len,
     )?;
-    validate_embedding_len(workspace.embedding_line.len(), core.embedding_len)?;
-    if workspace.line_buffer.len() < core.strided_line_len {
+    validate_embedding_len(embedding_line_len, core.embedding_len)
+}
+
+fn validate_line_buffer_len(actual: usize, required: usize) -> Result<(), R2rError> {
+    if actual < required {
         return Err(FftError::WorkspaceTooSmall {
             kind: "real line",
-            required: core.strided_line_len,
-            actual: workspace.line_buffer.len(),
+            required,
+            actual,
         }
         .into());
     }

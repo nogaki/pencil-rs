@@ -787,23 +787,13 @@ where
                 .map(|stage| &stage.output),
         )?;
         let (real_storage_len, complex_storage_len, storage_bytes, complex_capacity) =
-            in_place_storage_requirements(&self.core)?;
-
-        let mut storage = Vec::new();
-        storage
-            .try_reserve_exact(complex_capacity)
-            .map_err(|_| FftError::AllocationFailed {
-                required: complex_capacity,
-            })?;
-        storage.resize(complex_capacity, zero_complex::<R>());
-        let mut real_storage = cast_complex_vec_to_real(storage)?;
-        if real_storage.len() < real_storage_len {
-            return Err(FftError::StorageLayoutMismatch.into());
-        }
-        real_storage.truncate(real_storage_len);
-        let storage =
-            ManyPencilArray::from_vec(real_pencils, 0, self.core.extra_shape.clone(), real_storage)
-                .map_err(map_array_allocation)?;
+            r2c_in_place_storage_requirements(&self.core)?;
+        let storage = allocate_in_place_storage::<R, N, M>(
+            real_pencils,
+            &self.core.extra_shape,
+            real_storage_len,
+            complex_capacity,
+        )?;
 
         Ok(R2cInPlaceArray {
             core: Arc::clone(&self.core),
@@ -1567,38 +1557,18 @@ where
     if destination.len() != destination_len {
         return Err(FftError::PreparationFailed.into());
     }
-    let source_block = plan
-        .real_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    let destination_block = plan
-        .complex_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let source_base = outer
-            .checked_mul(source_block)
-            .ok_or(FftError::PreparationFailed)?;
-        let destination_base = outer
-            .checked_mul(destination_block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.real_len() {
-                real_source_line[k] = source[source_base + k * stride + inner];
-            }
-            plan.forward(
-                &real_source_line[..plan.real_len()],
-                &mut complex_line[..plan.complex_len()],
-                real_line,
-                scratch,
-            )
-            .map_err(R2cError::LocalR2c)?;
-            for k in 0..plan.complex_len() {
-                destination[destination_base + k * stride + inner] = complex_line[k];
-            }
-        }
-    }
-    Ok(())
+    super::for_each_strided_line_differing(
+        source,
+        destination,
+        &mut real_source_line[..plan.real_len()],
+        &mut complex_line[..plan.complex_len()],
+        count,
+        stride,
+        |source, destination| {
+            plan.forward(source, destination, real_line, scratch)
+                .map_err(R2cError::LocalR2c)
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1643,47 +1613,22 @@ where
     if destination.len() != destination_len {
         return Err(FftError::PreparationFailed.into());
     }
-    let source_block = plan
-        .complex_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    let destination_block = plan
-        .real_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let source_base = outer
-            .checked_mul(source_block)
-            .ok_or(FftError::PreparationFailed)?;
-        let destination_base = outer
-            .checked_mul(destination_block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.complex_len() {
-                complex_source_line[k] = source[source_base + k * stride + inner];
-            }
-            let result = if normalize {
-                plan.inverse(
-                    &complex_source_line[..plan.complex_len()],
-                    &mut real_line[..plan.real_len()],
-                    complex_line,
-                    scratch,
-                )
+    super::for_each_strided_line_differing(
+        source,
+        destination,
+        &mut complex_source_line[..plan.complex_len()],
+        &mut real_line[..plan.real_len()],
+        count,
+        stride,
+        |source, destination| {
+            if normalize {
+                plan.inverse(source, destination, complex_line, scratch)
             } else {
-                plan.backward(
-                    &complex_source_line[..plan.complex_len()],
-                    &mut real_line[..plan.real_len()],
-                    complex_line,
-                    scratch,
-                )
-            };
-            result.map_err(R2cError::LocalR2c)?;
-            for k in 0..plan.real_len() {
-                destination[destination_base + k * stride + inner] = real_line[k];
+                plan.backward(source, destination, complex_line, scratch)
             }
-        }
-    }
-    Ok(())
+            .map_err(R2cError::LocalR2c)
+        },
+    )
 }
 
 fn registered_layout_matches<R: FftReal, const N: usize, const M: usize>(
@@ -1725,25 +1670,32 @@ fn registered_real_stage_pencils<R: FftReal, const N: usize, const M: usize>(
     Ok(pencils.into_boxed_slice())
 }
 
-fn in_place_storage_requirements<R: FftReal, const N: usize, const M: usize>(
-    core: &TransformPlanCore<R, N, M>,
-) -> Result<(usize, usize, usize, usize), FftError> {
-    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
-    let extra = core.extra_shape.element_count();
+/// Capacity rule shared by every single-allocation in-place R2C layout.
+///
+/// `R` is the real scalar type of the plan, `real_lens` and `complex_lens` are
+/// the per-stage local lengths on either side of the R2C boundary, and `extra`
+/// is the `extra_shape` repeat count.  Returns
+/// `(real_len, complex_len, storage_bytes, complex_capacity)`.
+pub(super) fn in_place_storage_requirements<R, I, J>(
+    real_lens: I,
+    complex_lens: J,
+    extra: usize,
+    boundary_stride: usize,
+) -> Result<(usize, usize, usize, usize), FftError>
+where
+    I: Iterator<Item = usize>,
+    J: Iterator<Item = usize>,
+{
     let mut real_len = 0usize;
-    for stage in &core.stages[..=boundary] {
-        let length = stage
-            .input
-            .local_len()
+    for local_len in real_lens {
+        let length = local_len
             .checked_mul(extra)
             .ok_or(FftError::PreparationFailed)?;
         real_len = real_len.max(length);
     }
     let mut complex_len = 0usize;
-    for stage in &core.stages[boundary..] {
-        let length = stage
-            .output
-            .local_len()
+    for local_len in complex_lens {
+        let length = local_len
             .checked_mul(extra)
             .ok_or(FftError::PreparationFailed)?;
         complex_len = complex_len.max(length);
@@ -1751,14 +1703,10 @@ fn in_place_storage_requirements<R: FftReal, const N: usize, const M: usize>(
     let real_bytes = real_len
         .checked_mul(size_of::<R>())
         .ok_or(FftError::PreparationFailed)?;
-    let complex_bytes = complex_len
-        .checked_mul(size_of::<Complex<R>>())
-        .ok_or(FftError::PreparationFailed)?;
-    let boundary_stride = super::memory_stride(
-        core.stages[boundary].input.as_ref(),
-        core.stages[boundary].axis,
-    )?;
     let complex_size = size_of::<Complex<R>>();
+    let complex_bytes = complex_len
+        .checked_mul(complex_size)
+        .ok_or(FftError::PreparationFailed)?;
     let storage_bytes = if boundary_stride > 1 {
         // The strided handoff promotes each real scalar to one Complex slot
         // before outer compression.  This is the only route that needs the
@@ -1782,6 +1730,49 @@ fn in_place_storage_requirements<R: FftReal, const N: usize, const M: usize>(
         .ok_or(FftError::PreparationFailed)?;
     let complex_capacity = rounded / complex_size;
     Ok((real_len, complex_len, storage_bytes, complex_capacity))
+}
+
+fn r2c_in_place_storage_requirements<R: FftReal, const N: usize, const M: usize>(
+    core: &TransformPlanCore<R, N, M>,
+) -> Result<(usize, usize, usize, usize), FftError> {
+    let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
+    let boundary_stride = super::memory_stride(
+        core.stages[boundary].input.as_ref(),
+        core.stages[boundary].axis,
+    )?;
+    in_place_storage_requirements::<R, _, _>(
+        core.stages[..=boundary]
+            .iter()
+            .map(|stage| stage.input.local_len()),
+        core.stages[boundary..]
+            .iter()
+            .map(|stage| stage.output.local_len()),
+        core.extra_shape.element_count(),
+        boundary_stride,
+    )
+}
+
+/// Single allocation, cast, and wrap shared by the in-place R2C arrays.
+pub(super) fn allocate_in_place_storage<R: FftReal, const N: usize, const M: usize>(
+    pencils: Box<[Arc<Pencil<N, M>>]>,
+    extra_shape: &ExtraShape,
+    real_storage_len: usize,
+    complex_capacity: usize,
+) -> Result<ManyPencilArray<R, N, M>, FftError> {
+    let mut storage = Vec::new();
+    storage
+        .try_reserve_exact(complex_capacity)
+        .map_err(|_| FftError::AllocationFailed {
+            required: complex_capacity,
+        })?;
+    storage.resize(complex_capacity, zero_complex::<R>());
+    let mut real_storage = cast_complex_vec_to_real(storage)?;
+    if real_storage.len() < real_storage_len {
+        return Err(FftError::StorageLayoutMismatch);
+    }
+    real_storage.truncate(real_storage_len);
+    ManyPencilArray::from_vec(pencils, 0, extra_shape.clone(), real_storage)
+        .map_err(map_array_allocation)
 }
 
 fn promoted_complex_len<R: FftReal, const N: usize, const M: usize>(
@@ -1845,15 +1836,15 @@ fn strided_phase_shape<R: FftReal, const N: usize, const M: usize>(
         .checked_mul(plan.complex_len())
         .and_then(|value| value.checked_mul(stride))
         .ok_or(FftError::PreparationFailed)?;
-    let (real_storage_len, complex_storage_len, _, _) = in_place_storage_requirements(core)?;
+    let (real_storage_len, complex_storage_len, _, _) = r2c_in_place_storage_requirements(core)?;
     if real_span > real_storage_len || complex_span > complex_storage_len {
         return Err(FftError::PreparationFailed);
     }
     Ok(Some((rows, groups, real_span, complex_span)))
 }
 
-fn cast_complex_vec_to_real<R: FftReal>(storage: Vec<Complex<R>>) -> Result<Vec<R>, R2cError> {
-    try_cast_vec(storage).map_err(|(_, _)| R2cError::Fft(FftError::StorageLayoutMismatch))
+fn cast_complex_vec_to_real<R: FftReal>(storage: Vec<Complex<R>>) -> Result<Vec<R>, FftError> {
+    try_cast_vec(storage).map_err(|(_, _)| FftError::StorageLayoutMismatch)
 }
 
 pub(super) fn validate_recast_capacity<T, U>(
@@ -2303,7 +2294,7 @@ where
         }
 
         let (required_real, required_complex, required_bytes, _) =
-            in_place_storage_requirements(&self.core)?;
+            r2c_in_place_storage_requirements(&self.core)?;
         if required_real != array.real_storage_len
             || required_complex != array.complex_storage_len
             || required_bytes != array.storage_bytes
@@ -2379,41 +2370,15 @@ where
             return Err(FftError::WorkspaceMismatch.into());
         }
 
-        let (real_len, complex_len) = r2c_lengths(&self.core);
-        if boundary_stride > 1 {
-            let actual = workspace.real_source_line.as_ref().map_or(0, Vec::len);
-            if actual < real_len {
-                return Err(FftError::WorkspaceTooSmall {
-                    kind: "real source line",
-                    required: real_len,
-                    actual,
-                }
-                .into());
-            }
-        }
-        for (actual, required, kind) in [
-            (workspace.real_line.len(), real_len, "real line"),
-            (
-                workspace.complex_source_line.len(),
-                complex_len,
-                "complex source line",
-            ),
-            (workspace.complex_line.len(), complex_len, "complex line"),
-            (
-                workspace.complex_strided_line.len(),
-                self.core.strided_line_len,
-                "complex line",
-            ),
-        ] {
-            if actual < required {
-                return Err(FftError::WorkspaceTooSmall {
-                    kind,
-                    required,
-                    actual,
-                }
-                .into());
-            }
-        }
+        validate_line_resources(
+            &self.core,
+            boundary_stride,
+            workspace.real_source_line.as_ref().map_or(0, Vec::len),
+            workspace.real_line.len(),
+            Some(workspace.complex_source_line.len()),
+            workspace.complex_line.len(),
+            workspace.complex_strided_line.len(),
+        )?;
         Ok(())
     }
 
@@ -2485,48 +2450,97 @@ where
                 self.core.real_transpose_receive_len,
             )?;
         }
-        let (real_len, complex_len) = r2c_lengths(&self.core);
         let boundary_stride = super::memory_stride(
             self.core.stages[boundary].input.as_ref(),
             self.core.stages[boundary].axis,
         )?;
-        if boundary_stride > 1 {
-            let actual = workspace.real_source_line.as_ref().map_or(0, Vec::len);
-            if actual < real_len {
-                return Err(FftError::WorkspaceTooSmall {
-                    kind: "real source line",
-                    required: real_len,
-                    actual,
-                }
-                .into());
-            }
-        }
-        if workspace.real_line.len() < real_len {
-            return Err(FftError::WorkspaceTooSmall {
-                kind: "real line",
-                required: real_len,
-                actual: workspace.real_line.len(),
-            }
-            .into());
-        }
-        if workspace.complex_line.len() < complex_len {
-            return Err(FftError::WorkspaceTooSmall {
-                kind: "complex line",
-                required: complex_len,
-                actual: workspace.complex_line.len(),
-            }
-            .into());
-        }
-        if workspace.complex_strided_line.len() < self.core.strided_line_len {
-            return Err(FftError::WorkspaceTooSmall {
-                kind: "complex line",
-                required: self.core.strided_line_len,
-                actual: workspace.complex_strided_line.len(),
-            }
-            .into());
-        }
+        validate_line_resources(
+            &self.core,
+            boundary_stride,
+            workspace.real_source_line.as_ref().map_or(0, Vec::len),
+            workspace.real_line.len(),
+            None,
+            workspace.complex_line.len(),
+            workspace.complex_strided_line.len(),
+        )?;
         Ok(())
     }
+}
+
+/// Compares the per-line buffers of both R2C workspace kinds. The
+/// out-of-place workspace has no complex source line, so its caller passes
+/// `None` for that buffer. A non-strided real source is not checked.
+fn validate_line_resources<R: FftReal, const N: usize, const M: usize>(
+    core: &TransformPlanCore<R, N, M>,
+    boundary_stride: usize,
+    real_source_line: usize,
+    real_line: usize,
+    complex_source_line: Option<usize>,
+    complex_line: usize,
+    complex_strided_line: usize,
+) -> Result<(), FftError> {
+    let (real_len, complex_len) = r2c_lengths(core);
+    if boundary_stride > 1 && real_source_line < real_len {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "real source line",
+            required: real_len,
+            actual: real_source_line,
+        });
+    }
+    if real_line < real_len {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "real line",
+            required: real_len,
+            actual: real_line,
+        });
+    }
+    if let Some(actual) = complex_source_line.filter(|actual| *actual < complex_len) {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "complex source line",
+            required: complex_len,
+            actual,
+        });
+    }
+    if complex_line < complex_len {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "complex line",
+            required: complex_len,
+            actual: complex_line,
+        });
+    }
+    if complex_strided_line < core.strided_line_len {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "complex line",
+            required: core.strided_line_len,
+            actual: complex_strided_line,
+        });
+    }
+    Ok(())
+}
+
+fn execute_boundary_real_forward<R: FftReal, const N: usize, const M: usize>(
+    stage: &TransformStage<R, N, M>,
+    source: &[R],
+    destination: &mut [Complex<R>],
+    real_source_line: &mut [R],
+    real_line: &mut [R],
+    complex_line: &mut [Complex<R>],
+    scratch: &mut [Complex<R>],
+) -> Result<(), R2cError>
+where
+    Complex<R>: Equivalence,
+{
+    execute_strided_real_forward(
+        stage.local.real_complex(),
+        stage.input.as_ref(),
+        stage.axis,
+        source,
+        destination,
+        real_source_line,
+        real_line,
+        complex_line,
+        scratch,
+    )
 }
 
 fn execute_forward<R: FftReal, const N: usize, const M: usize>(
@@ -2560,31 +2574,16 @@ where
         workspace
             .intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
-                if stride > 1 {
-                    execute_strided_real_forward(
-                        stage.local.real_complex(),
-                        stage.input.as_ref(),
-                        stage.axis,
-                        source_view.as_slice(),
-                        target.as_mut_slice(),
-                        real_source_line,
-                        real_line,
-                        complex_line,
-                        fft_scratch,
-                    )
-                    .expect("distributed R2C strided forward was preflighted");
-                } else {
-                    stage
-                        .local
-                        .real_complex()
-                        .forward(
-                            source_view.as_slice(),
-                            target.as_mut_slice(),
-                            real_line,
-                            fft_scratch,
-                        )
-                        .expect("distributed R2C forward preflight validated real stage");
-                }
+                execute_boundary_real_forward(
+                    stage,
+                    source_view.as_slice(),
+                    target.as_mut_slice(),
+                    real_source_line,
+                    real_line,
+                    complex_line,
+                    fft_scratch,
+                )
+                .expect("distributed R2C boundary forward was preflighted");
                 Ok::<_, ()>(())
             })
             .expect("distributed R2C stage-zero overwrite was preflighted");
@@ -2639,31 +2638,16 @@ where
         workspace
             .intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
-                if stride > 1 {
-                    execute_strided_real_forward(
-                        stage.local.real_complex(),
-                        stage.input.as_ref(),
-                        stage.axis,
-                        active.as_slice(),
-                        target.as_mut_slice(),
-                        real_source_line,
-                        real_line,
-                        complex_line,
-                        fft_scratch,
-                    )
-                    .expect("distributed R2C strided forward was preflighted");
-                } else {
-                    stage
-                        .local
-                        .real_complex()
-                        .forward(
-                            active.as_slice(),
-                            target.as_mut_slice(),
-                            real_line,
-                            fft_scratch,
-                        )
-                        .expect("distributed R2C forward real boundary was preflighted");
-                }
+                execute_boundary_real_forward(
+                    stage,
+                    active.as_slice(),
+                    target.as_mut_slice(),
+                    real_source_line,
+                    real_line,
+                    complex_line,
+                    fft_scratch,
+                )
+                .expect("distributed R2C boundary forward was preflighted");
                 Ok::<_, ()>(())
             })
             .expect("distributed R2C boundary overwrite was preflighted");
@@ -2782,25 +2766,15 @@ where
                 intermediate
                     .overwrite_with(stage.output.as_ref(), |mut target| {
                         let callback = |data: &mut [R]| {
-                            if stride > 1 {
-                                execute_strided_real_forward(
-                                    stage.local.real_complex(),
-                                    stage.input.as_ref(),
-                                    stage.axis,
-                                    data,
-                                    target.as_mut_slice(),
-                                    real_source_line,
-                                    real_line,
-                                    complex_line,
-                                    fft_scratch,
-                                )
-                            } else {
-                                stage
-                                    .local
-                                    .real_complex()
-                                    .forward(data, target.as_mut_slice(), real_line, fft_scratch)
-                                    .map_err(R2cError::LocalR2c)
-                            }
+                            execute_boundary_real_forward(
+                                stage,
+                                data,
+                                target.as_mut_slice(),
+                                real_source_line,
+                                real_line,
+                                complex_line,
+                                fft_scratch,
+                            )
                         };
                         plan.execute_in_place_with_callback(real, rt, callback)
                             .map_err(map_r2c_overlap)
@@ -2831,30 +2805,15 @@ where
                 workspace
                     .intermediate
                     .overwrite_with(stage.output.as_ref(), |mut target| {
-                        if stride > 1 {
-                            execute_strided_real_forward(
-                                stage.local.real_complex(),
-                                stage.input.as_ref(),
-                                stage.axis,
-                                active.as_slice(),
-                                target.as_mut_slice(),
-                                real_source_line,
-                                real_line,
-                                complex_line,
-                                fft_scratch,
-                            )
-                        } else {
-                            stage
-                                .local
-                                .real_complex()
-                                .forward(
-                                    active.as_slice(),
-                                    target.as_mut_slice(),
-                                    real_line,
-                                    fft_scratch,
-                                )
-                                .map_err(R2cError::LocalR2c)
-                        }
+                        execute_boundary_real_forward(
+                            stage,
+                            active.as_slice(),
+                            target.as_mut_slice(),
+                            real_source_line,
+                            real_line,
+                            complex_line,
+                            fft_scratch,
+                        )
                     })
                     .map_err(|error| match error {
                         OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
@@ -2881,10 +2840,8 @@ where
         workspace
             .intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
-                execute_strided_real_forward(
-                    stage.local.real_complex(),
-                    stage.input.as_ref(),
-                    stage.axis,
+                execute_boundary_real_forward(
+                    stage,
                     view.as_slice(),
                     target.as_mut_slice(),
                     real_source_line,
@@ -3327,38 +3284,22 @@ where
         .intermediate
         .active_view()
         .expect("distributed R2C boundary active layout was validated");
-    let stride = super::memory_stride(stage.output.as_ref(), stage.axis)?;
+    // The local transform re-checks the stride; keep that failure on the old
+    // side of the timer.
+    super::memory_stride(stage.output.as_ref(), stage.axis)?;
     if boundary == 0 {
         let mut destination_view = destination.view_mut();
         let fft_started = Instant::now();
-        if stride > 1 {
-            execute_strided_real_reverse(
-                stage.local.real_complex(),
-                stage.output.as_ref(),
-                stage.axis,
-                active.as_slice(),
-                destination_view.as_mut_slice(),
-                &mut workspace.complex_strided_line,
-                &mut workspace.complex_line,
-                &mut workspace.real_line,
-                &mut workspace.fft_scratch,
-                normalize_inverse,
-            )?;
-        } else if normalize_inverse {
-            stage.local.real_complex().inverse(
-                active.as_slice(),
-                destination_view.as_mut_slice(),
-                &mut workspace.complex_line,
-                &mut workspace.fft_scratch,
-            )?;
-        } else {
-            stage.local.real_complex().backward(
-                active.as_slice(),
-                destination_view.as_mut_slice(),
-                &mut workspace.complex_line,
-                &mut workspace.fft_scratch,
-            )?;
-        }
+        execute_boundary_real_reverse(
+            stage,
+            active.as_slice(),
+            destination_view.as_mut_slice(),
+            &mut workspace.complex_strided_line,
+            &mut workspace.complex_line,
+            &mut workspace.real_line,
+            &mut workspace.fft_scratch,
+            normalize_inverse,
+        )?;
         super::record_fft_timing(&mut report, boundary, fft_started);
         return Ok(());
     }
@@ -3370,35 +3311,16 @@ where
     let fft_started = Instant::now();
     real_intermediate
         .overwrite_with(stage.input.as_ref(), |mut target| {
-            if stride > 1 {
-                execute_strided_real_reverse(
-                    stage.local.real_complex(),
-                    stage.output.as_ref(),
-                    stage.axis,
-                    active.as_slice(),
-                    target.as_mut_slice(),
-                    &mut workspace.complex_strided_line,
-                    &mut workspace.complex_line,
-                    &mut workspace.real_line,
-                    &mut workspace.fft_scratch,
-                    normalize_inverse,
-                )?;
-            } else if normalize_inverse {
-                stage.local.real_complex().inverse(
-                    active.as_slice(),
-                    target.as_mut_slice(),
-                    &mut workspace.complex_line,
-                    &mut workspace.fft_scratch,
-                )?;
-            } else {
-                stage.local.real_complex().backward(
-                    active.as_slice(),
-                    target.as_mut_slice(),
-                    &mut workspace.complex_line,
-                    &mut workspace.fft_scratch,
-                )?;
-            }
-            Ok::<_, R2cError>(())
+            execute_boundary_real_reverse(
+                stage,
+                active.as_slice(),
+                target.as_mut_slice(),
+                &mut workspace.complex_strided_line,
+                &mut workspace.complex_line,
+                &mut workspace.real_line,
+                &mut workspace.fft_scratch,
+                normalize_inverse,
+            )
         })
         .map_err(|error| match error {
             OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),

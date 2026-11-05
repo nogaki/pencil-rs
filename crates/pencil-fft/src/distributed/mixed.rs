@@ -45,8 +45,9 @@ use super::{
     TransformTiming, TransposeMethod, VALUE_KIND_C2C, VALUE_KIND_R2C,
     agree_execution_descriptor_ref, agree_header, agree_result, build_route, build_transitions,
     collective_descriptor, collective_valid, convert_strided_complex_reverse,
-    convert_strided_real_forward, for_each_strided_line, for_each_strided_line_in_place,
-    initialized_vec, map_array_allocation, memory_stride, r2c::validate_recast_capacity,
+    convert_strided_real_forward, for_each_strided_line, for_each_strided_line_differing,
+    for_each_strided_line_in_place, initialized_vec, map_array_allocation, memory_stride,
+    r2c::{allocate_in_place_storage, in_place_storage_requirements, validate_recast_capacity},
     registered_pencils, strided_line_count, validate_input, validate_workspace_lengths_values,
     zero_complex,
 };
@@ -2817,28 +2818,13 @@ fn validate_mixed_c2c_oop<R: FftReal, const N: usize, const M: usize>(
         workspace.intermediate.extra_shape(),
     )
     .map_err(MixedError::Fft)?;
-    validate_workspace_lengths_values(
+    validate_mixed_c2c_workspace_resources(
+        core,
         workspace.fft_scratch.len(),
-        core.fft_scratch_len,
-        workspace.transpose.send_len(),
-        core.transpose_send_len,
-        workspace.transpose.receive_len(),
-        core.transpose_receive_len,
+        &workspace.transpose,
+        workspace.embedding_line.len(),
+        workspace.line_buffer.len(),
     )?;
-    if workspace.embedding_line.len() < core.embedding_len {
-        return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
-            kind: "complex embedding",
-            required: core.embedding_len,
-            actual: workspace.embedding_line.len(),
-        }));
-    }
-    if workspace.line_buffer.len() < core.strided_line_len {
-        return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
-            kind: "complex line",
-            required: core.strided_line_len,
-            actual: workspace.line_buffer.len(),
-        }));
-    }
     Ok(())
 }
 
@@ -2890,26 +2876,43 @@ fn validate_mixed_c2c_ip<R: FftReal, const N: usize, const M: usize>(
     {
         return Err(MixedError::Fft(FftError::InputLayoutMismatch));
     }
-    validate_workspace_lengths_values(
+    validate_mixed_c2c_workspace_resources(
+        core,
         workspace.fft_scratch.len(),
+        &workspace.transpose,
+        workspace.embedding_line.len(),
+        workspace.line_buffer.len(),
+    )?;
+    Ok(())
+}
+
+fn validate_mixed_c2c_workspace_resources<R: FftReal, const N: usize, const M: usize>(
+    core: &MixedC2cCore<R, N, M>,
+    fft_scratch_len: usize,
+    transpose: &TransposeWorkspace<Complex<R>>,
+    embedding_line_len: usize,
+    line_buffer_len: usize,
+) -> Result<(), MixedError> {
+    validate_workspace_lengths_values(
+        fft_scratch_len,
         core.fft_scratch_len,
-        workspace.transpose.send_len(),
+        transpose.send_len(),
         core.transpose_send_len,
-        workspace.transpose.receive_len(),
+        transpose.receive_len(),
         core.transpose_receive_len,
     )?;
-    if workspace.embedding_line.len() < core.embedding_len {
+    if embedding_line_len < core.embedding_len {
         return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
             kind: "complex embedding",
             required: core.embedding_len,
-            actual: workspace.embedding_line.len(),
+            actual: embedding_line_len,
         }));
     }
-    if workspace.line_buffer.len() < core.strided_line_len {
+    if line_buffer_len < core.strided_line_len {
         return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
             kind: "complex line",
             required: core.strided_line_len,
-            actual: workspace.line_buffer.len(),
+            actual: line_buffer_len,
         }));
     }
     Ok(())
@@ -3310,22 +3313,12 @@ where
         let complex_pencils = self.core.complex_pencils.clone();
         let (real_storage_len, complex_storage_len, storage_bytes, complex_capacity) =
             mixed_r2c_storage_requirements(&self.core)?;
-        let mut storage = Vec::new();
-        storage.try_reserve_exact(complex_capacity).map_err(|_| {
-            MixedError::Fft(FftError::AllocationFailed {
-                required: complex_capacity,
-            })
-        })?;
-        storage.resize(complex_capacity, zero_complex::<R>());
-        let mut real_storage = try_cast_vec(storage)
-            .map_err(|(_, _)| MixedError::Fft(FftError::StorageLayoutMismatch))?;
-        if real_storage.len() < real_storage_len {
-            return Err(MixedError::Fft(FftError::StorageLayoutMismatch));
-        }
-        real_storage.truncate(real_storage_len);
-        let storage =
-            ManyPencilArray::from_vec(real_pencils, 0, self.core.extra_shape.clone(), real_storage)
-                .map_err(map_array_allocation)?;
+        let storage = allocate_in_place_storage::<R, N, M>(
+            real_pencils,
+            &self.core.extra_shape,
+            real_storage_len,
+            complex_capacity,
+        )?;
         Ok(MixedR2cInPlaceArray {
             core: Arc::clone(&self.core),
             real_pencils: None,
@@ -4271,55 +4264,21 @@ fn mixed_r2c_complex_pencils<R: FftReal, const N: usize, const M: usize>(
 fn mixed_r2c_storage_requirements<R: FftReal, const N: usize, const M: usize>(
     core: &MixedR2cCore<R, N, M>,
 ) -> Result<(usize, usize, usize, usize), MixedError> {
-    let extra = core.extra_shape.element_count();
     let boundary = core.real_stage_index;
-    let mut real_len = 0;
-    for stage in &core.stages[..=boundary] {
-        real_len = real_len.max(
-            stage
-                .input
-                .local_len()
-                .checked_mul(extra)
-                .ok_or(MixedError::Fft(FftError::PreparationFailed))?,
-        );
-    }
-    let mut complex_len = 0;
-    for stage in &core.stages[boundary..] {
-        complex_len = complex_len.max(
-            stage
-                .output
-                .local_len()
-                .checked_mul(extra)
-                .ok_or(MixedError::Fft(FftError::PreparationFailed))?,
-        );
-    }
-    let real_bytes = real_len
-        .checked_mul(size_of::<R>())
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-    let complex_size = size_of::<Complex<R>>();
-    let complex_bytes = complex_len
-        .checked_mul(complex_size)
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
     let boundary_stride = memory_stride(
         core.stages[boundary].input.as_ref(),
         core.stages[boundary].axis,
     )?;
-    let storage_bytes = if boundary_stride > 1 {
-        real_len
-            .max(complex_len)
-            .checked_mul(complex_size)
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?
-    } else {
-        real_bytes.max(complex_bytes)
-    };
-    if storage_bytes > isize::MAX as usize {
-        return Err(MixedError::Fft(FftError::PreparationFailed));
-    }
-    let capacity = storage_bytes
-        .checked_add(complex_size - 1)
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?
-        / complex_size;
-    Ok((real_len, complex_len, storage_bytes, capacity))
+    Ok(in_place_storage_requirements::<R, _, _>(
+        core.stages[..=boundary]
+            .iter()
+            .map(|stage| stage.input.local_len()),
+        core.stages[boundary..]
+            .iter()
+            .map(|stage| stage.output.local_len()),
+        core.extra_shape.element_count(),
+        boundary_stride,
+    )?)
 }
 
 fn ceil_log2_len(length: usize) -> f64 {
@@ -4330,11 +4289,12 @@ fn ceil_log2_len(length: usize) -> f64 {
     }
 }
 
-fn mixed_raw_threshold<R: FftReal, const N: usize, const M: usize>(
+// Shared error-model walk over the stages after the real boundary, so the
+// construction-time raw threshold and the runtime endpoint policy stay in sync.
+fn mixed_depth_normalization<R: FftReal, const N: usize, const M: usize>(
     stages: &[MixedR2cStage<R, N, M>],
-    _extra: &ExtraShape,
     boundary: usize,
-) -> Result<f64, MixedError> {
+) -> Result<(f64, f64), MixedError> {
     let mut depth = 1.0;
     let mut normalization = 1.0;
     for stage in &stages[boundary + 1..] {
@@ -4357,11 +4317,21 @@ fn mixed_raw_threshold<R: FftReal, const N: usize, const M: usize>(
         };
         depth += ceil_log2_len(native_len) + allowance;
         normalization *= factor;
-        if !depth.is_finite() || depth <= 0.0 || !normalization.is_finite() || normalization <= 0.0
-        {
-            return Err(MixedError::Fft(FftError::PreparationFailed));
-        }
     }
+    // depth only grows and normalization is a running product of positive
+    // factors, so one check after the loop matches a per-stage check.
+    if !depth.is_finite() || depth <= 0.0 || !normalization.is_finite() || normalization <= 0.0 {
+        return Err(MixedError::Fft(FftError::PreparationFailed));
+    }
+    Ok((depth, normalization))
+}
+
+fn mixed_raw_threshold<R: FftReal, const N: usize, const M: usize>(
+    stages: &[MixedR2cStage<R, N, M>],
+    _extra: &ExtraShape,
+    boundary: usize,
+) -> Result<f64, MixedError> {
+    let (depth, normalization) = mixed_depth_normalization(stages, boundary)?;
     let absolute = 128.0
         * <R as crate::private::Sealed>::pencil_fft_min_subnormal_f64()
         * depth
@@ -4511,38 +4481,18 @@ where
     if destination.len() != destination_len {
         return Err(MixedError::Fft(FftError::PreparationFailed));
     }
-    let source_block = plan
-        .real_len()
-        .checked_mul(stride)
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-    let destination_block = plan
-        .complex_len()
-        .checked_mul(stride)
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-    for outer in 0..count {
-        let source_base = outer
-            .checked_mul(source_block)
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        let destination_base = outer
-            .checked_mul(destination_block)
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        for inner in 0..stride {
-            for k in 0..plan.real_len() {
-                real_source_line[k] = source[source_base + k * stride + inner];
-            }
-            plan.forward(
-                &real_source_line[..plan.real_len()],
-                &mut complex_line[..plan.complex_len()],
-                real_line,
-                scratch,
-            )
-            .map_err(MixedError::LocalR2c)?;
-            for k in 0..plan.complex_len() {
-                destination[destination_base + k * stride + inner] = complex_line[k];
-            }
-        }
-    }
-    Ok(())
+    for_each_strided_line_differing(
+        source,
+        destination,
+        &mut real_source_line[..plan.real_len()],
+        &mut complex_line[..plan.complex_len()],
+        count,
+        stride,
+        |source, destination| {
+            plan.forward(source, destination, real_line, scratch)
+                .map_err(MixedError::LocalR2c)
+        },
+    )
 }
 
 fn mixed_rfft_reverse<R: FftReal, const N: usize, const M: usize>(
@@ -4577,10 +4527,6 @@ where
         }));
     }
     let count = strided_line_count(source.len(), plan.complex_len(), stride)?;
-    let source_block = plan
-        .complex_len()
-        .checked_mul(stride)
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
     let destination_block = plan
         .real_len()
         .checked_mul(stride)
@@ -4591,39 +4537,22 @@ where
     if destination.len() != expected {
         return Err(MixedError::Fft(FftError::PreparationFailed));
     }
-    for outer in 0..count {
-        let source_base = outer
-            .checked_mul(source_block)
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        let destination_base = outer
-            .checked_mul(destination_block)
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        for inner in 0..stride {
-            for k in 0..plan.complex_len() {
-                complex_source_line[k] = source[source_base + k * stride + inner];
-            }
-            let result = if normalize {
-                plan.inverse(
-                    &complex_source_line[..plan.complex_len()],
-                    &mut real_line[..plan.real_len()],
-                    complex_line,
-                    scratch,
-                )
+    for_each_strided_line_differing(
+        source,
+        destination,
+        &mut complex_source_line[..plan.complex_len()],
+        &mut real_line[..plan.real_len()],
+        count,
+        stride,
+        |source, destination| {
+            if normalize {
+                plan.inverse(source, destination, complex_line, scratch)
             } else {
-                plan.backward(
-                    &complex_source_line[..plan.complex_len()],
-                    &mut real_line[..plan.real_len()],
-                    complex_line,
-                    scratch,
-                )
-            };
-            result.map_err(MixedError::LocalR2c)?;
-            for k in 0..plan.real_len() {
-                destination[destination_base + k * stride + inner] = real_line[k];
+                plan.backward(source, destination, complex_line, scratch)
             }
-        }
-    }
-    Ok(())
+            .map_err(MixedError::LocalR2c)
+        },
+    )
 }
 
 fn mixed_r2c_complex_forward_tail<R: FftReal, const N: usize, const M: usize>(
@@ -4791,6 +4720,65 @@ where
     Ok(())
 }
 
+fn execute_mixed_boundary_real_forward<R: FftReal, const N: usize, const M: usize>(
+    stage: &MixedR2cStage<R, N, M>,
+    source: &[R],
+    destination: &mut [Complex<R>],
+    real_source_line: &mut [R],
+    real_line: &mut [R],
+    complex_line: &mut [Complex<R>],
+    scratch: &mut [Complex<R>],
+) -> Result<(), MixedError>
+where
+    Complex<R>: Equivalence,
+{
+    let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(plan)) = &stage.local else {
+        return Err(MixedError::Fft(FftError::PreparationFailed));
+    };
+    mixed_rfft_forward(
+        plan,
+        stage.input.as_ref(),
+        stage.axis,
+        source,
+        destination,
+        real_source_line,
+        real_line,
+        complex_line,
+        scratch,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_mixed_boundary_real_reverse<R: FftReal, const N: usize, const M: usize>(
+    stage: &MixedR2cStage<R, N, M>,
+    source: &[Complex<R>],
+    destination: &mut [R],
+    complex_source_line: &mut [Complex<R>],
+    complex_line: &mut [Complex<R>],
+    real_line: &mut [R],
+    scratch: &mut [Complex<R>],
+    normalize: bool,
+) -> Result<(), MixedError>
+where
+    Complex<R>: Equivalence,
+{
+    let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(plan)) = &stage.local else {
+        return Err(MixedError::Fft(FftError::PreparationFailed));
+    };
+    mixed_rfft_reverse(
+        plan,
+        stage.output.as_ref(),
+        stage.axis,
+        source,
+        destination,
+        complex_source_line,
+        complex_line,
+        real_line,
+        scratch,
+        normalize,
+    )
+}
+
 fn execute_mixed_r2c_forward<R: FftReal, const N: usize, const M: usize>(
     core: &Arc<MixedR2cCore<R, N, M>>,
     source: &PencilArray<R, N, M>,
@@ -4806,17 +4794,12 @@ where
     let source_view = source.view();
     if boundary == 0 {
         let stage = &core.stages[0];
-        let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(plan)) = &stage.local else {
-            return Err(MixedError::Fft(FftError::PreparationFailed));
-        };
         let fft_started = Instant::now();
         let overwrite_result = workspace
             .intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
-                mixed_rfft_forward(
-                    plan,
-                    stage.input.as_ref(),
-                    stage.axis,
+                execute_mixed_boundary_real_forward(
+                    stage,
                     source_view.as_slice(),
                     target.as_mut_slice(),
                     &mut workspace.real_source_line,
@@ -4870,17 +4853,12 @@ where
             if index + 1 == boundary {
                 let active = real.active_view().map_err(FftError::Array)?;
                 let stage = &core.stages[boundary];
-                let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(plan)) = &stage.local else {
-                    return Err(MixedError::Fft(FftError::PreparationFailed));
-                };
                 let fft_started = Instant::now();
                 let overwrite_result = workspace
                     .intermediate
                     .overwrite_with(stage.output.as_ref(), |mut target| {
-                        mixed_rfft_forward(
-                            plan,
-                            stage.input.as_ref(),
-                            stage.axis,
+                        execute_mixed_boundary_real_forward(
+                            stage,
                             active.as_slice(),
                             target.as_mut_slice(),
                             &mut workspace.real_source_line,
@@ -4957,9 +4935,6 @@ where
         zero_mixed_boundary(core, &mut workspace.intermediate),
     )?;
     let stage = &core.stages[boundary];
-    let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(plan)) = &stage.local else {
-        return Err(MixedError::Fft(FftError::PreparationFailed));
-    };
     let active = workspace
         .intermediate
         .active_view()
@@ -4968,10 +4943,8 @@ where
         let fft_started = Instant::now();
         let result = {
             let mut target = destination.view_mut();
-            mixed_rfft_reverse(
-                plan,
-                stage.output.as_ref(),
-                stage.axis,
+            execute_mixed_boundary_real_reverse(
+                stage,
                 active.as_slice(),
                 target.as_mut_slice(),
                 &mut workspace.complex_source_line,
@@ -4992,10 +4965,8 @@ where
     let fft_started = Instant::now();
     let overwrite_result = real
         .overwrite_with(stage.input.as_ref(), |mut target| {
-            mixed_rfft_reverse(
-                plan,
-                stage.output.as_ref(),
-                stage.axis,
+            execute_mixed_boundary_real_reverse(
+                stage,
                 active.as_slice(),
                 target.as_mut_slice(),
                 &mut workspace.complex_source_line,
@@ -5079,17 +5050,12 @@ where
     let boundary = core.real_stage_index;
     if boundary == 0 {
         let stage = &core.stages[0];
-        let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(plan)) = &stage.local else {
-            return Err(MixedError::Fft(FftError::PreparationFailed).into());
-        };
         let source_view = source.view();
         let result = workspace
             .intermediate
             .overwrite_with(stage.output.as_ref(), |mut target| {
-                mixed_rfft_forward(
-                    plan,
-                    stage.input.as_ref(),
-                    stage.axis,
+                execute_mixed_boundary_real_forward(
+                    stage,
                     source_view.as_slice(),
                     target.as_mut_slice(),
                     &mut workspace.real_source_line,
@@ -5141,17 +5107,12 @@ where
                 .map_err(MixedError::Fft)?;
                 let stage = &core.stages[index + 1];
                 if index + 1 == boundary {
-                    let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(rfft)) = &stage.local else {
-                        return Err(MixedError::Fft(FftError::PreparationFailed).into());
-                    };
                     let active = real.active_view().map_err(FftError::Array)?;
                     workspace
                         .intermediate
                         .overwrite_with(stage.output.as_ref(), |mut out| {
-                            mixed_rfft_forward(
-                                rfft,
-                                stage.input.as_ref(),
-                                stage.axis,
+                            execute_mixed_boundary_real_forward(
+                                stage,
                                 active.as_slice(),
                                 out.as_mut_slice(),
                                 &mut workspace.real_source_line,
@@ -5183,17 +5144,12 @@ where
             };
             if index + 1 == boundary {
                 let stage = &core.stages[boundary];
-                let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(rfft)) = &stage.local else {
-                    return Err(MixedError::Fft(FftError::PreparationFailed).into());
-                };
                 let callback = |data: &mut [R]| {
                     workspace
                         .intermediate
                         .overwrite_with(stage.output.as_ref(), |mut out| {
-                            mixed_rfft_forward(
-                                rfft,
-                                stage.input.as_ref(),
-                                stage.axis,
+                            execute_mixed_boundary_real_forward(
+                                stage,
                                 data,
                                 out.as_mut_slice(),
                                 &mut workspace.real_source_line,
@@ -5396,9 +5352,6 @@ where
         }
     }
     let stage = &core.stages[boundary];
-    let MixedR2cStageLocal::Real(MixedRealLocal::Rfft(rfft)) = &stage.local else {
-        return Err(MixedError::Fft(FftError::PreparationFailed).into());
-    };
     let mut convert = |data: &mut [Complex<R>]| {
         validate_mixed_boundary_data(core, Ok((stage.output.as_ref(), data)), normalize)?;
         zero_mixed_boundary_data(
@@ -5408,10 +5361,8 @@ where
             data,
         )?;
         let mut transform = |out: &mut [R]| {
-            mixed_rfft_reverse(
-                rfft,
-                stage.output.as_ref(),
-                stage.axis,
+            execute_mixed_boundary_real_reverse(
+                stage,
                 data,
                 out,
                 &mut workspace.complex_source_line,
@@ -5532,6 +5483,60 @@ where
     Ok(())
 }
 
+/// Compares the real transpose and per-line buffers of both mixed R2C workspace
+/// kinds. A missing real transpose is only an error when the plan has a real
+/// stage; `real` and `complex` hold (source, line, strided) lengths.
+fn validate_mixed_r2c_workspace_resources<R: FftReal, const N: usize, const M: usize>(
+    core: &MixedR2cCore<R, N, M>,
+    fft_scratch_len: usize,
+    real_transpose: Option<&TransposeWorkspace<R>>,
+    embedding_line_len: usize,
+    real: [usize; 3],
+    complex: [usize; 3],
+) -> Result<(), MixedError> {
+    if core.real_stage_index > 0 {
+        let transpose = real_transpose.ok_or(MixedError::Fft(FftError::WorkspaceMismatch))?;
+        validate_workspace_lengths_values(
+            fft_scratch_len,
+            core.fft_scratch_len,
+            transpose.send_len(),
+            core.real_transpose_send_len,
+            transpose.receive_len(),
+            core.real_transpose_receive_len,
+        )?;
+    } else if real_transpose.is_some() {
+        return Err(MixedError::Fft(FftError::WorkspaceMismatch));
+    }
+    let [real_source_line, real_line, real_strided_line] = real;
+    let [complex_source_line, complex_line, complex_strided_line] = complex;
+    for (actual, required, kind) in [
+        (embedding_line_len, core.embedding_len, "complex embedding"),
+        (real_source_line, core.real_len, "real source line"),
+        (
+            real_line,
+            core.real_line_len.max(core.real_len),
+            "real line",
+        ),
+        (real_strided_line, core.real_line_len, "real line"),
+        (complex_source_line, core.complex_len, "complex source line"),
+        (
+            complex_line,
+            core.complex_line_len.max(core.complex_len),
+            "complex line",
+        ),
+        (complex_strided_line, core.complex_line_len, "complex line"),
+    ] {
+        if actual < required {
+            return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
+                kind,
+                required,
+                actual,
+            }));
+        }
+    }
+    Ok(())
+}
+
 fn validate_mixed_r2c_common<R: FftReal, const N: usize, const M: usize>(
     core: &Arc<MixedR2cCore<R, N, M>>,
     workspace: &MixedR2cWorkspace<R, N, M>,
@@ -5579,68 +5584,25 @@ fn validate_mixed_r2c_common<R: FftReal, const N: usize, const M: usize>(
             real_intermediate.extra_shape(),
         )
         .map_err(MixedError::Fft)?;
-        let real_transpose = workspace
-            .real_transpose
-            .as_ref()
-            .ok_or(MixedError::Fft(FftError::WorkspaceMismatch))?;
-        validate_workspace_lengths_values(
-            workspace.fft_scratch.len(),
-            core.fft_scratch_len,
-            real_transpose.send_len(),
-            core.real_transpose_send_len,
-            real_transpose.receive_len(),
-            core.real_transpose_receive_len,
-        )?;
-    } else if workspace.real_intermediate.is_some() || workspace.real_transpose.is_some() {
+    } else if workspace.real_intermediate.is_some() {
         return Err(MixedError::Fft(FftError::WorkspaceMismatch));
     }
-    if workspace.embedding_line.len() < core.embedding_len {
-        return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
-            kind: "complex embedding",
-            required: core.embedding_len,
-            actual: workspace.embedding_line.len(),
-        }));
-    }
-    for (actual, required, kind) in [
-        (
+    validate_mixed_r2c_workspace_resources(
+        core,
+        workspace.fft_scratch.len(),
+        workspace.real_transpose.as_ref(),
+        workspace.embedding_line.len(),
+        [
             workspace.real_source_line.len(),
-            core.real_len,
-            "real source line",
-        ),
-        (
             workspace.real_line.len(),
-            core.real_line_len.max(core.real_len),
-            "real line",
-        ),
-        (
             workspace.real_strided_line.len(),
-            core.real_line_len,
-            "real line",
-        ),
-        (
+        ],
+        [
             workspace.complex_source_line.len(),
-            core.complex_len,
-            "complex source line",
-        ),
-        (
             workspace.complex_line.len(),
-            core.complex_line_len.max(core.complex_len),
-            "complex line",
-        ),
-        (
             workspace.complex_strided_line.len(),
-            core.complex_line_len,
-            "complex line",
-        ),
-    ] {
-        if actual < required {
-            return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
-                kind,
-                required,
-                actual,
-            }));
-        }
-    }
+        ],
+    )?;
     Ok(())
 }
 
@@ -5702,33 +5664,7 @@ fn validate_mixed_r2c_reverse<R: FftReal, const N: usize, const M: usize>(
 fn mixed_endpoint_policy<R: FftReal, const N: usize, const M: usize>(
     core: &MixedR2cCore<R, N, M>,
 ) -> Result<(f64, f64), MixedError> {
-    let mut depth = 1.0;
-    let mut normalization = 1.0;
-    for stage in &core.stages[core.real_stage_index + 1..] {
-        let (native_len, factor, allowance) = match &stage.local {
-            MixedR2cStageLocal::Complex(MixedComplexLocal::Identity) => continue,
-            MixedR2cStageLocal::Complex(MixedComplexLocal::Fft(plan)) => {
-                (plan.line_len(), plan.line_len() as f64, 0.0)
-            }
-            MixedR2cStageLocal::Complex(MixedComplexLocal::R2r(MixedR2rLocal::Transform(plan))) => {
-                (
-                    plan.error_model_len(),
-                    plan.normalization_factor() as f64,
-                    2.0,
-                )
-            }
-            MixedR2cStageLocal::Complex(MixedComplexLocal::R2r(MixedR2rLocal::Hartley(plan))) => {
-                (plan.line_len(), plan.normalization_factor() as f64, 2.0)
-            }
-            MixedR2cStageLocal::Real(_) => continue,
-        };
-        depth += ceil_log2_len(native_len) + allowance;
-        normalization *= factor;
-    }
-    if !depth.is_finite() || depth <= 0.0 || !normalization.is_finite() || normalization <= 0.0 {
-        return Err(MixedError::Fft(FftError::PreparationFailed));
-    }
-    Ok((depth, normalization))
+    mixed_depth_normalization(&core.stages, core.real_stage_index)
 }
 
 fn validate_mixed_boundary<R: FftReal, const N: usize, const M: usize>(
@@ -6022,67 +5958,22 @@ fn validate_mixed_r2c_ip<R: FftReal, const N: usize, const M: usize>(
         workspace.transpose.receive_len(),
         core.transpose_receive_len,
     )?;
-    if core.real_stage_index > 0 {
-        let transpose = workspace
-            .real_transpose
-            .as_ref()
-            .ok_or(MixedError::Fft(FftError::WorkspaceMismatch))?;
-        validate_workspace_lengths_values(
-            workspace.fft_scratch.len(),
-            core.fft_scratch_len,
-            transpose.send_len(),
-            core.real_transpose_send_len,
-            transpose.receive_len(),
-            core.real_transpose_receive_len,
-        )?;
-    } else if workspace.real_transpose.is_some() {
-        return Err(MixedError::Fft(FftError::WorkspaceMismatch));
-    }
-    for (actual, required, kind) in [
-        (
-            workspace.embedding_line.len(),
-            core.embedding_len,
-            "complex embedding",
-        ),
-        (
+    validate_mixed_r2c_workspace_resources(
+        core,
+        workspace.fft_scratch.len(),
+        workspace.real_transpose.as_ref(),
+        workspace.embedding_line.len(),
+        [
             workspace.real_source_line.len(),
-            core.real_len,
-            "real source line",
-        ),
-        (
             workspace.real_line.len(),
-            core.real_line_len.max(core.real_len),
-            "real line",
-        ),
-        (
             workspace.real_strided_line.len(),
-            core.real_line_len,
-            "real line",
-        ),
-        (
+        ],
+        [
             workspace.complex_source_line.len(),
-            core.complex_len,
-            "complex source line",
-        ),
-        (
             workspace.complex_line.len(),
-            core.complex_line_len.max(core.complex_len),
-            "complex line",
-        ),
-        (
             workspace.complex_strided_line.len(),
-            core.complex_line_len,
-            "complex line",
-        ),
-    ] {
-        if actual < required {
-            return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
-                kind,
-                required,
-                actual,
-            }));
-        }
-    }
+        ],
+    )?;
     let (real_len, complex_len, storage_bytes, storage_capacity) =
         mixed_r2c_storage_requirements(core)?;
     if real_len != array.real_storage_len

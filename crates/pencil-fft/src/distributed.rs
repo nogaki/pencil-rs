@@ -2668,6 +2668,104 @@ fn for_each_strided_line_in_place<T: Copy, E: From<FftError>>(
     Ok(())
 }
 
+/// Runs `transform` on each strided line of `source` and writes the result to
+/// the matching strided line of `destination`, for source and destination line
+/// lengths that differ (the lengths of `source_line` and `destination_line`).
+///
+/// [`for_each_strided_line`] covers the equal-length case. The caller owns the
+/// fast paths: `stride <= 1`, `count` (from [`strided_line_count`]), the line
+/// buffer checks, and the length checks. Nothing is allocated here.
+fn for_each_strided_line_differing<S: Copy, D: Copy, E: From<FftError>>(
+    source: &[S],
+    destination: &mut [D],
+    source_line: &mut [S],
+    destination_line: &mut [D],
+    count: usize,
+    stride: usize,
+    mut transform: impl FnMut(&[S], &mut [D]) -> Result<(), E>,
+) -> Result<(), E> {
+    let source_line_len = source_line.len();
+    let destination_line_len = destination_line.len();
+    let source_block = source_line_len
+        .checked_mul(stride)
+        .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+    let destination_block = destination_line_len
+        .checked_mul(stride)
+        .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+    for outer in 0..count {
+        let source_base = outer
+            .checked_mul(source_block)
+            .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+        let destination_base = outer
+            .checked_mul(destination_block)
+            .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+        for inner in 0..stride {
+            for k in 0..source_line_len {
+                source_line[k] = source[source_base + k * stride + inner];
+            }
+            transform(source_line, destination_line)?;
+            for k in 0..destination_line_len {
+                destination[destination_base + k * stride + inner] = destination_line[k];
+            }
+        }
+    }
+    Ok(())
+}
+
+/// In-place variant of [`for_each_strided_line_differing`] for storage whose
+/// element type differs from the line element types: `read` and `write`
+/// project between `storage` and the lines.
+///
+/// `source_block` and `destination_block` are the already checked element
+/// counts of one outer group of `storage`; the line lengths are the lengths of
+/// the line buffers.
+#[allow(clippy::too_many_arguments)]
+fn for_each_strided_line_differing_in_place<S, T: Copy, U: Copy, E: From<FftError>>(
+    storage: &mut [S],
+    source_line: &mut [T],
+    destination_line: &mut [U],
+    count: usize,
+    source_block: usize,
+    destination_block: usize,
+    stride: usize,
+    read: impl Fn(&S) -> T,
+    write: impl Fn(&mut S, U),
+    mut transform: impl FnMut(&[T], &mut [U]) -> Result<(), E>,
+) -> Result<(), E> {
+    for outer in 0..count {
+        let source_base = outer
+            .checked_mul(source_block)
+            .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+        let destination_base = outer
+            .checked_mul(destination_block)
+            .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+        for inner in 0..stride {
+            for (k, slot) in source_line.iter_mut().enumerate() {
+                let index = source_base
+                    .checked_add(
+                        k.checked_mul(stride)
+                            .ok_or_else(|| E::from(FftError::PreparationFailed))?,
+                    )
+                    .and_then(|value| value.checked_add(inner))
+                    .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+                *slot = read(&storage[index]);
+            }
+            transform(source_line, destination_line)?;
+            for (k, element) in destination_line.iter().enumerate() {
+                let index = destination_base
+                    .checked_add(
+                        k.checked_mul(stride)
+                            .ok_or_else(|| E::from(FftError::PreparationFailed))?,
+                    )
+                    .and_then(|value| value.checked_add(inner))
+                    .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+                write(&mut storage[index], *element);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn strided_complex_line_len<R: FftReal, const N: usize, const M: usize>(
     stages: &[TransformStage<R, N, M>],
 ) -> Result<usize, FftError> {
@@ -4082,7 +4180,6 @@ impl EndpointStatistics {
 /// `real_source_line`, `complex_line`, `real_line`, and `scratch` are the
 /// plan's line and local transform buffers. The caller keeps array ownership,
 /// poison handling, and the no-rows case.
-#[allow(clippy::needless_range_loop)]
 fn convert_strided_real_forward<R, E>(
     storage: &mut [Complex<R>],
     plan: &LocalR2cPlan<R>,
@@ -4104,13 +4201,17 @@ where
         return Err(FftError::PreparationFailed.into());
     }
     let groups = rows / stride;
+    let source_block = real_len
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
+    let destination_block = complex_len
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
     let source_span = groups
-        .checked_mul(real_len)
-        .and_then(|value| value.checked_mul(stride))
+        .checked_mul(source_block)
         .ok_or(FftError::PreparationFailed)?;
     let destination_span = groups
-        .checked_mul(complex_len)
-        .and_then(|value| value.checked_mul(stride))
+        .checked_mul(destination_block)
         .ok_or(FftError::PreparationFailed)?;
     if source_span > storage.len() || destination_span > storage.len() {
         return Err(FftError::StorageLayoutMismatch.into());
@@ -4129,40 +4230,21 @@ where
         }
         .into());
     }
-    for outer in 0..groups {
-        let source_base = outer
-            .checked_mul(real_len)
-            .and_then(|value| value.checked_mul(stride))
-            .ok_or(FftError::PreparationFailed)?;
-        let destination_base = outer
-            .checked_mul(complex_len)
-            .and_then(|value| value.checked_mul(stride))
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for j in 0..real_len {
-                let index = source_base
-                    .checked_add(j.checked_mul(stride).ok_or(FftError::PreparationFailed)?)
-                    .and_then(|value| value.checked_add(inner))
-                    .ok_or(FftError::PreparationFailed)?;
-                real_source_line[j] = storage[index].re;
-            }
-            plan.forward(
-                &real_source_line[..real_len],
-                &mut complex_line[..complex_len],
-                real_line,
-                scratch,
-            )
-            .map_err(E::from)?;
-            for k in 0..complex_len {
-                let index = destination_base
-                    .checked_add(k.checked_mul(stride).ok_or(FftError::PreparationFailed)?)
-                    .and_then(|value| value.checked_add(inner))
-                    .ok_or(FftError::PreparationFailed)?;
-                storage[index] = complex_line[k];
-            }
-        }
-    }
-    Ok(())
+    for_each_strided_line_differing_in_place(
+        storage,
+        &mut real_source_line[..real_len],
+        &mut complex_line[..complex_len],
+        groups,
+        source_block,
+        destination_block,
+        stride,
+        |value: &Complex<R>| value.re,
+        |slot: &mut Complex<R>, value: Complex<R>| *slot = value,
+        |source, destination| {
+            plan.forward(source, destination, real_line, scratch)
+                .map_err(E::from)
+        },
+    )
 }
 
 /// Repacks compressed complex boundary lines in place into the strided real
@@ -4171,7 +4253,6 @@ where
 /// `complex_source_line`, `real_line`, `complex_line`, and `scratch` are the
 /// plan's line and local transform buffers. The caller keeps array ownership,
 /// poison handling, and the no-rows case.
-#[allow(clippy::needless_range_loop)]
 fn convert_strided_complex_reverse<R, E>(
     storage: &mut [Complex<R>],
     plan: &LocalR2cPlan<R>,
@@ -4194,13 +4275,17 @@ where
         return Err(FftError::PreparationFailed.into());
     }
     let groups = rows / stride;
+    let source_block = complex_len
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
+    let destination_block = real_len
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
     let source_span = groups
-        .checked_mul(complex_len)
-        .and_then(|value| value.checked_mul(stride))
+        .checked_mul(source_block)
         .ok_or(FftError::PreparationFailed)?;
     let destination_span = groups
-        .checked_mul(real_len)
-        .and_then(|value| value.checked_mul(stride))
+        .checked_mul(destination_block)
         .ok_or(FftError::PreparationFailed)?;
     if source_span > storage.len() || destination_span > storage.len() {
         return Err(FftError::StorageLayoutMismatch.into());
@@ -4211,19 +4296,13 @@ where
     // be moved.
     for outer in (0..groups).rev() {
         let source_start = outer
-            .checked_mul(complex_len)
-            .and_then(|value| value.checked_mul(stride))
+            .checked_mul(source_block)
             .ok_or(FftError::PreparationFailed)?;
         let source_end = source_start
-            .checked_add(
-                complex_len
-                    .checked_mul(stride)
-                    .ok_or(FftError::PreparationFailed)?,
-            )
+            .checked_add(source_block)
             .ok_or(FftError::PreparationFailed)?;
         let destination_start = outer
-            .checked_mul(real_len)
-            .and_then(|value| value.checked_mul(stride))
+            .checked_mul(destination_block)
             .ok_or(FftError::PreparationFailed)?;
         storage.copy_within(source_start..source_end, destination_start);
     }
@@ -4242,50 +4321,30 @@ where
         }
         .into());
     }
-    for outer in 0..groups {
-        let base = outer
-            .checked_mul(real_len)
-            .and_then(|value| value.checked_mul(stride))
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..complex_len {
-                let index = base
-                    .checked_add(k.checked_mul(stride).ok_or(FftError::PreparationFailed)?)
-                    .and_then(|value| value.checked_add(inner))
-                    .ok_or(FftError::PreparationFailed)?;
-                complex_source_line[k] = storage[index];
-            }
-            let result = if normalize_inverse {
-                plan.inverse(
-                    &complex_source_line[..complex_len],
-                    &mut real_line[..real_len],
-                    complex_line,
-                    scratch,
-                )
+    // Store the C2R result in Complex::re slots.  Residues modulo S are
+    // disjoint, so every other inner line remains intact until it has been
+    // gathered.  The scalar projection out of Complex::re is left to the
+    // caller, which performs it once this function has consumed all source
+    // lines.  Both directions index the expanded real block.
+    for_each_strided_line_differing_in_place(
+        storage,
+        &mut complex_source_line[..complex_len],
+        &mut real_line[..real_len],
+        groups,
+        destination_block,
+        destination_block,
+        stride,
+        |value: &Complex<R>| *value,
+        |slot: &mut Complex<R>, value: R| slot.re = value,
+        |source, destination| {
+            if normalize_inverse {
+                plan.inverse(source, destination, complex_line, scratch)
             } else {
-                plan.backward(
-                    &complex_source_line[..complex_len],
-                    &mut real_line[..real_len],
-                    complex_line,
-                    scratch,
-                )
-            };
-            result.map_err(E::from)?;
-            // Store the C2R result in Complex::re slots.  Residues modulo S
-            // are disjoint, so every other inner line remains intact until it
-            // has been gathered.  The scalar projection out of Complex::re is
-            // left to the caller, which performs it once this function has
-            // consumed all source lines.
-            for j in 0..real_len {
-                let index = base
-                    .checked_add(j.checked_mul(stride).ok_or(FftError::PreparationFailed)?)
-                    .and_then(|value| value.checked_add(inner))
-                    .ok_or(FftError::PreparationFailed)?;
-                storage[index].re = real_line[j];
+                plan.backward(source, destination, complex_line, scratch)
             }
-        }
-    }
-    Ok(())
+            .map_err(E::from)
+        },
+    )
 }
 
 fn map_array_allocation(error: ArrayError) -> FftError {
