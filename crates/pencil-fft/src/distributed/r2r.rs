@@ -3103,15 +3103,12 @@ fn validate_r2r_out_of_place<T: R2rScalar, const N: usize, const M: usize>(
     if source.extra_shape() != &core.extra_shape || destination.extra_shape() != &core.extra_shape {
         return Err(FftError::ExtraShapeMismatch.into());
     }
-    validate_workspace_lengths_values(
+    validate_workspace_resources(
+        core,
         workspace.fft_scratch.len(),
-        core.fft_scratch_len,
-        workspace.transpose.send_len(),
-        core.transpose_send_len,
-        workspace.transpose.receive_len(),
-        core.transpose_receive_len,
+        &workspace.transpose,
+        workspace.embedding_line.len(),
     )?;
-    validate_embedding_len(workspace.embedding_line.len(), core.embedding_len)?;
     if workspace.intermediate.extra_shape() != &core.extra_shape {
         return Err(FftError::WorkspaceMismatch.into());
     }
@@ -3126,14 +3123,7 @@ fn validate_r2r_out_of_place<T: R2rScalar, const N: usize, const M: usize>(
     {
         return Err(FftError::WorkspaceMismatch.into());
     }
-    if workspace.line_buffer.len() < core.strided_line_len {
-        return Err(FftError::WorkspaceTooSmall {
-            kind: "real line",
-            required: core.strided_line_len,
-            actual: workspace.line_buffer.len(),
-        }
-        .into());
-    }
+    validate_line_buffer_len(workspace.line_buffer.len(), core.strided_line_len)?;
     Ok(())
 }
 
@@ -3181,20 +3171,39 @@ fn validate_r2r_in_place<T: R2rScalar, const N: usize, const M: usize>(
     {
         return Err(FftError::InputLayoutMismatch.into());
     }
-    validate_workspace_lengths_values(
+    validate_workspace_resources(
+        core,
         workspace.fft_scratch.len(),
+        &workspace.transpose,
+        workspace.embedding_line.len(),
+    )?;
+    validate_line_buffer_len(workspace.line_buffer.len(), core.strided_line_len)?;
+    Ok(())
+}
+
+fn validate_workspace_resources<T: R2rScalar, const N: usize, const M: usize>(
+    core: &R2rCore<T, N, M>,
+    fft_scratch_len: usize,
+    transpose: &TransposeWorkspace<T>,
+    embedding_line_len: usize,
+) -> Result<(), R2rError> {
+    validate_workspace_lengths_values(
+        fft_scratch_len,
         core.fft_scratch_len,
-        workspace.transpose.send_len(),
+        transpose.send_len(),
         core.transpose_send_len,
-        workspace.transpose.receive_len(),
+        transpose.receive_len(),
         core.transpose_receive_len,
     )?;
-    validate_embedding_len(workspace.embedding_line.len(), core.embedding_len)?;
-    if workspace.line_buffer.len() < core.strided_line_len {
+    validate_embedding_len(embedding_line_len, core.embedding_len)
+}
+
+fn validate_line_buffer_len(actual: usize, required: usize) -> Result<(), R2rError> {
+    if actual < required {
         return Err(FftError::WorkspaceTooSmall {
             kind: "real line",
-            required: core.strided_line_len,
-            actual: workspace.line_buffer.len(),
+            required,
+            actual,
         }
         .into());
     }

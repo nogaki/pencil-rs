@@ -2818,28 +2818,13 @@ fn validate_mixed_c2c_oop<R: FftReal, const N: usize, const M: usize>(
         workspace.intermediate.extra_shape(),
     )
     .map_err(MixedError::Fft)?;
-    validate_workspace_lengths_values(
+    validate_mixed_c2c_workspace_resources(
+        core,
         workspace.fft_scratch.len(),
-        core.fft_scratch_len,
-        workspace.transpose.send_len(),
-        core.transpose_send_len,
-        workspace.transpose.receive_len(),
-        core.transpose_receive_len,
+        &workspace.transpose,
+        workspace.embedding_line.len(),
+        workspace.line_buffer.len(),
     )?;
-    if workspace.embedding_line.len() < core.embedding_len {
-        return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
-            kind: "complex embedding",
-            required: core.embedding_len,
-            actual: workspace.embedding_line.len(),
-        }));
-    }
-    if workspace.line_buffer.len() < core.strided_line_len {
-        return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
-            kind: "complex line",
-            required: core.strided_line_len,
-            actual: workspace.line_buffer.len(),
-        }));
-    }
     Ok(())
 }
 
@@ -2891,26 +2876,43 @@ fn validate_mixed_c2c_ip<R: FftReal, const N: usize, const M: usize>(
     {
         return Err(MixedError::Fft(FftError::InputLayoutMismatch));
     }
-    validate_workspace_lengths_values(
+    validate_mixed_c2c_workspace_resources(
+        core,
         workspace.fft_scratch.len(),
+        &workspace.transpose,
+        workspace.embedding_line.len(),
+        workspace.line_buffer.len(),
+    )?;
+    Ok(())
+}
+
+fn validate_mixed_c2c_workspace_resources<R: FftReal, const N: usize, const M: usize>(
+    core: &MixedC2cCore<R, N, M>,
+    fft_scratch_len: usize,
+    transpose: &TransposeWorkspace<Complex<R>>,
+    embedding_line_len: usize,
+    line_buffer_len: usize,
+) -> Result<(), MixedError> {
+    validate_workspace_lengths_values(
+        fft_scratch_len,
         core.fft_scratch_len,
-        workspace.transpose.send_len(),
+        transpose.send_len(),
         core.transpose_send_len,
-        workspace.transpose.receive_len(),
+        transpose.receive_len(),
         core.transpose_receive_len,
     )?;
-    if workspace.embedding_line.len() < core.embedding_len {
+    if embedding_line_len < core.embedding_len {
         return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
             kind: "complex embedding",
             required: core.embedding_len,
-            actual: workspace.embedding_line.len(),
+            actual: embedding_line_len,
         }));
     }
-    if workspace.line_buffer.len() < core.strided_line_len {
+    if line_buffer_len < core.strided_line_len {
         return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
             kind: "complex line",
             required: core.strided_line_len,
-            actual: workspace.line_buffer.len(),
+            actual: line_buffer_len,
         }));
     }
     Ok(())
@@ -5459,6 +5461,60 @@ where
     Ok(())
 }
 
+/// Compares the real transpose and per-line buffers of both mixed R2C workspace
+/// kinds. A missing real transpose is only an error when the plan has a real
+/// stage; `real` and `complex` hold (source, line, strided) lengths.
+fn validate_mixed_r2c_workspace_resources<R: FftReal, const N: usize, const M: usize>(
+    core: &MixedR2cCore<R, N, M>,
+    fft_scratch_len: usize,
+    real_transpose: Option<&TransposeWorkspace<R>>,
+    embedding_line_len: usize,
+    real: [usize; 3],
+    complex: [usize; 3],
+) -> Result<(), MixedError> {
+    if core.real_stage_index > 0 {
+        let transpose = real_transpose.ok_or(MixedError::Fft(FftError::WorkspaceMismatch))?;
+        validate_workspace_lengths_values(
+            fft_scratch_len,
+            core.fft_scratch_len,
+            transpose.send_len(),
+            core.real_transpose_send_len,
+            transpose.receive_len(),
+            core.real_transpose_receive_len,
+        )?;
+    } else if real_transpose.is_some() {
+        return Err(MixedError::Fft(FftError::WorkspaceMismatch));
+    }
+    let [real_source_line, real_line, real_strided_line] = real;
+    let [complex_source_line, complex_line, complex_strided_line] = complex;
+    for (actual, required, kind) in [
+        (embedding_line_len, core.embedding_len, "complex embedding"),
+        (real_source_line, core.real_len, "real source line"),
+        (
+            real_line,
+            core.real_line_len.max(core.real_len),
+            "real line",
+        ),
+        (real_strided_line, core.real_line_len, "real line"),
+        (complex_source_line, core.complex_len, "complex source line"),
+        (
+            complex_line,
+            core.complex_line_len.max(core.complex_len),
+            "complex line",
+        ),
+        (complex_strided_line, core.complex_line_len, "complex line"),
+    ] {
+        if actual < required {
+            return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
+                kind,
+                required,
+                actual,
+            }));
+        }
+    }
+    Ok(())
+}
+
 fn validate_mixed_r2c_common<R: FftReal, const N: usize, const M: usize>(
     core: &Arc<MixedR2cCore<R, N, M>>,
     workspace: &MixedR2cWorkspace<R, N, M>,
@@ -5506,68 +5562,25 @@ fn validate_mixed_r2c_common<R: FftReal, const N: usize, const M: usize>(
             real_intermediate.extra_shape(),
         )
         .map_err(MixedError::Fft)?;
-        let real_transpose = workspace
-            .real_transpose
-            .as_ref()
-            .ok_or(MixedError::Fft(FftError::WorkspaceMismatch))?;
-        validate_workspace_lengths_values(
-            workspace.fft_scratch.len(),
-            core.fft_scratch_len,
-            real_transpose.send_len(),
-            core.real_transpose_send_len,
-            real_transpose.receive_len(),
-            core.real_transpose_receive_len,
-        )?;
-    } else if workspace.real_intermediate.is_some() || workspace.real_transpose.is_some() {
+    } else if workspace.real_intermediate.is_some() {
         return Err(MixedError::Fft(FftError::WorkspaceMismatch));
     }
-    if workspace.embedding_line.len() < core.embedding_len {
-        return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
-            kind: "complex embedding",
-            required: core.embedding_len,
-            actual: workspace.embedding_line.len(),
-        }));
-    }
-    for (actual, required, kind) in [
-        (
+    validate_mixed_r2c_workspace_resources(
+        core,
+        workspace.fft_scratch.len(),
+        workspace.real_transpose.as_ref(),
+        workspace.embedding_line.len(),
+        [
             workspace.real_source_line.len(),
-            core.real_len,
-            "real source line",
-        ),
-        (
             workspace.real_line.len(),
-            core.real_line_len.max(core.real_len),
-            "real line",
-        ),
-        (
             workspace.real_strided_line.len(),
-            core.real_line_len,
-            "real line",
-        ),
-        (
+        ],
+        [
             workspace.complex_source_line.len(),
-            core.complex_len,
-            "complex source line",
-        ),
-        (
             workspace.complex_line.len(),
-            core.complex_line_len.max(core.complex_len),
-            "complex line",
-        ),
-        (
             workspace.complex_strided_line.len(),
-            core.complex_line_len,
-            "complex line",
-        ),
-    ] {
-        if actual < required {
-            return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
-                kind,
-                required,
-                actual,
-            }));
-        }
-    }
+        ],
+    )?;
     Ok(())
 }
 
@@ -5923,67 +5936,22 @@ fn validate_mixed_r2c_ip<R: FftReal, const N: usize, const M: usize>(
         workspace.transpose.receive_len(),
         core.transpose_receive_len,
     )?;
-    if core.real_stage_index > 0 {
-        let transpose = workspace
-            .real_transpose
-            .as_ref()
-            .ok_or(MixedError::Fft(FftError::WorkspaceMismatch))?;
-        validate_workspace_lengths_values(
-            workspace.fft_scratch.len(),
-            core.fft_scratch_len,
-            transpose.send_len(),
-            core.real_transpose_send_len,
-            transpose.receive_len(),
-            core.real_transpose_receive_len,
-        )?;
-    } else if workspace.real_transpose.is_some() {
-        return Err(MixedError::Fft(FftError::WorkspaceMismatch));
-    }
-    for (actual, required, kind) in [
-        (
-            workspace.embedding_line.len(),
-            core.embedding_len,
-            "complex embedding",
-        ),
-        (
+    validate_mixed_r2c_workspace_resources(
+        core,
+        workspace.fft_scratch.len(),
+        workspace.real_transpose.as_ref(),
+        workspace.embedding_line.len(),
+        [
             workspace.real_source_line.len(),
-            core.real_len,
-            "real source line",
-        ),
-        (
             workspace.real_line.len(),
-            core.real_line_len.max(core.real_len),
-            "real line",
-        ),
-        (
             workspace.real_strided_line.len(),
-            core.real_line_len,
-            "real line",
-        ),
-        (
+        ],
+        [
             workspace.complex_source_line.len(),
-            core.complex_len,
-            "complex source line",
-        ),
-        (
             workspace.complex_line.len(),
-            core.complex_line_len.max(core.complex_len),
-            "complex line",
-        ),
-        (
             workspace.complex_strided_line.len(),
-            core.complex_line_len,
-            "complex line",
-        ),
-    ] {
-        if actual < required {
-            return Err(MixedError::Fft(FftError::WorkspaceTooSmall {
-                kind,
-                required,
-                actual,
-            }));
-        }
-    }
+        ],
+    )?;
     let (real_len, complex_len, storage_bytes, storage_capacity) =
         mixed_r2c_storage_requirements(core)?;
     if real_len != array.real_storage_len

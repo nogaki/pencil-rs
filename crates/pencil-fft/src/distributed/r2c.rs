@@ -2370,41 +2370,15 @@ where
             return Err(FftError::WorkspaceMismatch.into());
         }
 
-        let (real_len, complex_len) = r2c_lengths(&self.core);
-        if boundary_stride > 1 {
-            let actual = workspace.real_source_line.as_ref().map_or(0, Vec::len);
-            if actual < real_len {
-                return Err(FftError::WorkspaceTooSmall {
-                    kind: "real source line",
-                    required: real_len,
-                    actual,
-                }
-                .into());
-            }
-        }
-        for (actual, required, kind) in [
-            (workspace.real_line.len(), real_len, "real line"),
-            (
-                workspace.complex_source_line.len(),
-                complex_len,
-                "complex source line",
-            ),
-            (workspace.complex_line.len(), complex_len, "complex line"),
-            (
-                workspace.complex_strided_line.len(),
-                self.core.strided_line_len,
-                "complex line",
-            ),
-        ] {
-            if actual < required {
-                return Err(FftError::WorkspaceTooSmall {
-                    kind,
-                    required,
-                    actual,
-                }
-                .into());
-            }
-        }
+        validate_line_resources(
+            &self.core,
+            boundary_stride,
+            workspace.real_source_line.as_ref().map_or(0, Vec::len),
+            workspace.real_line.len(),
+            Some(workspace.complex_source_line.len()),
+            workspace.complex_line.len(),
+            workspace.complex_strided_line.len(),
+        )?;
         Ok(())
     }
 
@@ -2476,48 +2450,72 @@ where
                 self.core.real_transpose_receive_len,
             )?;
         }
-        let (real_len, complex_len) = r2c_lengths(&self.core);
         let boundary_stride = super::memory_stride(
             self.core.stages[boundary].input.as_ref(),
             self.core.stages[boundary].axis,
         )?;
-        if boundary_stride > 1 {
-            let actual = workspace.real_source_line.as_ref().map_or(0, Vec::len);
-            if actual < real_len {
-                return Err(FftError::WorkspaceTooSmall {
-                    kind: "real source line",
-                    required: real_len,
-                    actual,
-                }
-                .into());
-            }
-        }
-        if workspace.real_line.len() < real_len {
-            return Err(FftError::WorkspaceTooSmall {
-                kind: "real line",
-                required: real_len,
-                actual: workspace.real_line.len(),
-            }
-            .into());
-        }
-        if workspace.complex_line.len() < complex_len {
-            return Err(FftError::WorkspaceTooSmall {
-                kind: "complex line",
-                required: complex_len,
-                actual: workspace.complex_line.len(),
-            }
-            .into());
-        }
-        if workspace.complex_strided_line.len() < self.core.strided_line_len {
-            return Err(FftError::WorkspaceTooSmall {
-                kind: "complex line",
-                required: self.core.strided_line_len,
-                actual: workspace.complex_strided_line.len(),
-            }
-            .into());
-        }
+        validate_line_resources(
+            &self.core,
+            boundary_stride,
+            workspace.real_source_line.as_ref().map_or(0, Vec::len),
+            workspace.real_line.len(),
+            None,
+            workspace.complex_line.len(),
+            workspace.complex_strided_line.len(),
+        )?;
         Ok(())
     }
+}
+
+/// Compares the per-line buffers of both R2C workspace kinds. The
+/// out-of-place workspace has no complex source line, so its caller passes
+/// `None` for that buffer. A non-strided real source is not checked.
+fn validate_line_resources<R: FftReal, const N: usize, const M: usize>(
+    core: &TransformPlanCore<R, N, M>,
+    boundary_stride: usize,
+    real_source_line: usize,
+    real_line: usize,
+    complex_source_line: Option<usize>,
+    complex_line: usize,
+    complex_strided_line: usize,
+) -> Result<(), FftError> {
+    let (real_len, complex_len) = r2c_lengths(core);
+    if boundary_stride > 1 && real_source_line < real_len {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "real source line",
+            required: real_len,
+            actual: real_source_line,
+        });
+    }
+    if real_line < real_len {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "real line",
+            required: real_len,
+            actual: real_line,
+        });
+    }
+    if let Some(actual) = complex_source_line.filter(|actual| *actual < complex_len) {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "complex source line",
+            required: complex_len,
+            actual,
+        });
+    }
+    if complex_line < complex_len {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "complex line",
+            required: complex_len,
+            actual: complex_line,
+        });
+    }
+    if complex_strided_line < core.strided_line_len {
+        return Err(FftError::WorkspaceTooSmall {
+            kind: "complex line",
+            required: core.strided_line_len,
+            actual: complex_strided_line,
+        });
+    }
+    Ok(())
 }
 
 fn execute_forward<R: FftReal, const N: usize, const M: usize>(
