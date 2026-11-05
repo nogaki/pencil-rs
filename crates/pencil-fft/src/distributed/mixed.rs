@@ -47,8 +47,9 @@ use super::{
     collective_descriptor, collective_valid, convert_strided_complex_reverse,
     convert_strided_real_forward, for_each_strided_line, for_each_strided_line_differing,
     for_each_strided_line_in_place, initialized_vec, map_array_allocation, memory_stride,
-    r2c::validate_recast_capacity, registered_pencils, strided_line_count, validate_input,
-    validate_workspace_lengths_values, zero_complex,
+    r2c::{allocate_in_place_storage, in_place_storage_requirements, validate_recast_capacity},
+    registered_pencils, strided_line_count, validate_input, validate_workspace_lengths_values,
+    zero_complex,
 };
 
 #[cfg(test)]
@@ -3310,22 +3311,12 @@ where
         let complex_pencils = self.core.complex_pencils.clone();
         let (real_storage_len, complex_storage_len, storage_bytes, complex_capacity) =
             mixed_r2c_storage_requirements(&self.core)?;
-        let mut storage = Vec::new();
-        storage.try_reserve_exact(complex_capacity).map_err(|_| {
-            MixedError::Fft(FftError::AllocationFailed {
-                required: complex_capacity,
-            })
-        })?;
-        storage.resize(complex_capacity, zero_complex::<R>());
-        let mut real_storage = try_cast_vec(storage)
-            .map_err(|(_, _)| MixedError::Fft(FftError::StorageLayoutMismatch))?;
-        if real_storage.len() < real_storage_len {
-            return Err(MixedError::Fft(FftError::StorageLayoutMismatch));
-        }
-        real_storage.truncate(real_storage_len);
-        let storage =
-            ManyPencilArray::from_vec(real_pencils, 0, self.core.extra_shape.clone(), real_storage)
-                .map_err(map_array_allocation)?;
+        let storage = allocate_in_place_storage::<R, N, M>(
+            real_pencils,
+            &self.core.extra_shape,
+            real_storage_len,
+            complex_capacity,
+        )?;
         Ok(MixedR2cInPlaceArray {
             core: Arc::clone(&self.core),
             real_pencils: None,
@@ -4271,55 +4262,21 @@ fn mixed_r2c_complex_pencils<R: FftReal, const N: usize, const M: usize>(
 fn mixed_r2c_storage_requirements<R: FftReal, const N: usize, const M: usize>(
     core: &MixedR2cCore<R, N, M>,
 ) -> Result<(usize, usize, usize, usize), MixedError> {
-    let extra = core.extra_shape.element_count();
     let boundary = core.real_stage_index;
-    let mut real_len = 0;
-    for stage in &core.stages[..=boundary] {
-        real_len = real_len.max(
-            stage
-                .input
-                .local_len()
-                .checked_mul(extra)
-                .ok_or(MixedError::Fft(FftError::PreparationFailed))?,
-        );
-    }
-    let mut complex_len = 0;
-    for stage in &core.stages[boundary..] {
-        complex_len = complex_len.max(
-            stage
-                .output
-                .local_len()
-                .checked_mul(extra)
-                .ok_or(MixedError::Fft(FftError::PreparationFailed))?,
-        );
-    }
-    let real_bytes = real_len
-        .checked_mul(size_of::<R>())
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-    let complex_size = size_of::<Complex<R>>();
-    let complex_bytes = complex_len
-        .checked_mul(complex_size)
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
     let boundary_stride = memory_stride(
         core.stages[boundary].input.as_ref(),
         core.stages[boundary].axis,
     )?;
-    let storage_bytes = if boundary_stride > 1 {
-        real_len
-            .max(complex_len)
-            .checked_mul(complex_size)
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?
-    } else {
-        real_bytes.max(complex_bytes)
-    };
-    if storage_bytes > isize::MAX as usize {
-        return Err(MixedError::Fft(FftError::PreparationFailed));
-    }
-    let capacity = storage_bytes
-        .checked_add(complex_size - 1)
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?
-        / complex_size;
-    Ok((real_len, complex_len, storage_bytes, capacity))
+    Ok(in_place_storage_requirements::<R, _, _>(
+        core.stages[..=boundary]
+            .iter()
+            .map(|stage| stage.input.local_len()),
+        core.stages[boundary..]
+            .iter()
+            .map(|stage| stage.output.local_len()),
+        core.extra_shape.element_count(),
+        boundary_stride,
+    )?)
 }
 
 fn ceil_log2_len(length: usize) -> f64 {
