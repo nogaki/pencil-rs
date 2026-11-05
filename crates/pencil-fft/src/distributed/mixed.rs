@@ -45,10 +45,10 @@ use super::{
     TransformTiming, TransposeMethod, VALUE_KIND_C2C, VALUE_KIND_R2C,
     agree_execution_descriptor_ref, agree_header, agree_result, build_route, build_transitions,
     collective_descriptor, collective_valid, convert_strided_complex_reverse,
-    convert_strided_real_forward, for_each_strided_line, for_each_strided_line_in_place,
-    initialized_vec, map_array_allocation, memory_stride, r2c::validate_recast_capacity,
-    registered_pencils, strided_line_count, validate_input, validate_workspace_lengths_values,
-    zero_complex,
+    convert_strided_real_forward, for_each_strided_line, for_each_strided_line_differing,
+    for_each_strided_line_in_place, initialized_vec, map_array_allocation, memory_stride,
+    r2c::validate_recast_capacity, registered_pencils, strided_line_count, validate_input,
+    validate_workspace_lengths_values, zero_complex,
 };
 
 #[cfg(test)]
@@ -4522,38 +4522,18 @@ where
     if destination.len() != destination_len {
         return Err(MixedError::Fft(FftError::PreparationFailed));
     }
-    let source_block = plan
-        .real_len()
-        .checked_mul(stride)
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-    let destination_block = plan
-        .complex_len()
-        .checked_mul(stride)
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-    for outer in 0..count {
-        let source_base = outer
-            .checked_mul(source_block)
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        let destination_base = outer
-            .checked_mul(destination_block)
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        for inner in 0..stride {
-            for k in 0..plan.real_len() {
-                real_source_line[k] = source[source_base + k * stride + inner];
-            }
-            plan.forward(
-                &real_source_line[..plan.real_len()],
-                &mut complex_line[..plan.complex_len()],
-                real_line,
-                scratch,
-            )
-            .map_err(MixedError::LocalR2c)?;
-            for k in 0..plan.complex_len() {
-                destination[destination_base + k * stride + inner] = complex_line[k];
-            }
-        }
-    }
-    Ok(())
+    for_each_strided_line_differing(
+        source,
+        destination,
+        &mut real_source_line[..plan.real_len()],
+        &mut complex_line[..plan.complex_len()],
+        count,
+        stride,
+        |source, destination| {
+            plan.forward(source, destination, real_line, scratch)
+                .map_err(MixedError::LocalR2c)
+        },
+    )
 }
 
 fn mixed_rfft_reverse<R: FftReal, const N: usize, const M: usize>(
@@ -4588,10 +4568,6 @@ where
         }));
     }
     let count = strided_line_count(source.len(), plan.complex_len(), stride)?;
-    let source_block = plan
-        .complex_len()
-        .checked_mul(stride)
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
     let destination_block = plan
         .real_len()
         .checked_mul(stride)
@@ -4602,39 +4578,22 @@ where
     if destination.len() != expected {
         return Err(MixedError::Fft(FftError::PreparationFailed));
     }
-    for outer in 0..count {
-        let source_base = outer
-            .checked_mul(source_block)
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        let destination_base = outer
-            .checked_mul(destination_block)
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        for inner in 0..stride {
-            for k in 0..plan.complex_len() {
-                complex_source_line[k] = source[source_base + k * stride + inner];
-            }
-            let result = if normalize {
-                plan.inverse(
-                    &complex_source_line[..plan.complex_len()],
-                    &mut real_line[..plan.real_len()],
-                    complex_line,
-                    scratch,
-                )
+    for_each_strided_line_differing(
+        source,
+        destination,
+        &mut complex_source_line[..plan.complex_len()],
+        &mut real_line[..plan.real_len()],
+        count,
+        stride,
+        |source, destination| {
+            if normalize {
+                plan.inverse(source, destination, complex_line, scratch)
             } else {
-                plan.backward(
-                    &complex_source_line[..plan.complex_len()],
-                    &mut real_line[..plan.real_len()],
-                    complex_line,
-                    scratch,
-                )
-            };
-            result.map_err(MixedError::LocalR2c)?;
-            for k in 0..plan.real_len() {
-                destination[destination_base + k * stride + inner] = real_line[k];
+                plan.backward(source, destination, complex_line, scratch)
             }
-        }
-    }
-    Ok(())
+            .map_err(MixedError::LocalR2c)
+        },
+    )
 }
 
 fn mixed_r2c_complex_forward_tail<R: FftReal, const N: usize, const M: usize>(

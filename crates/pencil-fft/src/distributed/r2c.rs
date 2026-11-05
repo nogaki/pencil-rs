@@ -1567,38 +1567,18 @@ where
     if destination.len() != destination_len {
         return Err(FftError::PreparationFailed.into());
     }
-    let source_block = plan
-        .real_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    let destination_block = plan
-        .complex_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let source_base = outer
-            .checked_mul(source_block)
-            .ok_or(FftError::PreparationFailed)?;
-        let destination_base = outer
-            .checked_mul(destination_block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.real_len() {
-                real_source_line[k] = source[source_base + k * stride + inner];
-            }
-            plan.forward(
-                &real_source_line[..plan.real_len()],
-                &mut complex_line[..plan.complex_len()],
-                real_line,
-                scratch,
-            )
-            .map_err(R2cError::LocalR2c)?;
-            for k in 0..plan.complex_len() {
-                destination[destination_base + k * stride + inner] = complex_line[k];
-            }
-        }
-    }
-    Ok(())
+    super::for_each_strided_line_differing(
+        source,
+        destination,
+        &mut real_source_line[..plan.real_len()],
+        &mut complex_line[..plan.complex_len()],
+        count,
+        stride,
+        |source, destination| {
+            plan.forward(source, destination, real_line, scratch)
+                .map_err(R2cError::LocalR2c)
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1643,47 +1623,22 @@ where
     if destination.len() != destination_len {
         return Err(FftError::PreparationFailed.into());
     }
-    let source_block = plan
-        .complex_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    let destination_block = plan
-        .real_len()
-        .checked_mul(stride)
-        .ok_or(FftError::PreparationFailed)?;
-    for outer in 0..count {
-        let source_base = outer
-            .checked_mul(source_block)
-            .ok_or(FftError::PreparationFailed)?;
-        let destination_base = outer
-            .checked_mul(destination_block)
-            .ok_or(FftError::PreparationFailed)?;
-        for inner in 0..stride {
-            for k in 0..plan.complex_len() {
-                complex_source_line[k] = source[source_base + k * stride + inner];
-            }
-            let result = if normalize {
-                plan.inverse(
-                    &complex_source_line[..plan.complex_len()],
-                    &mut real_line[..plan.real_len()],
-                    complex_line,
-                    scratch,
-                )
+    super::for_each_strided_line_differing(
+        source,
+        destination,
+        &mut complex_source_line[..plan.complex_len()],
+        &mut real_line[..plan.real_len()],
+        count,
+        stride,
+        |source, destination| {
+            if normalize {
+                plan.inverse(source, destination, complex_line, scratch)
             } else {
-                plan.backward(
-                    &complex_source_line[..plan.complex_len()],
-                    &mut real_line[..plan.real_len()],
-                    complex_line,
-                    scratch,
-                )
-            };
-            result.map_err(R2cError::LocalR2c)?;
-            for k in 0..plan.real_len() {
-                destination[destination_base + k * stride + inner] = real_line[k];
+                plan.backward(source, destination, complex_line, scratch)
             }
-        }
-    }
-    Ok(())
+            .map_err(R2cError::LocalR2c)
+        },
+    )
 }
 
 fn registered_layout_matches<R: FftReal, const N: usize, const M: usize>(
