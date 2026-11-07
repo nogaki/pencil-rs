@@ -269,196 +269,40 @@ where
     };
     resources.group = Some(group);
 
-    let (datatype, error) = local_handle_phase(
+    if let Err(error) = create_type_and_space_handles(
         comm,
-        native::type_from_kind(T::CODE, T::WIDTH, duplicate.raw),
-        "HDF5 datatype create",
-    );
-    resources.datatype = datatype;
-    if let Some(error) = error {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-    let datatype = resources.datatype.expect("datatype creation agreement");
-
-    let (dataspace, error) = local_handle_phase(
-        comm,
-        match settings.chunks {
-            Some(chunks) => native::dataspace_chunked(&layout.global, chunks),
-            None => native::dataspace_simple(&layout.global),
-        },
-        "HDF5 dataspace create",
-    );
-    resources.dataspace = dataspace;
-    if let Some(error) = error {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-    let dataspace = resources.dataspace.expect("dataspace creation agreement");
-
-    if let Err(error) = configure_chunks(comm, settings, &mut resources) {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-    let dataset = match collective_handle_phase(
-        comm,
-        native::dataset_create(
-            resources.group.expect("group creation agreement"),
-            dataset_name,
-            datatype,
-            dataspace,
-            resources.dcpl.unwrap_or(0),
-        ),
-        "HDF5 dataset create",
+        duplicate.raw,
+        &mut resources,
+        &layout,
+        settings,
+        T::CODE,
+        T::WIDTH,
     ) {
-        Ok(dataset) => dataset,
-        Err(error) => return Err(cleanup_ready(comm, duplicate, opened, resources, error)),
-    };
-    resources.dataset = Some(dataset);
-
-    if let Some(name) = original_name
-        && let Err(error) = write_original_name(
-            comm,
-            duplicate.raw,
-            dataset,
-            name,
-            "HDF5 original-name attribute",
-        )
-    {
         return Err(cleanup_ready(comm, duplicate, opened, resources, error));
     }
-    if let Err(error) = write_metadata(
+    if let Err(error) = create_dataset_with_metadata(
         comm,
-        dataset,
-        view.pencil().topology().process_grid(),
-        view.pencil().permutation().axes(),
-        view.pencil().global_shape(),
+        duplicate.raw,
+        opened,
+        &mut resources,
+        dataset_name,
+        original_name,
+        view.pencil(),
         view.extra_shape().dimensions(),
         T::CODE,
         T::WIDTH,
     ) {
         return Err(cleanup_ready(comm, duplicate, opened, resources, error));
     }
-    if let Err(error) = phase_code(
-        comm,
-        native::file_flush(opened),
-        "HDF5 initial metadata flush",
-    ) {
+    if let Err(error) = open_hyperslab_spaces(comm, &mut resources, &layout) {
         return Err(cleanup_ready(comm, duplicate, opened, resources, error));
     }
-
-    let file_result = native::dataset_space(dataset);
-    let file_space = file_result.as_ref().ok().copied();
-    let mem_result = if layout.empty && !layout.global.contains(&0) {
-        native::dataspace_simple(&layout.global)
-    } else {
-        native::dataspace_simple(&layout.local)
-    };
-    let mem_space = mem_result.as_ref().ok().copied();
-    let space_error = file_result
-        .as_ref()
-        .err()
-        .map(|&code| hdf5_error("H5Dget_space", code))
-        .or_else(|| {
-            mem_result
-                .as_ref()
-                .err()
-                .map(|&code| hdf5_error("H5Screate memory space", code))
-        });
-    if let Err(agreement) = agree_phase(
-        comm,
-        file_space.is_some() && mem_space.is_some(),
-        "HDF5 hyperslab spaces",
-    ) {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            Hdf5Resources {
-                file_space,
-                mem_space,
-                ..resources
-            },
-            space_error.unwrap_or(agreement),
-        ));
-    }
-    if let Some(error) = space_error {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            Hdf5Resources {
-                file_space,
-                mem_space,
-                ..resources
-            },
-            error,
-        ));
-    }
-    resources.file_space = file_space;
-    resources.mem_space = mem_space;
-    let file_space = resources.file_space.expect("file-space agreement");
-    let mem_space = resources.mem_space.expect("memory-space agreement");
-    if let Err(error) = select_spaces(comm, file_space, mem_space, &layout) {
+    if let Err(error) = create_transfer_plist(comm, duplicate.raw, &mut resources, settings) {
         return Err(cleanup_ready(comm, duplicate, opened, resources, error));
     }
-    let (xfer, error) = local_handle_phase(
-        comm,
-        native::xfer_create(duplicate.raw, settings.collective),
-        "HDF5 collective transfer plist",
-    );
-    resources.xfer = xfer;
-    if let Some(error) = error {
+    if let Err(error) = write_payload_and_commit(comm, opened, &mut resources, &layout, &mut packed)
+    {
         return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-    let xfer = resources.xfer.expect("transfer-property agreement");
-    // HDF5 1.10's MPIO driver cannot issue a zero-byte collective write to
-    // a genuinely zero-extent dataset (it reports an address overflow). All
-    // ranks still reach the phase agreement and surrounding collective flush;
-    // there is no payload operation to perform in this case.
-    let io_code = if layout.global.contains(&0) {
-        0
-    } else {
-        native::dataset_io(
-            dataset,
-            datatype,
-            mem_space,
-            file_space,
-            xfer,
-            &mut packed,
-            true,
-        )
-    };
-    if let Err(agreement) = agree_phase(comm, io_code >= 0, "HDF5 collective dataset write") {
-        let primary = if io_code < 0 {
-            hdf5_error("H5Dwrite", io_code)
-        } else {
-            agreement
-        };
-        return Err(cleanup_ready(comm, duplicate, opened, resources, primary));
-    }
-    if let Err(error) = phase_code(comm, native::file_flush(opened), "HDF5 payload flush") {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-
-    if write_existing_attr(comm, dataset, Attribute::Commit.name(), COMMIT_MARKER).is_err() {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            resources,
-            IoError::CommitUncertain {
-                stage: "HDF5 commit marker",
-            },
-        ));
-    }
-    if phase_code(comm, native::file_flush(opened), "HDF5 commit marker flush").is_err() {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            resources,
-            IoError::CommitUncertain {
-                stage: "HDF5 commit marker flush",
-            },
-        ));
     }
 
     finish_hdf5(comm, duplicate, opened, resources);
@@ -1099,175 +943,28 @@ where
             ));
         }
     }
-    let dataset = match collective_handle_phase(
-        comm,
-        native::dataset_open(group, dataset_name),
-        "HDF5 dataset open",
-    ) {
-        Ok(dataset) => dataset,
-        Err(error) => return Err(cleanup_ready(comm, duplicate, opened, resources, error)),
-    };
-    resources.dataset = Some(dataset);
-    if let Some(expected) = expected_name {
-        let actual = match read_original_name(comm, dataset, "HDF5 original-name metadata read") {
-            Ok(actual) => actual,
-            Err(error) => return Err(cleanup_ready(comm, duplicate, opened, resources, error)),
-        };
-        let ok = actual == expected;
-        if let Err(agreement) = agree_phase(comm, ok, "HDF5 original-name metadata") {
-            return Err(cleanup_ready(
-                comm,
-                duplicate,
-                opened,
-                resources,
-                if ok {
-                    agreement
-                } else {
-                    IoError::MetadataMismatch {
-                        field: "original name",
-                    }
-                },
-            ));
-        }
-    }
-
-    if let Err(error) = validate_read_metadata::<T, N, M>(
+    if let Err(error) = validate_and_open_dataset::<T, N, M>(
         comm,
         duplicate.raw,
-        dataset,
+        &mut resources,
+        group,
+        dataset_name,
+        expected_name,
         target.pencil(),
         target.extra(),
+        &layout,
     ) {
         return Err(cleanup_ready(comm, duplicate, opened, resources, error));
     }
-
-    let (dataset_type, error) = local_handle_phase(
+    if let Err(error) = read_payload(
         comm,
-        native::dataset_type(dataset),
-        "HDF5 dataset type query",
-    );
-    resources.datatype = dataset_type;
-    if let Some(error) = error {
+        duplicate.raw,
+        &mut resources,
+        &layout,
+        &mut staging,
+        settings,
+    ) {
         return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-    let datatype = resources.datatype.expect("dataset type agreement");
-    let type_result = native::type_matches(datatype, T::CODE, T::WIDTH, duplicate.raw);
-    if let Err(agreement) = agree_phase(comm, type_result.is_ok(), "HDF5 datatype validation query")
-    {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            resources,
-            type_result
-                .err()
-                .map(|code| hdf5_error("HDF5 datatype validation query", code))
-                .unwrap_or(agreement),
-        ));
-    }
-    let type_ok = type_result.expect("datatype validation query agreement");
-    if let Err(agreement) = collective_bool(comm, type_ok, "HDF5 datatype validation") {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, agreement));
-    }
-    if !type_ok {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            resources,
-            IoError::MetadataMismatch {
-                field: "dataset datatype",
-            },
-        ));
-    }
-
-    let (file_space, error) = local_handle_phase(
-        comm,
-        native::dataset_space(dataset),
-        "HDF5 dataset shape query",
-    );
-    resources.file_space = file_space;
-    if let Some(error) = error {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-    let file_space = resources.file_space.expect("dataset-space agreement");
-    let shape_result = native::space_shape(file_space);
-    if let Err(agreement) = agree_phase(comm, shape_result.is_ok(), "HDF5 dataset dimensions query")
-    {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            resources,
-            shape_result
-                .err()
-                .map(|code| hdf5_error("H5Sget_simple_extent_dims", code))
-                .unwrap_or(agreement),
-        ));
-    }
-    let shape_ok = shape_result.expect("dataset dimensions agreement") == layout.global;
-    if let Err(agreement) = collective_bool(comm, shape_ok, "HDF5 dataset dimensions") {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, agreement));
-    }
-    if !shape_ok {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            resources,
-            IoError::MetadataMismatch {
-                field: "dataset dimensions",
-            },
-        ));
-    }
-
-    let mem_result = if layout.empty && !layout.global.contains(&0) {
-        native::dataspace_simple(&layout.global)
-    } else {
-        native::dataspace_simple(&layout.local)
-    };
-    let (mem_space, error) = local_handle_phase(comm, mem_result, "HDF5 read memory space");
-    resources.mem_space = mem_space;
-    if let Some(error) = error {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-    let mem_space = resources.mem_space.expect("memory-space agreement");
-    if let Err(error) = select_spaces(comm, file_space, mem_space, &layout) {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-
-    let (xfer, error) = local_handle_phase(
-        comm,
-        native::xfer_create(duplicate.raw, settings.collective),
-        "HDF5 collective transfer plist",
-    );
-    resources.xfer = xfer;
-    if let Some(error) = error {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-    let xfer = resources.xfer.expect("transfer-property agreement");
-    // See the write-side zero-extent guard above. The branch is descriptor
-    // identical on every rank, while the phase agreement remains collective.
-    let io_code = if layout.global.contains(&0) {
-        0
-    } else {
-        native::dataset_io(
-            dataset,
-            datatype,
-            mem_space,
-            file_space,
-            xfer,
-            &mut staging,
-            false,
-        )
-    };
-    if let Err(agreement) = agree_phase(comm, io_code >= 0, "HDF5 collective dataset read") {
-        let primary = if io_code < 0 {
-            hdf5_error("H5Dread", io_code)
-        } else {
-            agreement
-        };
-        return Err(cleanup_ready(comm, duplicate, opened, resources, primary));
     }
 
     // Validate layout and allocate decode scratch before native cleanup.
@@ -1690,6 +1387,343 @@ fn select_spaces(
         mem_code
     };
     phase_code(comm, code, "HDF5 hyperslab selection")
+}
+
+/// Creates the datatype, dataspace, and chunk property list used to create a
+/// dataset. The single-shot writer creates its transfer list after
+/// [`open_hyperslab_spaces`]; the session writer creates it before
+/// [`create_dataset_with_metadata`], so that step stays a separate helper.
+#[allow(clippy::too_many_arguments)]
+fn create_type_and_space_handles(
+    comm: &mpi::topology::CartesianCommunicator,
+    duplicate: ffi::MPI_Comm,
+    resources: &mut Hdf5Resources,
+    layout: &H5Layout,
+    settings: Hdf5Settings<'_>,
+    type_code: u64,
+    width: usize,
+) -> Result<(), IoError> {
+    let (datatype, error) = local_handle_phase(
+        comm,
+        native::type_from_kind(type_code, width, duplicate),
+        "HDF5 datatype create",
+    );
+    resources.datatype = datatype;
+    if let Some(error) = error {
+        return Err(error);
+    }
+
+    let (dataspace, error) = local_handle_phase(
+        comm,
+        match settings.chunks {
+            Some(chunks) => native::dataspace_chunked(&layout.global, chunks),
+            None => native::dataspace_simple(&layout.global),
+        },
+        "HDF5 dataspace create",
+    );
+    resources.dataspace = dataspace;
+    if let Some(error) = error {
+        return Err(error);
+    }
+
+    configure_chunks(comm, settings, resources)
+}
+
+fn create_transfer_plist(
+    comm: &mpi::topology::CartesianCommunicator,
+    duplicate: ffi::MPI_Comm,
+    resources: &mut Hdf5Resources,
+    settings: Hdf5Settings<'_>,
+) -> Result<(), IoError> {
+    let (xfer, error) = local_handle_phase(
+        comm,
+        native::xfer_create(duplicate, settings.collective),
+        "HDF5 collective transfer plist",
+    );
+    resources.xfer = xfer;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Creates the dataset, writes its provenance and schema attributes, and
+/// flushes the initial metadata.
+#[allow(clippy::too_many_arguments)]
+fn create_dataset_with_metadata<const N: usize, const M: usize>(
+    comm: &mpi::topology::CartesianCommunicator,
+    duplicate: ffi::MPI_Comm,
+    file: native::Hid,
+    resources: &mut Hdf5Resources,
+    name: &CStr,
+    original_name: Option<&[u8]>,
+    pencil: &pencil_array::Pencil<N, M>,
+    extra_dims: &[usize],
+    type_code: u64,
+    width: usize,
+) -> Result<(), IoError> {
+    let dataset = collective_handle_phase(
+        comm,
+        native::dataset_create(
+            resources.group.expect("group creation agreement"),
+            name,
+            resources.datatype.expect("datatype creation agreement"),
+            resources.dataspace.expect("dataspace creation agreement"),
+            resources.dcpl.unwrap_or(0),
+        ),
+        "HDF5 dataset create",
+    )?;
+    resources.dataset = Some(dataset);
+
+    if let Some(name) = original_name
+        && let Err(error) = write_original_name(
+            comm,
+            duplicate,
+            dataset,
+            name,
+            "HDF5 original-name attribute",
+        )
+    {
+        return Err(error);
+    }
+    write_metadata(
+        comm,
+        dataset,
+        pencil.topology().process_grid(),
+        pencil.permutation().axes(),
+        pencil.global_shape(),
+        extra_dims,
+        type_code,
+        width,
+    )?;
+    phase_code(
+        comm,
+        native::file_flush(file),
+        "HDF5 initial metadata flush",
+    )
+}
+
+/// Queries the file and memory dataspaces and installs the hyperslab
+/// selection. Resource slots are updated before each fallible collective so
+/// the caller's existing cleanup closes every opened handle.
+fn open_hyperslab_spaces(
+    comm: &mpi::topology::CartesianCommunicator,
+    resources: &mut Hdf5Resources,
+    layout: &H5Layout,
+) -> Result<(), IoError> {
+    let file_result = native::dataset_space(resources.dataset.expect("dataset creation agreement"));
+    let file_space = file_result.as_ref().ok().copied();
+    let mem_result = if layout.empty && !layout.global.contains(&0) {
+        native::dataspace_simple(&layout.global)
+    } else {
+        native::dataspace_simple(&layout.local)
+    };
+    let mem_space = mem_result.as_ref().ok().copied();
+    let space_error = file_result
+        .as_ref()
+        .err()
+        .map(|&code| hdf5_error("H5Dget_space", code))
+        .or_else(|| {
+            mem_result
+                .as_ref()
+                .err()
+                .map(|&code| hdf5_error("H5Screate memory space", code))
+        });
+    resources.file_space = file_space;
+    resources.mem_space = mem_space;
+    if let Err(agreement) = agree_phase(
+        comm,
+        file_space.is_some() && mem_space.is_some(),
+        "HDF5 hyperslab spaces",
+    ) {
+        return Err(space_error.unwrap_or(agreement));
+    }
+    if let Some(error) = space_error {
+        return Err(error);
+    }
+    let file_space = resources.file_space.expect("file-space agreement");
+    let mem_space = resources.mem_space.expect("memory-space agreement");
+    select_spaces(comm, file_space, mem_space, layout)
+}
+
+/// Transfers the packed payload into the selected hyperslab and publishes the
+/// commit marker with the two trailing collective flushes.
+fn write_payload_and_commit(
+    comm: &mpi::topology::CartesianCommunicator,
+    file: native::Hid,
+    resources: &mut Hdf5Resources,
+    layout: &H5Layout,
+    packed: &mut [u8],
+) -> Result<(), IoError> {
+    let dataset = resources.dataset.expect("dataset creation agreement");
+    let datatype = resources.datatype.expect("datatype creation agreement");
+    let mem_space = resources.mem_space.expect("memory-space agreement");
+    let file_space = resources.file_space.expect("file-space agreement");
+    let xfer = resources.xfer.expect("transfer-property agreement");
+    // HDF5 1.10's MPIO driver cannot issue a zero-byte collective write to
+    // a genuinely zero-extent dataset (it reports an address overflow). All
+    // ranks still reach the phase agreement and surrounding collective flush;
+    // there is no payload operation to perform in this case.
+    let io_code = if layout.global.contains(&0) {
+        0
+    } else {
+        native::dataset_io(dataset, datatype, mem_space, file_space, xfer, packed, true)
+    };
+    if let Err(agreement) = agree_phase(comm, io_code >= 0, "HDF5 collective dataset write") {
+        let primary = if io_code < 0 {
+            hdf5_error("H5Dwrite", io_code)
+        } else {
+            agreement
+        };
+        return Err(primary);
+    }
+    phase_code(comm, native::file_flush(file), "HDF5 payload flush")?;
+
+    if write_existing_attr(comm, dataset, ATTR_COMMIT, COMMIT_MARKER).is_err() {
+        return Err(IoError::CommitUncertain {
+            stage: "HDF5 commit marker",
+        });
+    }
+    if phase_code(comm, native::file_flush(file), "HDF5 commit marker flush").is_err() {
+        return Err(IoError::CommitUncertain {
+            stage: "HDF5 commit marker flush",
+        });
+    }
+    Ok(())
+}
+
+/// Opens the dataset, checks its name and schema metadata, validates the
+/// datatype and shape, and installs the read hyperslab selection.
+#[allow(clippy::too_many_arguments)]
+fn validate_and_open_dataset<T: IoElement, const N: usize, const M: usize>(
+    comm: &mpi::topology::CartesianCommunicator,
+    duplicate: ffi::MPI_Comm,
+    resources: &mut Hdf5Resources,
+    group: native::Hid,
+    name: &CStr,
+    expected_name: Option<&[u8]>,
+    pencil: &pencil_array::Pencil<N, M>,
+    extra_dims: &[usize],
+    layout: &H5Layout,
+) -> Result<(), IoError> {
+    let dataset =
+        collective_handle_phase(comm, native::dataset_open(group, name), "HDF5 dataset open")?;
+    resources.dataset = Some(dataset);
+    if let Some(expected) = expected_name {
+        let actual = read_original_name(comm, dataset, "HDF5 original-name metadata read")?;
+        let ok = actual == expected;
+        if let Err(agreement) = agree_phase(comm, ok, "HDF5 original-name metadata") {
+            return Err(if ok {
+                agreement
+            } else {
+                IoError::MetadataMismatch {
+                    field: "original name",
+                }
+            });
+        }
+    }
+
+    validate_read_metadata::<T, N, M>(comm, duplicate, dataset, pencil, extra_dims)?;
+
+    let (dataset_type, error) = local_handle_phase(
+        comm,
+        native::dataset_type(dataset),
+        "HDF5 dataset type query",
+    );
+    resources.datatype = dataset_type;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    let datatype = resources.datatype.expect("dataset type agreement");
+    let type_result = native::type_matches(datatype, T::CODE, T::WIDTH, duplicate);
+    if let Err(agreement) = agree_phase(comm, type_result.is_ok(), "HDF5 datatype validation query")
+    {
+        return Err(type_result
+            .err()
+            .map(|code| hdf5_error("HDF5 datatype validation query", code))
+            .unwrap_or(agreement));
+    }
+    let type_ok = type_result.expect("datatype validation query agreement");
+    collective_bool(comm, type_ok, "HDF5 datatype validation")?;
+    if !type_ok {
+        return Err(IoError::MetadataMismatch {
+            field: "dataset datatype",
+        });
+    }
+
+    let (file_space, error) = local_handle_phase(
+        comm,
+        native::dataset_space(dataset),
+        "HDF5 dataset shape query",
+    );
+    resources.file_space = file_space;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    let file_space = resources.file_space.expect("dataset-space agreement");
+    let shape_result = native::space_shape(file_space);
+    if let Err(agreement) = agree_phase(comm, shape_result.is_ok(), "HDF5 dataset dimensions query")
+    {
+        return Err(shape_result
+            .err()
+            .map(|code| hdf5_error("H5Sget_simple_extent_dims", code))
+            .unwrap_or(agreement));
+    }
+    let shape_ok = shape_result.expect("dataset dimensions agreement") == layout.global;
+    collective_bool(comm, shape_ok, "HDF5 dataset dimensions")?;
+    if !shape_ok {
+        return Err(IoError::MetadataMismatch {
+            field: "dataset dimensions",
+        });
+    }
+
+    let mem_result = if layout.empty && !layout.global.contains(&0) {
+        native::dataspace_simple(&layout.global)
+    } else {
+        native::dataspace_simple(&layout.local)
+    };
+    let (mem_space, error) = local_handle_phase(comm, mem_result, "HDF5 read memory space");
+    resources.mem_space = mem_space;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    let mem_space = resources.mem_space.expect("memory-space agreement");
+    select_spaces(comm, file_space, mem_space, layout)
+}
+
+/// Creates the read transfer list and transfers the payload into `staging`.
+fn read_payload(
+    comm: &mpi::topology::CartesianCommunicator,
+    duplicate: ffi::MPI_Comm,
+    resources: &mut Hdf5Resources,
+    layout: &H5Layout,
+    staging: &mut [u8],
+    settings: Hdf5Settings<'_>,
+) -> Result<(), IoError> {
+    create_transfer_plist(comm, duplicate, resources, settings)?;
+    let dataset = resources.dataset.expect("dataset open agreement");
+    let datatype = resources.datatype.expect("dataset type agreement");
+    let file_space = resources.file_space.expect("dataset-space agreement");
+    let mem_space = resources.mem_space.expect("memory-space agreement");
+    let xfer = resources.xfer.expect("transfer-property agreement");
+    // See the write-side zero-extent guard above. The branch is descriptor
+    // identical on every rank, while the phase agreement remains collective.
+    let io_code = if layout.global.contains(&0) {
+        0
+    } else {
+        native::dataset_io(
+            dataset, datatype, mem_space, file_space, xfer, staging, false,
+        )
+    };
+    if let Err(agreement) = agree_phase(comm, io_code >= 0, "HDF5 collective dataset read") {
+        let primary = if io_code < 0 {
+            hdf5_error("H5Dread", io_code)
+        } else {
+            agreement
+        };
+        return Err(primary);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
