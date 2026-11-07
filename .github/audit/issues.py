@@ -296,6 +296,14 @@ def file_issues(directory):
             path = os.path.join(directory, f"candidates-{kind}.json")
             if not os.path.exists(path):
                 continue
+            kind_env = dict(env)
+            model_path = os.path.join(directory, f"model-{kind}.txt")
+            if os.path.exists(model_path):
+                with open(model_path, encoding="utf-8") as f:
+                    model = f.read().strip()
+                if not re.fullmatch(r"[A-Za-z0-9._/:-]{1,100}", model):
+                    fail(f"{model_path}: モデル名が不正: {model!r}")
+                kind_env["AUDIT_MODEL"] = model
             with open(path, encoding="utf-8") as f:
                 raw = json.load(f)
             if not isinstance(raw, list):
@@ -359,7 +367,7 @@ def file_issues(directory):
                     (candidate["title"], number, reason) for number, reason in dropped
                 )
                 url = create_issue(
-                    candidate["title"], build_body(candidate, kind, env, related)
+                    candidate["title"], build_body(candidate, kind, kind_env, related)
                 )
                 print(f"起票した: {url} — {candidate['title']}")
                 filed.append((kind, candidate["title"], url))

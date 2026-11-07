@@ -1,8 +1,11 @@
 # 定期監査: 毎日 1 範囲ずつ巡回し、見つかった問題を GitHub Issue に起票する。
 #
 # 必要な Secret:
-#   OPENCODE_API_KEY  OpenCode Go の API キー（pi のモデル呼び出しに使う）
+#   OPENCODE_API_KEY      OpenCode Go の API キー（pi のモデル呼び出しに使う）
+#   COMMAND_CODE_API_KEY  Command Code の API キー（OpenCode Go が使用制限・混雑で失敗したときの代替）
 #
+# 各キーはそれぞれの実行ステップにだけ渡す。1 つのプロセスに両方を持たせると、
+# プロンプト注入で /proc/self/environ から他方のキーを読まれ得るため。
 # schedule トリガーは、このファイルがデフォルトブランチ（main）に存在するときだけ動く。
 # スケジュール実行でも監査対象は dev（env.AUDIT_REF）である。
 #
@@ -50,6 +53,8 @@ env:
   AUDIT_REF: dev
   PI_VERSION: 1.5.0
   AUDIT_MODEL: opencode-go/deepseek-v4.1-flash
+  AUDIT_FALLBACK_MODEL: commandcode/deepseek/deepseek-v4.1-flash
+  COMMANDCODE_PROVIDER_VERSION: 0.8.0
   PONYTAIL_SKILL_URL: https://raw.githubusercontent.com/DietrichGebert/ponytail/16352ac229eb08a9598dcae48fe9f2b342567d86/skills/ponytail-audit/SKILL.md
   PONYTAIL_SKILL_SHA256: 2b3223a02c386d1263e1b08343cb8eb3a53e444cdafb1d79e26c8ec2a8fcad28
 
@@ -118,6 +123,7 @@ jobs:
           node --version
           npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}"
           pi --version
+          pi install "npm:pi-commandcode-provider@${COMMANDCODE_PROVIDER_VERSION}"
 
       - name: Fetch ponytail-audit skill
         if: matrix.audit == 'ponytail'
@@ -152,7 +158,6 @@ jobs:
             echo "- scope: ${{ needs.plan.outputs.scope }}"
             echo "- 重点: ${{ needs.plan.outputs.focus }}"
             echo "- 監査対象: ブランチ ${{ env.AUDIT_REF }}（${{ needs.plan.outputs.short_sha }}）"
-            echo "- モデル: ${{ env.AUDIT_MODEL }}"
             echo "- dry run: ${{ inputs.dry_run || false }}"
             echo
           } >"$prompt"
@@ -167,18 +172,39 @@ jobs:
           cat .github/audit/output.md >>"$prompt"
 
       - name: Run audit
+        id: run
         # 渡すのは API キーだけ。GH_TOKEN は渡さない（job に書き込み権限もない）。
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          AUDIT_PROMPT: ${{ runner.temp }}/prompt.md
+          AUDIT_EXISTING: ${{ runner.temp }}/existing-issues.json
+          AUDIT_REPORT: ${{ runner.temp }}/report.md
+          AUDIT_MODEL_FILE: ${{ runner.temp }}/model-${{ matrix.audit }}.txt
         run: |
           set -euo pipefail
-          # read・grep・find・ls だけを渡す（bash・edit・write は使えない）。
-          pi -p --no-session --no-context-files --tools read,grep,find,ls \
-            --model "$AUDIT_MODEL" --thinking high \
-            @"$RUNNER_TEMP/prompt.md" \
-            @"$RUNNER_TEMP/existing-issues.json" \
-            "添付の指示に従って監査し、最後に指定の JSON ブロックを出力してください。" \
-            | tee "$RUNNER_TEMP/report.md"
+          status=0
+          bash .github/audit/run.sh || status=$?
+          if (( status == 3 )); then
+            echo "limited=true" >>"$GITHUB_OUTPUT"
+          elif (( status != 0 )); then
+            exit "$status"
+          fi
+
+      - name: Run audit with the fallback model
+        if: steps.run.outputs.limited == 'true'
+        # 代替モデル用のキーはこのステップにだけ渡す（両方のキーを同じプロセスに置かない）。
+        env:
+          COMMAND_CODE_API_KEY: ${{ secrets.COMMAND_CODE_API_KEY }}
+          PRIMARY_MODEL: ${{ env.AUDIT_MODEL }}
+          AUDIT_MODEL: ${{ env.AUDIT_FALLBACK_MODEL }}
+          AUDIT_PROMPT: ${{ runner.temp }}/prompt.md
+          AUDIT_EXISTING: ${{ runner.temp }}/existing-issues.json
+          AUDIT_REPORT: ${{ runner.temp }}/report.md
+          AUDIT_MODEL_FILE: ${{ runner.temp }}/model-${{ matrix.audit }}.txt
+        run: |
+          set -euo pipefail
+          echo "::warning::${PRIMARY_MODEL} が使用制限か混雑で失敗したため、${AUDIT_MODEL} で再実行します"
+          bash .github/audit/run.sh
 
       - name: Extract candidates
         run: |
@@ -191,7 +217,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: candidates-${{ matrix.audit }}
-          path: ${{ runner.temp }}/candidates-${{ matrix.audit }}.json
+          path: |
+            ${{ runner.temp }}/candidates-${{ matrix.audit }}.json
+            ${{ runner.temp }}/model-${{ matrix.audit }}.txt
           if-no-files-found: error
           retention-days: 7
 

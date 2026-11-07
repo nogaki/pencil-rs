@@ -199,6 +199,11 @@ class FileTest(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(items, f, ensure_ascii=False)
 
+    def write_model(self, kind, text):
+        path = os.path.join(self.candidates, f"model-{kind}.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
     def run_file(self):
         return subprocess.run(
             [sys.executable, ISSUES_PY, "file", self.candidates],
@@ -435,6 +440,25 @@ class FileTest(unittest.TestCase):
         bodies = self.bodies_written()
         self.assertEqual(len(bodies), 1)
         self.assertIn("（ponytail、", bodies[0])
+
+    def test_model_file_overrides_footer(self):
+        self.write("design", [candidate(title="モデルを書く")])
+        self.write_model("design", "commandcode/deepseek/deepseek-v4.1-flash\n")
+        proc = self.run_file()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        body = self.bodies_written()[0]
+        self.assertIn(
+            "commandcode/deepseek/deepseek-v4.1-flash による静的な確認", body
+        )
+        self.assertNotIn("test/model", body)
+
+    def test_invalid_model_file_stops_filing(self):
+        self.write("design", [candidate(title="起票しない")])
+        self.write_model("design", "commandcode model\n")
+        proc = self.run_file()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("モデル名が不正", proc.stderr)
+        self.assertEqual(self.bodies_written(), [])
 
     def test_missing_env(self):
         del self.env["AUDIT_MODEL"]
