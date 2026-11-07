@@ -349,6 +349,77 @@ fn preparation_failures(topology: &Arc<MpiTopology<1>>) {
     );
 }
 
+// Two-input validation must keep its historical error precedence: layouts are
+// checked before extents, and the left input reports before the right. The
+// in-place destination is its own output, so its extents are always valid;
+// there the layout check still wins over an invalid right extent.
+fn pointwise_two_input_error_precedence(p: &Arc<Pencil<2, 1>>) {
+    let other = Pencil::new(p.topology().clone(), *p.global_shape(), [0]).unwrap();
+
+    let left = array(p, &[2, 2], 1i64);
+    let right = array(&other, &[2, 3], 2i64);
+    let mut out = array(p, &[2, 3], -1i64);
+    let calls = Cell::new(0);
+    let error = pointwise2_views(left.view(), right.view(), out.view_mut(), |_, _| {
+        calls.set(calls.get() + 1);
+        0
+    })
+    .unwrap_err();
+    assert_eq!(error, PointwiseError::IncompatiblePencils);
+    assert_eq!(calls.get(), 0);
+    assert!(out.as_slice().iter().all(|&value| value == -1));
+
+    let left = array(p, &[2], 1i64);
+    let right = array(p, &[2, 2], 2i64);
+    let mut out = array(p, &[2, 3], -1i64);
+    let calls = Cell::new(0);
+    let error = pointwise2_views(left.view(), right.view(), out.view_mut(), |_, _| {
+        calls.set(calls.get() + 1);
+        0
+    })
+    .unwrap_err();
+    assert_eq!(
+        error,
+        PointwiseError::ExtraRankMismatch {
+            expected: 2,
+            actual: 1,
+        }
+    );
+    assert_eq!(calls.get(), 0);
+    assert!(out.as_slice().iter().all(|&value| value == -1));
+
+    let mut destination = array(p, &[2, 3], -1i64);
+    let right = array(&other, &[2, 2], 2i64);
+    let calls = Cell::new(0);
+    let error = pointwise2_in_place_views(destination.view_mut(), right.view(), |_, _| {
+        calls.set(calls.get() + 1);
+        0
+    })
+    .unwrap_err();
+    assert_eq!(error, PointwiseError::IncompatiblePencils);
+    assert_eq!(calls.get(), 0);
+    assert!(destination.as_slice().iter().all(|&value| value == -1));
+
+    let mut destination = array(p, &[2, 3], -1i64);
+    let right = array(p, &[2, 2], 2i64);
+    let calls = Cell::new(0);
+    let error = pointwise2_in_place_views(destination.view_mut(), right.view(), |_, _| {
+        calls.set(calls.get() + 1);
+        0
+    })
+    .unwrap_err();
+    assert_eq!(
+        error,
+        PointwiseError::ExtraExtentMismatch {
+            axis: 1,
+            output: 3,
+            input: 2,
+        }
+    );
+    assert_eq!(calls.get(), 0);
+    assert!(destination.as_slice().iter().all(|&value| value == -1));
+}
+
 #[test]
 fn array_ops() {
     let universe = mpi::initialize().unwrap();
@@ -365,6 +436,7 @@ fn array_ops() {
         )
         .unwrap();
         pointwise(&p);
+        pointwise_two_input_error_precedence(&p);
         empty_overflow_shapes(&p);
         reductions(&p, size, p.topology().communicator().rank() as usize);
     }

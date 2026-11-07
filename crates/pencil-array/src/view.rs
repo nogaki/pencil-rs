@@ -297,6 +297,15 @@ impl<'a, T, const N: usize, const M: usize> PencilArrayViewMut<'a, T, N, M> {
         LocalArrayLayout::as_slice(self)
     }
 
+    /// Reborrows this view immutably, wrapping the existing fields.
+    pub(crate) fn as_view(&self) -> PencilArrayView<'_, T, N, M> {
+        PencilArrayView {
+            pencil: self.pencil,
+            extra_shape: self.extra_shape,
+            storage: &*self.storage,
+        }
+    }
+
     /// Returns an exclusive borrow of the row-major buffer.
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         self.storage
