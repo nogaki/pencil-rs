@@ -8,21 +8,22 @@ use mpi::raw::AsRaw;
 use mpi::topology::Communicator;
 use pencil_array::{PencilArrayView, PencilArrayViewMut};
 
+#[cfg(test)]
+use crate::INCOMPLETE_MARKER;
 use crate::ffi;
 use crate::ffi::hdf5 as native;
 use crate::format::{IoElement, ReadTarget, pack_view};
 use crate::hdf5_schema::{
-    ATTR_COMMIT, ATTR_EXTRA, ATTR_EXTRA_RANK, ATTR_GLOBAL, ATTR_GRID, ATTR_N, ATTR_PERM, ATTR_TYPE,
-    ATTR_VERSION, ATTR_WIDTH, CommitState, combined_rank_in_range, commit_state, rank_in_range,
-    valid_global_shape, valid_permutation, valid_shape_bytes, valid_writer_grid,
+    ATTR_COMMIT, Attribute, CommitState, Metadata, combined_rank_in_range, commit_state,
+    rank_in_range, valid_global_shape, valid_permutation, valid_shape_bytes, valid_writer_grid,
 };
 use crate::mpi_io::{
     CommGuard, abort_unrecoverable, aggregate_cleanup_result, agree_phase, collective_state,
     descriptor_agreement, duplicate_comm, first_error2, try_u64_values,
 };
 use crate::{
-    COMMIT_MARKER, FORMAT_VERSION, INCOMPLETE_MARKER, IoError, MAX_PROTOCOL_RANK, NamedIoError,
-    OP_APPEND_HDF5_NAMED, OP_READ_HDF5, OP_READ_HDF5_NAMED, OP_WRITE_HDF5, OP_WRITE_HDF5_NAMED,
+    COMMIT_MARKER, IoError, MAX_PROTOCOL_RANK, NamedIoError, OP_APPEND_HDF5_NAMED, OP_READ_HDF5,
+    OP_READ_HDF5_NAMED, OP_WRITE_HDF5, OP_WRITE_HDF5_NAMED,
 };
 
 mod session;
@@ -431,7 +432,7 @@ where
         return Err(cleanup_ready(comm, duplicate, opened, resources, error));
     }
 
-    if write_existing_attr(comm, dataset, ATTR_COMMIT, COMMIT_MARKER).is_err() {
+    if write_existing_attr(comm, dataset, Attribute::Commit.name(), COMMIT_MARKER).is_err() {
         return Err(cleanup_ready(
             comm,
             duplicate,
@@ -1631,72 +1632,38 @@ fn write_metadata<const N: usize, const M: usize>(
     let (global_values, extra_values, grid_values, perm_values) =
         prepared.expect("HDF5 metadata preparation agreement");
 
-    attr_phase(
-        comm,
-        dataset,
-        ATTR_VERSION,
-        &[FORMAT_VERSION],
-        "HDF5 version attribute",
-    )?;
-    attr_phase(
-        comm,
-        dataset,
-        ATTR_COMMIT,
-        &[INCOMPLETE_MARKER],
-        "HDF5 commit attribute",
-    )?;
-    attr_phase(comm, dataset, ATTR_N, &[N as u64], "HDF5 rank attribute")?;
-    attr_phase(
-        comm,
-        dataset,
-        ATTR_TYPE,
-        &[type_code],
-        "HDF5 type attribute",
-    )?;
-    attr_phase(
-        comm,
-        dataset,
-        ATTR_WIDTH,
-        &[width as u64],
-        "HDF5 width attribute",
-    )?;
-    attr_phase(
-        comm,
-        dataset,
-        ATTR_EXTRA_RANK,
-        &[extra.len() as u64],
-        "HDF5 extra-rank attribute",
-    )?;
-    if !extra.is_empty() {
-        attr_phase(
-            comm,
-            dataset,
-            ATTR_EXTRA,
-            &extra_values,
-            "HDF5 extra-shape attribute",
-        )?;
-    }
-    attr_phase(
-        comm,
-        dataset,
-        ATTR_GLOBAL,
+    let metadata = Metadata::for_write(
+        N as u64,
+        type_code,
+        width as u64,
+        &extra_values,
         &global_values,
-        "HDF5 global-shape attribute",
-    )?;
-    attr_phase(
-        comm,
-        dataset,
-        ATTR_GRID,
         &grid_values,
-        "HDF5 writer-grid attribute",
-    )?;
-    attr_phase(
-        comm,
-        dataset,
-        ATTR_PERM,
         &perm_values,
+    );
+    const PHASES: [&str; 10] = [
+        "HDF5 version attribute",
+        "HDF5 commit attribute",
+        "HDF5 rank attribute",
+        "HDF5 type attribute",
+        "HDF5 width attribute",
+        "HDF5 extra-rank attribute",
+        "HDF5 extra-shape attribute",
+        "HDF5 global-shape attribute",
+        "HDF5 writer-grid attribute",
         "HDF5 permutation attribute",
-    )?;
+    ];
+    for (attribute, phase) in Attribute::ALL.into_iter().zip(PHASES) {
+        if attribute.present(extra_values.len()) {
+            attr_phase(
+                comm,
+                dataset,
+                attribute.name(),
+                metadata.value(attribute),
+                phase,
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -2041,20 +2008,37 @@ fn validate_read_metadata<T: IoElement, const N: usize, const M: usize>(
     pencil: &pencil_array::Pencil<N, M>,
     extra_dims: &[usize],
 ) -> Result<(), IoError> {
-    let read_attr = |name, expected, max, phase| {
-        read_attr_phase(comm, duplicate, dataset, name, expected, max, phase)
+    let expected = Metadata::expected(
+        N as u64,
+        T::CODE,
+        T::WIDTH as u64,
+        extra_dims.len() as u64,
+        extra_dims,
+        pencil.global_shape(),
+    );
+    let read_attr = |attribute: Attribute, phase| {
+        let (expected, max) = attribute.read_len(N, extra_dims.len());
+        read_attr_phase(
+            comm,
+            duplicate,
+            dataset,
+            attribute.name(),
+            expected,
+            max,
+            phase,
+        )
     };
-    let version = read_attr(ATTR_VERSION, Some(1), 1, "HDF5 version metadata")?;
-    let commit = read_attr(ATTR_COMMIT, Some(1), 1, "HDF5 commit metadata")?;
-    let n = read_attr(ATTR_N, Some(1), 1, "HDF5 rank metadata")?;
-    let type_code = read_attr(ATTR_TYPE, Some(1), 1, "HDF5 type metadata")?;
-    let width = read_attr(ATTR_WIDTH, Some(1), 1, "HDF5 width metadata")?;
-    let extra_rank = read_attr(ATTR_EXTRA_RANK, Some(1), 1, "HDF5 extra-rank metadata")?;
-    let metadata_ok = version == [FORMAT_VERSION]
-        && n == [N as u64]
-        && type_code == [T::CODE]
-        && width == [T::WIDTH as u64]
-        && usize::try_from(extra_rank[0]).ok() == Some(extra_dims.len())
+    let version = read_attr(Attribute::Version, "HDF5 version metadata")?;
+    let commit = read_attr(Attribute::Commit, "HDF5 commit metadata")?;
+    let n = read_attr(Attribute::Rank, "HDF5 rank metadata")?;
+    let type_code = read_attr(Attribute::TypeCode, "HDF5 type metadata")?;
+    let width = read_attr(Attribute::Width, "HDF5 width metadata")?;
+    let extra_rank = read_attr(Attribute::ExtraRank, "HDF5 extra-rank metadata")?;
+    let metadata_ok = expected.matches(Attribute::Version, &version)
+        && expected.matches(Attribute::Rank, &n)
+        && expected.matches(Attribute::TypeCode, &type_code)
+        && expected.matches(Attribute::Width, &width)
+        && expected.matches(Attribute::ExtraRank, &extra_rank)
         && rank_in_range(extra_rank[0]);
     let commit_result = match commit_state(commit[0]) {
         CommitState::Complete => Ok(()),
@@ -2074,38 +2058,30 @@ fn validate_read_metadata<T: IoElement, const N: usize, const M: usize>(
         });
     }
 
-    let extra = if extra_rank[0] == 0 {
-        if attribute_exists_phase(comm, dataset, ATTR_EXTRA, "HDF5 zero-extra metadata")? {
+    let extra = if Attribute::ExtraShape.present(extra_rank[0] as usize) {
+        read_attr(Attribute::ExtraShape, "HDF5 extra shape metadata")?
+    } else {
+        if attribute_exists_phase(
+            comm,
+            dataset,
+            Attribute::ExtraShape.name(),
+            "HDF5 zero-extra metadata",
+        )? {
             return Err(IoError::MetadataMismatch {
                 field: "extra shape",
             });
         }
         Vec::new()
-    } else {
-        read_attr(
-            ATTR_EXTRA,
-            Some(extra_rank[0] as usize),
-            extra_rank[0] as usize,
-            "HDF5 extra shape metadata",
-        )?
     };
-    let global = read_attr(ATTR_GLOBAL, Some(N), N, "HDF5 global shape metadata")?;
-    let writer_grid = read_attr(
-        ATTR_GRID,
-        None,
-        MAX_PROTOCOL_RANK,
-        "HDF5 writer grid metadata",
+    let global = read_attr(Attribute::GlobalShape, "HDF5 global shape metadata")?;
+    let writer_grid = read_attr(Attribute::WriterGrid, "HDF5 writer grid metadata")?;
+    let writer_perm = read_attr(
+        Attribute::WriterPermutation,
+        "HDF5 writer permutation metadata",
     )?;
-    let writer_perm = read_attr(ATTR_PERM, Some(N), N, "HDF5 writer permutation metadata")?;
     let metadata_ok = valid_global_shape(&global)
-        && global
-            .iter()
-            .copied()
-            .eq(pencil.global_shape().iter().map(|&v| v as u64))
-        && extra
-            .iter()
-            .copied()
-            .eq(extra_dims.iter().map(|&v| v as u64))
+        && expected.matches(Attribute::GlobalShape, &global)
+        && expected.matches(Attribute::ExtraShape, &extra)
         && valid_writer_provenance(&writer_grid, &writer_perm, N);
     if let Err(agreement) = agree_phase(comm, metadata_ok, "HDF5 shape metadata validation") {
         return Err(if metadata_ok {
@@ -2701,14 +2677,18 @@ pub(crate) fn inspect_catalog(
                 };
                 resources.dataset = Some(dataset);
                 macro_rules! attr {
-                    ($n:expr, $l:expr, $m:expr) => {{
+                    ($attribute:expr) => {
+                        attr!($attribute, 0, 0)
+                    };
+                    ($attribute:expr, $n:expr, $er:expr) => {{
+                        let (expected, max) = $attribute.read_len($n, $er);
                         let value = read_attr_phase(
                             comm,
                             duplicate.raw,
                             dataset,
-                            $n,
-                            $l,
-                            $m,
+                            $attribute.name(),
+                            expected,
+                            max,
                             "HDF5 catalog attribute",
                         )
                         .map_err(CatalogError::Io)?;
@@ -2717,12 +2697,12 @@ pub(crate) fn inspect_catalog(
                         value
                     }};
                 }
-                let version = attr!(ATTR_VERSION, Some(1), 1);
-                let commit = attr!(ATTR_COMMIT, Some(1), 1);
-                let nvals = attr!(ATTR_N, Some(1), 1);
-                let typ = attr!(ATTR_TYPE, Some(1), 1);
-                let width = attr!(ATTR_WIDTH, Some(1), 1);
-                let erank = attr!(ATTR_EXTRA_RANK, Some(1), 1);
+                let version = attr!(Attribute::Version);
+                let commit = attr!(Attribute::Commit);
+                let nvals = attr!(Attribute::Rank);
+                let typ = attr!(Attribute::TypeCode);
+                let width = attr!(Attribute::Width);
+                let erank = attr!(Attribute::ExtraRank);
                 let scalar_result = ScalarType::decode(typ[0], width[0]);
                 catalog_valid(comm, scalar_result.is_some(), "HDF5 catalog scalar type")?;
                 let scalar = scalar_result.expect("scalar type agreement");
@@ -2735,9 +2715,10 @@ pub(crate) fn inspect_catalog(
                 )?;
                 let n = n_result.expect("rank agreement");
                 let er = er_result.expect("extra rank agreement");
+                let metadata = Metadata::version_only();
                 catalog_valid(
                     comm,
-                    version == [FORMAT_VERSION]
+                    metadata.matches(Attribute::Version, &version)
                         && commit_state(commit[0]) == CommitState::Complete
                         && n > 0
                         && rank_in_range(nvals[0])
@@ -2745,22 +2726,22 @@ pub(crate) fn inspect_catalog(
                         && combined_rank_in_range(nvals[0], erank[0]),
                     "HDF5 catalog metadata",
                 )?;
-                let extra = if er == 0 {
+                let extra = if Attribute::ExtraShape.present(er) {
+                    attr!(Attribute::ExtraShape, n, er)
+                } else {
                     let has_extra = attribute_exists_phase(
                         comm,
                         dataset,
-                        ATTR_EXTRA,
+                        Attribute::ExtraShape.name(),
                         "HDF5 catalog extra shape",
                     )
                     .map_err(CatalogError::Io)?;
                     catalog_valid(comm, !has_extra, "HDF5 catalog extra shape")?;
                     Vec::new()
-                } else {
-                    attr!(ATTR_EXTRA, Some(er), er)
                 };
-                let global = attr!(ATTR_GLOBAL, Some(n), n);
-                let grid = attr!(ATTR_GRID, None, MAX_PROTOCOL_RANK);
-                let perm = attr!(ATTR_PERM, Some(n), n);
+                let global = attr!(Attribute::GlobalShape, n, er);
+                let grid = attr!(Attribute::WriterGrid, n, er);
+                let perm = attr!(Attribute::WriterPermutation, n, er);
                 let shape_ok = !global.is_empty()
                     && combined_rank_in_range(global.len() as u64, extra.len() as u64)
                     && valid_shape_bytes(&global, &extra, scalar.width() as u64)

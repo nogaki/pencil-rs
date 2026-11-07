@@ -1,6 +1,6 @@
 use super::*;
 use crate::catalog::{DatasetInfo, ScalarType};
-use crate::hdf5_schema::valid_shape_bytes_from_width;
+use crate::hdf5_schema::{Attribute, Metadata, valid_shape_bytes_from_width};
 use std::collections::BTreeSet;
 
 impl Hdf5FileSession<'_> {
@@ -155,14 +155,18 @@ fn leaf(
     resources: &mut Hdf5Resources,
 ) -> Result<DatasetInfo, Hdf5SessionError> {
     macro_rules! attr {
-        ($name:expr, $length:expr, $max:expr) => {{
+        ($attribute:expr) => {
+            attr!($attribute, 0, 0)
+        };
+        ($attribute:expr, $n:expr, $er:expr) => {{
+            let (expected, max) = $attribute.read_len($n, $er);
             let value = read_attr_phase(
                 comm,
                 duplicate,
                 dataset,
-                $name,
-                $length,
-                $max,
+                $attribute.name(),
+                expected,
+                max,
                 "session catalog attribute",
             )?;
             let mut bytes = [0u8; MAX_PROTOCOL_RANK * 8];
@@ -173,16 +177,17 @@ fn leaf(
             value
         }};
     }
-    let version = attr!(ATTR_VERSION, Some(1), 1);
-    let commit = attr!(ATTR_COMMIT, Some(1), 1);
-    let n = attr!(ATTR_N, Some(1), 1)[0];
-    let typ = attr!(ATTR_TYPE, Some(1), 1)[0];
-    let width = attr!(ATTR_WIDTH, Some(1), 1)[0];
-    let er = attr!(ATTR_EXTRA_RANK, Some(1), 1)[0];
+    let version = attr!(Attribute::Version);
+    let commit = attr!(Attribute::Commit);
+    let n = attr!(Attribute::Rank)[0];
+    let typ = attr!(Attribute::TypeCode)[0];
+    let width = attr!(Attribute::Width)[0];
+    let er = attr!(Attribute::ExtraRank)[0];
     let scalar = ScalarType::decode(typ, width);
+    let metadata = Metadata::version_only();
     agree_phase(
         comm,
-        version == [FORMAT_VERSION]
+        metadata.matches(Attribute::Version, &version)
             && commit_state(commit[0]) == CommitState::Complete
             && n > 0
             && rank_in_range(n)
@@ -194,16 +199,21 @@ fn leaf(
     let scalar = scalar.expect("agreed scalar");
     let n = n as usize;
     let er = er as usize;
-    let extra = if er == 0 {
-        let exists = attribute_exists_phase(comm, dataset, ATTR_EXTRA, "session extra metadata")?;
+    let extra = if Attribute::ExtraShape.present(er) {
+        attr!(Attribute::ExtraShape, n, er)
+    } else {
+        let exists = attribute_exists_phase(
+            comm,
+            dataset,
+            Attribute::ExtraShape.name(),
+            "session extra metadata",
+        )?;
         agree_phase(comm, !exists, "session absent extra shape")?;
         Vec::new()
-    } else {
-        attr!(ATTR_EXTRA, Some(er), er)
     };
-    let global = attr!(ATTR_GLOBAL, Some(n), n);
-    let grid = attr!(ATTR_GRID, None, MAX_PROTOCOL_RANK);
-    let perm = attr!(ATTR_PERM, Some(n), n);
+    let global = attr!(Attribute::GlobalShape, n, er);
+    let grid = attr!(Attribute::WriterGrid, n, er);
+    let perm = attr!(Attribute::WriterPermutation, n, er);
     agree_phase(
         comm,
         valid_shape_bytes_from_width(&global, &extra, width)

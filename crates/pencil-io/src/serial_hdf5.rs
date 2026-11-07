@@ -2,19 +2,13 @@
 
 use std::{ffi::CStr, path::Path};
 
-use hdf5_metno::{Attribute, Dataset, Dataspace, Datatype, File};
+use hdf5_metno::{Attribute as Hdf5Attribute, Dataset, Dataspace, Datatype, File};
 use hdf5_metno_sys::{h5a, h5d, h5p::H5P_DEFAULT, h5s::H5S_MAX_RANK, h5t};
 
 use crate::hdf5_schema::{
-    ATTR_COMMIT as COMMIT, ATTR_EXTRA as EXTRA, ATTR_EXTRA_RANK as EXTRA_RANK,
-    ATTR_GLOBAL as GLOBAL, ATTR_GRID as GRID, ATTR_N as N, ATTR_PERM as PERM, ATTR_TYPE as TYPE,
-    ATTR_VERSION as VERSION, ATTR_WIDTH as WIDTH, CommitState, commit_state, valid_permutation,
-    valid_writer_grid,
+    Attribute, CommitState, Metadata, commit_state, valid_permutation, valid_writer_grid,
 };
-use crate::{
-    COMMIT_MARKER, FORMAT_VERSION, INCOMPLETE_MARKER, IoElement, IoError, MAX_PROTOCOL_RANK,
-    format::element_count,
-};
+use crate::{COMMIT_MARKER, IoElement, IoError, MAX_PROTOCOL_RANK, format::element_count};
 
 const DATASET: &str = "/pencil_io_v1/data";
 
@@ -66,21 +60,28 @@ pub fn write_hdf5_serial<P: AsRef<Path>, T: IoElement>(
             let global: Vec<_> = global_shape.iter().map(|&n| n as u64).collect();
             let extra: Vec<_> = extra_shape.iter().map(|&n| n as u64).collect();
             let permutation: Vec<_> = (0..global_shape.len() as u64).collect();
-            for (name, values) in [
-                (VERSION, &[FORMAT_VERSION][..]),
-                (COMMIT, &[INCOMPLETE_MARKER][..]),
-                (N, &[global_shape.len() as u64][..]),
-                (TYPE, &[T::CODE][..]),
-                (WIDTH, &[T::WIDTH as u64][..]),
-                (EXTRA_RANK, &[extra_shape.len() as u64][..]),
-                (GLOBAL, global.as_slice()),
-                (GRID, &[1][..]),
-                (PERM, permutation.as_slice()),
-            ] {
-                write_attribute(&dataset, name, values)?;
+            let grid = [1u64];
+            let metadata = Metadata::for_write(
+                global_shape.len() as u64,
+                T::CODE,
+                T::WIDTH as u64,
+                &extra,
+                &global,
+                &grid,
+                &permutation,
+            );
+            for attribute in Attribute::ALL {
+                if attribute == Attribute::ExtraShape {
+                    continue;
+                }
+                write_attribute(&dataset, attribute.name(), metadata.value(attribute))?;
             }
-            if !extra.is_empty() {
-                write_attribute(&dataset, EXTRA, &extra)?;
+            if Attribute::ExtraShape.present(extra.len()) {
+                write_attribute(
+                    &dataset,
+                    Attribute::ExtraShape.name(),
+                    metadata.value(Attribute::ExtraShape),
+                )?;
             }
             native(file.flush(), "HDF5 serial initial metadata flush")?;
             if !packed.is_empty() {
@@ -106,7 +107,12 @@ pub fn write_hdf5_serial<P: AsRef<Path>, T: IoElement>(
                 stage: "HDF5 serial payload flush",
             })?;
             let commit = native(
-                dataset.attr(COMMIT.to_str().expect("HDF5 attribute name is ASCII")),
+                dataset.attr(
+                    Attribute::Commit
+                        .name()
+                        .to_str()
+                        .expect("HDF5 attribute name is ASCII"),
+                ),
                 "HDF5 serial commit attribute",
             )?;
             commit
@@ -280,7 +286,7 @@ fn write_attribute(dataset: &Dataset, name: &CStr, values: &[u64]) -> Result<(),
     )?;
     // SAFETY: live dataset/type/space, validated static attribute name, default
     // property lists. from_id takes ownership of the newly created attribute.
-    let attribute: Attribute = native(
+    let attribute: Hdf5Attribute = native(
         unsafe {
             hdf5_metno::from_id(h5a::H5Acreate2(
                 dataset.id(),
@@ -371,18 +377,33 @@ fn validate_metadata<T: IoElement>(
     global: &[usize],
     extra: &[usize],
 ) -> Result<(), IoError> {
-    let scalar = |name| read_attribute(dataset, name, Some(1)).map(|values| values[0]);
-    if scalar(VERSION)? != FORMAT_VERSION
-        || scalar(N)? != global.len() as u64
-        || scalar(TYPE)? != T::CODE
-        || scalar(WIDTH)? != T::WIDTH as u64
-        || scalar(EXTRA_RANK)? != extra.len() as u64
+    let metadata = Metadata::expected(
+        global.len() as u64,
+        T::CODE,
+        T::WIDTH as u64,
+        extra.len() as u64,
+        extra,
+        global,
+    );
+    let read = |attribute: Attribute| {
+        read_attribute(
+            dataset,
+            attribute.name(),
+            attribute.read_len(global.len(), extra.len()).0,
+        )
+    };
+    let scalar = |attribute: Attribute| read(attribute).map(|values| values[0]);
+    if !metadata.matches(Attribute::Version, &[scalar(Attribute::Version)?])
+        || !metadata.matches(Attribute::Rank, &[scalar(Attribute::Rank)?])
+        || !metadata.matches(Attribute::TypeCode, &[scalar(Attribute::TypeCode)?])
+        || !metadata.matches(Attribute::Width, &[scalar(Attribute::Width)?])
+        || !metadata.matches(Attribute::ExtraRank, &[scalar(Attribute::ExtraRank)?])
     {
         return Err(IoError::MetadataMismatch {
             field: "version, rank, or type",
         });
     }
-    match commit_state(scalar(COMMIT)?) {
+    match commit_state(scalar(Attribute::Commit)?) {
         CommitState::Complete => {}
         CommitState::Incomplete => return Err(IoError::IncompleteFile),
         CommitState::Invalid => {
@@ -391,9 +412,9 @@ fn validate_metadata<T: IoElement>(
             });
         }
     }
-    if extra.is_empty() {
+    if !Attribute::ExtraShape.present(extra.len()) {
         // SAFETY: live dataset and static NUL-terminated attribute name.
-        match unsafe { h5a::H5Aexists(dataset.id(), EXTRA.as_ptr()) } {
+        match unsafe { h5a::H5Aexists(dataset.id(), Attribute::ExtraShape.name().as_ptr()) } {
             0 => {}
             code if code < 0 => {
                 return Err(IoError::Native {
@@ -407,22 +428,15 @@ fn validate_metadata<T: IoElement>(
                 });
             }
         }
-    } else if !read_attribute(dataset, EXTRA, Some(extra.len()))?
-        .iter()
-        .copied()
-        .eq(extra.iter().map(|&n| n as u64))
-    {
+    } else if !metadata.matches(Attribute::ExtraShape, &read(Attribute::ExtraShape)?) {
         return Err(IoError::MetadataMismatch {
             field: "extra shape",
         });
     }
-    let stored_global = read_attribute(dataset, GLOBAL, Some(global.len()))?;
-    let grid = read_attribute(dataset, GRID, None)?;
-    let perm = read_attribute(dataset, PERM, Some(global.len()))?;
-    if !stored_global
-        .iter()
-        .copied()
-        .eq(global.iter().map(|&n| n as u64))
+    let stored_global = read(Attribute::GlobalShape)?;
+    let grid = read(Attribute::WriterGrid)?;
+    let perm = read(Attribute::WriterPermutation)?;
+    if !metadata.matches(Attribute::GlobalShape, &stored_global)
         || !valid_writer_provenance(&grid, &perm, global.len())
     {
         return Err(IoError::MetadataMismatch {
