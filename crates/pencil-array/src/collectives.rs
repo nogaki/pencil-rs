@@ -1322,63 +1322,40 @@ fn prepare_map_reduce3<A, B, D, U, const N: usize, const M: usize>(
 where
     U: SupportedScalar,
 {
-    let header = [
-        DESCRIPTOR_SCHEMA,
-        OP_MAP_REDUCE3,
-        u64::try_from(N).unwrap_or(INVALID_WORD),
-        u64::try_from(M).unwrap_or(INVALID_WORD),
-        0,
-    ];
-    if !agree_header(c, header) {
-        return Err(CollectiveError::CollectiveDescriptorMismatch);
-    }
     let lengths = [
         descriptor_len::<A, U, N, M>(a, 0, callback),
         descriptor_len::<B, U, N, M>(b, 0, callback),
         descriptor_len::<D, U, N, M>(d, 0, callback),
     ];
-    let expected = size_of::<U>().checked_mul(2).ok_or(()).and_then(|base| {
-        lengths.iter().try_fold(base, |n, x| {
-            n.checked_add(*x.as_ref().map_err(|_| ())?).ok_or(())
-        })
-    });
-    let header = [
-        DESCRIPTOR_SCHEMA,
+    agree_descriptor::<_, _, N, M>(
+        c,
         OP_MAP_REDUCE3,
-        u64::try_from(N).unwrap_or(INVALID_WORD),
-        u64::try_from(M).unwrap_or(INVALID_WORD),
-        expected
-            .as_ref()
-            .ok()
-            .and_then(|n| u64::try_from(*n).ok())
-            .unwrap_or(INVALID_WORD),
-    ];
-    if !agree_header(c, header) {
-        return Err(CollectiveError::CollectiveDescriptorMismatch);
-    }
-    let descriptor = (|| {
-        let mut out = Vec::new();
-        out.try_reserve_exact(expected.map_err(|_| ())?)
-            .map_err(|_| ())?;
-        let words_a = build_descriptor::<_, A, U, N, M>(a, OP_MAP_REDUCE3, 0, callback)?;
-        let words_b = build_descriptor::<_, B, U, N, M>(b, OP_MAP_REDUCE3, 0, callback)?;
-        let words_d = build_descriptor::<_, D, U, N, M>(d, OP_MAP_REDUCE3, 0, callback)?;
-        for (words, len) in [
-            (words_a, lengths[0]),
-            (words_b, lengths[1]),
-            (words_d, lengths[2]),
-        ] {
-            if Some(words.len()) != len.ok() {
-                return Err(());
-            }
-            out.extend(words);
-        }
-        for byte in neutral_bytes(neutral)? {
-            append_word(&mut out, u64::from(byte));
-        }
-        Ok(out)
-    })();
-    let _ = collective_descriptor(c, descriptor.ok(), expected.ok())?;
+        descriptor_total(lengths, size_of::<U>().checked_mul(2)),
+        |expected| {
+            let descriptor = (|| {
+                let mut out = Vec::new();
+                out.try_reserve_exact(expected.ok_or(())?).map_err(|_| ())?;
+                let words_a = build_descriptor::<_, A, U, N, M>(a, OP_MAP_REDUCE3, 0, callback)?;
+                let words_b = build_descriptor::<_, B, U, N, M>(b, OP_MAP_REDUCE3, 0, callback)?;
+                let words_d = build_descriptor::<_, D, U, N, M>(d, OP_MAP_REDUCE3, 0, callback)?;
+                for (words, len) in [
+                    (words_a, lengths[0]),
+                    (words_b, lengths[1]),
+                    (words_d, lengths[2]),
+                ] {
+                    if Some(words.len()) != len.ok() {
+                        return Err(());
+                    }
+                    out.extend(words);
+                }
+                for byte in neutral_bytes(neutral)? {
+                    append_word(&mut out, u64::from(byte));
+                }
+                Ok(out)
+            })();
+            descriptor.ok()
+        },
+    )?;
     let shape = broadcast_shape3(a.extra_shape(), b.extra_shape(), d.extra_shape());
     if !collective_valid(c, shape.is_ok()) {
         return Err(CollectiveError::CollectivePreconditionFailed);
@@ -1645,15 +1622,7 @@ where
         global_count,
         offsets,
     ) = prepared.expect("collective many preparation succeeded");
-    let length = u64::try_from(expected).unwrap_or(INVALID_WORD);
-    let mut minimum = length;
-    let mut maximum = length;
-    c.all_reduce_into(&length, &mut minimum, SystemOperation::min());
-    c.all_reduce_into(&length, &mut maximum, SystemOperation::max());
-    if minimum != maximum || minimum == INVALID_WORD {
-        return Err(CollectiveError::CollectiveDescriptorMismatch);
-    }
-    let _ = collective_descriptor(c, Some(descriptor), Some(expected))?;
+    agree_descriptor::<_, _, N, M>(c, operation, Some(expected), |_| Some(descriptor))?;
     let layout_ok = inputs.iter().all(|input| {
         input.pencil().same_layout(inputs[0].pencil())
             && matches!(
@@ -1739,55 +1708,38 @@ where
     U: SupportedScalar,
 {
     let communicator = left.pencil().topology().communicator();
-    // The fixed five-word exchange is the first collective.  In particular,
-    // do not allocate/build either composite descriptor until all ranks have
-    // agreed on the operation and its exact length.
-    let left_len = descriptor_len::<A, U, N, M>(left, 0, callback_name);
-    let right_len = descriptor_len::<B, U, N, M>(right, 0, callback_name);
-    let expected = left_len
-        .and_then(|left_len| {
-            right_len.and_then(|right_len| {
-                left_len
-                    .checked_add(right_len)
-                    .and_then(|length| length.checked_add(size_of::<U>().checked_mul(2)?))
-                    .ok_or(())
-            })
-        })
-        .ok();
-    let header = [
-        DESCRIPTOR_SCHEMA,
-        operation,
-        u64::try_from(N).unwrap_or(INVALID_WORD),
-        u64::try_from(M).unwrap_or(INVALID_WORD),
-        expected
-            .and_then(|length| u64::try_from(length).ok())
-            .unwrap_or(INVALID_WORD),
+    let lengths = [
+        descriptor_len::<A, U, N, M>(left, 0, callback_name),
+        descriptor_len::<B, U, N, M>(right, 0, callback_name),
     ];
-    if !agree_header(communicator, header) {
-        return Err(CollectiveError::CollectiveDescriptorMismatch);
-    }
-
-    let descriptor = match (left_len, right_len) {
-        (Ok(_), Ok(_)) => (|| {
-            let mut left_words =
-                build_descriptor::<_, A, U, N, M>(left, operation, 0, callback_name)?;
-            let right_words =
-                build_descriptor::<_, B, U, N, M>(right, operation, 0, callback_name)?;
-            left_words
-                .try_reserve_exact(expected.ok_or(())?.saturating_sub(left_words.len()))
-                .map_err(|_| ())?;
-            left_words.extend(right_words);
-            for byte in neutral_bytes(neutral)? {
-                append_word(&mut left_words, u64::from(byte));
-            }
-            if Some(left_words.len()) != expected {
-                return Err(());
-            }
-            Ok(left_words)
-        })(),
-        _ => Err(()),
-    };
-    let _ = collective_descriptor(communicator, descriptor.ok(), expected)?;
+    agree_descriptor::<_, _, N, M>(
+        communicator,
+        operation,
+        descriptor_total(lengths, size_of::<U>().checked_mul(2)),
+        |expected| {
+            let descriptor = match (lengths[0], lengths[1]) {
+                (Ok(_), Ok(_)) => (|| {
+                    let mut left_words =
+                        build_descriptor::<_, A, U, N, M>(left, operation, 0, callback_name)?;
+                    let right_words =
+                        build_descriptor::<_, B, U, N, M>(right, operation, 0, callback_name)?;
+                    left_words
+                        .try_reserve_exact(expected.ok_or(())?.saturating_sub(left_words.len()))
+                        .map_err(|_| ())?;
+                    left_words.extend(right_words);
+                    for byte in neutral_bytes(neutral)? {
+                        append_word(&mut left_words, u64::from(byte));
+                    }
+                    if Some(left_words.len()) != expected {
+                        return Err(());
+                    }
+                    Ok(left_words)
+                })(),
+                _ => Err(()),
+            };
+            descriptor.ok()
+        },
+    )?;
     let shape = broadcast_shape(left.extra_shape(), right.extra_shape());
     if !collective_valid(communicator, shape.is_ok()) {
         return Err(shape
@@ -2275,24 +2227,21 @@ where
     L: LocalArrayLayout<T, N, M>,
 {
     let communicator = layout.pencil().topology().communicator();
-    // Keep the paired five-word header ahead of all descriptor allocation.
-    let expected_len = descriptor_len::<T, U, N, M>(layout, root_word, callback_name).ok();
-    let header = [
-        DESCRIPTOR_SCHEMA,
+    let lengths = [descriptor_len::<T, U, N, M>(
+        layout,
+        root_word,
+        callback_name,
+    )];
+    agree_descriptor::<_, _, N, M>(
+        communicator,
         operation,
-        u64::try_from(N).unwrap_or(INVALID_WORD),
-        u64::try_from(M).unwrap_or(INVALID_WORD),
-        expected_len
-            .and_then(|length| u64::try_from(length).ok())
-            .unwrap_or(INVALID_WORD),
-    ];
-    if !agree_header(communicator, header) {
-        return Err(CollectiveError::CollectiveDescriptorMismatch);
-    }
-    let descriptor = expected_len.and_then(|_| {
-        build_descriptor::<L, T, U, N, M>(layout, operation, root_word, callback_name).ok()
-    });
-    let _ = collective_descriptor(communicator, descriptor, expected_len)?;
+        descriptor_total(lengths, Some(0)),
+        |expected_len| {
+            expected_len.and_then(|_| {
+                build_descriptor::<L, T, U, N, M>(layout, operation, root_word, callback_name).ok()
+            })
+        },
+    )?;
 
     let global_count = layout
         .extra_shape()
@@ -2447,6 +2396,47 @@ fn collective_descriptor<C: CommunicatorCollectives>(
         return Err(CollectiveError::CollectiveDescriptorMismatch);
     }
     Ok(words)
+}
+
+/// Agrees on one five-word header carrying the expected descriptor length,
+/// then builds and compares the combined descriptor. Callers that prepare
+/// their descriptor before this agreement (map_reduce_many) pass it through
+/// `prepare`; the others allocate only after the header is agreed.
+fn agree_descriptor<C, F, const N: usize, const M: usize>(
+    communicator: &C,
+    operation: u64,
+    expected: Option<usize>,
+    prepare: F,
+) -> Result<(), CollectiveError>
+where
+    C: CommunicatorCollectives,
+    F: FnOnce(Option<usize>) -> Option<Vec<u32>>,
+{
+    let header = [
+        DESCRIPTOR_SCHEMA,
+        operation,
+        u64::try_from(N).unwrap_or(INVALID_WORD),
+        u64::try_from(M).unwrap_or(INVALID_WORD),
+        expected
+            .and_then(|length| u64::try_from(length).ok())
+            .unwrap_or(INVALID_WORD),
+    ];
+    if !agree_header(communicator, header) {
+        return Err(CollectiveError::CollectiveDescriptorMismatch);
+    }
+    collective_descriptor(communicator, prepare(expected), expected)?;
+    Ok(())
+}
+
+fn descriptor_total(
+    lengths: impl IntoIterator<Item = Result<usize, ()>>,
+    neutral_words: Option<usize>,
+) -> Option<usize> {
+    neutral_words.and_then(|neutral| {
+        lengths
+            .into_iter()
+            .try_fold(neutral, |total, length| total.checked_add(length.ok()?))
+    })
 }
 
 fn collective_flags<C: CommunicatorCollectives>(communicator: &C, local: [u32; 6]) -> [u32; 6] {

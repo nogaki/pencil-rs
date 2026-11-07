@@ -8,7 +8,7 @@ use num_complex::{Complex32, Complex64};
 use pencil_array::{
     AllToAllvTransposePlan, AxisPermutation, CollectiveError, ExtraShape, MpiTopology, Pencil,
     PencilArray, SupportedScalar, TransposeError, all, all_by, any, any_by, gather, global_max,
-    global_min, global_sum, l2_norm, norm_by, sum_by,
+    global_min, global_sum, l2_norm, map_reduce_many, norm_by, sum_by,
 };
 
 fn check_all<C: CommunicatorCollectives>(communicator: &C, local: bool) {
@@ -579,6 +579,84 @@ fn run_mapped_reduction_tests<C: CommunicatorCollectives>(
     check_all(communicator, local_ok);
 }
 
+fn run_many_error_precedence_tests(
+    topology: &Arc<MpiTopology<2>>,
+    pencil: &Arc<Pencil<2, 2>>,
+    rank: usize,
+    size: usize,
+) {
+    type ManyMap = fn(&[&i64]) -> i64;
+    type ManyReduce = fn(i64, i64) -> i64;
+
+    fn many_array(p: &Arc<Pencil<2, 2>>, dims: &[usize], value: i64) -> PencilArray<i64, 2, 2> {
+        PencilArray::from_elem(Arc::clone(p), ExtraShape::new(dims).unwrap(), value).unwrap()
+    }
+    fn many_map_sum(values: &[&i64]) -> i64 {
+        values.iter().map(|value| **value).sum()
+    }
+    fn many_reduce_sum(left: i64, right: i64) -> i64 {
+        left + right
+    }
+
+    let communicator = topology.communicator();
+    let callback = many_map_sum as ManyMap;
+    let reduce = many_reduce_sum as ManyReduce;
+    let valid = [
+        many_array(pencil, &[1, 2], 1),
+        many_array(pencil, &[1, 2], 2),
+    ];
+    let valid_views = [valid[0].view(), valid[1].view()];
+    let expected = 3 * 2 * pencil.global_len() as i64;
+    let valid_call =
+        || map_reduce_many(communicator, &valid_views, 0_i64, callback, reduce) == Ok(expected);
+    if size == 1 {
+        check_all(communicator, valid_call());
+        return;
+    }
+
+    // Rank 0's own preparation fails (its extra shapes [2] and [3] cannot be
+    // broadcast), so every rank must return the readiness error, not the
+    // descriptor-length mismatch that the differing shapes also produce.
+    let incompatible = [many_array(pencil, &[2], 1), many_array(pencil, &[3], 1)];
+    let incompatible_views = [incompatible[0].view(), incompatible[1].view()];
+    let result = if rank == 0 {
+        map_reduce_many(communicator, &incompatible_views, 0_i64, callback, reduce)
+    } else {
+        map_reduce_many(communicator, &valid_views, 0_i64, callback, reduce)
+    };
+    check_all(
+        communicator,
+        matches!(result, Err(CollectiveError::CollectivePreconditionFailed)),
+    );
+    check_all(communicator, valid_call());
+
+    // Different input counts must be rejected before any preparation, even
+    // when the combined expected descriptor length collides. One input
+    // descriptor is `2 * (base + extra_dims)` words with `base` = 13 + 2N + 2M
+    // + the type and callback name lengths, so one input with `base + 1`
+    // dimensions matches two inputs with 0 and 1 dimensions.
+    let base_words = 13
+        + 2 * 2
+        + 2 * 2
+        + std::any::type_name::<i64>().len()
+        + std::any::type_name::<i64>().len()
+        + std::any::type_name::<(ManyMap, ManyReduce)>().len();
+    let single = [many_array(pencil, &vec![1; base_words + 1], 1)];
+    let single_views = [single[0].view()];
+    let pair = [many_array(pencil, &[], 1), many_array(pencil, &[1], 1)];
+    let pair_views = [pair[0].view(), pair[1].view()];
+    let result = if rank == 0 {
+        map_reduce_many(communicator, &single_views, 0_i64, callback, reduce)
+    } else {
+        map_reduce_many(communicator, &pair_views, 0_i64, callback, reduce)
+    };
+    check_all(
+        communicator,
+        matches!(result, Err(CollectiveError::CollectiveDescriptorMismatch)),
+    );
+    check_all(communicator, valid_call());
+}
+
 #[test]
 fn reductions_and_logical_gather_cover_permuted_pencils() {
     let universe = mpi::initialize().expect("MPI initialization failed");
@@ -708,4 +786,5 @@ fn reductions_and_logical_gather_cover_permuted_pencils() {
         &array,
         &empty_rank_array,
     );
+    run_many_error_precedence_tests(&topology, &pencil, rank, size);
 }
