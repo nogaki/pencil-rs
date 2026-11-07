@@ -9,7 +9,7 @@ use std::{
 
 use mpi::{
     Count,
-    collective::{CommunicatorCollectives, SystemOperation},
+    collective::CommunicatorCollectives,
     datatype::{DatatypeRef, Equivalence, UserDatatype},
     raw::traits::{AsRaw, FromRaw},
     topology::Communicator,
@@ -23,13 +23,12 @@ use crate::{
         CheckedPartition, CheckedPartitionMut, DatatypePartition, DatatypePartitionMut,
     },
     geometry::{partition_range, row_major_offset},
-    preflight::agree_header,
+    preflight::{WORD_CHUNK, agree_header, agree_preflight, agree_words},
 };
 
 const DESCRIPTOR_SCHEMA: u64 = 1;
 const OP_PREPARE: u64 = 0x3601;
 const OP_APPLY: u64 = 0x3602;
-const DESCRIPTOR_CHUNK: usize = 64;
 
 /// Errors returned while preparing or applying a [`SpatialRemapPlan`].
 #[derive(Debug, Error)]
@@ -364,7 +363,7 @@ where
         if !agree_header(communicator, header) {
             return Err(SpatialRemapError::CollectiveDescriptorMismatch);
         }
-        if !descriptors_equal(communicator, &self.descriptor) {
+        if !agree_words::<_, WORD_CHUNK>(communicator, &self.descriptor) {
             return Err(SpatialRemapError::CollectiveDescriptorMismatch);
         }
 
@@ -409,39 +408,23 @@ fn dimension_word(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+fn sign_word(sign: i8) -> u64 {
+    u64::from(sign.to_le_bytes()[0])
+}
+
 fn agree_stage<C, V>(comm: &C, local: Result<V, SpatialRemapError>) -> Result<V, SpatialRemapError>
 where
     C: CommunicatorCollectives,
 {
-    if all_ranks_succeeded_from_comm(comm, local.is_ok()) {
-        local
-    } else {
-        Err(local
-            .err()
-            .unwrap_or(SpatialRemapError::CollectivePreconditionFailed))
-    }
-}
-
-fn all_ranks_succeeded_from_comm<C: CommunicatorCollectives>(comm: &C, ok: bool) -> bool {
-    let local = i32::from(ok);
-    let mut all = 0i32;
-    comm.all_reduce_into(&local, &mut all, SystemOperation::min());
-    all != 0
+    agree_preflight(comm, local, SpatialRemapError::CollectivePreconditionFailed)
 }
 
 fn agree_signs<C: CommunicatorCollectives, const N: usize>(
     comm: &C,
     signs: &[i8; N],
 ) -> Result<(), SpatialRemapError> {
-    let mut equal = true;
-    for chunk in signs.chunks(DESCRIPTOR_CHUNK) {
-        let mut minimum = [i8::MAX; DESCRIPTOR_CHUNK];
-        let mut maximum = [i8::MIN; DESCRIPTOR_CHUNK];
-        comm.all_reduce_into(chunk, &mut minimum[..chunk.len()], SystemOperation::min());
-        comm.all_reduce_into(chunk, &mut maximum[..chunk.len()], SystemOperation::max());
-        equal &= minimum[..chunk.len()] == maximum[..chunk.len()];
-    }
-    if !equal {
+    let words = signs.map(sign_word);
+    if !agree_words::<_, WORD_CHUNK>(comm, &words) {
         return Err(SpatialRemapError::CollectiveDescriptorMismatch);
     }
     let valid = signs
@@ -480,12 +463,8 @@ where
         source.topology().process_grid(),
         SpatialRemapError::DifferentTopology,
     )?;
-    let size = source.topology().size();
-    let mut minimum_size = 0usize;
-    let mut maximum_size = 0usize;
-    comm.all_reduce_into(&size, &mut minimum_size, SystemOperation::min());
-    comm.all_reduce_into(&size, &mut maximum_size, SystemOperation::max());
-    if minimum_size != maximum_size {
+    let size = [dimension_word(source.topology().size())];
+    if !agree_words::<_, 1>(comm, &size) {
         return Err(SpatialRemapError::DifferentTopology);
     }
 
@@ -513,11 +492,8 @@ where
     if K == 0 {
         return Ok(());
     }
-    let mut minimum = [0usize; K];
-    let mut maximum = [0usize; K];
-    comm.all_reduce_into(&values[..], &mut minimum[..], SystemOperation::min());
-    comm.all_reduce_into(&values[..], &mut maximum[..], SystemOperation::max());
-    if minimum == maximum {
+    let words = (*values).map(dimension_word);
+    if agree_words::<_, K>(comm, &words) {
         Ok(())
     } else {
         Err(mismatch)
@@ -571,11 +547,7 @@ where
         comm,
         u64::try_from(descriptor_len).map_err(|_| SpatialRemapError::SizeOverflow),
     )?;
-    let mut minimum_len = 0u64;
-    let mut maximum_len = 0u64;
-    comm.all_reduce_into(&length_word, &mut minimum_len, SystemOperation::min());
-    comm.all_reduce_into(&length_word, &mut maximum_len, SystemOperation::max());
-    if minimum_len != maximum_len {
+    if !agree_words::<_, 1>(comm, &[length_word]) {
         return Err(SpatialRemapError::CollectiveDescriptorMismatch);
     }
 
@@ -590,7 +562,7 @@ where
             offsets,
         ),
     )?;
-    if descriptors_equal(comm, &descriptor) {
+    if agree_words::<_, WORD_CHUNK>(comm, &descriptor) {
         Ok(descriptor)
     } else {
         Err(SpatialRemapError::CollectiveDescriptorMismatch)
@@ -628,7 +600,7 @@ where
     push_usize(&mut descriptor, extra_shape.dimensions().len())?;
     append_usizes(&mut descriptor, extra_shape.dimensions())?;
     for sign in signs {
-        descriptor.push(u64::from(sign.to_le_bytes()[0]));
+        descriptor.push(sign_word(*sign));
     }
     for offset in offsets {
         let bytes = offset.to_le_bytes();
@@ -679,18 +651,6 @@ fn append_type_name(descriptor: &mut Vec<u64>, name: &str) -> Result<(), Spatial
     push_usize(descriptor, name.len())?;
     descriptor.extend(name.as_bytes().iter().copied().map(u64::from));
     Ok(())
-}
-
-fn descriptors_equal<C: CommunicatorCollectives>(comm: &C, descriptor: &[u64]) -> bool {
-    let mut equal = true;
-    for chunk in descriptor.chunks(DESCRIPTOR_CHUNK) {
-        let mut minimum = [0u64; DESCRIPTOR_CHUNK];
-        let mut maximum = [0u64; DESCRIPTOR_CHUNK];
-        comm.all_reduce_into(chunk, &mut minimum[..chunk.len()], SystemOperation::min());
-        comm.all_reduce_into(chunk, &mut maximum[..chunk.len()], SystemOperation::max());
-        equal &= minimum[..chunk.len()] == maximum[..chunk.len()];
-    }
-    equal
 }
 
 fn filled_vec<T: Copy>(

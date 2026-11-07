@@ -7,6 +7,9 @@ use crate::{MpiTopology, transpose::collective_valid};
 /// Words in the fixed header agreed before any variable-length metadata.
 pub(crate) const HEADER_WORDS: usize = 5;
 
+/// Words per exchange for descriptor and sign agreement.
+pub(crate) const WORD_CHUNK: usize = 64;
+
 /// Writes `[values, !values]` into `paired` for one max all-reduce.
 pub(crate) fn expand_for_max(values: &[u64], paired: &mut [u64]) {
     let (top, bottom) = paired.split_at_mut(values.len());
@@ -48,6 +51,44 @@ pub(crate) fn agree_header<C: CommunicatorCollectives>(
     let mut maximum = [0u64; HEADER_WORDS];
     split_min_max(&reduced, &mut minimum, &mut maximum);
     minimum == maximum
+}
+
+/// Agrees `words` across `comm` with one MIN and one MAX all-reduce per
+/// `CHUNK`-word group. Returns whether every word matched on every rank.
+///
+/// The grouping is explicit so each caller keeps its established collective
+/// sequence. Descriptors and signs use [`WORD_CHUNK`]; scalar and fixed-size
+/// metadata agree their whole slice in one group. This deliberately keeps the
+/// original spatial-remap MIN-then-MAX protocol: replacing a pair by one
+/// `[words, !words]` MAX exchange would halve the reduction count.
+pub(crate) fn agree_words<C: CommunicatorCollectives, const CHUNK: usize>(
+    comm: &C,
+    words: &[u64],
+) -> bool {
+    debug_assert!(CHUNK > 0);
+    let mut equal = true;
+    for chunk in words.chunks(CHUNK) {
+        let mut minimum = [0u64; CHUNK];
+        let mut maximum = [0u64; CHUNK];
+        comm.all_reduce_into(chunk, &mut minimum[..chunk.len()], SystemOperation::min());
+        comm.all_reduce_into(chunk, &mut maximum[..chunk.len()], SystemOperation::max());
+        equal &= minimum[..chunk.len()] == maximum[..chunk.len()];
+    }
+    equal
+}
+
+/// Agrees only success, preserving a local error or returning `peer_error`.
+/// Call after descriptor agreement and local preparation, before payload writes.
+pub(crate) fn agree_preflight<C: CommunicatorCollectives, T, E>(
+    comm: &C,
+    local: Result<T, E>,
+    peer_error: E,
+) -> Result<T, E> {
+    if collective_valid(comm, local.is_ok()) {
+        local
+    } else {
+        Err(local.err().unwrap_or(peer_error))
+    }
 }
 
 /// Returns whether every rank accepted its local precondition.
