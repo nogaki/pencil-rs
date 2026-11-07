@@ -2,14 +2,14 @@ use mpi::traits::*;
 use num_complex::Complex;
 use pencil_array::{AxisPermutation, ExtraShape, MpiTopology, Pencil, PencilArray};
 use pencil_io::IoElement;
+use pencil_io::{
+    CollectionIoError, IoError, MpiIoOptions, append_mpi_named_collection,
+    read_mpi_named_collection, write_mpi_named_collection,
+};
 #[cfg(feature = "parallel-hdf5")]
 use pencil_io::{
     Hdf5ReadOptions, Hdf5WriteOptions, append_hdf5_named_collection, read_hdf5_named_collection,
     write_hdf5_named_collection,
-};
-use pencil_io::{
-    MpiIoOptions, append_mpi_named_collection, read_mpi_named_collection,
-    write_mpi_named_collection,
 };
 mod support;
 
@@ -190,6 +190,52 @@ fn named_collections_mpi_roundtrip_append_and_collective_validation() {
         write_mpi_named_collection(&opcode, "retry", comm, &views, &options).unwrap();
     }
 
+    // An invalid option keeps the collection-level `Io` variant (not
+    // `Named`) on every named-collection entry point; a valid retry succeeds.
+    let bad = MpiIoOptions::default().hint("", "bad");
+    let option_path = dir.join("option-variant.pio");
+    assert_invalid_option_error(
+        world.rank(),
+        "mpi named collection write",
+        write_mpi_named_collection(&option_path, "bad", comm, &views, &bad),
+    );
+    world.barrier();
+    assert!(!option_path.exists());
+    world.barrier();
+    write_mpi_named_collection(&option_path, "first", comm, &views, &options).unwrap();
+    assert_invalid_option_error(
+        world.rank(),
+        "mpi named collection append",
+        append_mpi_named_collection(&option_path, "bad", comm, &views, &bad),
+    );
+    append_mpi_named_collection(&option_path, "second", comm, &views, &options).unwrap();
+    for a in &mut dest {
+        a.as_mut_slice().fill(-4);
+    }
+    assert_invalid_option_error(
+        world.rank(),
+        "mpi named collection read",
+        read_mpi_named_collection(
+            &option_path,
+            "second",
+            comm,
+            &mut dest.iter_mut().map(|a| a.view_mut()).collect::<Vec<_>>(),
+            &bad,
+        ),
+    );
+    assert!(dest.iter().all(|a| a.as_slice().iter().all(|x| *x == -4)));
+    read_mpi_named_collection(
+        &option_path,
+        "second",
+        comm,
+        &mut dest.iter_mut().map(|a| a.view_mut()).collect::<Vec<_>>(),
+        &options,
+    )
+    .unwrap();
+    for (actual, expected) in dest.iter().zip(&source) {
+        assert_eq!(actual.as_slice(), expected.as_slice());
+    }
+
     #[cfg(feature = "parallel-hdf5")]
     {
         let hpath = dir.join("named.h5");
@@ -266,6 +312,51 @@ fn named_collections_mpi_roundtrip_append_and_collective_validation() {
                     }
                 }
             }
+        }
+
+        let hbad_write = Hdf5WriteOptions::default().hint("", "bad");
+        let hbad_read = Hdf5ReadOptions::default().hint("", "bad");
+        let hoption = dir.join("option-variant.h5");
+        assert_invalid_option_error(
+            world.rank(),
+            "hdf5 named collection write",
+            write_hdf5_named_collection(&hoption, "bad", comm, &views, &hbad_write),
+        );
+        world.barrier();
+        assert!(!hoption.exists());
+        world.barrier();
+        write_hdf5_named_collection(&hoption, "first", comm, &views, &wo).unwrap();
+        assert_invalid_option_error(
+            world.rank(),
+            "hdf5 named collection append",
+            append_hdf5_named_collection(&hoption, "bad", comm, &views, &hbad_write),
+        );
+        append_hdf5_named_collection(&hoption, "second", comm, &views, &wo).unwrap();
+        for a in &mut dest {
+            a.as_mut_slice().fill(-10);
+        }
+        assert_invalid_option_error(
+            world.rank(),
+            "hdf5 named collection read",
+            read_hdf5_named_collection(
+                &hoption,
+                "second",
+                comm,
+                &mut dest.iter_mut().map(|a| a.view_mut()).collect::<Vec<_>>(),
+                &hbad_read,
+            ),
+        );
+        assert!(dest.iter().all(|a| a.as_slice().iter().all(|x| *x == -10)));
+        read_hdf5_named_collection(
+            &hoption,
+            "second",
+            comm,
+            &mut dest.iter_mut().map(|a| a.view_mut()).collect::<Vec<_>>(),
+            &ro,
+        )
+        .unwrap();
+        for (actual, expected) in dest.iter().zip(&source) {
+            assert_eq!(actual.as_slice(), expected.as_slice());
         }
     }
 
@@ -355,4 +446,13 @@ fn named_collections_cover_all_scalar_types(world: &mpi::topology::SimpleCommuni
     scalar_named_roundtrip(world, &dir, "cf32", Complex::new(1.0f32, -2.0));
     scalar_named_roundtrip(world, &dir, "cf64", Complex::new(1.0f64, -2.0));
     support::cleanup_owned_temp_dir(world, &dir);
+}
+
+fn assert_invalid_option_error(rank: i32, label: &str, result: Result<(), CollectionIoError>) {
+    match result {
+        Err(CollectionIoError::Io(IoError::InvalidInput(_))) => {}
+        other => panic!(
+            "rank {rank}: {label}: expected CollectionIoError::Io(IoError::InvalidInput(_)), got {other:?}"
+        ),
+    }
 }

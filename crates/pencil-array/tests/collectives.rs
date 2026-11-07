@@ -8,7 +8,7 @@ use num_complex::{Complex32, Complex64};
 use pencil_array::{
     AllToAllvTransposePlan, AxisPermutation, CollectiveError, ExtraShape, MpiTopology, Pencil,
     PencilArray, SupportedScalar, TransposeError, all, all_by, any, any_by, gather, global_max,
-    global_min, global_sum, l2_norm, norm_by, sum_by,
+    global_min, global_sum, l2_norm, map_reduce_many, max_by, min_by, norm_by, sum_by,
 };
 
 fn check_all<C: CommunicatorCollectives>(communicator: &C, local: bool) {
@@ -436,6 +436,17 @@ fn run_complex_sum_tests<C: CommunicatorCollectives>(
     successful_empty_collective(communicator, followup);
 }
 
+fn same_extreme(
+    left: Result<Option<f64>, CollectiveError>,
+    right: Result<Option<f64>, CollectiveError>,
+) -> bool {
+    match (left, right) {
+        (Ok(Some(left)), Ok(Some(right))) => (left.is_nan() && right.is_nan()) || left == right,
+        (Ok(None), Ok(None)) => true,
+        _ => false,
+    }
+}
+
 fn run_mapped_reduction_tests<C: CommunicatorCollectives>(
     communicator: &C,
     rank: usize,
@@ -577,6 +588,109 @@ fn run_mapped_reduction_tests<C: CommunicatorCollectives>(
             _ => false,
         };
     check_all(communicator, local_ok);
+
+    // The direct and mapped forms share their local fold, empty-input rule,
+    // and NaN policy.
+    let empty_f64 =
+        PencilArray::from_elem(Arc::clone(pencil), ExtraShape::new([0]).unwrap(), 1.0_f64).unwrap();
+    check_all(
+        communicator,
+        same_extreme(
+            global_min(&empty_f64.view()),
+            min_by(&empty_f64.view(), |value| *value),
+        ) && same_extreme(
+            global_max(&empty_f64.view()),
+            max_by(&empty_f64.view(), |value| *value),
+        ) && any(&empty_f64.view()) == any_by(&empty_f64.view(), |value| *value != 0.0)
+            && all(&empty_f64.view()) == all_by(&empty_f64.view(), |value| *value != 0.0),
+    );
+
+    let nan = PencilArray::from_elem(Arc::clone(pencil), ExtraShape::scalar(), f64::NAN).unwrap();
+    check_all(
+        communicator,
+        same_extreme(global_min(&nan.view()), min_by(&nan.view(), |value| *value))
+            && same_extreme(global_max(&nan.view()), max_by(&nan.view(), |value| *value))
+            && any(&nan.view()) == any_by(&nan.view(), |value| *value != 0.0)
+            && all(&nan.view()) == all_by(&nan.view(), |value| *value != 0.0),
+    );
+}
+
+fn run_many_error_precedence_tests(
+    topology: &Arc<MpiTopology<2>>,
+    pencil: &Arc<Pencil<2, 2>>,
+    rank: usize,
+    size: usize,
+) {
+    type ManyMap = fn(&[&i64]) -> i64;
+    type ManyReduce = fn(i64, i64) -> i64;
+
+    fn many_array(p: &Arc<Pencil<2, 2>>, dims: &[usize], value: i64) -> PencilArray<i64, 2, 2> {
+        PencilArray::from_elem(Arc::clone(p), ExtraShape::new(dims).unwrap(), value).unwrap()
+    }
+    fn many_map_sum(values: &[&i64]) -> i64 {
+        values.iter().map(|value| **value).sum()
+    }
+    fn many_reduce_sum(left: i64, right: i64) -> i64 {
+        left + right
+    }
+
+    let communicator = topology.communicator();
+    let callback = many_map_sum as ManyMap;
+    let reduce = many_reduce_sum as ManyReduce;
+    let valid = [
+        many_array(pencil, &[1, 2], 1),
+        many_array(pencil, &[1, 2], 2),
+    ];
+    let valid_views = [valid[0].view(), valid[1].view()];
+    let expected = 3 * 2 * pencil.global_len() as i64;
+    let valid_call =
+        || map_reduce_many(communicator, &valid_views, 0_i64, callback, reduce) == Ok(expected);
+    if size == 1 {
+        check_all(communicator, valid_call());
+        return;
+    }
+
+    // Rank 0's own preparation fails (its extra shapes [2] and [3] cannot be
+    // broadcast), so every rank must return the readiness error, not the
+    // descriptor-length mismatch that the differing shapes also produce.
+    let incompatible = [many_array(pencil, &[2], 1), many_array(pencil, &[3], 1)];
+    let incompatible_views = [incompatible[0].view(), incompatible[1].view()];
+    let result = if rank == 0 {
+        map_reduce_many(communicator, &incompatible_views, 0_i64, callback, reduce)
+    } else {
+        map_reduce_many(communicator, &valid_views, 0_i64, callback, reduce)
+    };
+    check_all(
+        communicator,
+        matches!(result, Err(CollectiveError::CollectivePreconditionFailed)),
+    );
+    check_all(communicator, valid_call());
+
+    // Different input counts must be rejected before any preparation, even
+    // when the combined expected descriptor length collides. One input
+    // descriptor is `2 * (base + extra_dims)` words with `base` = 13 + 2N + 2M
+    // + the type and callback name lengths, so one input with `base + 1`
+    // dimensions matches two inputs with 0 and 1 dimensions.
+    let base_words = 13
+        + 2 * 2
+        + 2 * 2
+        + std::any::type_name::<i64>().len()
+        + std::any::type_name::<i64>().len()
+        + std::any::type_name::<(ManyMap, ManyReduce)>().len();
+    let single = [many_array(pencil, &vec![1; base_words + 1], 1)];
+    let single_views = [single[0].view()];
+    let pair = [many_array(pencil, &[], 1), many_array(pencil, &[1], 1)];
+    let pair_views = [pair[0].view(), pair[1].view()];
+    let result = if rank == 0 {
+        map_reduce_many(communicator, &single_views, 0_i64, callback, reduce)
+    } else {
+        map_reduce_many(communicator, &pair_views, 0_i64, callback, reduce)
+    };
+    check_all(
+        communicator,
+        matches!(result, Err(CollectiveError::CollectiveDescriptorMismatch)),
+    );
+    check_all(communicator, valid_call());
 }
 
 #[test]
@@ -674,6 +788,27 @@ fn reductions_and_logical_gather_cover_permuted_pencils() {
         all_result == Ok(true) && all_calls.get() == array.len(),
     );
 
+    // The first local value already decides these results, but the mapped
+    // forms still visit every local value; only the direct forms short-circuit.
+    let deciding_any_calls = Cell::new(0usize);
+    let deciding_any_result = any_by(&array.view(), |_| {
+        deciding_any_calls.set(deciding_any_calls.get() + 1);
+        true
+    });
+    check_all(
+        &world,
+        deciding_any_result == Ok(true) && deciding_any_calls.get() == array.len(),
+    );
+    let deciding_all_calls = Cell::new(0usize);
+    let deciding_all_result = all_by(&array.view(), |_| {
+        deciding_all_calls.set(deciding_all_calls.get() + 1);
+        false
+    });
+    check_all(
+        &world,
+        deciding_all_result == Ok(false) && deciding_all_calls.get() == array.len(),
+    );
+
     check_all(
         &world,
         sum_by(&array.view(), |value| *value as i32) == Ok(expected_sum as i32),
@@ -708,4 +843,5 @@ fn reductions_and_logical_gather_cover_permuted_pencils() {
         &array,
         &empty_rank_array,
     );
+    run_many_error_precedence_tests(&topology, &pencil, rank, size);
 }

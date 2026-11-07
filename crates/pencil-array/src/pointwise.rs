@@ -46,33 +46,27 @@ pub fn pointwise2_views<A, B, U, F, const N: usize, const M: usize>(
 where
     F: FnMut(&A, &B) -> U,
 {
-    let plan = Plan::new(&left, &right, &output)?;
+    validate_two_inputs(
+        &left,
+        &right,
+        output.pencil(),
+        output.extra_shape().dimensions(),
+    )?;
+    let (plan, (left_dims, left_strides)) =
+        OutputPlan::new(&left, output.pencil(), output.extra_shape().dimensions())?;
+    let (right_dims, right_strides) = plan.input(output.pencil(), &right)?;
     if plan.spatial == 0 {
         return Ok(());
     }
     let ls = left.as_slice();
     let rs = right.as_slice();
     let os = output.as_mut_slice();
-    for out_linear in 0..plan.extra_count {
-        let left_linear = broadcast_linear(
-            out_linear,
-            &plan.output_dims,
-            &plan.left_dims,
-            &plan.left_strides,
-            &plan.output_strides,
-        );
-        let right_linear = broadcast_linear(
-            out_linear,
-            &plan.output_dims,
-            &plan.right_dims,
-            &plan.right_strides,
-            &plan.output_strides,
-        );
-        let oo = out_linear * plan.spatial;
-        let lo = left_linear * plan.spatial;
-        let ro = right_linear * plan.spatial;
+    for n in 0..plan.extra_count {
+        let li = broadcast_linear(n, &plan.dims, &left_dims, &left_strides, &plan.strides);
+        let ri = broadcast_linear(n, &plan.dims, &right_dims, &right_strides, &plan.strides);
         for k in 0..plan.spatial {
-            os[oo + k] = f(&ls[lo + k], &rs[ro + k]);
+            let i = n * plan.spatial + k;
+            os[i] = f(&ls[li * plan.spatial + k], &rs[ri * plan.spatial + k]);
         }
     }
     Ok(())
@@ -113,122 +107,30 @@ pub fn pointwise2_in_place_views<A, B, F, const N: usize, const M: usize>(
 where
     F: FnMut(&A, &B) -> A,
 {
-    let plan = Plan::build_shapes(
-        left.pencil(),
-        left.extra_shape().dimensions(),
-        right.pencil(),
-        right.extra_shape().dimensions(),
+    let left_view = left.as_view();
+    validate_two_inputs(
+        &left_view,
+        &right,
         left.pencil(),
         left.extra_shape().dimensions(),
     )?;
+    let (plan, (left_dims, left_strides)) =
+        OutputPlan::new(&left_view, left.pencil(), left.extra_shape().dimensions())?;
+    let (right_dims, right_strides) = plan.input(left.pencil(), &right)?;
     if plan.spatial == 0 {
         return Ok(());
     }
     let rs = right.as_slice();
     let os = left.as_mut_slice();
-    for out_linear in 0..plan.extra_count {
-        let right_linear = broadcast_linear(
-            out_linear,
-            &plan.output_dims,
-            &plan.right_dims,
-            &plan.right_strides,
-            &plan.output_strides,
-        );
-        let oo = out_linear * plan.spatial;
-        let ro = right_linear * plan.spatial;
+    for n in 0..plan.extra_count {
+        let li = broadcast_linear(n, &plan.dims, &left_dims, &left_strides, &plan.strides);
+        let ri = broadcast_linear(n, &plan.dims, &right_dims, &right_strides, &plan.strides);
         for k in 0..plan.spatial {
-            let value = f(&os[oo + k], &rs[ro + k]);
-            os[oo + k] = value;
+            let i = n * plan.spatial + k;
+            os[i] = f(&os[li * plan.spatial + k], &rs[ri * plan.spatial + k]);
         }
     }
     Ok(())
-}
-
-#[derive(Debug)]
-struct Plan {
-    output_dims: Vec<usize>,
-    left_dims: Vec<usize>,
-    right_dims: Vec<usize>,
-    output_strides: Vec<usize>,
-    left_strides: Vec<usize>,
-    right_strides: Vec<usize>,
-    spatial: usize,
-    extra_count: usize,
-}
-impl Plan {
-    fn new<A, B, U, const N: usize, const M: usize>(
-        left: &PencilArrayView<'_, A, N, M>,
-        right: &PencilArrayView<'_, B, N, M>,
-        output: &PencilArrayViewMut<'_, U, N, M>,
-    ) -> Result<Self, PointwiseError> {
-        Self::build(
-            left,
-            right,
-            output.pencil(),
-            output.extra_shape().dimensions(),
-        )
-    }
-    fn build<A, B, const N: usize, const M: usize>(
-        left: &PencilArrayView<'_, A, N, M>,
-        right: &PencilArrayView<'_, B, N, M>,
-        output_pencil: &crate::Pencil<N, M>,
-        output_dimensions: &[usize],
-    ) -> Result<Self, PointwiseError> {
-        Self::build_shapes(
-            left.pencil(),
-            left.extra_shape().dimensions(),
-            right.pencil(),
-            right.extra_shape().dimensions(),
-            output_pencil,
-            output_dimensions,
-        )
-    }
-    fn build_shapes<const N: usize, const M: usize>(
-        left_pencil: &crate::Pencil<N, M>,
-        left_dimensions: &[usize],
-        right_pencil: &crate::Pencil<N, M>,
-        right_dimensions: &[usize],
-        output_pencil: &crate::Pencil<N, M>,
-        output_dimensions: &[usize],
-    ) -> Result<Self, PointwiseError> {
-        if !left_pencil.same_layout(right_pencil) || !left_pencil.same_layout(output_pencil) {
-            return Err(PointwiseError::IncompatiblePencils);
-        }
-        for shape in [left_dimensions, right_dimensions] {
-            validate_extents(shape, output_dimensions)?;
-        }
-        let output_dims = copy_dims(output_dimensions)?;
-        let left_dims = copy_dims(left_dimensions)?;
-        let right_dims = copy_dims(right_dimensions)?;
-        let spatial = left_pencil.local_len();
-        let extra_count = checked_product(&output_dims).map_err(ArrayError::from)?;
-        spatial
-            .checked_mul(extra_count)
-            .ok_or(ArrayError::AllocationFailed {
-                required: usize::MAX,
-            })?;
-        // No element is visited for an empty extra shape, so the stride
-        // products may overflow without affecting the operation.
-        let (output_strides, left_strides, right_strides) = if extra_count == 0 {
-            (Vec::new(), Vec::new(), Vec::new())
-        } else {
-            (
-                strides(&output_dims)?,
-                strides(&left_dims)?,
-                strides(&right_dims)?,
-            )
-        };
-        Ok(Self {
-            output_strides,
-            left_strides,
-            right_strides,
-            output_dims,
-            left_dims,
-            right_dims,
-            spatial,
-            extra_count,
-        })
-    }
 }
 fn strides(dims: &[usize]) -> Result<Vec<usize>, PointwiseError> {
     let mut out = Vec::new();
@@ -247,6 +149,27 @@ fn strides(dims: &[usize]) -> Result<Vec<usize>, PointwiseError> {
             })?;
     }
     Ok(out)
+}
+
+/// Repeats the two-input checks in their historical order so shape errors keep
+/// priority over the plan's allocations. `OutputPlan` then reuses the same
+/// validation helpers while preparing the broadcast metadata.
+fn validate_two_inputs<A, B, const N: usize, const M: usize>(
+    left: &PencilArrayView<'_, A, N, M>,
+    right: &PencilArrayView<'_, B, N, M>,
+    output_pencil: &crate::Pencil<N, M>,
+    output_dimensions: &[usize],
+) -> Result<(), PointwiseError> {
+    if !left.pencil().same_layout(right.pencil()) || !left.pencil().same_layout(output_pencil) {
+        return Err(PointwiseError::IncompatiblePencils);
+    }
+    for dimensions in [
+        left.extra_shape().dimensions(),
+        right.extra_shape().dimensions(),
+    ] {
+        validate_extents(dimensions, output_dimensions)?;
+    }
+    Ok(())
 }
 
 /// Validates one input's extra dimensions against the output dimensions.

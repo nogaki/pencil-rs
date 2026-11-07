@@ -22,6 +22,8 @@ use crate::{
     preflight::{agree_header, expand_for_max},
 };
 
+pub(crate) use crate::preflight::agree_preflight;
+
 const DESCRIPTOR_SCHEMA: u64 = 1;
 // The operation word combines transport and operation; keep these values
 // stable because they are part of the collective preflight protocol.
@@ -1596,20 +1598,7 @@ fn append_type_name(descriptor: &mut Vec<u64>, name: &str) {
     descriptor.extend(name.as_bytes().iter().copied().map(u64::from));
 }
 
-/// Agrees only success, preserving a local error or returning `peer_error`.
-/// Call after descriptor agreement and local preparation, before payload writes.
-pub(crate) fn agree_preflight<C: CommunicatorCollectives, T, E>(
-    comm: &C,
-    local: Result<T, E>,
-    peer_error: E,
-) -> Result<T, E> {
-    if collective_valid(comm, local.is_ok()) {
-        local
-    } else {
-        Err(local.err().unwrap_or(peer_error))
-    }
-}
-
+/// Returns whether every rank reported `true` through one MIN all-reduce.
 pub(crate) fn collective_valid<C: CommunicatorCollectives>(comm: &C, local_valid: bool) -> bool {
     let value = i32::from(local_valid);
     let mut result = 0i32;

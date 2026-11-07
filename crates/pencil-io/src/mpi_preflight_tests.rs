@@ -2429,6 +2429,138 @@ fn hdf5_checks(rig: &Rig<'_>) {
         },
         "named HDF5 collection read is not subject to the MPI local byte limit",
     );
+
+    hdf5_filter_capability_checks(rig);
+}
+
+/// The unsplit base ran the filter capability query in the named layer, after
+/// collection metadata and staging.  A capability failure must return the
+/// named variant and lose to member incompatibility.
+#[cfg(feature = "parallel-hdf5")]
+fn hdf5_filter_capability_checks(rig: &Rig<'_>) {
+    let size = rig.world.size() as usize;
+    let a = array_for(rig.topology, [size, 128], 30.0);
+    let b = array_for(rig.topology, [size, 128], 40.0);
+    let comm = rig.topology.communicator();
+    let path = rig.directory.join("filter-capability-named.h5");
+    reset_file(rig.world, &path);
+    // Named collections prepend the member index, so the combined rank is 3.
+    let options = |shuffle: bool| {
+        let options = crate::Hdf5WriteOptions::default().chunks([1, 1, 1]);
+        if shuffle {
+            options.shuffle(true)
+        } else {
+            options.deflate(0)
+        }
+    };
+    let inject = |flags: Option<u32>| {
+        let flags = if rig.world.rank() == 0 { flags } else { None };
+        crate::ffi::FILTER_CAPABILITIES.with(|f| f.set(flags));
+    };
+    let capability_variant = |result: &Result<(), CollectionIoError>| {
+        matches!(
+            result,
+            Err(CollectionIoError::Named(NamedIoError::Io(
+                IoError::CollectivePrecondition {
+                    phase: "HDF5 filter capability"
+                }
+            )))
+        )
+    };
+
+    inject(Some(0));
+    let write = {
+        let views = [a.view(), b.view()];
+        crate::write_hdf5_named_collection(&path, "filtered", comm, &views, &options(false))
+    };
+    inject(None);
+    all_ranks(
+        rig.world,
+        capability_variant(&write),
+        "named HDF5 collection write keeps the named capability variant",
+    );
+    all_ranks(
+        rig.world,
+        !path.exists(),
+        "named HDF5 capability failure creates no file",
+    );
+
+    // Member incompatibility is detected before the named layer's query.
+    let mismatched = array_for(rig.topology, [size, 64], 50.0);
+    inject(Some(0));
+    let incompatible = {
+        let views = [a.view(), mismatched.view()];
+        crate::write_hdf5_named_collection(&path, "mixed", comm, &views, &options(true))
+    };
+    inject(None);
+    all_ranks(
+        rig.world,
+        matches!(incompatible, Err(CollectionIoError::Incompatible { .. })),
+        "member incompatibility precedes the capability query",
+    );
+
+    all_ranks(
+        rig.world,
+        {
+            let views = [a.view(), b.view()];
+            crate::write_hdf5_named_collection(&path, "filtered", comm, &views, &options(false))
+        }
+        .is_ok(),
+        "valid filtered named HDF5 write recovers",
+    );
+    inject(Some(0));
+    let append = {
+        let views = [a.view(), b.view()];
+        crate::append_hdf5_named_collection(&path, "filtered-append", comm, &views, &options(true))
+    };
+    inject(None);
+    all_ranks(
+        rig.world,
+        capability_variant(&append),
+        "named HDF5 collection append keeps the named capability variant",
+    );
+    all_ranks(
+        rig.world,
+        {
+            let views = [a.view(), b.view()];
+            crate::append_hdf5_named_collection(
+                &path,
+                "filtered-append",
+                comm,
+                &views,
+                &options(true),
+            )
+        }
+        .is_ok(),
+        "valid filtered named HDF5 append recovers",
+    );
+
+    // Read controls carry no filter request, so the injected capability never
+    // participates and the filtered file still reads back.
+    let mut da = array_for(rig.topology, [size, 128], -1.0);
+    let mut db = array_for(rig.topology, [size, 128], -2.0);
+    inject(Some(0));
+    let read = {
+        let mut views = [da.view_mut(), db.view_mut()];
+        crate::read_hdf5_named_collection(
+            &path,
+            "filtered",
+            comm,
+            &mut views,
+            &crate::Hdf5ReadOptions::default(),
+        )
+    };
+    inject(None);
+    all_ranks(
+        rig.world,
+        read.is_ok(),
+        "named HDF5 collection read skips the query",
+    );
+    all_ranks(
+        rig.world,
+        da.as_slice() == a.as_slice() && db.as_slice() == b.as_slice(),
+        "named HDF5 collection filtered values",
+    );
 }
 
 #[cfg(not(feature = "parallel-hdf5"))]

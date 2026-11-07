@@ -8,9 +8,7 @@ use std::ffi::CStr;
 
 use hdf5_metno_sys::h5i::hid_t;
 
-#[cfg(feature = "parallel-hdf5")]
-use crate::MAX_PROTOCOL_RANK;
-use crate::{COMMIT_MARKER, INCOMPLETE_MARKER};
+use crate::{COMMIT_MARKER, FORMAT_VERSION, INCOMPLETE_MARKER, MAX_PROTOCOL_RANK};
 
 pub(crate) const ATTR_VERSION: &CStr = c"pencil_io_version";
 pub(crate) const ATTR_COMMIT: &CStr = c"pencil_io_commit";
@@ -22,6 +20,152 @@ pub(crate) const ATTR_EXTRA: &CStr = c"pencil_io_extra_shape";
 pub(crate) const ATTR_GLOBAL: &CStr = c"pencil_io_global_shape";
 pub(crate) const ATTR_GRID: &CStr = c"pencil_io_writer_grid";
 pub(crate) const ATTR_PERM: &CStr = c"pencil_io_writer_permutation";
+
+macro_rules! attributes {
+    ($($variant:ident => $name:ident),+ $(,)?) => {
+        /// The ten attributes of the v1 metadata schema, in write and read order.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum Attribute {
+            $($variant,)+
+        }
+
+        impl Attribute {
+            pub(crate) const ALL: [Self; 10] = [$(Self::$variant,)+];
+
+            pub(crate) fn name(self) -> &'static CStr {
+                match self {
+                    $(Self::$variant => $name,)+
+                }
+            }
+        }
+    };
+}
+
+attributes! {
+    Version => ATTR_VERSION,
+    Commit => ATTR_COMMIT,
+    Rank => ATTR_N,
+    TypeCode => ATTR_TYPE,
+    Width => ATTR_WIDTH,
+    ExtraRank => ATTR_EXTRA_RANK,
+    ExtraShape => ATTR_EXTRA,
+    GlobalShape => ATTR_GLOBAL,
+    WriterGrid => ATTR_GRID,
+    WriterPermutation => ATTR_PERM,
+}
+
+impl Attribute {
+    /// The extra shape exists only when the extra rank is nonzero; every other
+    /// attribute is always present.
+    pub(crate) fn present(self, extra_rank: usize) -> bool {
+        self != Self::ExtraShape || extra_rank > 0
+    }
+
+    /// Expected and maximum read lengths for spatial rank `n` and extra rank
+    /// `er`. The writer grid has no fixed length and may be empty.
+    pub(crate) fn read_len(self, n: usize, er: usize) -> (Option<usize>, usize) {
+        match self {
+            Self::ExtraShape => (Some(er), er),
+            Self::GlobalShape | Self::WriterPermutation => (Some(n), n),
+            Self::WriterGrid => (None, MAX_PROTOCOL_RANK),
+            _ => (Some(1), 1),
+        }
+    }
+}
+
+/// One attribute's write value or read-side expectation. `None` means the
+/// reader makes no check for that attribute; the catalogs only expect the
+/// version.
+#[derive(Clone, Copy)]
+enum Slot<'a> {
+    None,
+    Scalar(u64),
+    Values(&'a [u64]),
+    Shape(&'a [usize]),
+}
+
+/// Values of the ten schema attributes. Writers use [`Self::for_write`];
+/// readers use [`Self::expected`] or [`Self::version_only`] and [`Self::matches`].
+pub(crate) struct Metadata<'a> {
+    slots: [Slot<'a>; 10],
+}
+
+impl<'a> Metadata<'a> {
+    pub(crate) fn for_write(
+        rank: u64,
+        type_code: u64,
+        width: u64,
+        extra: &'a [u64],
+        global: &'a [u64],
+        grid: &'a [u64],
+        permutation: &'a [u64],
+    ) -> Self {
+        Self {
+            slots: [
+                Slot::Scalar(FORMAT_VERSION),
+                Slot::Scalar(INCOMPLETE_MARKER),
+                Slot::Scalar(rank),
+                Slot::Scalar(type_code),
+                Slot::Scalar(width),
+                Slot::Scalar(extra.len() as u64),
+                Slot::Values(extra),
+                Slot::Values(global),
+                Slot::Values(grid),
+                Slot::Values(permutation),
+            ],
+        }
+    }
+
+    pub(crate) fn expected(
+        rank: u64,
+        type_code: u64,
+        width: u64,
+        extra_rank: u64,
+        extra: &'a [usize],
+        global: &'a [usize],
+    ) -> Self {
+        Self {
+            slots: [
+                Slot::Scalar(FORMAT_VERSION),
+                Slot::None,
+                Slot::Scalar(rank),
+                Slot::Scalar(type_code),
+                Slot::Scalar(width),
+                Slot::Scalar(extra_rank),
+                Slot::Shape(extra),
+                Slot::Shape(global),
+                Slot::None,
+                Slot::None,
+            ],
+        }
+    }
+
+    #[cfg(feature = "parallel-hdf5")]
+    pub(crate) fn version_only() -> Self {
+        let mut slots = [Slot::None; 10];
+        slots[Attribute::Version as usize] = Slot::Scalar(FORMAT_VERSION);
+        Self { slots }
+    }
+
+    pub(crate) fn value(&self, attribute: Attribute) -> &[u64] {
+        match &self.slots[attribute as usize] {
+            Slot::Scalar(value) => std::slice::from_ref(value),
+            Slot::Values(values) => values,
+            Slot::None | Slot::Shape(_) => &[],
+        }
+    }
+
+    /// True when `read` satisfies the expectation for `attribute`, or when the
+    /// reader has no expectation for it.
+    pub(crate) fn matches(&self, attribute: Attribute, read: &[u64]) -> bool {
+        match &self.slots[attribute as usize] {
+            Slot::None => true,
+            Slot::Scalar(expected) => read.iter().copied().eq(std::iter::once(*expected)),
+            Slot::Values(expected) => read.iter().copied().eq(expected.iter().copied()),
+            Slot::Shape(expected) => read.iter().copied().eq(expected.iter().map(|&v| v as u64)),
+        }
+    }
+}
 
 pub(crate) struct ScalarSpec {
     pub(crate) base: hid_t,

@@ -8,21 +8,22 @@ use mpi::raw::AsRaw;
 use mpi::topology::Communicator;
 use pencil_array::{PencilArrayView, PencilArrayViewMut};
 
+#[cfg(test)]
+use crate::INCOMPLETE_MARKER;
 use crate::ffi;
 use crate::ffi::hdf5 as native;
 use crate::format::{IoElement, ReadTarget, pack_view};
 use crate::hdf5_schema::{
-    ATTR_COMMIT, ATTR_EXTRA, ATTR_EXTRA_RANK, ATTR_GLOBAL, ATTR_GRID, ATTR_N, ATTR_PERM, ATTR_TYPE,
-    ATTR_VERSION, ATTR_WIDTH, CommitState, combined_rank_in_range, commit_state, rank_in_range,
-    valid_global_shape, valid_permutation, valid_shape_bytes, valid_writer_grid,
+    ATTR_COMMIT, Attribute, CommitState, Metadata, combined_rank_in_range, commit_state,
+    rank_in_range, valid_global_shape, valid_permutation, valid_shape_bytes, valid_writer_grid,
 };
 use crate::mpi_io::{
     CommGuard, abort_unrecoverable, aggregate_cleanup_result, agree_phase, collective_state,
     descriptor_agreement, duplicate_comm, first_error2, try_u64_values,
 };
 use crate::{
-    COMMIT_MARKER, FORMAT_VERSION, INCOMPLETE_MARKER, IoError, MAX_PROTOCOL_RANK, NamedIoError,
-    OP_APPEND_HDF5_NAMED, OP_READ_HDF5, OP_READ_HDF5_NAMED, OP_WRITE_HDF5, OP_WRITE_HDF5_NAMED,
+    COMMIT_MARKER, IoError, MAX_PROTOCOL_RANK, NamedIoError, OP_APPEND_HDF5_NAMED, OP_READ_HDF5,
+    OP_READ_HDF5_NAMED, OP_WRITE_HDF5, OP_WRITE_HDF5_NAMED,
 };
 
 mod session;
@@ -40,6 +41,9 @@ pub(crate) struct Hdf5Settings<'a> {
     pub chunks: Option<&'a [usize]>,
     pub hints: &'a [(String, String)],
     pub explicit: bool,
+    /// The caller already agreed the control rules; only the named wrapper's
+    /// filter capability query and the dataset-level validation remain.
+    pub options_agreed: bool,
     pub shuffle: bool,
     pub deflate: Option<u8>,
 }
@@ -51,6 +55,7 @@ impl Default for Hdf5Settings<'_> {
             chunks: None,
             hints: &[],
             explicit: false,
+            options_agreed: false,
             shuffle: false,
             deflate: None,
         }
@@ -235,7 +240,9 @@ where
     if settings.explicit {
         crate::options::agree_decomposition(view.pencil())?;
     }
-    validate_options(comm, settings, layout.global.len(), T::WIDTH)?;
+    if !settings.options_agreed {
+        validate_options(comm, settings, layout.global.len(), T::WIDTH)?;
+    }
 
     let duplicate = duplicate_comm(comm)?;
     let fapl = match prepare_hdf5_fapl(comm, duplicate.raw, settings.hints) {
@@ -262,196 +269,40 @@ where
     };
     resources.group = Some(group);
 
-    let (datatype, error) = local_handle_phase(
+    if let Err(error) = create_type_and_space_handles(
         comm,
-        native::type_from_kind(T::CODE, T::WIDTH, duplicate.raw),
-        "HDF5 datatype create",
-    );
-    resources.datatype = datatype;
-    if let Some(error) = error {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-    let datatype = resources.datatype.expect("datatype creation agreement");
-
-    let (dataspace, error) = local_handle_phase(
-        comm,
-        match settings.chunks {
-            Some(chunks) => native::dataspace_chunked(&layout.global, chunks),
-            None => native::dataspace_simple(&layout.global),
-        },
-        "HDF5 dataspace create",
-    );
-    resources.dataspace = dataspace;
-    if let Some(error) = error {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-    let dataspace = resources.dataspace.expect("dataspace creation agreement");
-
-    if let Err(error) = configure_chunks(comm, settings, &mut resources) {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-    let dataset = match collective_handle_phase(
-        comm,
-        native::dataset_create(
-            resources.group.expect("group creation agreement"),
-            dataset_name,
-            datatype,
-            dataspace,
-            resources.dcpl.unwrap_or(0),
-        ),
-        "HDF5 dataset create",
+        duplicate.raw,
+        &mut resources,
+        &layout,
+        settings,
+        T::CODE,
+        T::WIDTH,
     ) {
-        Ok(dataset) => dataset,
-        Err(error) => return Err(cleanup_ready(comm, duplicate, opened, resources, error)),
-    };
-    resources.dataset = Some(dataset);
-
-    if let Some(name) = original_name
-        && let Err(error) = write_original_name(
-            comm,
-            duplicate.raw,
-            dataset,
-            name,
-            "HDF5 original-name attribute",
-        )
-    {
         return Err(cleanup_ready(comm, duplicate, opened, resources, error));
     }
-    if let Err(error) = write_metadata(
+    if let Err(error) = create_dataset_with_metadata(
         comm,
-        dataset,
-        view.pencil().topology().process_grid(),
-        view.pencil().permutation().axes(),
-        view.pencil().global_shape(),
+        duplicate.raw,
+        opened,
+        &mut resources,
+        dataset_name,
+        original_name,
+        view.pencil(),
         view.extra_shape().dimensions(),
         T::CODE,
         T::WIDTH,
     ) {
         return Err(cleanup_ready(comm, duplicate, opened, resources, error));
     }
-    if let Err(error) = phase_code(
-        comm,
-        native::file_flush(opened),
-        "HDF5 initial metadata flush",
-    ) {
+    if let Err(error) = open_hyperslab_spaces(comm, &mut resources, &layout) {
         return Err(cleanup_ready(comm, duplicate, opened, resources, error));
     }
-
-    let file_result = native::dataset_space(dataset);
-    let file_space = file_result.as_ref().ok().copied();
-    let mem_result = if layout.empty && !layout.global.contains(&0) {
-        native::dataspace_simple(&layout.global)
-    } else {
-        native::dataspace_simple(&layout.local)
-    };
-    let mem_space = mem_result.as_ref().ok().copied();
-    let space_error = file_result
-        .as_ref()
-        .err()
-        .map(|&code| hdf5_error("H5Dget_space", code))
-        .or_else(|| {
-            mem_result
-                .as_ref()
-                .err()
-                .map(|&code| hdf5_error("H5Screate memory space", code))
-        });
-    if let Err(agreement) = agree_phase(
-        comm,
-        file_space.is_some() && mem_space.is_some(),
-        "HDF5 hyperslab spaces",
-    ) {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            Hdf5Resources {
-                file_space,
-                mem_space,
-                ..resources
-            },
-            space_error.unwrap_or(agreement),
-        ));
-    }
-    if let Some(error) = space_error {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            Hdf5Resources {
-                file_space,
-                mem_space,
-                ..resources
-            },
-            error,
-        ));
-    }
-    resources.file_space = file_space;
-    resources.mem_space = mem_space;
-    let file_space = resources.file_space.expect("file-space agreement");
-    let mem_space = resources.mem_space.expect("memory-space agreement");
-    if let Err(error) = select_spaces(comm, file_space, mem_space, &layout) {
+    if let Err(error) = create_transfer_plist(comm, duplicate.raw, &mut resources, settings) {
         return Err(cleanup_ready(comm, duplicate, opened, resources, error));
     }
-    let (xfer, error) = local_handle_phase(
-        comm,
-        native::xfer_create(duplicate.raw, settings.collective),
-        "HDF5 collective transfer plist",
-    );
-    resources.xfer = xfer;
-    if let Some(error) = error {
+    if let Err(error) = write_payload_and_commit(comm, opened, &mut resources, &layout, &mut packed)
+    {
         return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-    let xfer = resources.xfer.expect("transfer-property agreement");
-    // HDF5 1.10's MPIO driver cannot issue a zero-byte collective write to
-    // a genuinely zero-extent dataset (it reports an address overflow). All
-    // ranks still reach the phase agreement and surrounding collective flush;
-    // there is no payload operation to perform in this case.
-    let io_code = if layout.global.contains(&0) {
-        0
-    } else {
-        native::dataset_io(
-            dataset,
-            datatype,
-            mem_space,
-            file_space,
-            xfer,
-            &mut packed,
-            true,
-        )
-    };
-    if let Err(agreement) = agree_phase(comm, io_code >= 0, "HDF5 collective dataset write") {
-        let primary = if io_code < 0 {
-            hdf5_error("H5Dwrite", io_code)
-        } else {
-            agreement
-        };
-        return Err(cleanup_ready(comm, duplicate, opened, resources, primary));
-    }
-    if let Err(error) = phase_code(comm, native::file_flush(opened), "HDF5 payload flush") {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-
-    if write_existing_attr(comm, dataset, ATTR_COMMIT, COMMIT_MARKER).is_err() {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            resources,
-            IoError::CommitUncertain {
-                stage: "HDF5 commit marker",
-            },
-        ));
-    }
-    if phase_code(comm, native::file_flush(opened), "HDF5 commit marker flush").is_err() {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            resources,
-            IoError::CommitUncertain {
-                stage: "HDF5 commit marker flush",
-            },
-        ));
     }
 
     finish_hdf5(comm, duplicate, opened, resources);
@@ -517,6 +368,22 @@ where
     S: AsRef<str>,
     T: IoElement,
 {
+    write_hdf5_named_with_options_inner(path, name, view, options.settings())
+}
+
+/// Creates a named dataset with explicit controls.  `settings.options_agreed`
+/// skips the rule agreement and leaves the capability query to this layer.
+pub(crate) fn write_hdf5_named_with_options_inner<P, S, T, const N: usize, const M: usize>(
+    path: P,
+    name: S,
+    view: PencilArrayView<'_, T, N, M>,
+    settings: Hdf5Settings<'_>,
+) -> Result<(), NamedIoError>
+where
+    P: AsRef<Path>,
+    S: AsRef<str>,
+    T: IoElement,
+{
     let comm = view.pencil().topology().communicator();
     descriptor_agreement(
         comm,
@@ -532,9 +399,9 @@ where
     )
     .map_err(NamedIoError::Io)?;
     crate::options::agree_decomposition(view.pencil()).map_err(NamedIoError::Io)?;
-    validate_options(
+    agree_named_options(
         comm,
-        options.settings(),
+        settings,
         N + view.extra_shape().dimensions().len(),
         T::WIDTH,
     )
@@ -549,7 +416,10 @@ where
         false,
         Some(name.as_ref().as_bytes()),
         71,
-        options.settings(),
+        Hdf5Settings {
+            options_agreed: true,
+            ..settings
+        },
     )
     .map_err(NamedIoError::Io)
 }
@@ -707,6 +577,22 @@ where
     S: AsRef<str>,
     T: IoElement,
 {
+    append_hdf5_named_with_options_inner(path, name, view, options.settings())
+}
+
+/// Appends a named dataset with explicit controls.  `settings.options_agreed`
+/// skips the rule agreement and leaves the capability query to this layer.
+pub(crate) fn append_hdf5_named_with_options_inner<P, S, T, const N: usize, const M: usize>(
+    path: P,
+    name: S,
+    view: PencilArrayView<'_, T, N, M>,
+    settings: Hdf5Settings<'_>,
+) -> Result<(), NamedIoError>
+where
+    P: AsRef<Path>,
+    S: AsRef<str>,
+    T: IoElement,
+{
     let comm = view.pencil().topology().communicator();
     descriptor_agreement(
         comm,
@@ -722,15 +608,15 @@ where
     )
     .map_err(NamedIoError::Io)?;
     crate::options::agree_decomposition(view.pencil()).map_err(NamedIoError::Io)?;
-    validate_options(
+    agree_named_options(
         comm,
-        options.settings(),
+        settings,
         N + view.extra_shape().dimensions().len(),
         T::WIDTH,
     )
     .map_err(NamedIoError::Io)?;
     let link = named_link(comm, name.as_ref())?;
-    check_named_absent(comm, path.as_ref(), &link, options.settings().hints)?;
+    check_named_absent(comm, path.as_ref(), &link, settings.hints)?;
     write_hdf5_inner(
         path,
         view,
@@ -740,7 +626,10 @@ where
         true,
         Some(name.as_ref().as_bytes()),
         72,
-        options.settings(),
+        Hdf5Settings {
+            options_agreed: true,
+            ..settings
+        },
     )
     .map_err(NamedIoError::Io)
 }
@@ -835,17 +724,9 @@ where
     )
 }
 
-/// Reads a collection of named members with explicit controls.
-pub(crate) fn read_named_collection_with_options<T: IoElement, const N: usize, const M: usize>(
-    path: &Path,
-    name: &str,
-    target: ReadTarget<'_, '_, T, N, M>,
-    settings: Hdf5Settings<'_>,
-) -> Result<(), NamedIoError> {
-    read_named_with_options(path, name, target, settings, 73)
-}
-
-fn read_named_with_options<T: IoElement, const N: usize, const M: usize>(
+/// Reads a named dataset with explicit controls.  `settings.options_agreed`
+/// skips the rule agreement and leaves the capability query to this layer.
+pub(crate) fn read_named_with_options<T: IoElement, const N: usize, const M: usize>(
     path: &Path,
     name: &str,
     target: ReadTarget<'_, '_, T, N, M>,
@@ -867,8 +748,12 @@ fn read_named_with_options<T: IoElement, const N: usize, const M: usize>(
     )
     .map_err(NamedIoError::Io)?;
     crate::options::agree_decomposition(target.pencil()).map_err(NamedIoError::Io)?;
-    validate_options(comm, settings, N + target.extra().len(), T::WIDTH)
+    agree_named_options(comm, settings, N + target.extra().len(), T::WIDTH)
         .map_err(NamedIoError::Io)?;
+    let settings = Hdf5Settings {
+        options_agreed: true,
+        ..settings
+    };
     let link = named_link(comm, name)?;
     read_hdf5_inner(
         path,
@@ -1016,7 +901,9 @@ where
     if settings.explicit {
         crate::options::agree_decomposition(target.pencil())?;
     }
-    validate_options(comm, settings, layout.global.len(), T::WIDTH)?;
+    if !settings.options_agreed {
+        validate_options(comm, settings, layout.global.len(), T::WIDTH)?;
+    }
 
     let duplicate = duplicate_comm(comm)?;
     let fapl = match prepare_hdf5_fapl(comm, duplicate.raw, settings.hints) {
@@ -1056,175 +943,28 @@ where
             ));
         }
     }
-    let dataset = match collective_handle_phase(
-        comm,
-        native::dataset_open(group, dataset_name),
-        "HDF5 dataset open",
-    ) {
-        Ok(dataset) => dataset,
-        Err(error) => return Err(cleanup_ready(comm, duplicate, opened, resources, error)),
-    };
-    resources.dataset = Some(dataset);
-    if let Some(expected) = expected_name {
-        let actual = match read_original_name(comm, dataset, "HDF5 original-name metadata read") {
-            Ok(actual) => actual,
-            Err(error) => return Err(cleanup_ready(comm, duplicate, opened, resources, error)),
-        };
-        let ok = actual == expected;
-        if let Err(agreement) = agree_phase(comm, ok, "HDF5 original-name metadata") {
-            return Err(cleanup_ready(
-                comm,
-                duplicate,
-                opened,
-                resources,
-                if ok {
-                    agreement
-                } else {
-                    IoError::MetadataMismatch {
-                        field: "original name",
-                    }
-                },
-            ));
-        }
-    }
-
-    if let Err(error) = validate_read_metadata::<T, N, M>(
+    if let Err(error) = validate_and_open_dataset::<T, N, M>(
         comm,
         duplicate.raw,
-        dataset,
+        &mut resources,
+        group,
+        dataset_name,
+        expected_name,
         target.pencil(),
         target.extra(),
+        &layout,
     ) {
         return Err(cleanup_ready(comm, duplicate, opened, resources, error));
     }
-
-    let (dataset_type, error) = local_handle_phase(
+    if let Err(error) = read_payload(
         comm,
-        native::dataset_type(dataset),
-        "HDF5 dataset type query",
-    );
-    resources.datatype = dataset_type;
-    if let Some(error) = error {
+        duplicate.raw,
+        &mut resources,
+        &layout,
+        &mut staging,
+        settings,
+    ) {
         return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-    let datatype = resources.datatype.expect("dataset type agreement");
-    let type_result = native::type_matches(datatype, T::CODE, T::WIDTH, duplicate.raw);
-    if let Err(agreement) = agree_phase(comm, type_result.is_ok(), "HDF5 datatype validation query")
-    {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            resources,
-            type_result
-                .err()
-                .map(|code| hdf5_error("HDF5 datatype validation query", code))
-                .unwrap_or(agreement),
-        ));
-    }
-    let type_ok = type_result.expect("datatype validation query agreement");
-    if let Err(agreement) = collective_bool(comm, type_ok, "HDF5 datatype validation") {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, agreement));
-    }
-    if !type_ok {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            resources,
-            IoError::MetadataMismatch {
-                field: "dataset datatype",
-            },
-        ));
-    }
-
-    let (file_space, error) = local_handle_phase(
-        comm,
-        native::dataset_space(dataset),
-        "HDF5 dataset shape query",
-    );
-    resources.file_space = file_space;
-    if let Some(error) = error {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-    let file_space = resources.file_space.expect("dataset-space agreement");
-    let shape_result = native::space_shape(file_space);
-    if let Err(agreement) = agree_phase(comm, shape_result.is_ok(), "HDF5 dataset dimensions query")
-    {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            resources,
-            shape_result
-                .err()
-                .map(|code| hdf5_error("H5Sget_simple_extent_dims", code))
-                .unwrap_or(agreement),
-        ));
-    }
-    let shape_ok = shape_result.expect("dataset dimensions agreement") == layout.global;
-    if let Err(agreement) = collective_bool(comm, shape_ok, "HDF5 dataset dimensions") {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, agreement));
-    }
-    if !shape_ok {
-        return Err(cleanup_ready(
-            comm,
-            duplicate,
-            opened,
-            resources,
-            IoError::MetadataMismatch {
-                field: "dataset dimensions",
-            },
-        ));
-    }
-
-    let mem_result = if layout.empty && !layout.global.contains(&0) {
-        native::dataspace_simple(&layout.global)
-    } else {
-        native::dataspace_simple(&layout.local)
-    };
-    let (mem_space, error) = local_handle_phase(comm, mem_result, "HDF5 read memory space");
-    resources.mem_space = mem_space;
-    if let Some(error) = error {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-    let mem_space = resources.mem_space.expect("memory-space agreement");
-    if let Err(error) = select_spaces(comm, file_space, mem_space, &layout) {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-
-    let (xfer, error) = local_handle_phase(
-        comm,
-        native::xfer_create(duplicate.raw, settings.collective),
-        "HDF5 collective transfer plist",
-    );
-    resources.xfer = xfer;
-    if let Some(error) = error {
-        return Err(cleanup_ready(comm, duplicate, opened, resources, error));
-    }
-    let xfer = resources.xfer.expect("transfer-property agreement");
-    // See the write-side zero-extent guard above. The branch is descriptor
-    // identical on every rank, while the phase agreement remains collective.
-    let io_code = if layout.global.contains(&0) {
-        0
-    } else {
-        native::dataset_io(
-            dataset,
-            datatype,
-            mem_space,
-            file_space,
-            xfer,
-            &mut staging,
-            false,
-        )
-    };
-    if let Err(agreement) = agree_phase(comm, io_code >= 0, "HDF5 collective dataset read") {
-        let primary = if io_code < 0 {
-            hdf5_error("H5Dread", io_code)
-        } else {
-            agreement
-        };
-        return Err(cleanup_ready(comm, duplicate, opened, resources, primary));
     }
 
     // Validate layout and allocate decode scratch before native cleanup.
@@ -1348,7 +1088,21 @@ fn configure_chunks(
     Ok(())
 }
 
-fn validate_options(
+pub(crate) fn validate_options(
+    comm: &mpi::topology::CartesianCommunicator,
+    settings: Hdf5Settings<'_>,
+    rank: usize,
+    width: usize,
+) -> Result<(), IoError> {
+    validate_controls(comm, settings, rank, width)?;
+    agree_filter_capability(comm, settings)
+}
+
+/// Applies the shared control rules and agrees the resulting controls.
+///
+/// Collections call this at their old outer position, before staging; it never
+/// queries filter capability.
+pub(crate) fn validate_controls(
     comm: &mpi::topology::CartesianCommunicator,
     settings: Hdf5Settings<'_>,
     rank: usize,
@@ -1400,8 +1154,20 @@ fn validate_options(
         settings.hints,
         &extra[..len],
     )?;
-    // Options agree before filter-dependent collectives. Both directions must
-    // be supported so a successfully written dataset remains readable.
+    Ok(())
+}
+
+/// Queries the requested filters on every rank.
+///
+/// Options agree before filter-dependent collectives. Both directions must be
+/// supported so a successfully written dataset remains readable.
+fn agree_filter_capability(
+    comm: &mpi::topology::CartesianCommunicator,
+    settings: Hdf5Settings<'_>,
+) -> Result<(), IoError> {
+    if !settings.explicit {
+        return Ok(());
+    }
     for (requested, filter) in [(settings.shuffle, 2), (settings.deflate.is_some(), 1)] {
         if requested {
             let capable = native::filter_avail(filter)
@@ -1410,6 +1176,23 @@ fn validate_options(
         }
     }
     Ok(())
+}
+
+/// Runs the agreement a named wrapper owes after its caller's outer step.
+///
+/// When the caller already agreed the control rules, only the filter
+/// capability query remains, at the same position as the unsplit base.
+fn agree_named_options(
+    comm: &mpi::topology::CartesianCommunicator,
+    settings: Hdf5Settings<'_>,
+    rank: usize,
+    width: usize,
+) -> Result<(), IoError> {
+    if settings.options_agreed {
+        agree_filter_capability(comm, settings)
+    } else {
+        validate_options(comm, settings, rank, width)
+    }
 }
 
 fn prepare_hdf5_fapl(
@@ -1606,6 +1389,343 @@ fn select_spaces(
     phase_code(comm, code, "HDF5 hyperslab selection")
 }
 
+/// Creates the datatype, dataspace, and chunk property list used to create a
+/// dataset. The single-shot writer creates its transfer list after
+/// [`open_hyperslab_spaces`]; the session writer creates it before
+/// [`create_dataset_with_metadata`], so that step stays a separate helper.
+#[allow(clippy::too_many_arguments)]
+fn create_type_and_space_handles(
+    comm: &mpi::topology::CartesianCommunicator,
+    duplicate: ffi::MPI_Comm,
+    resources: &mut Hdf5Resources,
+    layout: &H5Layout,
+    settings: Hdf5Settings<'_>,
+    type_code: u64,
+    width: usize,
+) -> Result<(), IoError> {
+    let (datatype, error) = local_handle_phase(
+        comm,
+        native::type_from_kind(type_code, width, duplicate),
+        "HDF5 datatype create",
+    );
+    resources.datatype = datatype;
+    if let Some(error) = error {
+        return Err(error);
+    }
+
+    let (dataspace, error) = local_handle_phase(
+        comm,
+        match settings.chunks {
+            Some(chunks) => native::dataspace_chunked(&layout.global, chunks),
+            None => native::dataspace_simple(&layout.global),
+        },
+        "HDF5 dataspace create",
+    );
+    resources.dataspace = dataspace;
+    if let Some(error) = error {
+        return Err(error);
+    }
+
+    configure_chunks(comm, settings, resources)
+}
+
+fn create_transfer_plist(
+    comm: &mpi::topology::CartesianCommunicator,
+    duplicate: ffi::MPI_Comm,
+    resources: &mut Hdf5Resources,
+    settings: Hdf5Settings<'_>,
+) -> Result<(), IoError> {
+    let (xfer, error) = local_handle_phase(
+        comm,
+        native::xfer_create(duplicate, settings.collective),
+        "HDF5 collective transfer plist",
+    );
+    resources.xfer = xfer;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Creates the dataset, writes its provenance and schema attributes, and
+/// flushes the initial metadata.
+#[allow(clippy::too_many_arguments)]
+fn create_dataset_with_metadata<const N: usize, const M: usize>(
+    comm: &mpi::topology::CartesianCommunicator,
+    duplicate: ffi::MPI_Comm,
+    file: native::Hid,
+    resources: &mut Hdf5Resources,
+    name: &CStr,
+    original_name: Option<&[u8]>,
+    pencil: &pencil_array::Pencil<N, M>,
+    extra_dims: &[usize],
+    type_code: u64,
+    width: usize,
+) -> Result<(), IoError> {
+    let dataset = collective_handle_phase(
+        comm,
+        native::dataset_create(
+            resources.group.expect("group creation agreement"),
+            name,
+            resources.datatype.expect("datatype creation agreement"),
+            resources.dataspace.expect("dataspace creation agreement"),
+            resources.dcpl.unwrap_or(0),
+        ),
+        "HDF5 dataset create",
+    )?;
+    resources.dataset = Some(dataset);
+
+    if let Some(name) = original_name
+        && let Err(error) = write_original_name(
+            comm,
+            duplicate,
+            dataset,
+            name,
+            "HDF5 original-name attribute",
+        )
+    {
+        return Err(error);
+    }
+    write_metadata(
+        comm,
+        dataset,
+        pencil.topology().process_grid(),
+        pencil.permutation().axes(),
+        pencil.global_shape(),
+        extra_dims,
+        type_code,
+        width,
+    )?;
+    phase_code(
+        comm,
+        native::file_flush(file),
+        "HDF5 initial metadata flush",
+    )
+}
+
+/// Queries the file and memory dataspaces and installs the hyperslab
+/// selection. Resource slots are updated before each fallible collective so
+/// the caller's existing cleanup closes every opened handle.
+fn open_hyperslab_spaces(
+    comm: &mpi::topology::CartesianCommunicator,
+    resources: &mut Hdf5Resources,
+    layout: &H5Layout,
+) -> Result<(), IoError> {
+    let file_result = native::dataset_space(resources.dataset.expect("dataset creation agreement"));
+    let file_space = file_result.as_ref().ok().copied();
+    let mem_result = if layout.empty && !layout.global.contains(&0) {
+        native::dataspace_simple(&layout.global)
+    } else {
+        native::dataspace_simple(&layout.local)
+    };
+    let mem_space = mem_result.as_ref().ok().copied();
+    let space_error = file_result
+        .as_ref()
+        .err()
+        .map(|&code| hdf5_error("H5Dget_space", code))
+        .or_else(|| {
+            mem_result
+                .as_ref()
+                .err()
+                .map(|&code| hdf5_error("H5Screate memory space", code))
+        });
+    resources.file_space = file_space;
+    resources.mem_space = mem_space;
+    if let Err(agreement) = agree_phase(
+        comm,
+        file_space.is_some() && mem_space.is_some(),
+        "HDF5 hyperslab spaces",
+    ) {
+        return Err(space_error.unwrap_or(agreement));
+    }
+    if let Some(error) = space_error {
+        return Err(error);
+    }
+    let file_space = resources.file_space.expect("file-space agreement");
+    let mem_space = resources.mem_space.expect("memory-space agreement");
+    select_spaces(comm, file_space, mem_space, layout)
+}
+
+/// Transfers the packed payload into the selected hyperslab and publishes the
+/// commit marker with the two trailing collective flushes.
+fn write_payload_and_commit(
+    comm: &mpi::topology::CartesianCommunicator,
+    file: native::Hid,
+    resources: &mut Hdf5Resources,
+    layout: &H5Layout,
+    packed: &mut [u8],
+) -> Result<(), IoError> {
+    let dataset = resources.dataset.expect("dataset creation agreement");
+    let datatype = resources.datatype.expect("datatype creation agreement");
+    let mem_space = resources.mem_space.expect("memory-space agreement");
+    let file_space = resources.file_space.expect("file-space agreement");
+    let xfer = resources.xfer.expect("transfer-property agreement");
+    // HDF5 1.10's MPIO driver cannot issue a zero-byte collective write to
+    // a genuinely zero-extent dataset (it reports an address overflow). All
+    // ranks still reach the phase agreement and surrounding collective flush;
+    // there is no payload operation to perform in this case.
+    let io_code = if layout.global.contains(&0) {
+        0
+    } else {
+        native::dataset_io(dataset, datatype, mem_space, file_space, xfer, packed, true)
+    };
+    if let Err(agreement) = agree_phase(comm, io_code >= 0, "HDF5 collective dataset write") {
+        let primary = if io_code < 0 {
+            hdf5_error("H5Dwrite", io_code)
+        } else {
+            agreement
+        };
+        return Err(primary);
+    }
+    phase_code(comm, native::file_flush(file), "HDF5 payload flush")?;
+
+    if write_existing_attr(comm, dataset, ATTR_COMMIT, COMMIT_MARKER).is_err() {
+        return Err(IoError::CommitUncertain {
+            stage: "HDF5 commit marker",
+        });
+    }
+    if phase_code(comm, native::file_flush(file), "HDF5 commit marker flush").is_err() {
+        return Err(IoError::CommitUncertain {
+            stage: "HDF5 commit marker flush",
+        });
+    }
+    Ok(())
+}
+
+/// Opens the dataset, checks its name and schema metadata, validates the
+/// datatype and shape, and installs the read hyperslab selection.
+#[allow(clippy::too_many_arguments)]
+fn validate_and_open_dataset<T: IoElement, const N: usize, const M: usize>(
+    comm: &mpi::topology::CartesianCommunicator,
+    duplicate: ffi::MPI_Comm,
+    resources: &mut Hdf5Resources,
+    group: native::Hid,
+    name: &CStr,
+    expected_name: Option<&[u8]>,
+    pencil: &pencil_array::Pencil<N, M>,
+    extra_dims: &[usize],
+    layout: &H5Layout,
+) -> Result<(), IoError> {
+    let dataset =
+        collective_handle_phase(comm, native::dataset_open(group, name), "HDF5 dataset open")?;
+    resources.dataset = Some(dataset);
+    if let Some(expected) = expected_name {
+        let actual = read_original_name(comm, dataset, "HDF5 original-name metadata read")?;
+        let ok = actual == expected;
+        if let Err(agreement) = agree_phase(comm, ok, "HDF5 original-name metadata") {
+            return Err(if ok {
+                agreement
+            } else {
+                IoError::MetadataMismatch {
+                    field: "original name",
+                }
+            });
+        }
+    }
+
+    validate_read_metadata::<T, N, M>(comm, duplicate, dataset, pencil, extra_dims)?;
+
+    let (dataset_type, error) = local_handle_phase(
+        comm,
+        native::dataset_type(dataset),
+        "HDF5 dataset type query",
+    );
+    resources.datatype = dataset_type;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    let datatype = resources.datatype.expect("dataset type agreement");
+    let type_result = native::type_matches(datatype, T::CODE, T::WIDTH, duplicate);
+    if let Err(agreement) = agree_phase(comm, type_result.is_ok(), "HDF5 datatype validation query")
+    {
+        return Err(type_result
+            .err()
+            .map(|code| hdf5_error("HDF5 datatype validation query", code))
+            .unwrap_or(agreement));
+    }
+    let type_ok = type_result.expect("datatype validation query agreement");
+    collective_bool(comm, type_ok, "HDF5 datatype validation")?;
+    if !type_ok {
+        return Err(IoError::MetadataMismatch {
+            field: "dataset datatype",
+        });
+    }
+
+    let (file_space, error) = local_handle_phase(
+        comm,
+        native::dataset_space(dataset),
+        "HDF5 dataset shape query",
+    );
+    resources.file_space = file_space;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    let file_space = resources.file_space.expect("dataset-space agreement");
+    let shape_result = native::space_shape(file_space);
+    if let Err(agreement) = agree_phase(comm, shape_result.is_ok(), "HDF5 dataset dimensions query")
+    {
+        return Err(shape_result
+            .err()
+            .map(|code| hdf5_error("H5Sget_simple_extent_dims", code))
+            .unwrap_or(agreement));
+    }
+    let shape_ok = shape_result.expect("dataset dimensions agreement") == layout.global;
+    collective_bool(comm, shape_ok, "HDF5 dataset dimensions")?;
+    if !shape_ok {
+        return Err(IoError::MetadataMismatch {
+            field: "dataset dimensions",
+        });
+    }
+
+    let mem_result = if layout.empty && !layout.global.contains(&0) {
+        native::dataspace_simple(&layout.global)
+    } else {
+        native::dataspace_simple(&layout.local)
+    };
+    let (mem_space, error) = local_handle_phase(comm, mem_result, "HDF5 read memory space");
+    resources.mem_space = mem_space;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    let mem_space = resources.mem_space.expect("memory-space agreement");
+    select_spaces(comm, file_space, mem_space, layout)
+}
+
+/// Creates the read transfer list and transfers the payload into `staging`.
+fn read_payload(
+    comm: &mpi::topology::CartesianCommunicator,
+    duplicate: ffi::MPI_Comm,
+    resources: &mut Hdf5Resources,
+    layout: &H5Layout,
+    staging: &mut [u8],
+    settings: Hdf5Settings<'_>,
+) -> Result<(), IoError> {
+    create_transfer_plist(comm, duplicate, resources, settings)?;
+    let dataset = resources.dataset.expect("dataset open agreement");
+    let datatype = resources.datatype.expect("dataset type agreement");
+    let file_space = resources.file_space.expect("dataset-space agreement");
+    let mem_space = resources.mem_space.expect("memory-space agreement");
+    let xfer = resources.xfer.expect("transfer-property agreement");
+    // See the write-side zero-extent guard above. The branch is descriptor
+    // identical on every rank, while the phase agreement remains collective.
+    let io_code = if layout.global.contains(&0) {
+        0
+    } else {
+        native::dataset_io(
+            dataset, datatype, mem_space, file_space, xfer, staging, false,
+        )
+    };
+    if let Err(agreement) = agree_phase(comm, io_code >= 0, "HDF5 collective dataset read") {
+        let primary = if io_code < 0 {
+            hdf5_error("H5Dread", io_code)
+        } else {
+            agreement
+        };
+        return Err(primary);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_metadata<const N: usize, const M: usize>(
     comm: &mpi::topology::CartesianCommunicator,
@@ -1631,72 +1751,38 @@ fn write_metadata<const N: usize, const M: usize>(
     let (global_values, extra_values, grid_values, perm_values) =
         prepared.expect("HDF5 metadata preparation agreement");
 
-    attr_phase(
-        comm,
-        dataset,
-        ATTR_VERSION,
-        &[FORMAT_VERSION],
-        "HDF5 version attribute",
-    )?;
-    attr_phase(
-        comm,
-        dataset,
-        ATTR_COMMIT,
-        &[INCOMPLETE_MARKER],
-        "HDF5 commit attribute",
-    )?;
-    attr_phase(comm, dataset, ATTR_N, &[N as u64], "HDF5 rank attribute")?;
-    attr_phase(
-        comm,
-        dataset,
-        ATTR_TYPE,
-        &[type_code],
-        "HDF5 type attribute",
-    )?;
-    attr_phase(
-        comm,
-        dataset,
-        ATTR_WIDTH,
-        &[width as u64],
-        "HDF5 width attribute",
-    )?;
-    attr_phase(
-        comm,
-        dataset,
-        ATTR_EXTRA_RANK,
-        &[extra.len() as u64],
-        "HDF5 extra-rank attribute",
-    )?;
-    if !extra.is_empty() {
-        attr_phase(
-            comm,
-            dataset,
-            ATTR_EXTRA,
-            &extra_values,
-            "HDF5 extra-shape attribute",
-        )?;
-    }
-    attr_phase(
-        comm,
-        dataset,
-        ATTR_GLOBAL,
+    let metadata = Metadata::for_write(
+        N as u64,
+        type_code,
+        width as u64,
+        &extra_values,
         &global_values,
-        "HDF5 global-shape attribute",
-    )?;
-    attr_phase(
-        comm,
-        dataset,
-        ATTR_GRID,
         &grid_values,
-        "HDF5 writer-grid attribute",
-    )?;
-    attr_phase(
-        comm,
-        dataset,
-        ATTR_PERM,
         &perm_values,
+    );
+    const PHASES: [&str; 10] = [
+        "HDF5 version attribute",
+        "HDF5 commit attribute",
+        "HDF5 rank attribute",
+        "HDF5 type attribute",
+        "HDF5 width attribute",
+        "HDF5 extra-rank attribute",
+        "HDF5 extra-shape attribute",
+        "HDF5 global-shape attribute",
+        "HDF5 writer-grid attribute",
         "HDF5 permutation attribute",
-    )?;
+    ];
+    for (attribute, phase) in Attribute::ALL.into_iter().zip(PHASES) {
+        if attribute.present(extra_values.len()) {
+            attr_phase(
+                comm,
+                dataset,
+                attribute.name(),
+                metadata.value(attribute),
+                phase,
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -2041,20 +2127,37 @@ fn validate_read_metadata<T: IoElement, const N: usize, const M: usize>(
     pencil: &pencil_array::Pencil<N, M>,
     extra_dims: &[usize],
 ) -> Result<(), IoError> {
-    let read_attr = |name, expected, max, phase| {
-        read_attr_phase(comm, duplicate, dataset, name, expected, max, phase)
+    let expected = Metadata::expected(
+        N as u64,
+        T::CODE,
+        T::WIDTH as u64,
+        extra_dims.len() as u64,
+        extra_dims,
+        pencil.global_shape(),
+    );
+    let read_attr = |attribute: Attribute, phase| {
+        let (expected, max) = attribute.read_len(N, extra_dims.len());
+        read_attr_phase(
+            comm,
+            duplicate,
+            dataset,
+            attribute.name(),
+            expected,
+            max,
+            phase,
+        )
     };
-    let version = read_attr(ATTR_VERSION, Some(1), 1, "HDF5 version metadata")?;
-    let commit = read_attr(ATTR_COMMIT, Some(1), 1, "HDF5 commit metadata")?;
-    let n = read_attr(ATTR_N, Some(1), 1, "HDF5 rank metadata")?;
-    let type_code = read_attr(ATTR_TYPE, Some(1), 1, "HDF5 type metadata")?;
-    let width = read_attr(ATTR_WIDTH, Some(1), 1, "HDF5 width metadata")?;
-    let extra_rank = read_attr(ATTR_EXTRA_RANK, Some(1), 1, "HDF5 extra-rank metadata")?;
-    let metadata_ok = version == [FORMAT_VERSION]
-        && n == [N as u64]
-        && type_code == [T::CODE]
-        && width == [T::WIDTH as u64]
-        && usize::try_from(extra_rank[0]).ok() == Some(extra_dims.len())
+    let version = read_attr(Attribute::Version, "HDF5 version metadata")?;
+    let commit = read_attr(Attribute::Commit, "HDF5 commit metadata")?;
+    let n = read_attr(Attribute::Rank, "HDF5 rank metadata")?;
+    let type_code = read_attr(Attribute::TypeCode, "HDF5 type metadata")?;
+    let width = read_attr(Attribute::Width, "HDF5 width metadata")?;
+    let extra_rank = read_attr(Attribute::ExtraRank, "HDF5 extra-rank metadata")?;
+    let metadata_ok = expected.matches(Attribute::Version, &version)
+        && expected.matches(Attribute::Rank, &n)
+        && expected.matches(Attribute::TypeCode, &type_code)
+        && expected.matches(Attribute::Width, &width)
+        && expected.matches(Attribute::ExtraRank, &extra_rank)
         && rank_in_range(extra_rank[0]);
     let commit_result = match commit_state(commit[0]) {
         CommitState::Complete => Ok(()),
@@ -2074,38 +2177,30 @@ fn validate_read_metadata<T: IoElement, const N: usize, const M: usize>(
         });
     }
 
-    let extra = if extra_rank[0] == 0 {
-        if attribute_exists_phase(comm, dataset, ATTR_EXTRA, "HDF5 zero-extra metadata")? {
+    let extra = if Attribute::ExtraShape.present(extra_rank[0] as usize) {
+        read_attr(Attribute::ExtraShape, "HDF5 extra shape metadata")?
+    } else {
+        if attribute_exists_phase(
+            comm,
+            dataset,
+            Attribute::ExtraShape.name(),
+            "HDF5 zero-extra metadata",
+        )? {
             return Err(IoError::MetadataMismatch {
                 field: "extra shape",
             });
         }
         Vec::new()
-    } else {
-        read_attr(
-            ATTR_EXTRA,
-            Some(extra_rank[0] as usize),
-            extra_rank[0] as usize,
-            "HDF5 extra shape metadata",
-        )?
     };
-    let global = read_attr(ATTR_GLOBAL, Some(N), N, "HDF5 global shape metadata")?;
-    let writer_grid = read_attr(
-        ATTR_GRID,
-        None,
-        MAX_PROTOCOL_RANK,
-        "HDF5 writer grid metadata",
+    let global = read_attr(Attribute::GlobalShape, "HDF5 global shape metadata")?;
+    let writer_grid = read_attr(Attribute::WriterGrid, "HDF5 writer grid metadata")?;
+    let writer_perm = read_attr(
+        Attribute::WriterPermutation,
+        "HDF5 writer permutation metadata",
     )?;
-    let writer_perm = read_attr(ATTR_PERM, Some(N), N, "HDF5 writer permutation metadata")?;
     let metadata_ok = valid_global_shape(&global)
-        && global
-            .iter()
-            .copied()
-            .eq(pencil.global_shape().iter().map(|&v| v as u64))
-        && extra
-            .iter()
-            .copied()
-            .eq(extra_dims.iter().map(|&v| v as u64))
+        && expected.matches(Attribute::GlobalShape, &global)
+        && expected.matches(Attribute::ExtraShape, &extra)
         && valid_writer_provenance(&writer_grid, &writer_perm, N);
     if let Err(agreement) = agree_phase(comm, metadata_ok, "HDF5 shape metadata validation") {
         return Err(if metadata_ok {
@@ -2701,14 +2796,18 @@ pub(crate) fn inspect_catalog(
                 };
                 resources.dataset = Some(dataset);
                 macro_rules! attr {
-                    ($n:expr, $l:expr, $m:expr) => {{
+                    ($attribute:expr) => {
+                        attr!($attribute, 0, 0)
+                    };
+                    ($attribute:expr, $n:expr, $er:expr) => {{
+                        let (expected, max) = $attribute.read_len($n, $er);
                         let value = read_attr_phase(
                             comm,
                             duplicate.raw,
                             dataset,
-                            $n,
-                            $l,
-                            $m,
+                            $attribute.name(),
+                            expected,
+                            max,
                             "HDF5 catalog attribute",
                         )
                         .map_err(CatalogError::Io)?;
@@ -2717,12 +2816,12 @@ pub(crate) fn inspect_catalog(
                         value
                     }};
                 }
-                let version = attr!(ATTR_VERSION, Some(1), 1);
-                let commit = attr!(ATTR_COMMIT, Some(1), 1);
-                let nvals = attr!(ATTR_N, Some(1), 1);
-                let typ = attr!(ATTR_TYPE, Some(1), 1);
-                let width = attr!(ATTR_WIDTH, Some(1), 1);
-                let erank = attr!(ATTR_EXTRA_RANK, Some(1), 1);
+                let version = attr!(Attribute::Version);
+                let commit = attr!(Attribute::Commit);
+                let nvals = attr!(Attribute::Rank);
+                let typ = attr!(Attribute::TypeCode);
+                let width = attr!(Attribute::Width);
+                let erank = attr!(Attribute::ExtraRank);
                 let scalar_result = ScalarType::decode(typ[0], width[0]);
                 catalog_valid(comm, scalar_result.is_some(), "HDF5 catalog scalar type")?;
                 let scalar = scalar_result.expect("scalar type agreement");
@@ -2735,9 +2834,10 @@ pub(crate) fn inspect_catalog(
                 )?;
                 let n = n_result.expect("rank agreement");
                 let er = er_result.expect("extra rank agreement");
+                let metadata = Metadata::version_only();
                 catalog_valid(
                     comm,
-                    version == [FORMAT_VERSION]
+                    metadata.matches(Attribute::Version, &version)
                         && commit_state(commit[0]) == CommitState::Complete
                         && n > 0
                         && rank_in_range(nvals[0])
@@ -2745,22 +2845,22 @@ pub(crate) fn inspect_catalog(
                         && combined_rank_in_range(nvals[0], erank[0]),
                     "HDF5 catalog metadata",
                 )?;
-                let extra = if er == 0 {
+                let extra = if Attribute::ExtraShape.present(er) {
+                    attr!(Attribute::ExtraShape, n, er)
+                } else {
                     let has_extra = attribute_exists_phase(
                         comm,
                         dataset,
-                        ATTR_EXTRA,
+                        Attribute::ExtraShape.name(),
                         "HDF5 catalog extra shape",
                     )
                     .map_err(CatalogError::Io)?;
                     catalog_valid(comm, !has_extra, "HDF5 catalog extra shape")?;
                     Vec::new()
-                } else {
-                    attr!(ATTR_EXTRA, Some(er), er)
                 };
-                let global = attr!(ATTR_GLOBAL, Some(n), n);
-                let grid = attr!(ATTR_GRID, None, MAX_PROTOCOL_RANK);
-                let perm = attr!(ATTR_PERM, Some(n), n);
+                let global = attr!(Attribute::GlobalShape, n, er);
+                let grid = attr!(Attribute::WriterGrid, n, er);
+                let perm = attr!(Attribute::WriterPermutation, n, er);
                 let shape_ok = !global.is_empty()
                     && combined_rank_in_range(global.len() as u64, extra.len() as u64)
                     && valid_shape_bytes(&global, &extra, scalar.width() as u64)

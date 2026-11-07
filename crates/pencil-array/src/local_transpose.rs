@@ -189,15 +189,7 @@ impl<const N: usize, const M: usize> LocalTransposePlan<N, M> {
             }
         }
 
-        let mut guard = array.begin_in_place_write()?;
-        let storage = guard.storage_mut();
-        for linear in 0..required {
-            let (source_offset, destination_offset) =
-                logical_offsets(self.source.as_ref(), self.destination.as_ref(), linear)?;
-            storage[destination_offset].clone_from(&scratch[source_offset]);
-        }
-        guard.commit(destination_index)?;
-        Ok(())
+        self.write_staged_in_place(array, destination_index, required, &scratch[..required])
     }
 
     /// Permutes the active layout using the initialized prefix of a shared
@@ -231,13 +223,32 @@ impl<const N: usize, const M: usize> LocalTransposePlan<N, M> {
             }
         }
 
+        self.write_staged_in_place(
+            array,
+            destination_index,
+            required,
+            &workspace.send_buffer[..required],
+        )
+    }
+
+    /// Writes the staged source values back in destination memory order.
+    ///
+    /// Shared by both in-place adapters after staging, so they poison, write,
+    /// and commit in the same order. The caller supplies exactly `required`
+    /// staged values in source physical order.
+    fn write_staged_in_place<T: Clone>(
+        &self,
+        array: &mut ManyPencilArray<T, N, M>,
+        destination_index: usize,
+        required: usize,
+        staged: &[T],
+    ) -> Result<(), LocalTransposeError> {
         let mut guard = array.begin_in_place_write()?;
         let storage = guard.storage_mut();
-        let send = &workspace.send_buffer[..required];
         for linear in 0..required {
             let (source_offset, destination_offset) =
                 logical_offsets(self.source.as_ref(), self.destination.as_ref(), linear)?;
-            storage[destination_offset].clone_from(&send[source_offset]);
+            storage[destination_offset].clone_from(&staged[source_offset]);
         }
         guard.commit(destination_index)?;
         Ok(())
