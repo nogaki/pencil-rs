@@ -1,7 +1,7 @@
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[cfg(test)]
@@ -141,8 +141,54 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
     pub fn execute_views<T>(
         &self,
         source: PencilArrayView<'_, T, N, M>,
+        destination: PencilArrayViewMut<'_, T, N, M>,
+        workspace: &mut TransposeWorkspace<T>,
+    ) -> Result<(), TransposeError>
+    where
+        T: Equivalence + Copy,
+    {
+        self.execute_views_impl(
+            source,
+            destination,
+            workspace,
+            CommunicationMode::PointToPoint.views_operation(),
+            None,
+        )
+    }
+
+    /// Executes `execute_views` and returns wall-clock timings for its local phases.
+    pub fn execute_views_with_timing<T>(
+        &self,
+        source: PencilArrayView<'_, T, N, M>,
+        destination: PencilArrayViewMut<'_, T, N, M>,
+        workspace: &mut TransposeWorkspace<T>,
+    ) -> Result<TransposeTiming, TransposeError>
+    where
+        T: Equivalence + Copy,
+    {
+        let total = Instant::now();
+        let mut timing = TransposeTiming::default();
+        self.execute_views_impl(
+            source,
+            destination,
+            workspace,
+            CommunicationMode::PointToPoint.timed_views_operation(),
+            Some(&mut timing),
+        )?;
+        timing.total = total.elapsed();
+        Ok(timing)
+    }
+
+    /// Execution body shared by [`Self::execute_views`] and its timed variant.
+    /// The operation word keeps their operation IDs distinct; a `None` timing
+    /// sink leaves every clock unread.
+    fn execute_views_impl<T>(
+        &self,
+        source: PencilArrayView<'_, T, N, M>,
         mut destination: PencilArrayViewMut<'_, T, N, M>,
         workspace: &mut TransposeWorkspace<T>,
+        operation: u64,
+        mut timing: Option<&mut TransposeTiming>,
     ) -> Result<(), TransposeError>
     where
         T: Equivalence + Copy,
@@ -153,7 +199,7 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
             communicator,
             source.extra_shape(),
             destination.extra_shape(),
-            CommunicationMode::PointToPoint.views_operation(),
+            operation,
         )?;
 
         let extra_count = source.extra_shape().element_count();
@@ -164,9 +210,11 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
                 .prepare_execution(&source, &destination, workspace),
             workspace,
             extra_count,
+            timing.as_deref_mut(),
             true,
         )?;
 
+        let unpack = timing.as_deref().map(|_| Instant::now());
         let self_peer = self.core.self_peer();
         copy_self_region(
             self_peer,
@@ -184,61 +232,12 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
             &workspace.receive_buffer[..prepared.requirements.receive_len],
             extra_count,
         );
+        if let Some(timing) = timing {
+            timing.unpack = unpack
+                .expect("timed execution has an unpack clock")
+                .elapsed();
+        }
         Ok(())
-    }
-
-    /// Executes `execute_views` and returns wall-clock timings for its local phases.
-    pub fn execute_views_with_timing<T>(
-        &self,
-        source: PencilArrayView<'_, T, N, M>,
-        mut destination: PencilArrayViewMut<'_, T, N, M>,
-        workspace: &mut TransposeWorkspace<T>,
-    ) -> Result<TransposeTiming, TransposeError>
-    where
-        T: Equivalence + Copy,
-    {
-        let total = Instant::now();
-        let communicator = self.core.source().topology().cartesian();
-        crate::transpose::agree_execute_descriptor::<_, T, N, M>(
-            &self.core,
-            communicator,
-            source.extra_shape(),
-            destination.extra_shape(),
-            CommunicationMode::PointToPoint.timed_views_operation(),
-        )?;
-        let extra_count = source.extra_shape().element_count();
-        let mut timing = TransposeTiming::default();
-        let prepared = execute_point_to_point_exchange_timed(
-            &self.core,
-            source.as_slice(),
-            self.core
-                .prepare_execution(&source, &destination, workspace),
-            workspace,
-            extra_count,
-            &mut timing,
-            true,
-        )?;
-        let unpack = Instant::now();
-        let self_peer = self.core.self_peer();
-        copy_self_region(
-            self_peer,
-            self.core.source().as_ref(),
-            source.as_slice(),
-            self.core.destination().as_ref(),
-            destination.as_mut_slice(),
-            extra_count,
-        );
-        unpack_destination_except_self(
-            self.core.peers(),
-            self_peer.peer_coordinate,
-            self.core.destination().as_ref(),
-            destination.as_mut_slice(),
-            &workspace.receive_buffer[..prepared.requirements.receive_len],
-            extra_count,
-        );
-        timing.unpack = unpack.elapsed();
-        timing.total = total.elapsed();
-        Ok(timing)
     }
 
     /// Runs a local callback after receive completion and unpacking, before send waits.
@@ -417,15 +416,56 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
     where
         T: Equivalence + Copy,
     {
+        self.execute_in_place_impl(
+            array,
+            workspace,
+            CommunicationMode::PointToPoint.in_place_operation(),
+            None,
+        )
+    }
+
+    /// Executes the in-place transpose and reports local phase timings.
+    pub fn execute_in_place_with_timing<T>(
+        &self,
+        array: &mut ManyPencilArray<T, N, M>,
+        workspace: &mut TransposeWorkspace<T>,
+    ) -> Result<TransposeTiming, TransposeError>
+    where
+        T: Equivalence + Copy,
+    {
+        let total = Instant::now();
+        let mut timing = TransposeTiming::default();
+        self.execute_in_place_impl(
+            array,
+            workspace,
+            CommunicationMode::PointToPoint.timed_in_place_operation(),
+            Some(&mut timing),
+        )?;
+        timing.total = total.elapsed();
+        Ok(timing)
+    }
+
+    /// Execution body shared by [`Self::execute_in_place`] and its timed
+    /// variant. The operation word keeps their operation IDs distinct; a `None`
+    /// timing sink leaves every clock unread.
+    fn execute_in_place_impl<T>(
+        &self,
+        array: &mut ManyPencilArray<T, N, M>,
+        workspace: &mut TransposeWorkspace<T>,
+        operation: u64,
+        mut timing: Option<&mut TransposeTiming>,
+    ) -> Result<(), TransposeError>
+    where
+        T: Equivalence + Copy,
+    {
         let communicator = self.core.source().topology().cartesian();
         crate::transpose::agree_execute_descriptor::<_, T, N, M>(
             &self.core,
             communicator,
             array.extra_shape(),
             array.extra_shape(),
-            CommunicationMode::PointToPoint.in_place_operation(),
+            operation,
         )?;
-
         let extra_count = array.extra_shape().element_count();
         let (destination_index, exchange) = match prepare_in_place(&self.core, array, workspace) {
             Ok(prepared) => (Some(prepared.destination_index), Ok(prepared.exchange)),
@@ -442,6 +482,7 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
                     Ok(exchange),
                     workspace,
                     extra_count,
+                    timing.as_deref_mut(),
                     false,
                 )
             }
@@ -453,72 +494,11 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
                 Err(error),
                 workspace,
                 extra_count,
+                timing.as_deref_mut(),
                 false,
             ),
         }?;
-        let destination_index =
-            destination_index.expect("agreed in-place preflight has a destination layout");
-        finish_in_place(
-            &self.core,
-            array,
-            destination_index,
-            &exchange,
-            &workspace.receive_buffer[..exchange.requirements.receive_len],
-            extra_count,
-        );
-        Ok(())
-    }
-
-    /// Executes the in-place transpose and reports local phase timings.
-    pub fn execute_in_place_with_timing<T>(
-        &self,
-        array: &mut ManyPencilArray<T, N, M>,
-        workspace: &mut TransposeWorkspace<T>,
-    ) -> Result<TransposeTiming, TransposeError>
-    where
-        T: Equivalence + Copy,
-    {
-        let total = Instant::now();
-        let communicator = self.core.source().topology().cartesian();
-        crate::transpose::agree_execute_descriptor::<_, T, N, M>(
-            &self.core,
-            communicator,
-            array.extra_shape(),
-            array.extra_shape(),
-            CommunicationMode::PointToPoint.timed_in_place_operation(),
-        )?;
-        let extra_count = array.extra_shape().element_count();
-        let (destination_index, exchange) = match prepare_in_place(&self.core, array, workspace) {
-            Ok(prepared) => (Some(prepared.destination_index), Ok(prepared.exchange)),
-            Err(error) => (None, Err(error)),
-        };
-        let mut timing = TransposeTiming::default();
-        let exchange = match exchange {
-            Ok(exchange) => {
-                let source = array.active_view().expect("validated active source");
-                execute_point_to_point_exchange_timed(
-                    &self.core,
-                    source.as_slice(),
-                    Ok(exchange),
-                    workspace,
-                    extra_count,
-                    &mut timing,
-                    false,
-                )
-            }
-            // A failed preflight cannot pack; agreement returns before this
-            // empty slice would be read.
-            Err(error) => execute_point_to_point_exchange_timed(
-                &self.core,
-                &[],
-                Err(error),
-                workspace,
-                extra_count,
-                &mut timing,
-                false,
-            ),
-        }?;
-        let unpack = Instant::now();
+        let unpack = timing.as_deref().map(|_| Instant::now());
         finish_in_place(
             &self.core,
             array,
@@ -527,9 +507,12 @@ impl<const N: usize, const M: usize> PointToPointTransposePlan<N, M> {
             &workspace.receive_buffer[..exchange.requirements.receive_len],
             extra_count,
         );
-        timing.unpack = unpack.elapsed();
-        timing.total = total.elapsed();
-        Ok(timing)
+        if let Some(timing) = timing {
+            timing.unpack = unpack
+                .expect("timed execution has an unpack clock")
+                .elapsed();
+        }
+        Ok(())
     }
 }
 
@@ -563,26 +546,16 @@ fn agree_preflight_and_reservation<C: CommunicatorCollectives, T, E>(
     local
 }
 
-fn execute_point_to_point_exchange<T, const N: usize, const M: usize>(
-    plan: &TransposePlanCore<N, M>,
-    source_storage: &[T],
-    preflight: Result<PreparedExchange, TransposeError>,
-    workspace: &mut TransposeWorkspace<T>,
-    extra_count: usize,
-    skip_self: bool,
-) -> Result<PreparedExchange, TransposeError>
-where
-    T: Equivalence + Copy,
-{
-    execute_point_to_point_exchange_timed(
-        plan,
-        source_storage,
-        preflight,
-        workspace,
-        extra_count,
-        &mut TransposeTiming::default(),
-        skip_self,
-    )
+/// Runs one local execution phase, recording its wall-clock duration in `sink`.
+/// Without a sink the clock is not read at all.
+fn timed<R>(sink: Option<&mut Duration>, phase: impl FnOnce() -> R) -> R {
+    let Some(sink) = sink else {
+        return phase();
+    };
+    let started = Instant::now();
+    let result = phase();
+    *sink = started.elapsed();
+    result
 }
 
 fn execute_point_to_point_exchange_callback<T, P, F, E, const N: usize, const M: usize>(
@@ -709,13 +682,13 @@ where
     }
 }
 
-fn execute_point_to_point_exchange_timed<T, const N: usize, const M: usize>(
+fn execute_point_to_point_exchange<T, const N: usize, const M: usize>(
     plan: &TransposePlanCore<N, M>,
     source_storage: &[T],
     preflight: Result<PreparedExchange, TransposeError>,
     workspace: &mut TransposeWorkspace<T>,
     extra_count: usize,
-    timing: &mut TransposeTiming,
+    mut timing: Option<&mut TransposeTiming>,
     skip_self: bool,
 ) -> Result<PreparedExchange, TransposeError>
 where
@@ -743,55 +716,56 @@ where
             TransposeError::CollectivePreconditionFailed,
             TransposeError::PreparationFailed,
         )?;
-        let started = Instant::now();
-        if skip_self {
-            pack_source_except_self(
-                plan.peers(),
-                self_coordinate,
-                plan.source().as_ref(),
-                source_storage,
-                &mut workspace.send_buffer[..prepared.requirements.send_len],
-                prepared.requirements.send_len,
-                extra_count,
-            );
-        } else {
-            pack_source(
-                plan.peers(),
-                plan.source().as_ref(),
-                source_storage,
-                &mut workspace.send_buffer[..prepared.requirements.send_len],
-                prepared.requirements.send_len,
-                extra_count,
-            );
-        }
-        timing.pack = started.elapsed();
-        let started = Instant::now();
-
-        let subcommunicator = plan
-            .source()
-            .topology()
-            .subcommunicator(plan.changed_topology_axis());
-        let mut receive_tail = &mut workspace.receive_buffer[..prepared.requirements.receive_len];
-        for peer in plan.peers() {
-            let count = peer
-                .receive_spatial_len
-                .checked_mul(extra_count)
-                .expect("point-to-point preflight validated receive count");
-            if count == 0 {
-                continue;
+        timed(timing.as_deref_mut().map(|t| &mut t.pack), || {
+            if skip_self {
+                pack_source_except_self(
+                    plan.peers(),
+                    self_coordinate,
+                    plan.source().as_ref(),
+                    source_storage,
+                    &mut workspace.send_buffer[..prepared.requirements.send_len],
+                    prepared.requirements.send_len,
+                    extra_count,
+                );
+            } else {
+                pack_source(
+                    plan.peers(),
+                    plan.source().as_ref(),
+                    source_storage,
+                    &mut workspace.send_buffer[..prepared.requirements.send_len],
+                    prepared.requirements.send_len,
+                    extra_count,
+                );
             }
-            let (segment, rest) = receive_tail.split_at_mut(count);
-            receive_tail = rest;
-            if skip_self && peer.peer_coordinate == self_coordinate {
-                continue;
+        });
+        let subcommunicator = timed(timing.as_deref_mut().map(|t| &mut t.post_receive), || {
+            let subcommunicator = plan
+                .source()
+                .topology()
+                .subcommunicator(plan.changed_topology_axis());
+            let mut receive_tail =
+                &mut workspace.receive_buffer[..prepared.requirements.receive_len];
+            for peer in plan.peers() {
+                let count = peer
+                    .receive_spatial_len
+                    .checked_mul(extra_count)
+                    .expect("point-to-point preflight validated receive count");
+                if count == 0 {
+                    continue;
+                }
+                let (segment, rest) = receive_tail.split_at_mut(count);
+                receive_tail = rest;
+                if skip_self && peer.peer_coordinate == self_coordinate {
+                    continue;
+                }
+                let request = subcommunicator
+                    .process_at_rank(peer.peer_rank)
+                    .immediate_receive_into_with_tag(scope, segment, POINT_TO_POINT_RESERVED_TAG);
+                receive_requests.push(request);
             }
-            let request = subcommunicator
-                .process_at_rank(peer.peer_rank)
-                .immediate_receive_into_with_tag(scope, segment, POINT_TO_POINT_RESERVED_TAG);
-            receive_requests.push(request);
-        }
+            subcommunicator
+        });
 
-        timing.post_receive = started.elapsed();
         let send_buffer = &workspace.send_buffer[..prepared.requirements.send_len];
         let mut send_tail = send_buffer;
         for peer in plan.peers() {
@@ -813,16 +787,16 @@ where
             send_requests.push(request);
         }
 
-        let started = Instant::now();
-        for request in receive_requests.drain(..) {
-            request.wait_without_status();
-        }
-        timing.receive_wait = started.elapsed();
-        let started = Instant::now();
-        for request in send_requests.drain(..) {
-            request.wait_without_status();
-        }
-        timing.send_wait = started.elapsed();
+        timed(timing.as_deref_mut().map(|t| &mut t.receive_wait), || {
+            for request in receive_requests.drain(..) {
+                request.wait_without_status();
+            }
+        });
+        timed(timing.map(|t| &mut t.send_wait), || {
+            for request in send_requests.drain(..) {
+                request.wait_without_status();
+            }
+        });
         Ok::<PreparedExchange, TransposeError>(prepared)
     })?;
     Ok(prepared)
