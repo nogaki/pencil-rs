@@ -41,6 +41,9 @@ pub(crate) struct Hdf5Settings<'a> {
     pub chunks: Option<&'a [usize]>,
     pub hints: &'a [(String, String)],
     pub explicit: bool,
+    /// The caller already agreed the control rules; only the named wrapper's
+    /// filter capability query and the dataset-level validation remain.
+    pub options_agreed: bool,
     pub shuffle: bool,
     pub deflate: Option<u8>,
 }
@@ -52,6 +55,7 @@ impl Default for Hdf5Settings<'_> {
             chunks: None,
             hints: &[],
             explicit: false,
+            options_agreed: false,
             shuffle: false,
             deflate: None,
         }
@@ -236,7 +240,9 @@ where
     if settings.explicit {
         crate::options::agree_decomposition(view.pencil())?;
     }
-    validate_options(comm, settings, layout.global.len(), T::WIDTH)?;
+    if !settings.options_agreed {
+        validate_options(comm, settings, layout.global.len(), T::WIDTH)?;
+    }
 
     let duplicate = duplicate_comm(comm)?;
     let fapl = match prepare_hdf5_fapl(comm, duplicate.raw, settings.hints) {
@@ -518,6 +524,22 @@ where
     S: AsRef<str>,
     T: IoElement,
 {
+    write_hdf5_named_with_options_inner(path, name, view, options.settings())
+}
+
+/// Creates a named dataset with explicit controls.  `settings.options_agreed`
+/// skips the rule agreement and leaves the capability query to this layer.
+pub(crate) fn write_hdf5_named_with_options_inner<P, S, T, const N: usize, const M: usize>(
+    path: P,
+    name: S,
+    view: PencilArrayView<'_, T, N, M>,
+    settings: Hdf5Settings<'_>,
+) -> Result<(), NamedIoError>
+where
+    P: AsRef<Path>,
+    S: AsRef<str>,
+    T: IoElement,
+{
     let comm = view.pencil().topology().communicator();
     descriptor_agreement(
         comm,
@@ -533,9 +555,9 @@ where
     )
     .map_err(NamedIoError::Io)?;
     crate::options::agree_decomposition(view.pencil()).map_err(NamedIoError::Io)?;
-    validate_options(
+    agree_named_options(
         comm,
-        options.settings(),
+        settings,
         N + view.extra_shape().dimensions().len(),
         T::WIDTH,
     )
@@ -550,7 +572,10 @@ where
         false,
         Some(name.as_ref().as_bytes()),
         71,
-        options.settings(),
+        Hdf5Settings {
+            options_agreed: true,
+            ..settings
+        },
     )
     .map_err(NamedIoError::Io)
 }
@@ -708,6 +733,22 @@ where
     S: AsRef<str>,
     T: IoElement,
 {
+    append_hdf5_named_with_options_inner(path, name, view, options.settings())
+}
+
+/// Appends a named dataset with explicit controls.  `settings.options_agreed`
+/// skips the rule agreement and leaves the capability query to this layer.
+pub(crate) fn append_hdf5_named_with_options_inner<P, S, T, const N: usize, const M: usize>(
+    path: P,
+    name: S,
+    view: PencilArrayView<'_, T, N, M>,
+    settings: Hdf5Settings<'_>,
+) -> Result<(), NamedIoError>
+where
+    P: AsRef<Path>,
+    S: AsRef<str>,
+    T: IoElement,
+{
     let comm = view.pencil().topology().communicator();
     descriptor_agreement(
         comm,
@@ -723,15 +764,15 @@ where
     )
     .map_err(NamedIoError::Io)?;
     crate::options::agree_decomposition(view.pencil()).map_err(NamedIoError::Io)?;
-    validate_options(
+    agree_named_options(
         comm,
-        options.settings(),
+        settings,
         N + view.extra_shape().dimensions().len(),
         T::WIDTH,
     )
     .map_err(NamedIoError::Io)?;
     let link = named_link(comm, name.as_ref())?;
-    check_named_absent(comm, path.as_ref(), &link, options.settings().hints)?;
+    check_named_absent(comm, path.as_ref(), &link, settings.hints)?;
     write_hdf5_inner(
         path,
         view,
@@ -741,7 +782,10 @@ where
         true,
         Some(name.as_ref().as_bytes()),
         72,
-        options.settings(),
+        Hdf5Settings {
+            options_agreed: true,
+            ..settings
+        },
     )
     .map_err(NamedIoError::Io)
 }
@@ -836,17 +880,9 @@ where
     )
 }
 
-/// Reads a collection of named members with explicit controls.
-pub(crate) fn read_named_collection_with_options<T: IoElement, const N: usize, const M: usize>(
-    path: &Path,
-    name: &str,
-    target: ReadTarget<'_, '_, T, N, M>,
-    settings: Hdf5Settings<'_>,
-) -> Result<(), NamedIoError> {
-    read_named_with_options(path, name, target, settings, 73)
-}
-
-fn read_named_with_options<T: IoElement, const N: usize, const M: usize>(
+/// Reads a named dataset with explicit controls.  `settings.options_agreed`
+/// skips the rule agreement and leaves the capability query to this layer.
+pub(crate) fn read_named_with_options<T: IoElement, const N: usize, const M: usize>(
     path: &Path,
     name: &str,
     target: ReadTarget<'_, '_, T, N, M>,
@@ -868,8 +904,12 @@ fn read_named_with_options<T: IoElement, const N: usize, const M: usize>(
     )
     .map_err(NamedIoError::Io)?;
     crate::options::agree_decomposition(target.pencil()).map_err(NamedIoError::Io)?;
-    validate_options(comm, settings, N + target.extra().len(), T::WIDTH)
+    agree_named_options(comm, settings, N + target.extra().len(), T::WIDTH)
         .map_err(NamedIoError::Io)?;
+    let settings = Hdf5Settings {
+        options_agreed: true,
+        ..settings
+    };
     let link = named_link(comm, name)?;
     read_hdf5_inner(
         path,
@@ -1017,7 +1057,9 @@ where
     if settings.explicit {
         crate::options::agree_decomposition(target.pencil())?;
     }
-    validate_options(comm, settings, layout.global.len(), T::WIDTH)?;
+    if !settings.options_agreed {
+        validate_options(comm, settings, layout.global.len(), T::WIDTH)?;
+    }
 
     let duplicate = duplicate_comm(comm)?;
     let fapl = match prepare_hdf5_fapl(comm, duplicate.raw, settings.hints) {
@@ -1349,7 +1391,21 @@ fn configure_chunks(
     Ok(())
 }
 
-fn validate_options(
+pub(crate) fn validate_options(
+    comm: &mpi::topology::CartesianCommunicator,
+    settings: Hdf5Settings<'_>,
+    rank: usize,
+    width: usize,
+) -> Result<(), IoError> {
+    validate_controls(comm, settings, rank, width)?;
+    agree_filter_capability(comm, settings)
+}
+
+/// Applies the shared control rules and agrees the resulting controls.
+///
+/// Collections call this at their old outer position, before staging; it never
+/// queries filter capability.
+pub(crate) fn validate_controls(
     comm: &mpi::topology::CartesianCommunicator,
     settings: Hdf5Settings<'_>,
     rank: usize,
@@ -1401,8 +1457,20 @@ fn validate_options(
         settings.hints,
         &extra[..len],
     )?;
-    // Options agree before filter-dependent collectives. Both directions must
-    // be supported so a successfully written dataset remains readable.
+    Ok(())
+}
+
+/// Queries the requested filters on every rank.
+///
+/// Options agree before filter-dependent collectives. Both directions must be
+/// supported so a successfully written dataset remains readable.
+fn agree_filter_capability(
+    comm: &mpi::topology::CartesianCommunicator,
+    settings: Hdf5Settings<'_>,
+) -> Result<(), IoError> {
+    if !settings.explicit {
+        return Ok(());
+    }
     for (requested, filter) in [(settings.shuffle, 2), (settings.deflate.is_some(), 1)] {
         if requested {
             let capable = native::filter_avail(filter)
@@ -1411,6 +1479,23 @@ fn validate_options(
         }
     }
     Ok(())
+}
+
+/// Runs the agreement a named wrapper owes after its caller's outer step.
+///
+/// When the caller already agreed the control rules, only the filter
+/// capability query remains, at the same position as the unsplit base.
+fn agree_named_options(
+    comm: &mpi::topology::CartesianCommunicator,
+    settings: Hdf5Settings<'_>,
+    rank: usize,
+    width: usize,
+) -> Result<(), IoError> {
+    if settings.options_agreed {
+        agree_filter_capability(comm, settings)
+    } else {
+        validate_options(comm, settings, rank, width)
+    }
 }
 
 fn prepare_hdf5_fapl(

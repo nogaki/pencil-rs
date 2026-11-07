@@ -47,73 +47,12 @@ impl Hdf5ReadOptions {
             chunks: None,
             hints: &self.hints,
             explicit: true,
+            options_agreed: false,
             shuffle: false,
             deflate: None,
         }
     }
 }
-fn agree_hdf5_controls(
-    comm: &mpi::topology::CartesianCommunicator,
-    settings: Hdf5Settings<'_>,
-    rank: usize,
-    width: usize,
-) -> Result<(), IoError> {
-    let Hdf5Settings {
-        collective,
-        hints,
-        chunks,
-        shuffle,
-        deflate,
-        ..
-    } = settings;
-    let mode = if collective {
-        MpiIoMode::Collective
-    } else {
-        MpiIoMode::Independent
-    };
-    let filtered = shuffle || deflate.is_some();
-    let valid = chunks.is_none_or(|chunks| {
-        let bytes = chunks
-            .iter()
-            .try_fold(width as u64, |n, &x| n.checked_mul(x as u64));
-        chunks.len() == rank
-            && chunks.iter().all(|&x| x > 0 && x <= u32::MAX as usize)
-            && bytes.is_some_and(|n| n < (1u64 << 32))
-    }) && (!filtered || chunks.is_some())
-        && deflate.is_none_or(|level| level <= 9)
-        && !(filtered && mode == MpiIoMode::Independent && chunks.is_some());
-    crate::mpi_io::agree_phase(comm, valid, "HDF5 filter/chunk validation")?;
-    let mut extra = vec![0u64; chunks.map_or(4, |c| c.len() + 4)];
-    extra[0] = 2;
-    extra[1] = u64::from(shuffle);
-    extra[2] = deflate.map_or(0, |level| u64::from(level) + 1);
-    if let Some(chunks) = chunks {
-        extra[3] = chunks.len() as u64;
-        for (dst, &value) in extra[4..].iter_mut().zip(chunks) {
-            *dst = value as u64;
-        }
-    }
-    crate::options::agree_controls(comm, mode, hints, &extra)
-}
-
-pub(crate) fn agree_collection_write_options(
-    comm: &mpi::topology::CartesianCommunicator,
-    options: &Hdf5WriteOptions,
-    rank: usize,
-    width: usize,
-) -> Result<(), IoError> {
-    agree_hdf5_controls(comm, options.settings(), rank, width)
-}
-
-pub(crate) fn agree_collection_read_options(
-    comm: &mpi::topology::CartesianCommunicator,
-    options: &Hdf5ReadOptions,
-    rank: usize,
-    width: usize,
-) -> Result<(), IoError> {
-    agree_hdf5_controls(comm, options.settings(), rank, width)
-}
-
 impl Hdf5WriteOptions {
     /// Select native payload mode.
     pub fn mode(mut self, mode: MpiIoMode) -> Self {
@@ -143,6 +82,7 @@ impl Hdf5WriteOptions {
             chunks: self.chunks.as_deref(),
             hints: &self.hints,
             explicit: true,
+            options_agreed: false,
             shuffle: self.shuffle,
             deflate: self.deflate,
         }

@@ -1006,7 +1006,15 @@ pub fn write_mpi_named<
     name: S,
     view: PencilArrayView<'_, T, N, M>,
 ) -> Result<(), NamedIoError> {
-    write_named(path.as_ref(), name.as_ref(), view, false, false, None)
+    write_named(
+        path.as_ref(),
+        name.as_ref(),
+        view,
+        false,
+        false,
+        None,
+        false,
+    )
 }
 
 /// Create a named MPI container with explicit native controls. Applies the same
@@ -1030,6 +1038,7 @@ pub fn write_mpi_named_with_options<
         false,
         false,
         Some(options),
+        false,
     )
 }
 
@@ -1050,7 +1059,7 @@ pub fn append_mpi_named<
     name: S,
     view: PencilArrayView<'_, T, N, M>,
 ) -> Result<(), NamedIoError> {
-    write_named(path.as_ref(), name.as_ref(), view, true, false, None)
+    write_named(path.as_ref(), name.as_ref(), view, true, false, None, false)
 }
 
 /// Append a new name with native controls. Same-file writers require external
@@ -1075,7 +1084,19 @@ pub fn append_mpi_named_with_options<
         true,
         false,
         Some(options),
+        false,
     )
+}
+
+/// Writes a prepared named collection after its caller agreed the options.
+pub(crate) fn write_named_target<T: IoElement, const N: usize, const M: usize>(
+    path: &Path,
+    name: &str,
+    view: PencilArrayView<'_, T, N, M>,
+    append: bool,
+    options: &MpiIoOptions,
+) -> Result<(), NamedIoError> {
+    write_named(path, name, view, append, false, Some(options), true)
 }
 
 fn write_named<T: IoElement, const N: usize, const M: usize>(
@@ -1085,6 +1106,7 @@ fn write_named<T: IoElement, const N: usize, const M: usize>(
     append: bool,
     inject_post_cleanup_failure: bool,
     options: Option<&MpiIoOptions>,
+    options_agreed: bool,
 ) -> Result<(), NamedIoError> {
     let comm = view.pencil().topology().communicator();
     crate::mpi_io::descriptor_agreement(
@@ -1110,7 +1132,9 @@ fn write_named<T: IoElement, const N: usize, const M: usize>(
         T::WIDTH,
     )?;
     name_bytes(comm, name)?;
-    if let Some(options) = options {
+    if let Some(options) = options
+        && !options_agreed
+    {
         agree_options(comm, options, &[])?;
     }
     let pc = prepared(comm, path_c(path), "named path preparation")?;
@@ -1336,7 +1360,7 @@ pub(crate) fn read_named_target<T: IoElement, const N: usize, const M: usize>(
     target: ReadTarget<'_, '_, T, N, M>,
     options: Option<&MpiIoOptions>,
 ) -> Result<(), NamedIoError> {
-    read_named_inner(path, name, target, false, options)
+    read_named_inner(path, name, target, false, options, true)
 }
 
 fn read_named<T: IoElement, const N: usize, const M: usize>(
@@ -1352,6 +1376,7 @@ fn read_named<T: IoElement, const N: usize, const M: usize>(
         ReadTarget::Single(view),
         inject_post_cleanup_failure,
         options,
+        false,
     )
 }
 
@@ -1361,6 +1386,7 @@ fn read_named_inner<T: IoElement, const N: usize, const M: usize>(
     mut target: ReadTarget<'_, '_, T, N, M>,
     inject_post_cleanup_failure: bool,
     options: Option<&MpiIoOptions>,
+    options_agreed: bool,
 ) -> Result<(), NamedIoError> {
     // Take the reserved staging out before borrowing the target's metadata.
     let mut packed = target.take_staging();
@@ -1382,7 +1408,9 @@ fn read_named_inner<T: IoElement, const N: usize, const M: usize>(
         T::WIDTH,
     )?;
     name_bytes(comm, name)?;
-    if let Some(options) = options {
+    if let Some(options) = options
+        && !options_agreed
+    {
         agree_options(comm, options, &[])?;
     }
     let pc = prepared(comm, path_c(path), "named path preparation")?;
@@ -1521,5 +1549,5 @@ pub(crate) fn write_with_commit_uncertainty<T: IoElement, const N: usize, const 
     name: &str,
     view: PencilArrayView<'_, T, N, M>,
 ) -> Result<(), NamedIoError> {
-    write_named(path, name, view, false, true, None)
+    write_named(path, name, view, false, true, None, false)
 }

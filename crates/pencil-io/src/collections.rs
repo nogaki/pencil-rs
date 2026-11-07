@@ -300,9 +300,6 @@ fn mpi_write<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
     operation: u64,
 ) -> Result<(), CollectionIoError> {
     header(comm, operation, views.len())?;
-    if let Some(o) = options {
-        agree_options(comm, o, &[])?;
-    }
     let array = prepare(
         comm,
         path.as_ref(),
@@ -368,9 +365,6 @@ fn mpi_read<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
     operation: u64,
 ) -> Result<(), CollectionIoError> {
     header(comm, operation, views.len())?;
-    if let Some(o) = options {
-        agree_options(comm, o, &[])?;
-    }
     let (dims, len, staging) = prepare_read(comm, path.as_ref(), operation, true, views)?;
     let target = ReadTarget::collection(views, dims, len, staging);
     crate::mpi_io::read_mpi_target(path, target, options)?;
@@ -452,7 +446,7 @@ pub fn write_mpi_named_collection<
     agree_name(comm, name.as_ref())?;
     agree_options(comm, o, &[])?;
     let a = named_prepare(comm, path.as_ref(), MPI_NAMED_WRITE_OPTIONS, true, views)?;
-    crate::write_mpi_named_with_options(path, name, a.view(), o)?;
+    crate::named_mpi::write_named_target(path.as_ref(), name.as_ref(), a.view(), false, o)?;
     Ok(())
 }
 /// Append a named combined MPI collection. Applies the same combined-payload MPI
@@ -478,7 +472,7 @@ pub fn append_mpi_named_collection<
     agree_name(comm, name.as_ref())?;
     agree_options(comm, o, &[])?;
     let a = named_prepare(comm, path.as_ref(), MPI_NAMED_APPEND_OPTIONS, true, views)?;
-    crate::append_mpi_named_with_options(path, name, a.view(), o)?;
+    crate::named_mpi::write_named_target(path.as_ref(), name.as_ref(), a.view(), true, o)?;
     Ok(())
 }
 /// Read a named combined MPI collection atomically into member destinations.
@@ -553,13 +547,6 @@ pub fn write_hdf5_collection_with_options<
     o: &crate::hdf5_options::Hdf5WriteOptions,
 ) -> Result<(), CollectionIoError> {
     header(comm, HDF5_WRITE_OPTIONS, views.len())?;
-    let first = views.first().expect("nonempty collection");
-    crate::hdf5_options::agree_collection_write_options(
-        comm,
-        o,
-        N + first.extra_shape().dimensions().len() + 1,
-        T::WIDTH,
-    )?;
     let a = prepare(
         comm,
         path.as_ref(),
@@ -608,13 +595,6 @@ pub fn read_hdf5_collection_with_options<
     o: &crate::hdf5_options::Hdf5ReadOptions,
 ) -> Result<(), CollectionIoError> {
     header(comm, HDF5_READ_OPTIONS, views.len())?;
-    let first = views.first().expect("nonempty collection");
-    crate::hdf5_options::agree_collection_read_options(
-        comm,
-        o,
-        N + first.extra_shape().dimensions().len() + 1,
-        T::WIDTH,
-    )?;
     let (dims, len, staging) = prepare_read(comm, path.as_ref(), HDF5_READ_OPTIONS, false, views)?;
     let target = ReadTarget::collection(views, dims, len, staging);
     crate::hdf5_io::read_hdf5_target_options(path, target, o.settings())?;
@@ -642,14 +622,22 @@ pub fn write_hdf5_named_collection<
     header(comm, HDF5_NAMED_WRITE_OPTIONS, views.len())?;
     agree_name(comm, name.as_ref())?;
     let first = views.first().expect("nonempty collection");
-    crate::hdf5_options::agree_collection_write_options(
+    crate::hdf5_io::validate_controls(
         comm,
-        o,
+        o.settings(),
         N + first.extra_shape().dimensions().len() + 1,
         T::WIDTH,
     )?;
     let a = named_prepare(comm, path.as_ref(), HDF5_NAMED_WRITE_OPTIONS, false, views)?;
-    crate::write_hdf5_named_with_options(path, name, a.view(), o)?;
+    crate::hdf5_io::write_hdf5_named_with_options_inner(
+        path,
+        name,
+        a.view(),
+        crate::hdf5_io::Hdf5Settings {
+            options_agreed: true,
+            ..o.settings()
+        },
+    )?;
     Ok(())
 }
 #[cfg(feature = "parallel-hdf5")]
@@ -674,14 +662,22 @@ pub fn append_hdf5_named_collection<
     header(comm, HDF5_NAMED_APPEND_OPTIONS, views.len())?;
     agree_name(comm, name.as_ref())?;
     let first = views.first().expect("nonempty collection");
-    crate::hdf5_options::agree_collection_write_options(
+    crate::hdf5_io::validate_controls(
         comm,
-        o,
+        o.settings(),
         N + first.extra_shape().dimensions().len() + 1,
         T::WIDTH,
     )?;
     let a = named_prepare(comm, path.as_ref(), HDF5_NAMED_APPEND_OPTIONS, false, views)?;
-    crate::append_hdf5_named_with_options(path, name, a.view(), o)?;
+    crate::hdf5_io::append_hdf5_named_with_options_inner(
+        path,
+        name,
+        a.view(),
+        crate::hdf5_io::Hdf5Settings {
+            options_agreed: true,
+            ..o.settings()
+        },
+    )?;
     Ok(())
 }
 #[cfg(feature = "parallel-hdf5")]
@@ -705,20 +701,24 @@ pub fn read_hdf5_named_collection<
     header(comm, HDF5_NAMED_READ_OPTIONS, views.len())?;
     agree_name(comm, name.as_ref())?;
     let first = views.first().expect("nonempty collection");
-    crate::hdf5_options::agree_collection_read_options(
+    crate::hdf5_io::validate_controls(
         comm,
-        o,
+        o.settings(),
         N + first.extra_shape().dimensions().len() + 1,
         T::WIDTH,
     )?;
     let (dims, len, staging) =
         prepare_read(comm, path.as_ref(), HDF5_NAMED_READ_OPTIONS, false, views)?;
     let target = ReadTarget::collection(views, dims, len, staging);
-    crate::hdf5_io::read_named_collection_with_options(
+    crate::hdf5_io::read_named_with_options(
         path.as_ref(),
         name.as_ref(),
         target,
-        o.settings(),
+        crate::hdf5_io::Hdf5Settings {
+            options_agreed: true,
+            ..o.settings()
+        },
+        73,
     )?;
     Ok(())
 }

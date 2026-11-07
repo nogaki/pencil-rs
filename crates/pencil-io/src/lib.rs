@@ -967,13 +967,13 @@ mod tests {
             }
         }
 
-        // Collection controls are agreed before staging, including the legacy
-        // MPI collection entry points (and their named-name precondition).
+        // Collection controls are agreed after staging; the legacy MPI
+        // collection entry points still check their named-name precondition
+        // first.
         let mut bad_hint = super::MpiIoOptions::default();
         if world.rank() == 0 {
             bad_hint = bad_hint.hint("", "bad");
         }
-        crate::collections::STAGING_FAILURE.with(|f| f.set(Some(0)));
         crate::collections::STAGING_CALLS.with(|c| c.set(0));
         assert!(
             super::write_mpi_collection_with_options(
@@ -986,9 +986,8 @@ mod tests {
         );
         assert_eq!(
             crate::collections::STAGING_CALLS.with(std::cell::Cell::get),
-            0
+            1
         );
-        crate::collections::STAGING_FAILURE.with(|f| f.set(None));
 
         let option_collection = directory.join("option-collection.pio");
         super::write_mpi_collection_with_options(
@@ -1003,7 +1002,6 @@ mod tests {
         } else {
             super::MpiIoOptions::default()
         };
-        crate::collections::STAGING_FAILURE.with(|f| f.set(Some(0)));
         crate::collections::STAGING_CALLS.with(|c| c.set(0));
         assert!(
             super::read_mpi_collection_with_options(
@@ -1016,9 +1014,8 @@ mod tests {
         );
         assert_eq!(
             crate::collections::STAGING_CALLS.with(std::cell::Cell::get),
-            0
+            1
         );
-        crate::collections::STAGING_FAILURE.with(|f| f.set(None));
 
         let bad_name = if size == 1 {
             ""
@@ -1046,7 +1043,6 @@ mod tests {
         crate::collections::STAGING_FAILURE.with(|f| f.set(None));
 
         if size > 1 {
-            crate::collections::STAGING_FAILURE.with(|f| f.set(Some(0)));
             let mixed_mode = super::MpiIoOptions::default().mode(if world.rank() == 0 {
                 super::MpiIoMode::Independent
             } else {
@@ -1064,7 +1060,7 @@ mod tests {
             );
             assert_eq!(
                 crate::collections::STAGING_CALLS.with(std::cell::Cell::get),
-                0
+                1
             );
 
             let mixed_hints = super::MpiIoOptions::default()
@@ -1081,11 +1077,9 @@ mod tests {
             );
             assert_eq!(
                 crate::collections::STAGING_CALLS.with(std::cell::Cell::get),
-                0
+                1
             );
         }
-
-        crate::collections::STAGING_FAILURE.with(|f| f.set(None));
 
         #[cfg(feature = "parallel-hdf5")]
         {
@@ -1093,7 +1087,6 @@ mod tests {
             if world.rank() == 0 {
                 bad_hdf_hint = bad_hdf_hint.hint("", "bad");
             }
-            crate::collections::STAGING_FAILURE.with(|f| f.set(Some(0)));
             crate::collections::STAGING_CALLS.with(|c| c.set(0));
             assert!(
                 super::write_hdf5_collection_with_options(
@@ -1106,9 +1099,8 @@ mod tests {
             );
             assert_eq!(
                 crate::collections::STAGING_CALLS.with(std::cell::Cell::get),
-                0
+                1
             );
-            crate::collections::STAGING_FAILURE.with(|f| f.set(None));
         }
 
         super::read_mpi_named_collection(
@@ -1259,7 +1251,7 @@ mod tests {
         });
 
         // Native collection controls reach the payload read, not just the
-        // pre-staging agreement.
+        // post-staging agreement.
         let native_collection_options = super::MpiIoOptions::default()
             .mode(super::MpiIoMode::Independent)
             .hint("cb_buffer_size", "3145728");
