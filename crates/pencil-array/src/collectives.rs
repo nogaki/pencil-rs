@@ -17,7 +17,7 @@
 //! `[127i8, 1, -1]` fails at the second value rather than returning 127.
 
 use std::{
-    any::type_name,
+    any::{type_name, type_name_of_val},
     mem::{align_of, size_of},
     ops::Range,
 };
@@ -594,7 +594,15 @@ pub fn any_by<T, F, const N: usize, const M: usize>(
 where
     F: FnMut(&T) -> bool,
 {
-    by_truth_layout(view, OP_ANY_BY, true, |value| predicate(value))
+    let wrapper = |value: &T| predicate(value);
+    by_truth_layout(
+        view,
+        OP_ANY_BY,
+        true,
+        false,
+        type_name_of_val(&wrapper),
+        wrapper,
+    )
 }
 
 /// Computes global all after applying `predicate` once to every local value.
@@ -608,7 +616,15 @@ pub fn all_by<T, F, const N: usize, const M: usize>(
 where
     F: FnMut(&T) -> bool,
 {
-    by_truth_layout(view, OP_ALL_BY, false, |value| predicate(value))
+    let wrapper = |value: &T| predicate(value);
+    by_truth_layout(
+        view,
+        OP_ALL_BY,
+        false,
+        false,
+        type_name_of_val(&wrapper),
+        wrapper,
+    )
 }
 
 /// Computes a global sum after invoking `f` once per local input value.
@@ -648,7 +664,7 @@ where
     U: OrderedScalar,
     F: FnMut(&T) -> U,
 {
-    mapped_extreme_layout(view, OP_MAPPED_MIN, true, f)
+    mapped_extreme_layout(view, OP_MAPPED_MIN, true, type_name::<F>(), f)
 }
 
 /// Computes a checked global maximum after mapping each value in memory order.
@@ -662,7 +678,7 @@ where
     U: OrderedScalar,
     F: FnMut(&T) -> U,
 {
-    mapped_extreme_layout(view, OP_MAPPED_MAX, false, f)
+    mapped_extreme_layout(view, OP_MAPPED_MAX, false, type_name::<F>(), f)
 }
 
 /// Computes a checked global sum of mapped pairs.
@@ -1897,21 +1913,9 @@ where
     L: LocalArrayLayout<T, N, M>,
     T: OrderedScalar,
 {
-    let prepared = prepare_layout::<L, T, T, N, M>(layout, operation, 0, type_name::<()>())?;
-    let communicator = layout.pencil().topology().communicator();
-    let local = T::local_extreme(layout.as_slice(), minimum);
-    let result = T::collective_extreme(communicator, local, minimum);
-    let flags = collective_flags(
-        communicator,
-        values_nonfinite_flags(layout.as_slice().iter().copied()),
-    );
-    if prepared.global_count == 0 {
-        Ok(None)
-    } else if flags[0] != 0 {
-        Ok(Some(T::nan_value()))
-    } else {
-        Ok(Some(result))
-    }
+    mapped_extreme_layout(layout, operation, minimum, type_name::<()>(), |value| {
+        *value
+    })
 }
 
 fn norm_layout<L, T, const N: usize, const M: usize>(
@@ -1939,36 +1943,37 @@ where
     L: LocalArrayLayout<T, N, M>,
     T: TruthValue,
 {
-    let _ = prepare_layout::<L, T, bool, N, M>(layout, operation, 0, type_name::<()>())?;
-    let local = if any_operation {
-        layout.as_slice().iter().copied().any(TruthValue::truth)
-    } else {
-        layout.as_slice().iter().copied().all(TruthValue::truth)
-    };
-    let communicator = layout.pencil().topology().communicator();
-    let local_word = i32::from(local);
-    let mut result = 0i32;
-    let operation = if any_operation {
-        SystemOperation::max()
-    } else {
-        SystemOperation::min()
-    };
-    communicator.all_reduce_into(&local_word, &mut result, operation);
-    Ok(result != 0)
+    by_truth_layout(
+        layout,
+        operation,
+        any_operation,
+        true,
+        type_name::<()>(),
+        |value| TruthValue::truth(*value),
+    )
 }
 
 fn by_truth_layout<L, T, F, const N: usize, const M: usize>(
     layout: &L,
     operation: u64,
     any_operation: bool,
+    short_circuit: bool,
+    callback_name: &str,
     mut predicate: F,
 ) -> Result<bool, CollectiveError>
 where
     L: LocalArrayLayout<T, N, M>,
     F: FnMut(&T) -> bool,
 {
-    let _ = prepare_layout::<L, T, bool, N, M>(layout, operation, 0, type_name::<F>())?;
-    let local = if any_operation {
+    let _ = prepare_layout::<L, T, bool, N, M>(layout, operation, 0, callback_name)?;
+    let local = if short_circuit {
+        // The direct any/all forms stop at the first deciding element.
+        if any_operation {
+            layout.as_slice().iter().any(&mut predicate)
+        } else {
+            layout.as_slice().iter().all(&mut predicate)
+        }
+    } else if any_operation {
         layout
             .as_slice()
             .iter()
@@ -2031,6 +2036,7 @@ fn mapped_extreme_layout<L, T, U, F, const N: usize, const M: usize>(
     layout: &L,
     operation: u64,
     minimum: bool,
+    callback_name: &str,
     mut f: F,
 ) -> Result<Option<U>, CollectiveError>
 where
@@ -2038,7 +2044,7 @@ where
     U: OrderedScalar,
     F: FnMut(&T) -> U,
 {
-    let prepared = prepare_layout::<L, T, U, N, M>(layout, operation, 0, type_name::<F>())?;
+    let prepared = prepare_layout::<L, T, U, N, M>(layout, operation, 0, callback_name)?;
     let communicator = layout.pencil().topology().communicator();
     let mut local = U::local_extreme(&[], minimum);
     let mut flags = [0_u32; 6];

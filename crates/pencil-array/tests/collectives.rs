@@ -8,7 +8,7 @@ use num_complex::{Complex32, Complex64};
 use pencil_array::{
     AllToAllvTransposePlan, AxisPermutation, CollectiveError, ExtraShape, MpiTopology, Pencil,
     PencilArray, SupportedScalar, TransposeError, all, all_by, any, any_by, gather, global_max,
-    global_min, global_sum, l2_norm, map_reduce_many, norm_by, sum_by,
+    global_min, global_sum, l2_norm, map_reduce_many, max_by, min_by, norm_by, sum_by,
 };
 
 fn check_all<C: CommunicatorCollectives>(communicator: &C, local: bool) {
@@ -436,6 +436,17 @@ fn run_complex_sum_tests<C: CommunicatorCollectives>(
     successful_empty_collective(communicator, followup);
 }
 
+fn same_extreme(
+    left: Result<Option<f64>, CollectiveError>,
+    right: Result<Option<f64>, CollectiveError>,
+) -> bool {
+    match (left, right) {
+        (Ok(Some(left)), Ok(Some(right))) => (left.is_nan() && right.is_nan()) || left == right,
+        (Ok(None), Ok(None)) => true,
+        _ => false,
+    }
+}
+
 fn run_mapped_reduction_tests<C: CommunicatorCollectives>(
     communicator: &C,
     rank: usize,
@@ -577,6 +588,31 @@ fn run_mapped_reduction_tests<C: CommunicatorCollectives>(
             _ => false,
         };
     check_all(communicator, local_ok);
+
+    // The direct and mapped forms share their local fold, empty-input rule,
+    // and NaN policy.
+    let empty_f64 =
+        PencilArray::from_elem(Arc::clone(pencil), ExtraShape::new([0]).unwrap(), 1.0_f64).unwrap();
+    check_all(
+        communicator,
+        same_extreme(
+            global_min(&empty_f64.view()),
+            min_by(&empty_f64.view(), |value| *value),
+        ) && same_extreme(
+            global_max(&empty_f64.view()),
+            max_by(&empty_f64.view(), |value| *value),
+        ) && any(&empty_f64.view()) == any_by(&empty_f64.view(), |value| *value != 0.0)
+            && all(&empty_f64.view()) == all_by(&empty_f64.view(), |value| *value != 0.0),
+    );
+
+    let nan = PencilArray::from_elem(Arc::clone(pencil), ExtraShape::scalar(), f64::NAN).unwrap();
+    check_all(
+        communicator,
+        same_extreme(global_min(&nan.view()), min_by(&nan.view(), |value| *value))
+            && same_extreme(global_max(&nan.view()), max_by(&nan.view(), |value| *value))
+            && any(&nan.view()) == any_by(&nan.view(), |value| *value != 0.0)
+            && all(&nan.view()) == all_by(&nan.view(), |value| *value != 0.0),
+    );
 }
 
 fn run_many_error_precedence_tests(
@@ -750,6 +786,27 @@ fn reductions_and_logical_gather_cover_permuted_pencils() {
     check_all(
         &world,
         all_result == Ok(true) && all_calls.get() == array.len(),
+    );
+
+    // The first local value already decides these results, but the mapped
+    // forms still visit every local value; only the direct forms short-circuit.
+    let deciding_any_calls = Cell::new(0usize);
+    let deciding_any_result = any_by(&array.view(), |_| {
+        deciding_any_calls.set(deciding_any_calls.get() + 1);
+        true
+    });
+    check_all(
+        &world,
+        deciding_any_result == Ok(true) && deciding_any_calls.get() == array.len(),
+    );
+    let deciding_all_calls = Cell::new(0usize);
+    let deciding_all_result = all_by(&array.view(), |_| {
+        deciding_all_calls.set(deciding_all_calls.get() + 1);
+        false
+    });
+    check_all(
+        &world,
+        deciding_all_result == Ok(false) && deciding_all_calls.get() == array.len(),
     );
 
     check_all(
