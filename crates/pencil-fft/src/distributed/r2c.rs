@@ -44,11 +44,9 @@ use super::{
 #[cfg(test)]
 use super::{EndpointReductionEvent, record_endpoint_reduction};
 use crate::BackendInitError;
-#[cfg(test)]
-use crate::LocalR2cError;
 #[cfg(feature = "fftw")]
 use crate::PlanOptions;
-use crate::{Complex, FftReal, LocalR2cPlan, R2cState};
+use crate::{Complex, FftReal, LocalR2cError, LocalR2cPlan, R2cState};
 
 impl From<FftError> for BackendInitError<R2cError> {
     fn from(error: FftError) -> Self {
@@ -1385,15 +1383,23 @@ where
                 reduced_route.distributed[index]
             });
         }
+        let (transition_inputs, transition_outputs) = agree_result(
+            communicator,
+            super::pencil_columns(
+                stages.stages.iter().map(|stage| &stage.input),
+                stages.stages.iter().map(|stage| &stage.output),
+            ),
+        )?;
         let (
             transitions,
             transpose_send_len,
             transpose_receive_len,
             real_transpose_send_len,
             real_transpose_receive_len,
-        ) = build_transitions::<R, N, M>(
+        ) = build_transitions::<N, M>(
             communicator,
-            &stages,
+            &transition_inputs,
+            &transition_outputs,
             &distributed,
             &extra_shape,
             layout.transpose_method,
@@ -1520,7 +1526,7 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_strided_real_forward<R: FftReal, const N: usize, const M: usize>(
+pub(super) fn execute_strided_real_forward<R, E, const N: usize, const M: usize>(
     plan: &LocalR2cPlan<R>,
     pencil: &Pencil<N, M>,
     axis: usize,
@@ -1530,15 +1536,17 @@ fn execute_strided_real_forward<R: FftReal, const N: usize, const M: usize>(
     real_line: &mut [R],
     complex_line: &mut [Complex<R>],
     scratch: &mut [Complex<R>],
-) -> Result<(), R2cError>
+) -> Result<(), E>
 where
+    R: FftReal,
     Complex<R>: Equivalence,
+    E: From<FftError> + From<LocalR2cError>,
 {
     let stride = super::memory_stride(pencil, axis)?;
     if stride <= 1 {
         return plan
             .forward(source, destination, real_line, scratch)
-            .map_err(R2cError::LocalR2c);
+            .map_err(E::from);
     }
     if real_source_line.len() < plan.real_len() || complex_line.len() < plan.complex_len() {
         return Err(FftError::WorkspaceTooSmall {
@@ -1548,8 +1556,7 @@ where
         }
         .into());
     }
-    let count =
-        super::strided_line_count(source.len(), plan.real_len(), stride).map_err(R2cError::Fft)?;
+    let count = super::strided_line_count(source.len(), plan.real_len(), stride)?;
     let destination_len = count
         .checked_mul(plan.complex_len())
         .and_then(|value| value.checked_mul(stride))
@@ -1566,13 +1573,13 @@ where
         stride,
         |source, destination| {
             plan.forward(source, destination, real_line, scratch)
-                .map_err(R2cError::LocalR2c)
+                .map_err(E::from)
         },
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_strided_real_reverse<R: FftReal, const N: usize, const M: usize>(
+pub(super) fn execute_strided_real_reverse<R, E, const N: usize, const M: usize>(
     plan: &LocalR2cPlan<R>,
     pencil: &Pencil<N, M>,
     axis: usize,
@@ -1583,9 +1590,11 @@ fn execute_strided_real_reverse<R: FftReal, const N: usize, const M: usize>(
     real_line: &mut [R],
     scratch: &mut [Complex<R>],
     normalize: bool,
-) -> Result<(), R2cError>
+) -> Result<(), E>
 where
+    R: FftReal,
     Complex<R>: Equivalence,
+    E: From<FftError> + From<LocalR2cError>,
 {
     let stride = super::memory_stride(pencil, axis)?;
     if stride <= 1 {
@@ -1594,7 +1603,7 @@ where
         } else {
             plan.backward(source, destination, complex_line, scratch)
         }
-        .map_err(R2cError::LocalR2c);
+        .map_err(E::from);
     }
     if complex_source_line.len() < plan.complex_len() || real_line.len() < plan.real_len() {
         return Err(FftError::WorkspaceTooSmall {
@@ -1604,8 +1613,7 @@ where
         }
         .into());
     }
-    let count = super::strided_line_count(source.len(), plan.complex_len(), stride)
-        .map_err(R2cError::Fft)?;
+    let count = super::strided_line_count(source.len(), plan.complex_len(), stride)?;
     let destination_len = count
         .checked_mul(plan.real_len())
         .and_then(|value| value.checked_mul(stride))
@@ -1626,9 +1634,167 @@ where
             } else {
                 plan.backward(source, destination, complex_line, scratch)
             }
-            .map_err(R2cError::LocalR2c)
+            .map_err(E::from)
         },
     )
+}
+
+/// Promotes the packed real prefix of an R2C in-place buffer to complex
+/// slots. The reverse order keeps every not-yet-read scalar slot intact.
+pub(super) fn promote_packed_real_prefix<R: FftReal>(
+    storage: &mut [Complex<R>],
+    len: usize,
+) -> Result<(), FftError> {
+    if len > storage.len() {
+        return Err(FftError::StorageLayoutMismatch);
+    }
+    for i in (0..len).rev() {
+        let value = match try_cast_slice::<Complex<R>, R>(storage) {
+            Ok(view) => view
+                .get(i)
+                .copied()
+                .ok_or(FftError::StorageLayoutMismatch)?,
+            Err(_) => return Err(FftError::StorageLayoutMismatch),
+        };
+        storage[i] = Complex::new(value, R::zero());
+    }
+    Ok(())
+}
+
+/// Demotes the complex prefix of an R2C in-place buffer back to the packed
+/// real slots. Forward order matches the original real storage order.
+pub(super) fn demote_complex_prefix_to_real<R: FftReal>(
+    storage: &mut [R],
+    len: usize,
+) -> Result<(), FftError> {
+    if len > storage.len() {
+        return Err(FftError::StorageLayoutMismatch);
+    }
+    for i in 0..len {
+        let value = match try_cast_slice::<R, Complex<R>>(storage) {
+            Ok(view) => view
+                .get(i)
+                .copied()
+                .ok_or(FftError::StorageLayoutMismatch)?,
+            Err(_) => return Err(FftError::StorageLayoutMismatch),
+        };
+        storage[i] = value.re;
+    }
+    Ok(())
+}
+
+/// Runs the contiguous packed-row R2C forward repack shared by the homogeneous
+/// and mixed in-place arrays.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn repack_rows_real_to_complex<R, E>(
+    plan: &LocalR2cPlan<R>,
+    storage: &mut [Complex<R>],
+    rows: usize,
+    real_len: usize,
+    complex_len: usize,
+    real_source_line: &mut [R],
+    real_line: &mut [R],
+    _complex_line: &mut [Complex<R>],
+    scratch: &mut [Complex<R>],
+) -> Result<(), E>
+where
+    R: FftReal,
+    Complex<R>: Equivalence,
+    E: From<FftError> + From<LocalR2cError>,
+{
+    for row in (0..rows).rev() {
+        let source_start = row
+            .checked_mul(real_len)
+            .ok_or(FftError::PreparationFailed)?;
+        let source_end = source_start
+            .checked_add(real_len)
+            .ok_or(FftError::PreparationFailed)?;
+        let source = try_cast_slice::<Complex<R>, R>(storage)
+            .map_err(|_| FftError::StorageLayoutMismatch)?;
+        if source_end > source.len() {
+            return Err(FftError::PreparationFailed.into());
+        }
+        real_source_line[..real_len].copy_from_slice(&source[source_start..source_end]);
+        let destination_start = row
+            .checked_mul(complex_len)
+            .ok_or(FftError::PreparationFailed)?;
+        let destination_end = destination_start
+            .checked_add(complex_len)
+            .ok_or(FftError::PreparationFailed)?;
+        if destination_end > storage.len() {
+            return Err(FftError::PreparationFailed.into());
+        }
+        plan.forward(
+            &real_source_line[..real_len],
+            &mut storage[destination_start..destination_end],
+            real_line,
+            scratch,
+        )
+        .map_err(E::from)?;
+    }
+    Ok(())
+}
+
+/// Runs the contiguous packed-row R2C reverse repack shared by the homogeneous
+/// and mixed in-place arrays.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn repack_rows_complex_to_real<R, E>(
+    plan: &LocalR2cPlan<R>,
+    storage: &mut [R],
+    rows: usize,
+    complex_len: usize,
+    real_len: usize,
+    complex_source_line: &mut [Complex<R>],
+    complex_line: &mut [Complex<R>],
+    _real_line: &mut [R],
+    scratch: &mut [Complex<R>],
+    normalize: bool,
+) -> Result<(), E>
+where
+    R: FftReal,
+    Complex<R>: Equivalence,
+    E: From<FftError> + From<LocalR2cError>,
+{
+    for row in 0..rows {
+        let source_start = row
+            .checked_mul(complex_len)
+            .ok_or(FftError::PreparationFailed)?;
+        let source_end = source_start
+            .checked_add(complex_len)
+            .ok_or(FftError::PreparationFailed)?;
+        let source = try_cast_slice::<R, Complex<R>>(storage)
+            .map_err(|_| FftError::StorageLayoutMismatch)?;
+        if source_end > source.len() {
+            return Err(FftError::PreparationFailed.into());
+        }
+        complex_source_line[..complex_len].copy_from_slice(&source[source_start..source_end]);
+        let destination_start = row
+            .checked_mul(real_len)
+            .ok_or(FftError::PreparationFailed)?;
+        let destination_end = destination_start
+            .checked_add(real_len)
+            .ok_or(FftError::PreparationFailed)?;
+        if destination_end > storage.len() {
+            return Err(FftError::PreparationFailed.into());
+        }
+        let result = if normalize {
+            plan.inverse(
+                &complex_source_line[..complex_len],
+                &mut storage[destination_start..destination_end],
+                complex_line,
+                scratch,
+            )
+        } else {
+            plan.backward(
+                &complex_source_line[..complex_len],
+                &mut storage[destination_start..destination_end],
+                complex_line,
+                scratch,
+            )
+        };
+        result.map_err(E::from)?;
+    }
+    Ok(())
 }
 
 fn registered_layout_matches<R: FftReal, const N: usize, const M: usize>(
@@ -2530,7 +2696,7 @@ fn execute_boundary_real_forward<R: FftReal, const N: usize, const M: usize>(
 where
     Complex<R>: Equivalence,
 {
-    execute_strided_real_forward(
+    execute_strided_real_forward::<R, R2cError, N, M>(
         stage.local.real_complex(),
         stage.input.as_ref(),
         stage.axis,
@@ -2779,11 +2945,10 @@ where
                         plan.execute_in_place_with_callback(real, rt, callback)
                             .map_err(map_r2c_overlap)
                     })
-                    .map_err(|error| match error {
-                        OverwriteError::Array(error) => {
+                    .map_err(|error| {
+                        super::map_overwrite(error, |error| {
                             FftOverlapError::Operation(R2cError::Fft(FftError::Array(error)))
-                        }
-                        OverwriteError::Writer(error) => error,
+                        })
                     })?;
             }
             C2cTransition::Identity | C2cTransition::Local(_) => {
@@ -2815,10 +2980,7 @@ where
                             fft_scratch,
                         )
                     })
-                    .map_err(|error| match error {
-                        OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
-                        OverwriteError::Writer(error) => error,
-                    })?;
+                    .map_err(map_r2c_overwrite)?;
             }
             C2cTransition::AllToAllv(_) => {
                 return Err(FftOverlapError::UnsupportedTransport);
@@ -2850,10 +3012,7 @@ where
                     &mut workspace.fft_scratch,
                 )
             })
-            .map_err(|error| match error {
-                OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
-                OverwriteError::Writer(error) => error,
-            })?;
+            .map_err(map_r2c_overwrite)?;
     }
     for index in boundary..core.transitions.len() {
         let stage = &core.stages[index + 1];
@@ -2928,13 +3087,11 @@ where
 }
 
 fn map_r2c_overlap<E: Into<R2cError>>(error: OverlapError<E>) -> FftOverlapError<R2cError> {
-    FftOverlapError::Overlap(match error {
-        OverlapError::Transpose(error) => OverlapError::Transpose(error),
-        OverlapError::Callback(error) => OverlapError::Callback(error.into()),
-        OverlapError::PeerPanicked => OverlapError::PeerPanicked,
-        OverlapError::PeerCallbackFailed => OverlapError::PeerCallbackFailed,
-        OverlapError::CollectivePreconditionFailed => OverlapError::CollectivePreconditionFailed,
-    })
+    super::map_overlap(error)
+}
+
+fn map_r2c_overwrite<E: Into<R2cError>>(error: OverwriteError<E>) -> R2cError {
+    super::map_overwrite(error, |error| R2cError::Fft(FftError::Array(error)))
 }
 
 fn execute_reverse_overlap<R: FftReal, const N: usize, const M: usize>(
@@ -2975,10 +3132,7 @@ where
                 normalize,
             )
         })
-        .map_err(|error| match error {
-            OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
-            OverwriteError::Writer(error) => error.into(),
-        })?;
+        .map_err(map_r2c_overwrite)?;
 
     // Every complex transition except the handoff to C2R has the next local
     // FFT in its receive callback.  Identity/local routes have no receive to
@@ -3102,11 +3256,10 @@ where
                     )
                     .map_err(map_r2c_overlap)
                 })
-                .map_err(|error| match error {
-                    OverwriteError::Array(error) => {
+                .map_err(|error| {
+                    super::map_overwrite(error, |error| {
                         FftOverlapError::Operation(R2cError::Fft(FftError::Array(error)))
-                    }
-                    OverwriteError::Writer(error) => error,
+                    })
                 })?;
             }
             transition => {
@@ -3171,7 +3324,7 @@ fn execute_boundary_real_reverse<R: FftReal, const N: usize, const M: usize>(
 where
     Complex<R>: Equivalence,
 {
-    execute_strided_real_reverse(
+    execute_strided_real_reverse::<R, R2cError, N, M>(
         stage.local.real_complex(),
         stage.output.as_ref(),
         stage.axis,
@@ -3228,10 +3381,7 @@ where
             normalize,
         )
     })
-    .map_err(|error| match error {
-        OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
-        OverwriteError::Writer(error) => error,
-    })
+    .map_err(map_r2c_overwrite)
 }
 
 fn shift_tail_timing<const N: usize>(
@@ -3322,10 +3472,7 @@ where
                 normalize_inverse,
             )
         })
-        .map_err(|error| match error {
-            OverwriteError::Array(error) => R2cError::Fft(FftError::Array(error)),
-            OverwriteError::Writer(error) => error,
-        })?;
+        .map_err(map_r2c_overwrite)?;
     super::record_fft_timing(&mut report, boundary, fft_started);
     {
         let real_transpose = workspace
@@ -3743,38 +3890,18 @@ where
             ));
         }
         // Promote the original packed real prefix before projecting any
-        // result into the compressed complex layout. Read through a checked
-        // scalar view before each write; reading `Complex::re` here would
-        // observe a slot already overwritten by the reverse promotion order.
-        for i in (0..array.real_storage_len).rev() {
-            let value = match try_cast_slice::<Complex<R>, R>(&complex_storage) {
-                Ok(scalar_view) => match scalar_view.get(i).copied() {
-                    Some(value) => value,
-                    None => {
-                        return Err(fail_forward_complex(
-                            array,
-                            source_pencils,
-                            destination_pencils,
-                            extra_shape,
-                            complex_storage,
-                            0,
-                            FftError::StorageLayoutMismatch.into(),
-                        ));
-                    }
-                },
-                Err(_) => {
-                    return Err(fail_forward_complex(
-                        array,
-                        source_pencils,
-                        destination_pencils,
-                        extra_shape,
-                        complex_storage,
-                        0,
-                        FftError::StorageLayoutMismatch.into(),
-                    ));
-                }
-            };
-            complex_storage[i] = Complex::new(value, R::zero());
+        // result into the compressed complex layout.
+        if let Err(error) = promote_packed_real_prefix(&mut complex_storage, array.real_storage_len)
+        {
+            return Err(fail_forward_complex(
+                array,
+                source_pencils,
+                destination_pencils,
+                extra_shape,
+                complex_storage,
+                0,
+                error.into(),
+            ));
         }
         if rows != 0 {
             let Some(real_source_line) = workspace.real_source_line.as_mut() else {
@@ -3831,116 +3958,27 @@ where
                 ));
             }
         };
-    for row in (0..rows).rev() {
-        let source_start = match row.checked_mul(real_len) {
-            Some(value) => value,
-            None => {
-                return Err(fail_forward_complex(
-                    array,
-                    source_pencils,
-                    destination_pencils,
-                    extra_shape,
-                    complex_storage,
-                    0,
-                    FftError::PreparationFailed.into(),
-                ));
-            }
-        };
-        let source_end = match source_start.checked_add(real_len) {
-            Some(value) => value,
-            None => {
-                return Err(fail_forward_complex(
-                    array,
-                    source_pencils,
-                    destination_pencils,
-                    extra_shape,
-                    complex_storage,
-                    0,
-                    FftError::PreparationFailed.into(),
-                ));
-            }
-        };
-        let source = match try_cast_slice::<Complex<R>, R>(&complex_storage) {
-            Ok(source) => source,
-            Err(_) => {
-                return Err(fail_forward_complex(
-                    array,
-                    source_pencils,
-                    destination_pencils,
-                    extra_shape,
-                    complex_storage,
-                    0,
-                    FftError::StorageLayoutMismatch.into(),
-                ));
-            }
-        };
-        if source_end > source.len() {
-            return Err(fail_forward_complex(
-                array,
-                source_pencils,
-                destination_pencils,
-                extra_shape,
-                complex_storage,
-                0,
-                FftError::PreparationFailed.into(),
-            ));
-        }
-        real_source_line[..real_len].copy_from_slice(&source[source_start..source_end]);
-        let destination_start = match row.checked_mul(complex_len) {
-            Some(value) => value,
-            None => {
-                return Err(fail_forward_complex(
-                    array,
-                    source_pencils,
-                    destination_pencils,
-                    extra_shape,
-                    complex_storage,
-                    0,
-                    FftError::PreparationFailed.into(),
-                ));
-            }
-        };
-        let destination_end = match destination_start.checked_add(complex_len) {
-            Some(value) => value,
-            None => {
-                return Err(fail_forward_complex(
-                    array,
-                    source_pencils,
-                    destination_pencils,
-                    extra_shape,
-                    complex_storage,
-                    0,
-                    FftError::PreparationFailed.into(),
-                ));
-            }
-        };
-        if destination_end > complex_storage.len() {
-            return Err(fail_forward_complex(
-                array,
-                source_pencils,
-                destination_pencils,
-                extra_shape,
-                complex_storage,
-                0,
-                FftError::PreparationFailed.into(),
-            ));
-        }
-        if let Err(error) = plan.forward(
-            &real_source_line[..real_len],
-            &mut complex_storage[destination_start..destination_end],
-            &mut workspace.real_line,
-            &mut workspace.fft_scratch,
-        ) {
-            return Err(fail_forward_complex(
-                array,
-                source_pencils,
-                destination_pencils,
-                extra_shape,
-                complex_storage,
-                0,
-                error.into(),
-            ));
-        }
+    let repacked = repack_rows_real_to_complex::<R, R2cError>(
+        plan,
+        &mut complex_storage,
+        rows,
+        real_len,
+        complex_len,
+        real_source_line,
+        &mut workspace.real_line,
+        &mut workspace.complex_line,
+        &mut workspace.fft_scratch,
+    );
+    if let Err(error) = repacked {
+        return Err(fail_forward_complex(
+            array,
+            source_pencils,
+            destination_pencils,
+            extra_shape,
+            complex_storage,
+            0,
+            error,
+        ));
     }
     let result =
         install_complex_storage(array, destination_pencils, extra_shape, complex_storage, 0);
@@ -4060,35 +4098,17 @@ where
                 FftError::StorageLayoutMismatch.into(),
             ));
         }
-        for i in 0..array.real_storage_len {
-            let value = match try_cast_slice::<R, Complex<R>>(&real_storage) {
-                Ok(complex_view) => match complex_view.get(i).copied() {
-                    Some(value) => value.re,
-                    None => {
-                        return Err(fail_reverse_real(
-                            array,
-                            source_pencils,
-                            destination_pencils,
-                            extra_shape,
-                            real_storage,
-                            boundary,
-                            FftError::StorageLayoutMismatch.into(),
-                        ));
-                    }
-                },
-                Err(_) => {
-                    return Err(fail_reverse_real(
-                        array,
-                        source_pencils,
-                        destination_pencils,
-                        extra_shape,
-                        real_storage,
-                        boundary,
-                        FftError::StorageLayoutMismatch.into(),
-                    ));
-                }
-            };
-            real_storage[i] = value;
+        if let Err(error) = demote_complex_prefix_to_real(&mut real_storage, array.real_storage_len)
+        {
+            return Err(fail_reverse_real(
+                array,
+                source_pencils,
+                destination_pencils,
+                extra_shape,
+                real_storage,
+                destination_active,
+                error.into(),
+            ));
         }
         #[cfg(test)]
         let mut destination_pencils = destination_pencils;
@@ -4128,127 +4148,28 @@ where
             FftError::StorageLayoutMismatch.into(),
         ));
     }
-    for row in 0..rows {
-        let source_start = match row.checked_mul(complex_len) {
-            Some(value) => value,
-            None => {
-                return Err(fail_reverse_real(
-                    array,
-                    source_pencils,
-                    destination_pencils,
-                    extra_shape,
-                    real_storage,
-                    boundary,
-                    FftError::PreparationFailed.into(),
-                ));
-            }
-        };
-        let source_end = match source_start.checked_add(complex_len) {
-            Some(value) => value,
-            None => {
-                return Err(fail_reverse_real(
-                    array,
-                    source_pencils,
-                    destination_pencils,
-                    extra_shape,
-                    real_storage,
-                    boundary,
-                    FftError::PreparationFailed.into(),
-                ));
-            }
-        };
-        let source = match try_cast_slice::<R, Complex<R>>(&real_storage) {
-            Ok(source) => source,
-            Err(_) => {
-                return Err(fail_reverse_real(
-                    array,
-                    source_pencils,
-                    destination_pencils,
-                    extra_shape,
-                    real_storage,
-                    boundary,
-                    FftError::StorageLayoutMismatch.into(),
-                ));
-            }
-        };
-        if source_end > source.len() {
-            return Err(fail_reverse_real(
-                array,
-                source_pencils,
-                destination_pencils,
-                extra_shape,
-                real_storage,
-                destination_active,
-                FftError::PreparationFailed.into(),
-            ));
-        }
-        workspace.complex_source_line[..complex_len]
-            .copy_from_slice(&source[source_start..source_end]);
-        let destination_start = match row.checked_mul(real_len) {
-            Some(value) => value,
-            None => {
-                return Err(fail_reverse_real(
-                    array,
-                    source_pencils,
-                    destination_pencils,
-                    extra_shape,
-                    real_storage,
-                    boundary,
-                    FftError::PreparationFailed.into(),
-                ));
-            }
-        };
-        let destination_end = match destination_start.checked_add(real_len) {
-            Some(value) => value,
-            None => {
-                return Err(fail_reverse_real(
-                    array,
-                    source_pencils,
-                    destination_pencils,
-                    extra_shape,
-                    real_storage,
-                    boundary,
-                    FftError::PreparationFailed.into(),
-                ));
-            }
-        };
-        if destination_end > real_storage.len() {
-            return Err(fail_reverse_real(
-                array,
-                source_pencils,
-                destination_pencils,
-                extra_shape,
-                real_storage,
-                destination_active,
-                FftError::PreparationFailed.into(),
-            ));
-        }
-        let result = if normalize_inverse {
-            plan.inverse(
-                &workspace.complex_source_line[..complex_len],
-                &mut real_storage[destination_start..destination_end],
-                &mut workspace.complex_line,
-                &mut workspace.fft_scratch,
-            )
-        } else {
-            plan.backward(
-                &workspace.complex_source_line[..complex_len],
-                &mut real_storage[destination_start..destination_end],
-                &mut workspace.complex_line,
-                &mut workspace.fft_scratch,
-            )
-        };
-        if let Err(error) = result {
-            return Err(fail_reverse_real(
-                array,
-                source_pencils,
-                destination_pencils,
-                extra_shape,
-                real_storage,
-                destination_active,
-                error.into(),
-            ));
-        }
+    let repacked = repack_rows_complex_to_real::<R, R2cError>(
+        plan,
+        &mut real_storage,
+        rows,
+        complex_len,
+        real_len,
+        &mut workspace.complex_source_line,
+        &mut workspace.complex_line,
+        &mut workspace.real_line,
+        &mut workspace.fft_scratch,
+        normalize_inverse,
+    );
+    if let Err(error) = repacked {
+        return Err(fail_reverse_real(
+            array,
+            source_pencils,
+            destination_pencils,
+            extra_shape,
+            real_storage,
+            destination_active,
+            error,
+        ));
     }
     #[cfg(test)]
     let mut destination_pencils = destination_pencils;
@@ -4613,6 +4534,19 @@ struct R2cEndpointStatistics {
     statistics: super::EndpointStatistics,
 }
 
+/// The DC bin is always constrained; the Nyquist bin only when the reduced
+/// boundary length is even. Both the endpoint check and endpoint zeroing use
+/// this rule.
+pub(super) fn endpoint_plane(k: usize, complex_len: usize, plane_count: usize) -> Option<usize> {
+    if k == 0 {
+        Some(0)
+    } else if plane_count == 2 && k == complex_len - 1 {
+        Some(1)
+    } else {
+        None
+    }
+}
+
 fn validate_boundary<R: FftReal, const N: usize, const M: usize>(
     core: &TransformPlanCore<R, N, M>,
     intermediate: &ManyPencilArray<Complex<R>, N, M>,
@@ -4702,13 +4636,7 @@ where
             for (offset, value) in values.iter().enumerate() {
                 let coord = (offset / stride) % local_axis_len;
                 let k = global_axis_start + coord;
-                let plane = if k == 0 {
-                    Some(0)
-                } else if plane_count == 2 && k == complex_len - 1 {
-                    Some(1)
-                } else {
-                    None
-                };
+                let plane = endpoint_plane(k, complex_len, plane_count);
                 let Some(plane) = plane else { continue };
                 visit(plane * 2, *value);
             }
@@ -4745,7 +4673,7 @@ fn zero_accepted_boundary<R: FftReal, const N: usize, const M: usize>(
             for (offset, value) in values.iter_mut().enumerate() {
                 let coord = (offset / stride) % local_axis_len;
                 let k = global_axis_start + coord;
-                if k == 0 || (plane_count == 2 && k == complex_len - 1) {
+                if endpoint_plane(k, complex_len, plane_count).is_some() {
                     value.im = R::zero();
                 }
             }

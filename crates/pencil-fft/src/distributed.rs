@@ -1855,15 +1855,23 @@ where
         }
         let stages = prepared.expect("collective backend preflight accepted");
 
+        let (transition_inputs, transition_outputs) = agree_result(
+            communicator,
+            pencil_columns(
+                stages.stages.iter().map(|stage| &stage.input),
+                stages.stages.iter().map(|stage| &stage.output),
+            ),
+        )?;
         let (
             transitions,
             transpose_send_len,
             transpose_receive_len,
             real_transpose_send_len,
             real_transpose_receive_len,
-        ) = build_transitions::<R, N, M>(
+        ) = build_transitions::<N, M>(
             communicator,
-            &stages,
+            &transition_inputs,
+            &transition_outputs,
             &route.distributed,
             &extra_shape,
             layout.transpose_method,
@@ -2426,14 +2434,56 @@ fn prepare_stages_backend<R: FftReal, const N: usize, const M: usize>(
     })
 }
 
-fn build_transitions<R: FftReal, const N: usize, const M: usize>(
+/// Copies the stage input and output pencils into the two transition columns.
+///
+/// Transition `index` runs from `outputs[index]` to `inputs[index + 1]`; the
+/// two columns differ at the real/complex boundary that a single pencil column
+/// cannot express.
+#[allow(clippy::type_complexity)]
+fn pencil_columns<'a, I, J, const N: usize, const M: usize>(
+    inputs: I,
+    outputs: J,
+) -> Result<(Box<[Arc<Pencil<N, M>>]>, Box<[Arc<Pencil<N, M>>]>), FftError>
+where
+    I: ExactSizeIterator<Item = &'a Arc<Pencil<N, M>>>,
+    J: ExactSizeIterator<Item = &'a Arc<Pencil<N, M>>>,
+{
+    let required = inputs.len();
+    if outputs.len() != required {
+        return Err(FftError::PreparationFailed);
+    }
+    let mut input_column = Vec::new();
+    input_column
+        .try_reserve_exact(required)
+        .map_err(|_| FftError::AllocationFailed { required })?;
+    input_column.extend(inputs.map(Arc::clone));
+    let mut output_column = Vec::new();
+    output_column
+        .try_reserve_exact(required)
+        .map_err(|_| FftError::AllocationFailed { required })?;
+    output_column.extend(outputs.map(Arc::clone));
+    Ok((
+        input_column.into_boxed_slice(),
+        output_column.into_boxed_slice(),
+    ))
+}
+
+fn build_transitions<const N: usize, const M: usize>(
     communicator: &mpi::topology::CartesianCommunicator,
-    stages: &StagePreparation<R, N, M>,
+    inputs: &[Arc<Pencil<N, M>>],
+    outputs: &[Arc<Pencil<N, M>>],
     distributed: &[bool],
     extra_shape: &ExtraShape,
     method: TransposeMethod,
     real_transition_count: usize,
 ) -> Result<(Vec<C2cStageTransition<N, M>>, usize, usize, usize, usize), FftError> {
+    let required_columns = distributed
+        .len()
+        .checked_add(1)
+        .ok_or(FftError::PreparationFailed)?;
+    if inputs.len() < required_columns || outputs.len() < required_columns {
+        return Err(FftError::PreparationFailed);
+    }
     let mut transitions = Vec::new();
     agree_result(
         communicator,
@@ -2451,8 +2501,8 @@ fn build_transitions<R: FftReal, const N: usize, const M: usize>(
     let extra_count = extra_shape.element_count();
 
     for (index, &is_distributed) in distributed.iter().enumerate() {
-        let source = Arc::clone(&stages.stages[index].output);
-        let destination = Arc::clone(&stages.stages[index + 1].input);
+        let source = Arc::clone(&outputs[index]);
+        let destination = Arc::clone(&inputs[index + 1]);
         let is_real = index < real_transition_count;
         if is_distributed {
             let forward = agree_result(
@@ -3120,10 +3170,7 @@ where
                 &mut workspace.line_buffer,
             )
         })
-        .map_err(|error| match error {
-            OverwriteError::Writer(error) => error,
-            OverwriteError::Array(error) => FftError::Array(error),
-        })?;
+        .map_err(|error| map_overwrite(error, FftError::Array))?;
     for (index, transition) in core.transitions.iter().enumerate() {
         let stage = &core.stages[index + 1];
         match &transition.forward {
@@ -3207,10 +3254,7 @@ where
                 normalize_inverse,
             )
         })
-        .map_err(|error| match error {
-            OverwriteError::Writer(error) => error,
-            OverwriteError::Array(error) => FftError::Array(error),
-        })?;
+        .map_err(|error| map_overwrite(error, FftError::Array))?;
     for (index, transition) in core.transitions.iter().enumerate().rev() {
         let stage = &core.stages[index];
         match &transition.backward {
@@ -3269,7 +3313,12 @@ where
     Ok(())
 }
 
-fn map_overlap<E: Into<FftError>>(error: OverlapError<E>) -> FftOverlapError<FftError> {
+/// Repacks every `OverlapError` variant into a new callback error type.
+fn map_overlap<E, F>(error: OverlapError<E>) -> FftOverlapError<F>
+where
+    E: Into<F>,
+    F: std::fmt::Debug,
+{
     FftOverlapError::Overlap(match error {
         OverlapError::Transpose(error) => OverlapError::Transpose(error),
         OverlapError::Callback(error) => OverlapError::Callback(error.into()),
@@ -3277,6 +3326,18 @@ fn map_overlap<E: Into<FftError>>(error: OverlapError<E>) -> FftOverlapError<Fft
         OverlapError::PeerCallbackFailed => OverlapError::PeerCallbackFailed,
         OverlapError::CollectivePreconditionFailed => OverlapError::CollectivePreconditionFailed,
     })
+}
+
+/// Maps an overwrite failure to any writer/array error pair reachable from the
+/// caller, including the overlap wrapper whose array arm is an operation error.
+fn map_overwrite<E, F>(error: OverwriteError<E>, array: impl FnOnce(ArrayError) -> F) -> F
+where
+    E: Into<F>,
+{
+    match error {
+        OverwriteError::Array(error) => array(error),
+        OverwriteError::Writer(error) => error.into(),
+    }
 }
 
 fn execute_inverse<R: FftReal, const N: usize, const M: usize>(
