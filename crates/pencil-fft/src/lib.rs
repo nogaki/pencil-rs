@@ -369,9 +369,7 @@ pub struct LocalC2cPlan<R: FftReal> {
     scratch_len: usize,
     forward: Arc<dyn Fft<R>>,
     backward: Arc<dyn Fft<R>>,
-    backend: BackendKind,
-    #[cfg(feature = "fftw")]
-    backend_options: Option<PlanOptions>,
+    backend: backend::LocalBackend,
 }
 
 impl<R: FftReal> fmt::Debug for LocalC2cPlan<R> {
@@ -400,8 +398,7 @@ impl<R: FftReal> LocalC2cPlan<R> {
         positive_forward: bool,
         forward: Arc<dyn Fft<R>>,
         inverse: Arc<dyn Fft<R>>,
-        backend: BackendKind,
-        #[cfg(feature = "fftw")] backend_options: Option<PlanOptions>,
+        backend: backend::LocalBackend,
     ) -> Self {
         let (forward, backward) = if positive_forward {
             (inverse, forward)
@@ -419,8 +416,6 @@ impl<R: FftReal> LocalC2cPlan<R> {
             forward,
             backward,
             backend,
-            #[cfg(feature = "fftw")]
-            backend_options,
         }
     }
 
@@ -438,9 +433,7 @@ impl<R: FftReal> LocalC2cPlan<R> {
             positive_forward,
             forward,
             inverse,
-            BackendKind::RustFft,
-            #[cfg(feature = "fftw")]
-            None,
+            backend::LocalBackend::RUST,
         ))
     }
 
@@ -469,20 +462,19 @@ impl<R: FftReal> LocalC2cPlan<R> {
             positive_forward,
             forward,
             inverse,
-            BackendKind::Fftw,
-            Some(options),
+            backend::LocalBackend::fftw(options),
         ))
     }
 
     /// Returns the selected backend.
     pub fn backend_kind(&self) -> BackendKind {
-        self.backend
+        self.backend.kind()
     }
 
     /// Returns the FFTW options, when this plan uses FFTW.
     #[cfg(feature = "fftw")]
     pub fn backend_options(&self) -> Option<PlanOptions> {
-        self.backend_options
+        self.backend.options()
     }
 
     /// Returns the number of complex values in each transformed line.
@@ -514,8 +506,7 @@ impl<R: FftReal> LocalC2cPlan<R> {
             return Ok(());
         }
 
-        let fft = &self.forward;
-        fft.process_immutable_with_scratch(src, dst, scratch);
+        Self::process_immutable(self.forward.as_ref(), src, dst, scratch);
         Ok(())
     }
 
@@ -536,8 +527,7 @@ impl<R: FftReal> LocalC2cPlan<R> {
             return Ok(());
         }
 
-        let fft = &self.backward;
-        fft.process_immutable_with_scratch(src, dst, scratch);
+        Self::process_immutable(self.backward.as_ref(), src, dst, scratch);
         Ok(())
     }
 
@@ -574,8 +564,7 @@ impl<R: FftReal> LocalC2cPlan<R> {
             return Ok(());
         }
 
-        let fft = &self.forward;
-        fft.process_with_scratch(data, scratch);
+        Self::process_in_place(self.forward.as_ref(), data, scratch);
         Ok(())
     }
 
@@ -594,9 +583,23 @@ impl<R: FftReal> LocalC2cPlan<R> {
             return Ok(());
         }
 
-        let fft = &self.backward;
-        fft.process_with_scratch(data, scratch);
+        Self::process_in_place(self.backward.as_ref(), data, scratch);
         Ok(())
+    }
+
+    /// Runs every line through `fft`, preserving `src`.
+    fn process_immutable(
+        fft: &dyn Fft<R>,
+        src: &[Complex<R>],
+        dst: &mut [Complex<R>],
+        scratch: &mut [Complex<R>],
+    ) {
+        fft.process_immutable_with_scratch(src, dst, scratch);
+    }
+
+    /// Runs every line through `fft` in place.
+    fn process_in_place(fft: &dyn Fft<R>, data: &mut [Complex<R>], scratch: &mut [Complex<R>]) {
+        fft.process_with_scratch(data, scratch);
     }
 
     /// Computes a normalized positive-sign inverse FFT in place for every line
