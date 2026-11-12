@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use crate::{
     ArrayError, ExtraShape, LocalGrid, LocalGridError, Pencil, PencilArrayView, PencilArrayViewMut,
-    checked::checked_product, view::LocalArrayLayout,
+    checked::{check_storage_len, local_storage_len},
+    view::LocalArrayLayout,
 };
 
 #[derive(Debug)]
@@ -21,12 +22,7 @@ impl<T, const N: usize, const M: usize> PencilArray<T, N, M> {
         storage: Vec<T>,
     ) -> Result<Self, ArrayError> {
         let required = required_len(&pencil, &extra_shape)?;
-        if storage.len() != required {
-            return Err(ArrayError::StorageLengthMismatch {
-                required,
-                actual: storage.len(),
-            });
-        }
+        check_storage_len(required, storage.len())?;
         Ok(Self {
             pencil,
             extra_shape,
@@ -199,8 +195,8 @@ fn required_len<const N: usize, const M: usize>(
     pencil: &Pencil<N, M>,
     extra_shape: &ExtraShape,
 ) -> Result<usize, ArrayError> {
-    Ok(checked_product(&[
+    Ok(local_storage_len(
         pencil.local_len(),
         extra_shape.element_count(),
-    ])?)
+    )?)
 }

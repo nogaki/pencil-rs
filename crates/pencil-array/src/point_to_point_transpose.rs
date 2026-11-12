@@ -558,6 +558,122 @@ fn timed<R>(sink: Option<&mut Duration>, phase: impl FnOnce() -> R) -> R {
     result
 }
 
+#[allow(clippy::too_many_arguments)]
+fn execute_point_to_point_exchange_core<T, E, R, P, A, const N: usize, const M: usize>(
+    plan: &TransposePlanCore<N, M>,
+    preflight: Result<PreparedExchange, E>,
+    workspace: &mut TransposeWorkspace<T>,
+    extra_count: usize,
+    skip_self: bool,
+    peer_error: E,
+    local_reservation_error: E,
+    pack: P,
+    after_receive: A,
+    mut timing: Option<&mut TransposeTiming>,
+) -> Result<(PreparedExchange, R), E>
+where
+    T: Equivalence + Copy,
+    P: FnOnce(&PreparedExchange, &mut [T]),
+    A: FnOnce(&mut [T]) -> R,
+{
+    let self_coordinate = plan.self_peer().peer_coordinate;
+    scope(|send_scope| {
+        let mut send_requests = Vec::new();
+        let mut receive_requests = Vec::new();
+        let (receive_slots, send_slots) = match preflight.as_ref() {
+            Ok(prepared) => plan.request_counts(prepared),
+            Err(_) => (0, 0),
+        };
+        // Reserve the actual request vectors before packing or posting.
+        let reserved = if preflight.is_ok() {
+            let receive_reserved = receive_requests.try_reserve(receive_slots).is_ok();
+            let send_reserved = send_requests.try_reserve(send_slots).is_ok();
+            receive_reserved && send_reserved
+        } else {
+            false
+        };
+        let prepared = agree_preflight_and_reservation(
+            plan.source().topology().cartesian(),
+            preflight,
+            reserved,
+            peer_error,
+            local_reservation_error,
+        )?;
+        let send_len = prepared.requirements.send_len;
+        let receive_len = prepared.requirements.receive_len;
+        timed(timing.as_deref_mut().map(|t| &mut t.pack), || {
+            pack(&prepared, &mut workspace.send_buffer[..send_len]);
+        });
+        scope(|receive_scope| {
+            let mut receive_requests = receive_requests;
+            let subcommunicator = timed(timing.as_deref_mut().map(|t| &mut t.post_receive), || {
+                let subcommunicator = plan
+                    .source()
+                    .topology()
+                    .subcommunicator(plan.changed_topology_axis());
+                let mut receive_tail = &mut workspace.receive_buffer[..receive_len];
+                for peer in plan.peers() {
+                    let count = peer
+                        .receive_spatial_len
+                        .checked_mul(extra_count)
+                        .expect("point-to-point preflight validated receive count");
+                    if count == 0 {
+                        continue;
+                    }
+                    let (segment, rest) = receive_tail.split_at_mut(count);
+                    receive_tail = rest;
+                    if skip_self && peer.peer_coordinate == self_coordinate {
+                        continue;
+                    }
+                    receive_requests.push(
+                        subcommunicator
+                            .process_at_rank(peer.peer_rank)
+                            .immediate_receive_into_with_tag(
+                                receive_scope,
+                                segment,
+                                POINT_TO_POINT_RESERVED_TAG,
+                            ),
+                    );
+                }
+                subcommunicator
+            });
+            let mut send_tail = &workspace.send_buffer[..send_len];
+            for peer in plan.peers() {
+                let count = peer
+                    .send_spatial_len
+                    .checked_mul(extra_count)
+                    .expect("point-to-point preflight validated send count");
+                if count == 0 {
+                    continue;
+                }
+                let (segment, rest) = send_tail.split_at(count);
+                send_tail = rest;
+                if skip_self && peer.peer_coordinate == self_coordinate {
+                    continue;
+                }
+                send_requests.push(
+                    subcommunicator
+                        .process_at_rank(peer.peer_rank)
+                        .immediate_send_with_tag(send_scope, segment, POINT_TO_POINT_RESERVED_TAG),
+                );
+            }
+            timed(timing.as_deref_mut().map(|t| &mut t.receive_wait), || {
+                for request in receive_requests.drain(..) {
+                    request.wait_without_status();
+                }
+            });
+            Ok::<(), E>(())
+        })?;
+        let result = after_receive(&mut workspace.receive_buffer[..receive_len]);
+        timed(timing.map(|t| &mut t.send_wait), || {
+            for request in send_requests.drain(..) {
+                request.wait_without_status();
+            }
+        });
+        Ok((prepared, result))
+    })
+}
+
 fn execute_point_to_point_exchange_callback<T, P, F, E, const N: usize, const M: usize>(
     plan: &TransposePlanCore<N, M>,
     preflight: Result<PreparedExchange, OverlapError<E>>,
@@ -573,95 +689,23 @@ where
     F: FnOnce(&mut [T]) -> Result<(), E>,
     E: std::fmt::Debug,
 {
-    let sub = plan
-        .source()
-        .topology()
-        .subcommunicator(plan.changed_topology_axis());
-    let self_coordinate = plan.self_peer().peer_coordinate;
-
-    let callback_result = scope(|send_scope| {
-        let mut sends = Vec::new();
-        let mut receives = Vec::new();
-        let (receive_slots, send_slots) = match preflight.as_ref() {
-            Ok(prepared) => plan.request_counts(prepared),
-            Err(_) => (0, 0),
-        };
-        // Reserve the actual request vectors before packing or posting.
-        let reserved = if preflight.is_ok() {
-            let receive_reserved = receives.try_reserve(receive_slots).is_ok();
-            let send_reserved = sends.try_reserve(send_slots).is_ok();
-            receive_reserved && send_reserved
-        } else {
-            false
-        };
-        let prepared = agree_preflight_and_reservation(
-            plan.source().topology().cartesian(),
-            preflight,
-            reserved,
-            OverlapError::CollectivePreconditionFailed,
-            OverlapError::CollectivePreconditionFailed,
-        )?;
-        let send_buffer = &mut workspace.send_buffer[..prepared.requirements.send_len];
-        let receive_buffer = &mut workspace.receive_buffer[..prepared.requirements.receive_len];
-        scope(|receive_scope| {
-            let mut receives = receives;
-            pack(&prepared, send_buffer);
-            let mut receive_tail = &mut receive_buffer[..];
-            for peer in plan.peers() {
-                let count = peer
-                    .receive_spatial_len
-                    .checked_mul(extra_count)
-                    .expect("validated count");
-                if count == 0 {
-                    continue;
-                }
-                let (segment, rest) = receive_tail.split_at_mut(count);
-                receive_tail = rest;
-                if skip_self && peer.peer_coordinate == self_coordinate {
-                    continue;
-                }
-                receives.push(
-                    sub.process_at_rank(peer.peer_rank)
-                        .immediate_receive_into_with_tag(
-                            receive_scope,
-                            segment,
-                            POINT_TO_POINT_RESERVED_TAG,
-                        ),
-                );
-            }
-            let mut send_tail = &send_buffer[..];
-            for peer in plan.peers() {
-                let count = peer
-                    .send_spatial_len
-                    .checked_mul(extra_count)
-                    .expect("validated count");
-                if count == 0 {
-                    continue;
-                }
-                let (segment, rest) = send_tail.split_at(count);
-                send_tail = rest;
-                if skip_self && peer.peer_coordinate == self_coordinate {
-                    continue;
-                }
-                sends.push(sub.process_at_rank(peer.peer_rank).immediate_send_with_tag(
-                    send_scope,
-                    segment,
-                    POINT_TO_POINT_RESERVED_TAG,
-                ));
-            }
-            for request in receives {
-                request.wait_without_status();
-            }
-            Ok::<(), OverlapError<E>>(())
-        })?;
-        let result = catch_unwind(AssertUnwindSafe(|| callback(receive_buffer)));
-        #[cfg(test)]
-        test_trace_event("send_wait");
-        for request in sends.drain(..) {
-            request.wait_without_status();
-        }
-        Ok::<_, OverlapError<E>>(result)
-    })?;
+    let (_, callback_result) = execute_point_to_point_exchange_core(
+        plan,
+        preflight,
+        workspace,
+        extra_count,
+        skip_self,
+        OverlapError::CollectivePreconditionFailed,
+        OverlapError::CollectivePreconditionFailed,
+        pack,
+        |receive_buffer| {
+            let result = catch_unwind(AssertUnwindSafe(|| callback(receive_buffer)));
+            #[cfg(test)]
+            test_trace_event("send_wait");
+            result
+        },
+        None,
+    )?;
     let local_status: i32 = match callback_result {
         Ok(Ok(())) => 0,
         Ok(Err(_)) => 1,
@@ -688,42 +732,28 @@ fn execute_point_to_point_exchange<T, const N: usize, const M: usize>(
     preflight: Result<PreparedExchange, TransposeError>,
     workspace: &mut TransposeWorkspace<T>,
     extra_count: usize,
-    mut timing: Option<&mut TransposeTiming>,
+    timing: Option<&mut TransposeTiming>,
     skip_self: bool,
 ) -> Result<PreparedExchange, TransposeError>
 where
     T: Equivalence + Copy,
 {
-    let self_coordinate = plan.self_peer().peer_coordinate;
-    let prepared = scope(|scope| {
-        let mut receive_requests = Vec::new();
-        let mut send_requests = Vec::new();
-        let (receive_slots, send_slots) = match preflight.as_ref() {
-            Ok(prepared) => plan.request_counts(prepared),
-            Err(_) => (0, 0),
-        };
-        let reserved = if preflight.is_ok() {
-            let receive_reserved = receive_requests.try_reserve(receive_slots).is_ok();
-            let send_reserved = send_requests.try_reserve(send_slots).is_ok();
-            receive_reserved && send_reserved
-        } else {
-            false
-        };
-        let prepared = agree_preflight_and_reservation(
-            plan.source().topology().cartesian(),
-            preflight,
-            reserved,
-            TransposeError::CollectivePreconditionFailed,
-            TransposeError::PreparationFailed,
-        )?;
-        timed(timing.as_deref_mut().map(|t| &mut t.pack), || {
+    let (prepared, ()) = execute_point_to_point_exchange_core(
+        plan,
+        preflight,
+        workspace,
+        extra_count,
+        skip_self,
+        TransposeError::CollectivePreconditionFailed,
+        TransposeError::PreparationFailed,
+        |prepared, send_buffer| {
             if skip_self {
                 pack_source_except_self(
                     plan.peers(),
-                    self_coordinate,
+                    plan.self_peer().peer_coordinate,
                     plan.source().as_ref(),
                     source_storage,
-                    &mut workspace.send_buffer[..prepared.requirements.send_len],
+                    send_buffer,
                     prepared.requirements.send_len,
                     extra_count,
                 );
@@ -732,72 +762,14 @@ where
                     plan.peers(),
                     plan.source().as_ref(),
                     source_storage,
-                    &mut workspace.send_buffer[..prepared.requirements.send_len],
+                    send_buffer,
                     prepared.requirements.send_len,
                     extra_count,
                 );
             }
-        });
-        let subcommunicator = timed(timing.as_deref_mut().map(|t| &mut t.post_receive), || {
-            let subcommunicator = plan
-                .source()
-                .topology()
-                .subcommunicator(plan.changed_topology_axis());
-            let mut receive_tail =
-                &mut workspace.receive_buffer[..prepared.requirements.receive_len];
-            for peer in plan.peers() {
-                let count = peer
-                    .receive_spatial_len
-                    .checked_mul(extra_count)
-                    .expect("point-to-point preflight validated receive count");
-                if count == 0 {
-                    continue;
-                }
-                let (segment, rest) = receive_tail.split_at_mut(count);
-                receive_tail = rest;
-                if skip_self && peer.peer_coordinate == self_coordinate {
-                    continue;
-                }
-                let request = subcommunicator
-                    .process_at_rank(peer.peer_rank)
-                    .immediate_receive_into_with_tag(scope, segment, POINT_TO_POINT_RESERVED_TAG);
-                receive_requests.push(request);
-            }
-            subcommunicator
-        });
-
-        let send_buffer = &workspace.send_buffer[..prepared.requirements.send_len];
-        let mut send_tail = send_buffer;
-        for peer in plan.peers() {
-            let count = peer
-                .send_spatial_len
-                .checked_mul(extra_count)
-                .expect("point-to-point preflight validated send count");
-            if count == 0 {
-                continue;
-            }
-            let (segment, rest) = send_tail.split_at(count);
-            send_tail = rest;
-            if skip_self && peer.peer_coordinate == self_coordinate {
-                continue;
-            }
-            let request = subcommunicator
-                .process_at_rank(peer.peer_rank)
-                .immediate_send_with_tag(scope, segment, POINT_TO_POINT_RESERVED_TAG);
-            send_requests.push(request);
-        }
-
-        timed(timing.as_deref_mut().map(|t| &mut t.receive_wait), || {
-            for request in receive_requests.drain(..) {
-                request.wait_without_status();
-            }
-        });
-        timed(timing.map(|t| &mut t.send_wait), || {
-            for request in send_requests.drain(..) {
-                request.wait_without_status();
-            }
-        });
-        Ok::<PreparedExchange, TransposeError>(prepared)
-    })?;
+        },
+        |_| (),
+        timing,
+    )?;
     Ok(prepared)
 }

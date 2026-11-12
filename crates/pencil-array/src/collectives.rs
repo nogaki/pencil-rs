@@ -1518,7 +1518,8 @@ where
     C: CommunicatorCollectives,
 {
     // The header is deliberately first: do not inspect input-dependent lengths
-    // or allocate a composite descriptor before this agreement.
+    // or allocate a composite descriptor before this agreement. It rejects a
+    // mismatched map-reduce API or input-count set before any other collective.
     let header = [
         DESCRIPTOR_SCHEMA,
         operation,
@@ -1621,11 +1622,32 @@ where
             lengths,
         ))
     })();
-    let ready = prepared.is_ok();
-    if !collective_valid(c, ready) {
+    // Agree readiness and the descriptor length in one reduction. Readiness
+    // wins, so a shape/precondition failure is reported before a length
+    // mismatch; the agreed length then makes the variable-length descriptor
+    // comparison safe.
+    let expected = prepared.as_ref().ok().map(|prepared| prepared.1);
+    let ready = u64::from(expected.is_some());
+    let expected_word = expected
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(0);
+    let local = [ready, expected_word];
+    let mut paired = [0u64; 4];
+    paired[..2].copy_from_slice(&local);
+    paired[2] = !local[0];
+    paired[3] = !local[1];
+    let mut reduced = [0u64; 4];
+    c.all_reduce_into(&paired[..], &mut reduced[..], SystemOperation::max());
+    let minimum_ready = !reduced[2];
+    if minimum_ready == 0 {
         return Err(prepared
             .err()
             .unwrap_or(CollectiveError::CollectivePreconditionFailed));
+    }
+    let minimum_length = !reduced[3];
+    let maximum_length = reduced[1];
+    if minimum_length != maximum_length {
+        return Err(CollectiveError::CollectiveDescriptorMismatch);
     }
     let (
         descriptor,
@@ -1638,14 +1660,19 @@ where
         global_count,
         offsets,
     ) = prepared.expect("collective many preparation succeeded");
-    agree_descriptor::<_, _, N, M>(c, operation, Some(expected), |_| Some(descriptor))?;
-    let layout_ok = inputs.iter().all(|input| {
-        input.pencil().same_layout(inputs[0].pencil())
+    collective_descriptor(c, Some(descriptor), Some(expected))?;
+    let mut layout_ok = true;
+    for input in inputs {
+        if !(input.pencil().same_layout(inputs[0].pencil())
             && matches!(
                 c.compare(input.pencil().topology().communicator()),
                 CommunicatorRelation::Identical | CommunicatorRelation::Congruent
-            )
-    });
+            ))
+        {
+            layout_ok = false;
+            break;
+        }
+    }
     if !collective_valid(c, layout_ok) || !layout_ok {
         return Err(CollectiveError::CollectivePreconditionFailed);
     }
@@ -2405,9 +2432,9 @@ fn collective_descriptor<C: CommunicatorCollectives>(
 }
 
 /// Agrees on one five-word header carrying the expected descriptor length,
-/// then builds and compares the combined descriptor. Callers that prepare
-/// their descriptor before this agreement (map_reduce_many) pass it through
-/// `prepare`; the others allocate only after the header is agreed.
+/// then builds and compares the combined descriptor. The descriptor is built
+/// only after the header is agreed, so a rank-set length mismatch is rejected
+/// before any variable-length collective.
 fn agree_descriptor<C, F, const N: usize, const M: usize>(
     communicator: &C,
     operation: u64,
