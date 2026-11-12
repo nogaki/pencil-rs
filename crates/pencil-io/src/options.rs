@@ -99,6 +99,20 @@ pub(crate) fn agree_options<C: CommunicatorCollectives>(
     agree_controls(comm, options.mode, &options.hints, extra)
 }
 
+/// Agrees a fixed-size set of caller state values without re-agreeing options.
+pub(crate) fn agree_values<C: CommunicatorCollectives, const K: usize>(
+    comm: &C,
+    values: &[u64; K],
+) -> Result<(), IoError> {
+    let (mut minimum, mut maximum) = ([0u64; K], [0u64; K]);
+    comm.all_reduce_into(values, &mut minimum, SystemOperation::min());
+    comm.all_reduce_into(values, &mut maximum, SystemOperation::max());
+    if minimum != maximum {
+        return Err(IoError::CollectiveDescriptorMismatch);
+    }
+    Ok(())
+}
+
 pub(crate) fn agree_controls<C: CommunicatorCollectives>(
     comm: &C,
     mode: MpiIoMode,

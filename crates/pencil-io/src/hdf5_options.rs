@@ -48,6 +48,7 @@ impl Hdf5ReadOptions {
             hints: &self.hints,
             explicit: true,
             options_agreed: false,
+            descriptor_agreed: false,
             shuffle: false,
             deflate: None,
         }
@@ -83,6 +84,7 @@ impl Hdf5WriteOptions {
             hints: &self.hints,
             explicit: true,
             options_agreed: false,
+            descriptor_agreed: false,
             shuffle: self.shuffle,
             deflate: self.deflate,
         }

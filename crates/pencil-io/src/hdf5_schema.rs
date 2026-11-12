@@ -213,17 +213,14 @@ pub(crate) fn commit_state(value: u64) -> CommitState {
     }
 }
 
-#[cfg(feature = "parallel-hdf5")]
 pub(crate) fn rank_in_range(rank: u64) -> bool {
     rank <= MAX_PROTOCOL_RANK as u64
 }
 
-#[cfg(feature = "parallel-hdf5")]
 pub(crate) fn combined_rank_in_range(rank: u64, extra_rank: u64) -> bool {
     rank.checked_add(extra_rank).is_some_and(rank_in_range)
 }
 
-#[cfg(feature = "parallel-hdf5")]
 pub(crate) fn valid_global_shape(values: &[u64]) -> bool {
     !values.is_empty()
         && values
@@ -231,29 +228,6 @@ pub(crate) fn valid_global_shape(values: &[u64]) -> bool {
             .copied()
             .try_fold(1u64, |product, value| product.checked_mul(value))
             .is_some()
-}
-
-/// Checks the byte count with the combined shape product first and the width
-/// last, matching the catalog's historical overflow points.
-#[cfg(feature = "parallel-hdf5")]
-pub(crate) fn valid_shape_bytes(global: &[u64], extra: &[u64], width: u64) -> bool {
-    global
-        .iter()
-        .chain(extra)
-        .try_fold(1u64, |product, &value| product.checked_mul(value))
-        .and_then(|product| product.checked_mul(width))
-        .is_some()
-}
-
-/// Checks the byte count starting from the element width, matching the
-/// session catalog's historical overflow points.
-#[cfg(feature = "parallel-hdf5")]
-pub(crate) fn valid_shape_bytes_from_width(global: &[u64], extra: &[u64], width: u64) -> bool {
-    global
-        .iter()
-        .chain(extra)
-        .try_fold(width, |product, &value| product.checked_mul(value))
-        .is_some()
 }
 
 /// Checks a writer grid without validating the axis permutation; permutation
@@ -285,4 +259,101 @@ pub(crate) fn valid_permutation(values: &[u64], n: usize, seen: &mut [bool]) -> 
         seen[index] = true;
     }
     true
+}
+
+/// Writer provenance: a bounded positive grid and an axis permutation.
+pub(crate) fn valid_writer_provenance(
+    grid: &[u64],
+    permutation: &[u64],
+    spatial_rank: usize,
+) -> bool {
+    let mut seen = [false; MAX_PROTOCOL_RANK];
+    valid_writer_grid(grid, spatial_rank) && valid_permutation(permutation, spatial_rank, &mut seen)
+}
+
+/// Which extra shape/overflow rule a reader applies to stored metadata.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "parallel-hdf5"), allow(dead_code))]
+pub(crate) enum ShapeRule {
+    /// Compare the stored shape with the caller's expected shape (serial read).
+    Expected,
+    /// Require a nonempty global shape whose product fits (parallel read).
+    Global,
+    /// Require the combined shape product and width to fit (catalog).
+    Bytes,
+    /// Require the width-first combined product to fit (session catalog).
+    BytesFromWidth,
+}
+
+/// Stored shape and provenance values already read from a dataset.
+pub(crate) struct ShapeMetadata<'a> {
+    pub(crate) extra: &'a [u64],
+    pub(crate) global: &'a [u64],
+    pub(crate) grid: &'a [u64],
+    pub(crate) permutation: &'a [u64],
+    pub(crate) spatial_rank: usize,
+    pub(crate) width: u64,
+    pub(crate) rule: ShapeRule,
+}
+
+/// Why shared metadata acceptance rejected a dataset.
+pub(crate) enum MetadataIssue {
+    /// The commit marker records an unfinished write.
+    Incomplete,
+    /// The commit marker is not a recognized value.
+    InvalidCommit,
+    /// The stored shape or writer provenance is invalid.
+    Shape,
+}
+
+/// The one acceptance rule for commit, shape and writer provenance metadata.
+/// Readers pass only the group they have read so far, preserving their own
+/// attribute read and error order.
+pub(crate) fn metadata_acceptance(
+    expected: &Metadata<'_>,
+    commit: Option<u64>,
+    shape: Option<ShapeMetadata<'_>>,
+) -> Result<(), MetadataIssue> {
+    if let Some(value) = commit {
+        match commit_state(value) {
+            CommitState::Complete => {}
+            CommitState::Incomplete => return Err(MetadataIssue::Incomplete),
+            CommitState::Invalid => return Err(MetadataIssue::InvalidCommit),
+        }
+    }
+    let Some(shape) = shape else {
+        return Ok(());
+    };
+    // Multiplication is commutative, so the catalog (`Bytes`) and session
+    // (`BytesFromWidth`) orderings have the same result once zero extents are
+    // handled together: one zero factor makes the element count zero, and no
+    // later factor can overflow. Only a nonzero product may be rejected.
+    let mut dims = shape.global.iter().chain(shape.extra).copied();
+    let width = match shape.rule {
+        ShapeRule::Bytes | ShapeRule::BytesFromWidth => Some(shape.width),
+        ShapeRule::Expected | ShapeRule::Global => None,
+    };
+    let bytes_ok = width == Some(0)
+        || dims.clone().any(|value| value == 0)
+        || dims
+            .try_fold(1u64, |product, value| product.checked_mul(value))
+            .and_then(|product| width.map_or(Some(product), |width| product.checked_mul(width)))
+            .is_some();
+    let rule_ok = match shape.rule {
+        ShapeRule::Expected | ShapeRule::BytesFromWidth => true,
+        ShapeRule::Global => valid_global_shape(shape.global),
+        ShapeRule::Bytes => {
+            !shape.global.is_empty()
+                && combined_rank_in_range(shape.global.len() as u64, shape.extra.len() as u64)
+        }
+    };
+    if !bytes_ok
+        || !rule_ok
+        || !expected.matches(Attribute::GlobalShape, shape.global)
+        || !expected.matches(Attribute::ExtraShape, shape.extra)
+        || !valid_writer_provenance(shape.grid, shape.permutation, shape.spatial_rank)
+    {
+        return Err(MetadataIssue::Shape);
+    }
+    Ok(())
 }

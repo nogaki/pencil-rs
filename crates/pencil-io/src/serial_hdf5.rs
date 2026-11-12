@@ -6,7 +6,7 @@ use hdf5_metno::{Attribute as Hdf5Attribute, Dataset, Dataspace, Datatype, File}
 use hdf5_metno_sys::{h5a, h5d, h5p::H5P_DEFAULT, h5s::H5S_MAX_RANK, h5t};
 
 use crate::hdf5_schema::{
-    Attribute, CommitState, Metadata, commit_state, valid_permutation, valid_writer_grid,
+    Attribute, Metadata, MetadataIssue, ShapeMetadata, ShapeRule, metadata_acceptance,
 };
 use crate::{COMMIT_MARKER, IoElement, IoError, MAX_PROTOCOL_RANK, format::element_count};
 
@@ -367,11 +367,6 @@ fn read_attribute(
     native(attribute.read_raw::<u64>(), "HDF5 serial attribute read")
 }
 
-fn valid_writer_provenance(grid: &[u64], permutation: &[u64], spatial_rank: usize) -> bool {
-    let mut seen = [false; MAX_PROTOCOL_RANK];
-    valid_writer_grid(grid, spatial_rank) && valid_permutation(permutation, spatial_rank, &mut seen)
-}
-
 fn validate_metadata<T: IoElement>(
     dataset: &Dataset,
     global: &[usize],
@@ -403,16 +398,16 @@ fn validate_metadata<T: IoElement>(
             field: "version, rank, or type",
         });
     }
-    match commit_state(scalar(Attribute::Commit)?) {
-        CommitState::Complete => {}
-        CommitState::Incomplete => return Err(IoError::IncompleteFile),
-        CommitState::Invalid => {
-            return Err(IoError::InvalidFile {
+    if let Err(issue) = metadata_acceptance(&metadata, Some(scalar(Attribute::Commit)?), None) {
+        return Err(match issue {
+            MetadataIssue::Incomplete => IoError::IncompleteFile,
+            MetadataIssue::InvalidCommit => IoError::InvalidFile {
                 reason: "HDF5 commit marker",
-            });
-        }
+            },
+            MetadataIssue::Shape => unreachable!("shape was not checked"),
+        });
     }
-    if !Attribute::ExtraShape.present(extra.len()) {
+    let stored_extra = if !Attribute::ExtraShape.present(extra.len()) {
         // SAFETY: live dataset and static NUL-terminated attribute name.
         match unsafe { h5a::H5Aexists(dataset.id(), Attribute::ExtraShape.name().as_ptr()) } {
             0 => {}
@@ -428,16 +423,33 @@ fn validate_metadata<T: IoElement>(
                 });
             }
         }
-    } else if !metadata.matches(Attribute::ExtraShape, &read(Attribute::ExtraShape)?) {
-        return Err(IoError::MetadataMismatch {
-            field: "extra shape",
-        });
-    }
+        Vec::new()
+    } else {
+        let values = read(Attribute::ExtraShape)?;
+        if !metadata.matches(Attribute::ExtraShape, &values) {
+            return Err(IoError::MetadataMismatch {
+                field: "extra shape",
+            });
+        }
+        values
+    };
     let stored_global = read(Attribute::GlobalShape)?;
     let grid = read(Attribute::WriterGrid)?;
     let perm = read(Attribute::WriterPermutation)?;
-    if !metadata.matches(Attribute::GlobalShape, &stored_global)
-        || !valid_writer_provenance(&grid, &perm, global.len())
+    if metadata_acceptance(
+        &metadata,
+        None,
+        Some(ShapeMetadata {
+            extra: &stored_extra,
+            global: &stored_global,
+            grid: &grid,
+            permutation: &perm,
+            spatial_rank: global.len(),
+            width: T::WIDTH as u64,
+            rule: ShapeRule::Expected,
+        }),
+    )
+    .is_err()
     {
         return Err(IoError::MetadataMismatch {
             field: "shape or writer provenance",

@@ -1511,6 +1511,15 @@ pub(crate) mod hdf5 {
         space_shape(space)
     }
 
+    /// Whether a live dataspace is `H5S_SCALAR`. `H5S_NULL` also reports rank
+    /// zero, so readers must not read every empty shape as a scalar attribute.
+    pub(crate) fn space_is_scalar(space: Hid) -> bool {
+        hdf5_metno::sync::sync(|| {
+            // SAFETY: `space` is a live dataspace for the duration of the query.
+            unsafe { h5::h5s::H5Sget_simple_extent_type(space) == h5::h5s::H5S_class_t::H5S_SCALAR }
+        })
+    }
+
     #[cfg(test)]
     thread_local! {
         pub(crate) static FAIL_XFER_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
