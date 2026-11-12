@@ -4,7 +4,9 @@ use thiserror::Error;
 
 use crate::{
     ArrayError, ManyPencilArray, Pencil, PencilArrayView, PencilArrayViewMut,
-    checked::checked_product, geometry::row_major_offset, transpose::TransposeWorkspace,
+    checked::{check_storage_len, local_storage_len, storage_length_mismatch},
+    geometry::row_major_offset,
+    transpose::TransposeWorkspace,
 };
 
 #[derive(Debug, Error)]
@@ -97,25 +99,13 @@ impl<const N: usize, const M: usize> LocalTransposePlan<N, M> {
             return Err(LocalTransposeError::ExtraShapeMismatch);
         }
 
-        let required = checked_product(&[
+        let required = local_storage_len(
             self.source.local_len(),
             source.extra_shape().element_count(),
-        ])
+        )
         .map_err(ArrayError::from)?;
-        if source.len() != required {
-            return Err(ArrayError::StorageLengthMismatch {
-                required,
-                actual: source.len(),
-            }
-            .into());
-        }
-        if destination.len() != required {
-            return Err(ArrayError::StorageLengthMismatch {
-                required,
-                actual: destination.len(),
-            }
-            .into());
-        }
+        check_storage_len(required, source.len())?;
+        check_storage_len(required, destination.len())?;
 
         // Resolve every checked offset before borrowing the destination for
         // writes, so an ordinary validation failure cannot partially write it.
@@ -123,11 +113,9 @@ impl<const N: usize, const M: usize> LocalTransposePlan<N, M> {
             let (source_offset, destination_offset) =
                 logical_offsets(self.source.as_ref(), self.destination.as_ref(), linear)?;
             if source_offset >= source.len() || destination_offset >= destination.len() {
-                return Err(ArrayError::StorageLengthMismatch {
-                    required,
-                    actual: source.len().min(destination.len()),
-                }
-                .into());
+                return Err(
+                    storage_length_mismatch(required, source.len().min(destination.len())).into(),
+                );
             }
         }
 
@@ -266,7 +254,7 @@ impl<const N: usize, const M: usize> LocalTransposePlan<N, M> {
             .find_layout(self.destination.as_ref())
             .ok_or(LocalTransposeError::DestinationLayoutMismatch)?;
         let required =
-            checked_product(&[self.source.local_len(), array.extra_shape().element_count()])
+            local_storage_len(self.source.local_len(), array.extra_shape().element_count())
                 .map_err(ArrayError::from)?;
         Ok((destination_index, required))
     }
@@ -276,22 +264,12 @@ impl<const N: usize, const M: usize> LocalTransposePlan<N, M> {
         source: &PencilArrayView<'_, T, N, M>,
         required: usize,
     ) -> Result<(), LocalTransposeError> {
-        if source.len() != required {
-            return Err(ArrayError::StorageLengthMismatch {
-                required,
-                actual: source.len(),
-            }
-            .into());
-        }
+        check_storage_len(required, source.len())?;
         for linear in 0..required {
             let (source_offset, destination_offset) =
                 logical_offsets(self.source.as_ref(), self.destination.as_ref(), linear)?;
             if source_offset >= source.len() || destination_offset >= required {
-                return Err(ArrayError::StorageLengthMismatch {
-                    required,
-                    actual: source.len().min(required),
-                }
-                .into());
+                return Err(storage_length_mismatch(required, source.len().min(required)).into());
             }
         }
         Ok(())

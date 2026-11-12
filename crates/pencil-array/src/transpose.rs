@@ -17,7 +17,7 @@ use thiserror::Error;
 use crate::{
     ArrayError, AxisPermutation, ExtraShape, ManyPencilArray, Pencil, PencilArrayView,
     PencilArrayViewMut,
-    checked::checked_product,
+    checked::{checked_product, local_storage_len},
     geometry::row_major_offset,
     preflight::{agree_header, expand_for_max},
 };
@@ -537,13 +537,13 @@ where
         .find_layout(plan.destination.as_ref())
         .ok_or(TransposeError::DestinationLayoutMismatch)?;
     let extra_count = array.extra_shape().element_count();
-    let source_len = checked_product(&[active_source.local_len(), extra_count])
+    let source_len = local_storage_len(active_source.local_len(), extra_count)
         .map_err(|error| TransposeError::Array(ArrayError::from(error)))?;
     let destination_pencil = array
         .pencils()
         .get(destination_index)
         .ok_or(TransposeError::DestinationLayoutMismatch)?;
-    let destination_len = checked_product(&[destination_pencil.local_len(), extra_count])
+    let destination_len = local_storage_len(destination_pencil.local_len(), extra_count)
         .map_err(|error| TransposeError::Array(ArrayError::from(error)))?;
     let exchange =
         plan.prepare_common(array.extra_shape(), source_len, destination_len, workspace)?;
@@ -1047,12 +1047,9 @@ fn advance_region<const N: usize>(
     }
 }
 
-/// Copies one region from pencil storage into payload order.
-fn copy_region_to_payload<T: Copy, const N: usize>(
-    walk: &RegionWalk<N>,
-    storage: &[T],
-    payload: &mut [T],
-) {
+/// Visits every region run in global row-major payload order, passing the
+/// storage offset and payload offset of each run to `visit`.
+fn walk_region<const N: usize>(walk: &RegionWalk<N>, mut visit: impl FnMut(usize, usize)) {
     if walk.run_len == 0 {
         return;
     }
@@ -1060,6 +1057,22 @@ fn copy_region_to_payload<T: Copy, const N: usize>(
     let mut offset = walk.start;
     let mut payload_offset = 0usize;
     for position in 0..walk.outer_len {
+        visit(offset, payload_offset);
+        payload_offset += walk.run_len;
+        if position + 1 == walk.outer_len {
+            break;
+        }
+        advance_region(walk, &mut counter, &mut offset);
+    }
+}
+
+/// Copies one region from pencil storage into payload order.
+fn copy_region_to_payload<T: Copy, const N: usize>(
+    walk: &RegionWalk<N>,
+    storage: &[T],
+    payload: &mut [T],
+) {
+    walk_region(walk, |offset, payload_offset| {
         let payload_end = payload_offset + walk.run_len;
         if walk.run_stride == 1 {
             payload[payload_offset..payload_end]
@@ -1069,12 +1082,7 @@ fn copy_region_to_payload<T: Copy, const N: usize>(
                 payload[payload_offset + index] = storage[offset + index * walk.run_stride];
             }
         }
-        payload_offset = payload_end;
-        if position + 1 == walk.outer_len {
-            break;
-        }
-        advance_region(walk, &mut counter, &mut offset);
-    }
+    });
 }
 
 /// Copies one region from payload order into pencil storage.
@@ -1083,13 +1091,7 @@ fn copy_region_from_payload<T: Copy, const N: usize>(
     payload: &[T],
     storage: &mut [T],
 ) {
-    if walk.run_len == 0 {
-        return;
-    }
-    let mut counter = [0usize; N];
-    let mut offset = walk.start;
-    let mut payload_offset = 0usize;
-    for position in 0..walk.outer_len {
+    walk_region(walk, |offset, payload_offset| {
         let payload_end = payload_offset + walk.run_len;
         if walk.run_stride == 1 {
             storage[offset..offset + walk.run_len]
@@ -1099,12 +1101,7 @@ fn copy_region_from_payload<T: Copy, const N: usize>(
                 storage[offset + index * walk.run_stride] = payload[payload_offset + index];
             }
         }
-        payload_offset = payload_end;
-        if position + 1 == walk.outer_len {
-            break;
-        }
-        advance_region(walk, &mut counter, &mut offset);
-    }
+    });
 }
 
 fn pack_source_regions<T: Copy, const N: usize>(

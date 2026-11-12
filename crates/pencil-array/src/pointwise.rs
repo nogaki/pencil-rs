@@ -369,13 +369,23 @@ where
             required: inputs.len(),
         })
     })?;
+    let mut base_offsets = Vec::new();
+    base_offsets.try_reserve_exact(inputs.len()).map_err(|_| {
+        MultiInputError::Array(ArrayError::AllocationFailed {
+            required: inputs.len(),
+        })
+    })?;
     let os = output.as_mut_slice();
     for out_linear in 0..plan.extra_count {
+        base_offsets.clear();
+        for (dims, strides) in &input_strides {
+            let linear = broadcast_linear(out_linear, &plan.dims, dims, strides, &plan.strides);
+            base_offsets.push(linear * plan.spatial);
+        }
         for k in 0..plan.spatial {
             refs.clear();
-            for (input, (dims, strides)) in inputs.iter().zip(&input_strides) {
-                let linear = broadcast_linear(out_linear, &plan.dims, dims, strides, &plan.strides);
-                refs.push(&input.as_slice()[linear * plan.spatial + k]);
+            for (input, offset) in inputs.iter().zip(&base_offsets) {
+                refs.push(&input.as_slice()[offset + k]);
             }
             os[out_linear * plan.spatial + k] = f(&refs);
         }

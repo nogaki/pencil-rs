@@ -10,8 +10,6 @@ use super::r2r::{
     LocalR2rError, R2rKernel, R2rScalar, for_each_in_place_line, for_each_out_of_place_line,
     r2r_from_complex, r2r_to_complex, validate_addressable,
 };
-#[cfg(feature = "fftw")]
-use super::r2r::{native_r2r_line, native_r2r_output};
 use super::{Complex, FftReal};
 
 /// A local batched discrete Hartley transform plan.
@@ -37,9 +35,7 @@ pub struct LocalDhtPlan<T: R2rScalar> {
     scratch_len: usize,
     fft: R2rKernel<T::Real>,
     marker: PhantomData<T>,
-    backend: super::BackendKind,
-    #[cfg(feature = "fftw")]
-    backend_options: Option<super::PlanOptions>,
+    backend: super::backend::LocalBackend,
 }
 
 impl<T: R2rScalar> fmt::Debug for LocalDhtPlan<T> {
@@ -72,9 +68,7 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
             scratch_len,
             fft: R2rKernel::Rust(fft),
             marker: PhantomData,
-            backend: super::BackendKind::RustFft,
-            #[cfg(feature = "fftw")]
-            backend_options: None,
+            backend: super::backend::LocalBackend::RUST,
         })
     }
 
@@ -94,20 +88,19 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
             scratch_len: 0,
             fft: R2rKernel::Native([Arc::clone(&plan), plan]),
             marker: PhantomData,
-            backend: super::BackendKind::Fftw,
-            backend_options: Some(options),
+            backend: super::backend::LocalBackend::fftw(options),
         })
     }
 
     /// Returns the selected backend.
     pub fn backend_kind(&self) -> super::BackendKind {
-        self.backend
+        self.backend.kind()
     }
 
     /// Returns the FFTW options, when this plan uses FFTW.
     #[cfg(feature = "fftw")]
     pub fn backend_options(&self) -> Option<super::PlanOptions> {
-        self.backend_options
+        self.backend.options()
     }
 
     /// Returns the number of values in each transformed line.
@@ -159,7 +152,7 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
         embedding_line: &mut [Complex<T::Real>],
         scratch: &mut [Complex<T::Real>],
     ) -> Result<(), LocalR2rError> {
-        self.execute_out_of_place(src, dst, embedding_line, scratch, false)
+        self.forward(src, dst, embedding_line, scratch)
     }
 
     /// Computes the normalized self-paired inverse Hartley transform.
@@ -192,7 +185,7 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
         embedding_line: &mut [Complex<T::Real>],
         scratch: &mut [Complex<T::Real>],
     ) -> Result<(), LocalR2rError> {
-        self.execute_in_place(data, embedding_line, scratch, false)
+        self.forward_in_place(data, embedding_line, scratch)
     }
 
     /// Computes the normalized self-paired inverse Hartley transform in place.
@@ -263,21 +256,18 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
         embedding_line: &mut [Complex<T::Real>],
         scratch: &mut [Complex<T::Real>],
     ) {
-        match &self.fft {
-            R2rKernel::Rust(fft) => {
-                for (embedding, &value) in
-                    embedding_line[..self.embedding_len].iter_mut().zip(source)
-                {
+        self.fft.transform_line(
+            0,
+            source,
+            embedding_line,
+            self.embedding_len,
+            &mut scratch[..self.scratch_len],
+            |embedding| {
+                for (embedding, &value) in embedding.iter_mut().zip(source) {
                     *embedding = r2r_to_complex(value);
                 }
-                fft.process_with_scratch(
-                    &mut embedding_line[..self.embedding_len],
-                    &mut scratch[..self.scratch_len],
-                );
-            }
-            #[cfg(feature = "fftw")]
-            R2rKernel::Native(plans) => native_r2r_line(&plans[0], source, embedding_line),
-        }
+            },
+        );
     }
 
     fn write_line(
@@ -286,30 +276,29 @@ impl<T: R2rScalar> LocalDhtPlan<T> {
         embedding_line: &[Complex<T::Real>],
         normalize: bool,
     ) {
-        #[cfg(feature = "fftw")]
-        if matches!(self.fft, R2rKernel::Native(_)) {
-            for (out, value) in destination
-                .iter_mut()
-                .zip(native_r2r_output(embedding_line, self.line_len))
-            {
-                *out = r2r_from_complex(scaled(value, normalize, self.line_len));
-            }
-            return;
-        }
-        for (k, destination) in destination.iter_mut().enumerate() {
-            let value = embedding_line[k];
-            let value = if k == 0 || (self.line_len.is_multiple_of(2) && k == self.line_len / 2) {
-                scaled(value, normalize, self.line_len)
-            } else {
-                let mirror = embedding_line[self.line_len - k];
-                let real = half_sum(real_as_f64(value.re), real_as_f64(mirror.re))
-                    + half_sum(real_as_f64(mirror.im), -real_as_f64(value.im));
-                let imaginary = half_sum(real_as_f64(value.im), real_as_f64(mirror.im))
-                    + half_sum(real_as_f64(value.re), -real_as_f64(mirror.re));
-                scaled_f64(real, imaginary, normalize, self.line_len)
-            };
-            *destination = r2r_from_complex(value);
-        }
+        let line_len = self.line_len;
+        self.fft.write_line(
+            destination,
+            embedding_line,
+            line_len,
+            |destination| {
+                for (k, destination) in destination.iter_mut().enumerate() {
+                    let value = embedding_line[k];
+                    let value = if k == 0 || (line_len.is_multiple_of(2) && k == line_len / 2) {
+                        scaled(value, normalize, line_len)
+                    } else {
+                        let mirror = embedding_line[line_len - k];
+                        let real = half_sum(real_as_f64(value.re), real_as_f64(mirror.re))
+                            + half_sum(real_as_f64(mirror.im), -real_as_f64(value.im));
+                        let imaginary = half_sum(real_as_f64(value.im), real_as_f64(mirror.im))
+                            + half_sum(real_as_f64(value.re), -real_as_f64(mirror.re));
+                        scaled_f64(real, imaginary, normalize, line_len)
+                    };
+                    *destination = r2r_from_complex(value);
+                }
+            },
+            |value| r2r_from_complex(scaled(value, normalize, line_len)),
+        );
     }
 }
 
