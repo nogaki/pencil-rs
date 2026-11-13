@@ -14,8 +14,8 @@ use crate::ffi;
 use crate::ffi::hdf5 as native;
 use crate::format::{IoElement, ReadTarget, pack_view};
 use crate::hdf5_schema::{
-    ATTR_COMMIT, Attribute, CommitState, Metadata, combined_rank_in_range, commit_state,
-    rank_in_range, valid_global_shape, valid_permutation, valid_shape_bytes, valid_writer_grid,
+    ATTR_COMMIT, Attribute, Metadata, MetadataIssue, ShapeMetadata, ShapeRule,
+    combined_rank_in_range, metadata_acceptance, rank_in_range,
 };
 use crate::mpi_io::{
     CommGuard, abort_unrecoverable, aggregate_cleanup_result, agree_phase, collective_state,
@@ -44,6 +44,8 @@ pub(crate) struct Hdf5Settings<'a> {
     /// The caller already agreed the control rules; only the named wrapper's
     /// filter capability query and the dataset-level validation remain.
     pub options_agreed: bool,
+    /// A collection hand-off already agreed the descriptor and decomposition.
+    pub descriptor_agreed: bool,
     pub shuffle: bool,
     pub deflate: Option<u8>,
 }
@@ -56,6 +58,7 @@ impl Default for Hdf5Settings<'_> {
             hints: &[],
             explicit: false,
             options_agreed: false,
+            descriptor_agreed: false,
             shuffle: false,
             deflate: None,
         }
@@ -111,6 +114,18 @@ fn named_link<C: CommunicatorCollectives>(comm: &C, name: &str) -> Result<CStrin
     comm.all_gather_into(name.as_bytes(), &mut bytes);
     if bytes.chunks_exact(name.len()).any(|x| x != name.as_bytes()) {
         return Err(NamedIoError::Io(IoError::CollectiveDescriptorMismatch));
+    }
+    named_link_component(comm, name)
+}
+
+/// Builds the hex link after the caller agreed the name. The small allocation
+/// is still agreed collectively so a local failure cannot desynchronize ranks.
+fn named_link_component<C: CommunicatorCollectives>(
+    comm: &C,
+    name: &str,
+) -> Result<CString, NamedIoError> {
+    if name.is_empty() || name.len() > MAX_NAME || name.as_bytes().contains(&0) {
+        return Err(NamedIoError::InvalidName);
     }
     let hex_len = name
         .len()
@@ -210,18 +225,20 @@ where
     T: IoElement,
 {
     let comm = view.pencil().topology().communicator();
-    descriptor_agreement(
-        comm,
-        path.as_ref(),
-        operation,
-        view.pencil().global_shape(),
-        view.extra_shape().dimensions(),
-        view.pencil().topology().process_grid(),
-        view.pencil().decomposition(),
-        view.pencil().permutation().axes(),
-        T::CODE,
-        T::WIDTH,
-    )?;
+    if !settings.descriptor_agreed {
+        descriptor_agreement(
+            comm,
+            path.as_ref(),
+            operation,
+            view.pencil().global_shape(),
+            view.extra_shape().dimensions(),
+            view.pencil().topology().process_grid(),
+            view.pencil().decomposition(),
+            view.pencil().permutation().axes(),
+            T::CODE,
+            T::WIDTH,
+        )?;
+    }
     let path = path_cstring(path.as_ref(), comm)?;
     let packed_result = pack_view(&view);
     let layout_result = build_layout(
@@ -237,7 +254,7 @@ where
     }
     let mut packed = packed_result.expect("HDF5 preparation agreement established");
     let layout = layout_result.expect("HDF5 preparation agreement established");
-    if settings.explicit {
+    if settings.explicit && !settings.descriptor_agreed {
         crate::options::agree_decomposition(view.pencil())?;
     }
     if !settings.options_agreed {
@@ -368,7 +385,7 @@ where
     S: AsRef<str>,
     T: IoElement,
 {
-    write_hdf5_named_with_options_inner(path, name, view, options.settings())
+    write_hdf5_named_with_options_inner(path, name, view, options.settings(), false)
 }
 
 /// Creates a named dataset with explicit controls.  `settings.options_agreed`
@@ -378,6 +395,7 @@ pub(crate) fn write_hdf5_named_with_options_inner<P, S, T, const N: usize, const
     name: S,
     view: PencilArrayView<'_, T, N, M>,
     settings: Hdf5Settings<'_>,
+    agreed: bool,
 ) -> Result<(), NamedIoError>
 where
     P: AsRef<Path>,
@@ -385,28 +403,40 @@ where
     T: IoElement,
 {
     let comm = view.pencil().topology().communicator();
-    descriptor_agreement(
-        comm,
-        path.as_ref(),
-        71,
-        view.pencil().global_shape(),
-        view.extra_shape().dimensions(),
-        view.pencil().topology().process_grid(),
-        view.pencil().decomposition(),
-        view.pencil().permutation().axes(),
-        T::CODE,
-        T::WIDTH,
-    )
-    .map_err(NamedIoError::Io)?;
-    crate::options::agree_decomposition(view.pencil()).map_err(NamedIoError::Io)?;
-    agree_named_options(
-        comm,
-        settings,
-        N + view.extra_shape().dimensions().len(),
-        T::WIDTH,
-    )
-    .map_err(NamedIoError::Io)?;
-    let link = named_link(comm, name.as_ref())?;
+    if !agreed {
+        descriptor_agreement(
+            comm,
+            path.as_ref(),
+            71,
+            view.pencil().global_shape(),
+            view.extra_shape().dimensions(),
+            view.pencil().topology().process_grid(),
+            view.pencil().decomposition(),
+            view.pencil().permutation().axes(),
+            T::CODE,
+            T::WIDTH,
+        )
+        .map_err(NamedIoError::Io)?;
+    }
+    if !agreed {
+        crate::options::agree_decomposition(view.pencil()).map_err(NamedIoError::Io)?;
+    }
+    if agreed {
+        agree_filter_capability(comm, settings).map_err(NamedIoError::Io)?;
+    } else {
+        agree_named_options(
+            comm,
+            settings,
+            N + view.extra_shape().dimensions().len(),
+            T::WIDTH,
+        )
+        .map_err(NamedIoError::Io)?;
+    }
+    let link = if agreed {
+        named_link_component(comm, name.as_ref())?
+    } else {
+        named_link(comm, name.as_ref())?
+    };
     write_hdf5_inner(
         path,
         view,
@@ -418,6 +448,7 @@ where
         71,
         Hdf5Settings {
             options_agreed: true,
+            descriptor_agreed: true,
             ..settings
         },
     )
@@ -455,7 +486,10 @@ pub(crate) fn write_named<T: IoElement, const N: usize, const M: usize>(
         false,
         Some(name.as_bytes()),
         OP_WRITE_HDF5_NAMED,
-        Hdf5Settings::default(),
+        Hdf5Settings {
+            descriptor_agreed: true,
+            ..Default::default()
+        },
     )
     .map_err(NamedIoError::Io)
 }
@@ -560,7 +594,10 @@ where
         true,
         Some(name.as_ref().as_bytes()),
         OP_APPEND_HDF5_NAMED,
-        Hdf5Settings::default(),
+        Hdf5Settings {
+            descriptor_agreed: true,
+            ..Default::default()
+        },
     )
     .map_err(NamedIoError::Io)
 }
@@ -577,7 +614,7 @@ where
     S: AsRef<str>,
     T: IoElement,
 {
-    append_hdf5_named_with_options_inner(path, name, view, options.settings())
+    append_hdf5_named_with_options_inner(path, name, view, options.settings(), false)
 }
 
 /// Appends a named dataset with explicit controls.  `settings.options_agreed`
@@ -587,6 +624,7 @@ pub(crate) fn append_hdf5_named_with_options_inner<P, S, T, const N: usize, cons
     name: S,
     view: PencilArrayView<'_, T, N, M>,
     settings: Hdf5Settings<'_>,
+    agreed: bool,
 ) -> Result<(), NamedIoError>
 where
     P: AsRef<Path>,
@@ -594,28 +632,40 @@ where
     T: IoElement,
 {
     let comm = view.pencil().topology().communicator();
-    descriptor_agreement(
-        comm,
-        path.as_ref(),
-        72,
-        view.pencil().global_shape(),
-        view.extra_shape().dimensions(),
-        view.pencil().topology().process_grid(),
-        view.pencil().decomposition(),
-        view.pencil().permutation().axes(),
-        T::CODE,
-        T::WIDTH,
-    )
-    .map_err(NamedIoError::Io)?;
-    crate::options::agree_decomposition(view.pencil()).map_err(NamedIoError::Io)?;
-    agree_named_options(
-        comm,
-        settings,
-        N + view.extra_shape().dimensions().len(),
-        T::WIDTH,
-    )
-    .map_err(NamedIoError::Io)?;
-    let link = named_link(comm, name.as_ref())?;
+    if !agreed {
+        descriptor_agreement(
+            comm,
+            path.as_ref(),
+            72,
+            view.pencil().global_shape(),
+            view.extra_shape().dimensions(),
+            view.pencil().topology().process_grid(),
+            view.pencil().decomposition(),
+            view.pencil().permutation().axes(),
+            T::CODE,
+            T::WIDTH,
+        )
+        .map_err(NamedIoError::Io)?;
+    }
+    if !agreed {
+        crate::options::agree_decomposition(view.pencil()).map_err(NamedIoError::Io)?;
+    }
+    if agreed {
+        agree_filter_capability(comm, settings).map_err(NamedIoError::Io)?;
+    } else {
+        agree_named_options(
+            comm,
+            settings,
+            N + view.extra_shape().dimensions().len(),
+            T::WIDTH,
+        )
+        .map_err(NamedIoError::Io)?;
+    }
+    let link = if agreed {
+        named_link_component(comm, name.as_ref())?
+    } else {
+        named_link(comm, name.as_ref())?
+    };
     check_named_absent(comm, path.as_ref(), &link, settings.hints)?;
     write_hdf5_inner(
         path,
@@ -628,6 +678,7 @@ where
         72,
         Hdf5Settings {
             options_agreed: true,
+            descriptor_agreed: true,
             ..settings
         },
     )
@@ -693,7 +744,10 @@ fn read_named_inner<T: IoElement, const N: usize, const M: usize>(
         &link,
         Some(name.as_bytes()),
         OP_READ_HDF5_NAMED,
-        settings,
+        Hdf5Settings {
+            descriptor_agreed: true,
+            ..settings
+        },
     )
     .map_err(|error| match error {
         IoError::MetadataMismatch {
@@ -721,6 +775,7 @@ where
         ReadTarget::Single(view),
         options.settings(),
         73,
+        false,
     )
 }
 
@@ -732,29 +787,43 @@ pub(crate) fn read_named_with_options<T: IoElement, const N: usize, const M: usi
     target: ReadTarget<'_, '_, T, N, M>,
     settings: Hdf5Settings<'_>,
     operation: u64,
+    agreed: bool,
 ) -> Result<(), NamedIoError> {
     let comm = target.pencil().topology().communicator();
-    descriptor_agreement(
-        comm,
-        path,
-        operation,
-        target.pencil().global_shape(),
-        target.extra(),
-        target.pencil().topology().process_grid(),
-        target.pencil().decomposition(),
-        target.pencil().permutation().axes(),
-        T::CODE,
-        T::WIDTH,
-    )
-    .map_err(NamedIoError::Io)?;
-    crate::options::agree_decomposition(target.pencil()).map_err(NamedIoError::Io)?;
-    agree_named_options(comm, settings, N + target.extra().len(), T::WIDTH)
+    if !agreed {
+        descriptor_agreement(
+            comm,
+            path,
+            operation,
+            target.pencil().global_shape(),
+            target.extra(),
+            target.pencil().topology().process_grid(),
+            target.pencil().decomposition(),
+            target.pencil().permutation().axes(),
+            T::CODE,
+            T::WIDTH,
+        )
         .map_err(NamedIoError::Io)?;
+    }
+    if !agreed {
+        crate::options::agree_decomposition(target.pencil()).map_err(NamedIoError::Io)?;
+    }
+    if agreed {
+        agree_filter_capability(comm, settings).map_err(NamedIoError::Io)?;
+    } else {
+        agree_named_options(comm, settings, N + target.extra().len(), T::WIDTH)
+            .map_err(NamedIoError::Io)?;
+    }
     let settings = Hdf5Settings {
         options_agreed: true,
+        descriptor_agreed: true,
         ..settings
     };
-    let link = named_link(comm, name)?;
+    let link = if agreed {
+        named_link_component(comm, name)?
+    } else {
+        named_link(comm, name)?
+    };
     read_hdf5_inner(
         path,
         target,
@@ -773,6 +842,58 @@ pub(crate) fn read_named_with_options<T: IoElement, const N: usize, const M: usi
     })
 }
 
+/// Writes a prepared HDF5 collection after its caller agreed the descriptor
+/// and decomposition.
+pub(crate) fn write_hdf5_target<P, T, const N: usize, const M: usize>(
+    path: P,
+    view: PencilArrayView<'_, T, N, M>,
+) -> Result<(), IoError>
+where
+    P: AsRef<Path>,
+    T: IoElement,
+{
+    write_hdf5_inner(
+        path,
+        view,
+        false,
+        cstr(GROUP_NAME),
+        cstr(DATASET_NAME),
+        false,
+        None,
+        OP_WRITE_HDF5,
+        Hdf5Settings {
+            descriptor_agreed: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// Writes a prepared HDF5 collection with explicit controls.
+pub(crate) fn write_hdf5_target_options<P, T, const N: usize, const M: usize>(
+    path: P,
+    view: PencilArrayView<'_, T, N, M>,
+    settings: Hdf5Settings<'_>,
+) -> Result<(), IoError>
+where
+    P: AsRef<Path>,
+    T: IoElement,
+{
+    write_hdf5_inner(
+        path,
+        view,
+        false,
+        cstr(GROUP_NAME),
+        cstr(DATASET_NAME),
+        false,
+        None,
+        OP_OPTIONS_WRITE_HDF5,
+        Hdf5Settings {
+            descriptor_agreed: true,
+            ..settings
+        },
+    )
+}
+
 /// Reads the version-1 HDF5 dataset collectively without modifying the destination on failure.
 pub fn read_hdf5<P, T, const N: usize, const M: usize>(
     path: P,
@@ -782,12 +903,13 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_hdf5_target(path, ReadTarget::Single(view))
+    read_hdf5_target(path, ReadTarget::Single(view), false)
 }
 
 pub(crate) fn read_hdf5_target<P, T, const N: usize, const M: usize>(
     path: P,
     target: ReadTarget<'_, '_, T, N, M>,
+    descriptor_agreed: bool,
 ) -> Result<(), IoError>
 where
     P: AsRef<Path>,
@@ -801,7 +923,10 @@ where
         cstr(DATASET_NAME),
         None,
         OP_READ_HDF5,
-        Hdf5Settings::default(),
+        Hdf5Settings {
+            descriptor_agreed,
+            ..Default::default()
+        },
     )
 }
 
@@ -809,6 +934,7 @@ pub(crate) fn read_hdf5_target_options<P, T, const N: usize, const M: usize>(
     path: P,
     target: ReadTarget<'_, '_, T, N, M>,
     settings: Hdf5Settings<'_>,
+    descriptor_agreed: bool,
 ) -> Result<(), IoError>
 where
     P: AsRef<Path>,
@@ -822,7 +948,10 @@ where
         cstr(DATASET_NAME),
         None,
         OP_OPTIONS_READ_HDF5,
-        settings,
+        Hdf5Settings {
+            descriptor_agreed,
+            ..settings
+        },
     )
 }
 
@@ -835,7 +964,7 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_hdf5_target_options(path, ReadTarget::Single(view), settings)
+    read_hdf5_target_options(path, ReadTarget::Single(view), settings, false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -856,18 +985,20 @@ where
     // Take the reserved staging out before borrowing the target's metadata.
     let mut staging = target.take_staging();
     let comm = target.pencil().topology().communicator();
-    descriptor_agreement(
-        comm,
-        path.as_ref(),
-        operation,
-        target.pencil().global_shape(),
-        target.extra(),
-        target.pencil().topology().process_grid(),
-        target.pencil().decomposition(),
-        target.pencil().permutation().axes(),
-        T::CODE,
-        T::WIDTH,
-    )?;
+    if !settings.descriptor_agreed {
+        descriptor_agreement(
+            comm,
+            path.as_ref(),
+            operation,
+            target.pencil().global_shape(),
+            target.extra(),
+            target.pencil().topology().process_grid(),
+            target.pencil().decomposition(),
+            target.pencil().permutation().axes(),
+            T::CODE,
+            T::WIDTH,
+        )?;
+    }
     let path = path_cstring(path.as_ref(), comm)?;
     let layout_result = build_layout(
         target.pencil().global_shape(),
@@ -898,7 +1029,7 @@ where
         staging_result.expect("HDF5 preparation agreement established"),
         0,
     );
-    if settings.explicit {
+    if settings.explicit && !settings.descriptor_agreed {
         crate::options::agree_decomposition(target.pencil())?;
     }
     if !settings.options_agreed {
@@ -1028,18 +1159,6 @@ struct Hdf5Resources {
     mem_space: Option<native::Hid>,
     xfer: Option<native::Hid>,
     dcpl: Option<native::Hid>,
-}
-
-fn valid_writer_provenance(grid: &[u64], permutation: &[u64], spatial_rank: usize) -> bool {
-    if !valid_writer_grid(grid, spatial_rank) || permutation.len() != spatial_rank {
-        return false;
-    }
-    let mut seen = Vec::new();
-    if seen.try_reserve_exact(spatial_rank).is_err() {
-        return false;
-    }
-    seen.resize(spatial_rank, false);
-    valid_permutation(permutation, spatial_rank, &mut seen)
 }
 
 fn configure_chunks(
@@ -2159,12 +2278,13 @@ fn validate_read_metadata<T: IoElement, const N: usize, const M: usize>(
         && expected.matches(Attribute::Width, &width)
         && expected.matches(Attribute::ExtraRank, &extra_rank)
         && rank_in_range(extra_rank[0]);
-    let commit_result = match commit_state(commit[0]) {
-        CommitState::Complete => Ok(()),
-        CommitState::Incomplete => Err(IoError::IncompleteFile),
-        CommitState::Invalid => Err(IoError::InvalidFile {
+    let commit_result = match metadata_acceptance(&expected, Some(commit[0]), None) {
+        Ok(()) => Ok(()),
+        Err(MetadataIssue::Incomplete) => Err(IoError::IncompleteFile),
+        Err(MetadataIssue::InvalidCommit) => Err(IoError::InvalidFile {
             reason: "HDF5 commit marker",
         }),
+        Err(MetadataIssue::Shape) => unreachable!("shape was not checked"),
     };
     let scalar_ok = metadata_ok && commit_result.is_ok();
     if let Err(agreement) = agree_phase(comm, scalar_ok, "HDF5 scalar metadata validation") {
@@ -2198,10 +2318,20 @@ fn validate_read_metadata<T: IoElement, const N: usize, const M: usize>(
         Attribute::WriterPermutation,
         "HDF5 writer permutation metadata",
     )?;
-    let metadata_ok = valid_global_shape(&global)
-        && expected.matches(Attribute::GlobalShape, &global)
-        && expected.matches(Attribute::ExtraShape, &extra)
-        && valid_writer_provenance(&writer_grid, &writer_perm, N);
+    let metadata_ok = metadata_acceptance(
+        &expected,
+        None,
+        Some(ShapeMetadata {
+            extra: &extra,
+            global: &global,
+            grid: &writer_grid,
+            permutation: &writer_perm,
+            spatial_rank: N,
+            width: T::WIDTH as u64,
+            rule: ShapeRule::Global,
+        }),
+    )
+    .is_ok();
     if let Err(agreement) = agree_phase(comm, metadata_ok, "HDF5 shape metadata validation") {
         return Err(if metadata_ok {
             agreement
@@ -2296,7 +2426,15 @@ fn read_attr_phase(
     }
     let shape = shape_result.expect("attribute shape agreement");
     let length_result = if shape.is_empty() {
-        Ok(1usize)
+        // `H5S_NULL` also reports rank zero, but it carries no value; only an
+        // `H5S_SCALAR` dataspace stands for a one-element attribute.
+        if native::space_is_scalar(space) {
+            Ok(1usize)
+        } else {
+            Err(IoError::MetadataMismatch {
+                field: "HDF5 attribute type or shape",
+            })
+        }
     } else if shape.len() == 1 {
         usize::try_from(shape[0]).map_err(|_| IoError::InvalidFile {
             reason: "HDF5 attribute length",
@@ -2838,7 +2976,7 @@ pub(crate) fn inspect_catalog(
                 catalog_valid(
                     comm,
                     metadata.matches(Attribute::Version, &version)
-                        && commit_state(commit[0]) == CommitState::Complete
+                        && metadata_acceptance(&metadata, Some(commit[0]), None).is_ok()
                         && n > 0
                         && rank_in_range(nvals[0])
                         && rank_in_range(erank[0])
@@ -2861,10 +2999,20 @@ pub(crate) fn inspect_catalog(
                 let global = attr!(Attribute::GlobalShape, n, er);
                 let grid = attr!(Attribute::WriterGrid, n, er);
                 let perm = attr!(Attribute::WriterPermutation, n, er);
-                let shape_ok = !global.is_empty()
-                    && combined_rank_in_range(global.len() as u64, extra.len() as u64)
-                    && valid_shape_bytes(&global, &extra, scalar.width() as u64)
-                    && valid_writer_provenance(&grid, &perm, n);
+                let shape_ok = metadata_acceptance(
+                    &metadata,
+                    None,
+                    Some(ShapeMetadata {
+                        extra: &extra,
+                        global: &global,
+                        grid: &grid,
+                        permutation: &perm,
+                        spatial_rank: n,
+                        width: scalar.width() as u64,
+                        rule: ShapeRule::Bytes,
+                    }),
+                )
+                .is_ok();
                 catalog_valid(comm, shape_ok, "HDF5 catalog shape or provenance")?;
                 let expected_result: Result<Vec<hsize_t>, _> = extra
                     .iter()

@@ -1,6 +1,6 @@
 use crate::{
-    ArrayError, ExtraShape, LocalGrid, LocalGridError, Pencil, checked::checked_product,
-    geometry::row_major_offset,
+    ArrayError, ExtraShape, GeometryError, LocalGrid, LocalGridError, Pencil,
+    checked::{check_storage_len, local_storage_len},
 };
 
 pub(crate) trait LocalArrayLayout<T, const N: usize, const M: usize> {
@@ -43,16 +43,45 @@ pub(crate) trait LocalArrayLayout<T, const N: usize, const M: usize> {
             });
         }
 
-        let mut memory_indices = Vec::with_capacity(extra_rank + N);
-        memory_indices.extend_from_slice(extra_indices);
-        memory_indices.extend(
-            self.pencil()
-                .permutation()
-                .axes()
-                .iter()
-                .map(|axis| spatial_indices[axis.index()]),
-        );
-        Ok(row_major_offset(&self.memory_shape(), &memory_indices)?)
+        let mut offset = 0usize;
+        for (axis, (&extent, &index)) in self
+            .extra_shape()
+            .dimensions()
+            .iter()
+            .zip(extra_indices)
+            .enumerate()
+        {
+            if index >= extent {
+                return Err(GeometryError::LocalIndexOutOfBounds {
+                    axis,
+                    index,
+                    extent,
+                }
+                .into());
+            }
+            offset = offset
+                .checked_mul(extent)
+                .and_then(|base| base.checked_add(index))
+                .ok_or(GeometryError::SizeOverflow)?;
+        }
+        let memory_shape = self.pencil().local_shape_memory();
+        for (memory_position, axis) in self.pencil().permutation().axes().iter().enumerate() {
+            let extent = memory_shape[memory_position];
+            let index = spatial_indices[axis.index()];
+            if index >= extent {
+                return Err(GeometryError::LocalIndexOutOfBounds {
+                    axis: extra_rank + memory_position,
+                    index,
+                    extent,
+                }
+                .into());
+            }
+            offset = offset
+                .checked_mul(extent)
+                .and_then(|base| base.checked_add(index))
+                .ok_or(GeometryError::SizeOverflow)?;
+        }
+        Ok(offset)
     }
 
     fn global_offset(
@@ -383,10 +412,8 @@ fn validate_storage_len<const N: usize, const M: usize>(
     extra_shape: &ExtraShape,
     actual: usize,
 ) -> Result<(), ArrayError> {
-    let required = checked_product(&[extra_shape.element_count(), pencil.local_len()])?;
-    if actual != required {
-        return Err(ArrayError::StorageLengthMismatch { required, actual });
-    }
+    let required = local_storage_len(pencil.local_len(), extra_shape.element_count())?;
+    check_storage_len(required, actual)?;
     Ok(())
 }
 

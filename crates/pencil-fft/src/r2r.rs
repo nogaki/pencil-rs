@@ -294,15 +294,67 @@ pub struct LocalR2rPlan<T: R2rScalar> {
     normalization_factor: usize,
     fft: R2rKernel<T::Real>,
     marker: PhantomData<T>,
-    backend: super::BackendKind,
-    #[cfg(feature = "fftw")]
-    backend_options: Option<super::PlanOptions>,
+    backend: super::backend::LocalBackend,
 }
 
 pub(crate) enum R2rKernel<R: FftReal> {
     Rust(Arc<dyn Fft<R>>),
     #[cfg(feature = "fftw")]
     Native([Arc<pencil_fftw::R2rPlan<R>>; 2]),
+}
+
+impl<R: FftReal> R2rKernel<R> {
+    /// Runs one line through the selected backend.
+    ///
+    /// `fill` writes the RustFFT embedding from `source`. The native backend
+    /// stages `source` in the first `n` complex values itself, so `plan_index`,
+    /// `source`, `fill`, and `n` are native-only or RustFFT-only inputs.
+    #[cfg_attr(not(feature = "fftw"), allow(unused_variables))]
+    pub(crate) fn transform_line<T: R2rScalar<Real = R>>(
+        &self,
+        plan_index: usize,
+        source: &[T],
+        embedding_line: &mut [Complex<R>],
+        n: usize,
+        scratch: &mut [Complex<R>],
+        fill: impl FnOnce(&mut [Complex<R>]),
+    ) {
+        match self {
+            R2rKernel::Rust(fft) => {
+                fill(&mut embedding_line[..n]);
+                fft.process_with_scratch(&mut embedding_line[..n], scratch);
+            }
+            #[cfg(feature = "fftw")]
+            R2rKernel::Native(plans) => native_r2r_line(&plans[plan_index], source, embedding_line),
+        }
+    }
+
+    /// Writes one transformed line to `destination`.
+    ///
+    /// Native output is staged as two contiguous real lines; RustFFT output is
+    /// shaped by `rust_write`.
+    #[cfg_attr(not(feature = "fftw"), allow(unused_variables))]
+    pub(crate) fn write_line<T: R2rScalar<Real = R>>(
+        &self,
+        destination: &mut [T],
+        embedding_line: &[Complex<R>],
+        n: usize,
+        rust_write: impl FnOnce(&mut [T]),
+        native_value: impl Fn(Complex<R>) -> T,
+    ) {
+        match self {
+            R2rKernel::Rust(_) => rust_write(destination),
+            #[cfg(feature = "fftw")]
+            R2rKernel::Native(_) => {
+                for (out, value) in destination
+                    .iter_mut()
+                    .zip(native_r2r_output(embedding_line, n))
+                {
+                    *out = native_value(value);
+                }
+            }
+        }
+    }
 }
 
 // ponytail: native staging needs n complex values; RustFFT needs its full embedding.
@@ -376,9 +428,7 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
             normalization_factor,
             fft: R2rKernel::Rust(fft),
             marker: PhantomData,
-            backend: super::BackendKind::RustFft,
-            #[cfg(feature = "fftw")]
-            backend_options: None,
+            backend: super::backend::LocalBackend::RUST,
         })
     }
 
@@ -413,20 +463,19 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
             scratch_len: 0,
             fft: R2rKernel::Native([forward, backward]),
             marker: PhantomData,
-            backend: super::BackendKind::Fftw,
-            backend_options: Some(options),
+            backend: super::backend::LocalBackend::fftw(options),
         })
     }
 
     /// Returns the selected backend.
     pub fn backend_kind(&self) -> super::BackendKind {
-        self.backend
+        self.backend.kind()
     }
 
     /// Returns the FFTW options, when this plan uses FFTW.
     #[cfg(feature = "fftw")]
     pub fn backend_options(&self) -> Option<super::PlanOptions> {
-        self.backend_options
+        self.backend.options()
     }
 
     /// Returns the number of values in each logical input or output line.
@@ -635,23 +684,14 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         embedding_line: &mut [Complex<T::Real>],
         scratch: &mut [Complex<T::Real>],
     ) {
-        match &self.fft {
-            R2rKernel::Rust(fft) => {
-                self.build_embedding(kind, source, embedding_line);
-                fft.process_with_scratch(
-                    &mut embedding_line[..self.embedding_len],
-                    &mut scratch[..self.scratch_len],
-                );
-            }
-            #[cfg(feature = "fftw")]
-            R2rKernel::Native(plans) => {
-                native_r2r_line(
-                    &plans[usize::from(kind != self.kind)],
-                    source,
-                    embedding_line,
-                );
-            }
-        }
+        self.fft.transform_line(
+            usize::from(kind != self.kind),
+            source,
+            embedding_line,
+            self.embedding_len,
+            &mut scratch[..self.scratch_len],
+            |embedding_line| self.build_embedding(kind, source, embedding_line),
+        );
     }
 
     fn build_embedding(
@@ -672,7 +712,7 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
                     put_pair(embedding, j, value.to_complex(), false);
                 }
             }
-            R2rKind::DctII => {
+            R2rKind::DctII | R2rKind::DctIV => {
                 for (j, value) in source.iter().enumerate() {
                     put_pair(embedding, 2 * j + 1, value.to_complex(), false);
                 }
@@ -683,17 +723,12 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
                     put_pair(embedding, j, value.to_complex(), false);
                 }
             }
-            R2rKind::DctIV => {
-                for (j, value) in source.iter().enumerate() {
-                    put_pair(embedding, 2 * j + 1, value.to_complex(), false);
-                }
-            }
             R2rKind::DstI => {
                 for (j, value) in source.iter().enumerate() {
                     put_pair(embedding, j + 1, value.to_complex(), true);
                 }
             }
-            R2rKind::DstII => {
+            R2rKind::DstII | R2rKind::DstIV => {
                 for (j, value) in source.iter().enumerate() {
                     put_pair(embedding, 2 * j + 1, value.to_complex(), true);
                 }
@@ -703,11 +738,6 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
                     put_pair(embedding, j + 1, value.to_complex(), true);
                 }
                 embedding[self.line_len] = source[self.line_len - 1].to_complex();
-            }
-            R2rKind::DstIV => {
-                for (j, value) in source.iter().enumerate() {
-                    put_pair(embedding, 2 * j + 1, value.to_complex(), true);
-                }
             }
         }
     }
@@ -719,31 +749,31 @@ impl<T: R2rScalar> LocalR2rPlan<T> {
         embedding_line: &[Complex<T::Real>],
         scale: Option<T::Real>,
     ) {
-        #[cfg(feature = "fftw")]
-        if matches!(self.fft, R2rKernel::Native(_)) {
-            for (out, mut value) in destination
-                .iter_mut()
-                .zip(native_r2r_output(embedding_line, self.line_len))
-            {
+        self.fft.write_line(
+            destination,
+            embedding_line,
+            self.line_len,
+            |destination| {
+                for (k, destination_value) in destination.iter_mut().enumerate() {
+                    let mut value = embedding_line[output_bin(kind, k)];
+                    if kind.is_dst() {
+                        value = Complex::new(-value.im, value.re);
+                    }
+                    if let Some(scale) = scale {
+                        value.re = value.re * scale;
+                        value.im = value.im * scale;
+                    }
+                    *destination_value = T::from_complex(value);
+                }
+            },
+            |mut value| {
                 if let Some(scale) = scale {
                     value.re = value.re * scale;
                     value.im = value.im * scale;
                 }
-                *out = T::from_complex(value);
-            }
-            return;
-        }
-        for (k, destination_value) in destination.iter_mut().enumerate() {
-            let mut value = embedding_line[output_bin(kind, k)];
-            if kind.is_dst() {
-                value = Complex::new(-value.im, value.re);
-            }
-            if let Some(scale) = scale {
-                value.re = value.re * scale;
-                value.im = value.im * scale;
-            }
-            *destination_value = T::from_complex(value);
-        }
+                T::from_complex(value)
+            },
+        );
     }
 }
 

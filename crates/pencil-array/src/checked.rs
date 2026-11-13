@@ -1,4 +1,4 @@
-use crate::GeometryError;
+use crate::{ArrayError, GeometryError};
 
 pub(crate) fn checked_product(values: &[usize]) -> Result<usize, GeometryError> {
     if values.contains(&0) {
@@ -8,6 +8,24 @@ pub(crate) fn checked_product(values: &[usize]) -> Result<usize, GeometryError> 
     values.iter().try_fold(1usize, |acc, &value| {
         acc.checked_mul(value).ok_or(GeometryError::SizeOverflow)
     })
+}
+
+pub(crate) fn local_storage_len(
+    local_len: usize,
+    extra_count: usize,
+) -> Result<usize, GeometryError> {
+    checked_product(&[local_len, extra_count])
+}
+
+pub(crate) fn check_storage_len(required: usize, actual: usize) -> Result<(), ArrayError> {
+    if actual != required {
+        return Err(storage_length_mismatch(required, actual));
+    }
+    Ok(())
+}
+
+pub(crate) fn storage_length_mismatch(required: usize, actual: usize) -> ArrayError {
+    ArrayError::StorageLengthMismatch { required, actual }
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use super::*;
 use crate::catalog::{DatasetInfo, ScalarType};
-use crate::hdf5_schema::{Attribute, Metadata, valid_shape_bytes_from_width};
+use crate::hdf5_schema::{Attribute, Metadata, ShapeMetadata, ShapeRule, metadata_acceptance};
 use std::collections::BTreeSet;
 
 impl Hdf5FileSession<'_> {
@@ -188,7 +188,7 @@ fn leaf(
     agree_phase(
         comm,
         metadata.matches(Attribute::Version, &version)
-            && commit_state(commit[0]) == CommitState::Complete
+            && metadata_acceptance(&metadata, Some(commit[0]), None).is_ok()
             && n > 0
             && rank_in_range(n)
             && rank_in_range(er)
@@ -216,8 +216,20 @@ fn leaf(
     let perm = attr!(Attribute::WriterPermutation, n, er);
     agree_phase(
         comm,
-        valid_shape_bytes_from_width(&global, &extra, width)
-            && valid_writer_provenance(&grid, &perm, n),
+        metadata_acceptance(
+            &metadata,
+            None,
+            Some(ShapeMetadata {
+                extra: &extra,
+                global: &global,
+                grid: &grid,
+                permutation: &perm,
+                spatial_rank: n,
+                width,
+                rule: ShapeRule::BytesFromWidth,
+            }),
+        )
+        .is_ok(),
         "session catalog shape and provenance",
     )?;
     let (space, error) = local_handle_phase(

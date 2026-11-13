@@ -1,7 +1,10 @@
 //! Retained native handles for the existing named-v2 format.
 use super::*;
 use crate::format::prepare_physical_decode;
-use crate::mpi_io::{CommGuard, FileGuard, abort_unrecoverable, collective_state};
+use crate::mpi_io::{
+    CommGuard, FileGuard, ReadPhases, WritePhases, abort_unrecoverable, collective_state,
+    read_payload, write_payload_and_commit,
+};
 use crate::{CatalogError, DatasetInfo, ScalarType};
 use mpi::topology::CartesianCommunicator;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,6 +76,7 @@ pub struct MpiFileSession<'c> {
     resources: Option<(CommGuard, FileGuard)>,
     info: Option<InfoGuard>,
     options: MpiIoOptions,
+    fixed_options: MpiIoOptions,
     id: u64,
     readonly: bool,
     poisoned: bool,
@@ -217,6 +221,7 @@ impl<'c> MpiFileSession<'c> {
             resources: Some((duplicate, FileGuard { raw: file })),
             info: Some(info),
             options: options.clone(),
+            fixed_options: options.clone(),
             id,
             readonly: op == OPEN_READ,
             poisoned: false,
@@ -224,14 +229,14 @@ impl<'c> MpiFileSession<'c> {
     }
     fn begin(&self, op: u64) -> Result<(), MpiSessionError> {
         entry(self.comm, op)?;
-        agree_options(
+        crate::options::agree_values(
             self.comm,
-            &self.options,
             &[
                 self.id,
                 u64::from(self.readonly),
                 u64::from(self.resources.is_none()),
                 u64::from(self.poisoned),
+                u64::from(self.options == self.fixed_options),
             ],
         )?;
         if op != CLOSE {
@@ -280,7 +285,7 @@ impl<'c> MpiFileSession<'c> {
             width,
         )?;
         let axes: [u64; M] = std::array::from_fn(|i| pencil.decomposition()[i].index() as u64);
-        agree_options(self.comm, &self.options, &axes)?;
+        crate::options::agree_values(self.comm, &axes)?;
         Ok(())
     }
     fn scan(&self) -> Result<(Vec<Rec>, usize, usize), MpiSessionError> {
@@ -385,34 +390,29 @@ impl<'c> MpiFileSession<'c> {
                 "session header flush",
             )?;
             let ft = datatype.as_ref().map_or_else(ffi::byte_datatype, |d| d.raw);
-            agree_phase(
+            let mut marker_attempted = false;
+            if let Err(error) = write_payload_and_commit(
                 comm,
-                ffi::file_set_view_with_info(file, (tail + head.len()) as i64, ft, self.info_raw())
-                    == ffi::MPI_SUCCESS as i32,
-                "session write view",
-            )?;
-            let written = if self.options.mode == MpiIoMode::Independent {
-                ffi::file_write_independent(file, &packed)
-            } else {
-                ffi::file_write_all(file, &packed)
-            };
-            agree_phase(
-                comm,
-                matches!(written, Ok(n) if n == packed.len()),
-                "session payload write",
-            )?;
-            agree_phase(
-                comm,
-                ffi::file_sync(file) == ffi::MPI_SUCCESS as i32,
-                "session payload flush",
-            )?;
-            self.reset_view()?;
-            write_metadata(comm, file, end - 8, &COMMIT_MARKER.to_le_bytes())?;
-            agree_phase(
-                comm,
-                ffi::file_sync(file) == ffi::MPI_SUCCESS as i32,
-                "session marker flush",
-            )?;
+                file,
+                self.info_raw(),
+                self.options.mode,
+                (tail + head.len()) as i64,
+                &packed,
+                ft,
+                None,
+                (end - 8) as i64,
+                WritePhases {
+                    payload_view: "session write view",
+                    payload_write: "session payload write",
+                    payload_flush: "session payload flush",
+                    marker_view: "session byte view reset",
+                    marker_write: "named metadata write",
+                    marker_flush: "session marker flush",
+                },
+                &mut marker_attempted,
+            ) {
+                return Err(error.agreement.into());
+            }
             Ok(())
         })();
         let cleanup = self.finish_operation(datatype);
@@ -497,26 +497,21 @@ impl<'c> MpiFileSession<'c> {
             datatype = native.ok().flatten();
             agree_phase(comm, ok, "session read datatype")?;
             let ft = datatype.as_ref().map_or_else(ffi::byte_datatype, |d| d.raw);
-            agree_phase(
+            if let Err(error) = read_payload(
                 comm,
-                ffi::file_set_view_with_info(
-                    file,
-                    record.payload_offset as i64,
-                    ft,
-                    self.info_raw(),
-                ) == ffi::MPI_SUCCESS as i32,
-                "session read view",
-            )?;
-            let read = if self.options.mode == MpiIoMode::Independent {
-                ffi::file_read_independent(file, &mut packed)
-            } else {
-                ffi::file_read_all(file, &mut packed)
-            };
-            agree_phase(
-                comm,
-                matches!(read, Ok(n) if n == packed.len()),
-                "session payload read",
-            )?;
+                file,
+                self.info_raw(),
+                self.options.mode,
+                record.payload_offset as i64,
+                ft,
+                &mut packed,
+                ReadPhases {
+                    view: "session read view",
+                    payload: "session payload read",
+                },
+            ) {
+                return Err(error.agreement.into());
+            }
             Ok(prepared(
                 comm,
                 prepare_physical_decode(&view, &packed),

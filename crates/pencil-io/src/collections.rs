@@ -310,11 +310,7 @@ fn mpi_write<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
             .iter()
             .map(|v| (v.pencil(), v.extra_shape(), v.as_slice())),
     )?;
-    if let Some(o) = options {
-        crate::write_mpi_with_options(path, array.view(), o)?;
-    } else {
-        crate::write_mpi(path, array.view())?;
-    }
+    crate::mpi_io::write_mpi_target(path, array.view(), options)?;
     Ok(())
 }
 /// Write one native combined `[component, extra..., spatial...]` MPI payload.
@@ -526,7 +522,7 @@ pub fn write_hdf5_collection<P: AsRef<Path>, T: IoElement, const N: usize, const
             .iter()
             .map(|v| (v.pencil(), v.extra_shape(), v.as_slice())),
     )?;
-    crate::write_hdf5(path, a.view())?;
+    crate::hdf5_io::write_hdf5_target(path, a.view())?;
     Ok(())
 }
 #[cfg(feature = "parallel-hdf5")]
@@ -557,7 +553,7 @@ pub fn write_hdf5_collection_with_options<
             .iter()
             .map(|v| (v.pencil(), v.extra_shape(), v.as_slice())),
     )?;
-    crate::write_hdf5_with_options(path, a.view(), o)?;
+    crate::hdf5_io::write_hdf5_target_options(path, a.view(), o.settings())?;
     Ok(())
 }
 #[cfg(feature = "parallel-hdf5")]
@@ -574,7 +570,7 @@ pub fn read_hdf5_collection<P: AsRef<Path>, T: IoElement, const N: usize, const 
     header(comm, HDF5_READ, views.len())?;
     let (dims, len, staging) = prepare_read(comm, path.as_ref(), HDF5_READ, false, views)?;
     let target = ReadTarget::collection(views, dims, len, staging);
-    crate::hdf5_io::read_hdf5_target(path, target)?;
+    crate::hdf5_io::read_hdf5_target(path, target, true)?;
     Ok(())
 }
 #[cfg(feature = "parallel-hdf5")]
@@ -597,7 +593,7 @@ pub fn read_hdf5_collection_with_options<
     header(comm, HDF5_READ_OPTIONS, views.len())?;
     let (dims, len, staging) = prepare_read(comm, path.as_ref(), HDF5_READ_OPTIONS, false, views)?;
     let target = ReadTarget::collection(views, dims, len, staging);
-    crate::hdf5_io::read_hdf5_target_options(path, target, o.settings())?;
+    crate::hdf5_io::read_hdf5_target_options(path, target, o.settings(), true)?;
     Ok(())
 }
 #[cfg(feature = "parallel-hdf5")]
@@ -637,6 +633,7 @@ pub fn write_hdf5_named_collection<
             options_agreed: true,
             ..o.settings()
         },
+        true,
     )?;
     Ok(())
 }
@@ -677,6 +674,7 @@ pub fn append_hdf5_named_collection<
             options_agreed: true,
             ..o.settings()
         },
+        true,
     )?;
     Ok(())
 }
@@ -719,6 +717,7 @@ pub fn read_hdf5_named_collection<
             ..o.settings()
         },
         73,
+        true,
     )?;
     Ok(())
 }

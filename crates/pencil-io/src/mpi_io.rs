@@ -23,6 +23,13 @@ const MAGIC: &[u8; 8] = b"PENCILIO";
 const COMMIT_OFFSET: i64 = 24;
 const ROOT_RANK: i32 = 0;
 
+/// Inputs a collection hand-off already agreed collectively.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct AgreedInputs {
+    pub(crate) descriptor: bool,
+    pub(crate) options: bool,
+}
+
 /// A communicator duplicated for native I/O.  The duplicate owns its native
 /// error handler; the caller's topology communicator is never retained.
 #[derive(Debug)]
@@ -196,7 +203,7 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    write_mpi_inner(path, view, false, None)
+    write_mpi_inner(path, view, false, None, AgreedInputs::default())
 }
 
 /// Option-bearing additive form of [`write_mpi`]. Applies the same MPI local
@@ -210,7 +217,30 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    write_mpi_inner(path, view, false, Some(options))
+    write_mpi_inner(path, view, false, Some(options), AgreedInputs::default())
+}
+
+/// Writes a prepared collection after its caller agreed the descriptor and
+/// decomposition.
+pub(crate) fn write_mpi_target<P, T, const N: usize, const M: usize>(
+    path: P,
+    view: PencilArrayView<'_, T, N, M>,
+    options: Option<&MpiIoOptions>,
+) -> Result<(), IoError>
+where
+    P: AsRef<Path>,
+    T: IoElement,
+{
+    write_mpi_inner(
+        path,
+        view,
+        false,
+        options,
+        AgreedInputs {
+            descriptor: true,
+            options: false,
+        },
+    )
 }
 
 fn write_mpi_inner<P, T, const N: usize, const M: usize>(
@@ -218,6 +248,7 @@ fn write_mpi_inner<P, T, const N: usize, const M: usize>(
     view: PencilArrayView<'_, T, N, M>,
     inject_post_cleanup_failure: bool,
     options: Option<&MpiIoOptions>,
+    agreed: AgreedInputs,
 ) -> Result<(), IoError>
 where
     P: AsRef<Path>,
@@ -228,18 +259,20 @@ where
     let extra = view.extra_shape().dimensions();
     let grid = view.pencil().topology().process_grid();
     let permutation = view.pencil().permutation().axes();
-    descriptor_agreement(
-        comm,
-        path.as_ref(),
-        if options.is_some() { 41 } else { OP_WRITE_MPI },
-        global,
-        extra,
-        grid,
-        view.pencil().decomposition(),
-        permutation,
-        T::CODE,
-        T::WIDTH,
-    )?;
+    if !agreed.descriptor {
+        descriptor_agreement(
+            comm,
+            path.as_ref(),
+            if options.is_some() { 41 } else { OP_WRITE_MPI },
+            global,
+            extra,
+            grid,
+            view.pencil().decomposition(),
+            permutation,
+            T::CODE,
+            T::WIDTH,
+        )?;
+    }
 
     let path_result = path_bytes(path.as_ref())
         .and_then(|bytes| CString::new(bytes).map_err(|_| IoError::InvalidPath));
@@ -264,12 +297,14 @@ where
     // the communicator is duplicated or the next collective is entered.
     let defaults = MpiIoOptions::default();
     let controls = options.unwrap_or(&defaults);
-    if options.is_some() {
+    if options.is_some() && !agreed.options {
         agree_options(comm, controls, &[])?;
     }
     let info = options
         .map(|_| {
-            crate::options::agree_decomposition(view.pencil())?;
+            if !agreed.descriptor {
+                crate::options::agree_decomposition(view.pencil())?;
+            }
             InfoGuard::new(comm, controls)
         })
         .transpose()?;
@@ -356,93 +391,70 @@ where
     let filetype = datatype
         .as_ref()
         .map_or_else(ffi::byte_datatype, |datatype| datatype.raw);
-    let set_view = ffi::file_set_view_with_info(file.raw, header_offset, filetype, native_info)
-        .checked_success();
-    if let Err(agreement) = agree_phase(comm, set_view.is_ok(), "MPI-IO byte-subarray view") {
-        let primary = IoError::WriteIncomplete {
-            stage: "MPI_File_set_view",
-        };
-        finish_resources(comm, duplicate, file, datatype);
-        let primary = set_view.err().map(|_| primary).unwrap_or(agreement);
-        return Err(primary);
-    }
-
-    let payload_write = if controls.mode == MpiIoMode::Independent {
-        ffi::file_write_independent(file.raw, &packed)
-    } else {
-        ffi::file_write_all(file.raw, &packed)
-    };
-    let payload_ok = matches!(payload_write, Ok(actual) if actual == packed.len());
-    if agree_phase(comm, payload_ok, "MPI-IO payload write").is_err() {
-        let primary = IoError::WriteIncomplete {
-            stage: "payload write",
-        };
-        finish_resources(comm, duplicate, file, datatype);
-        return Err(primary);
-    }
-    let payload_flush = ffi::file_sync(file.raw).checked_success();
-    if let Err(agreement) = agree_phase(comm, payload_flush.is_ok(), "MPI-IO payload flush") {
-        let primary = IoError::WriteIncomplete {
-            stage: "payload flush",
-        };
-        finish_resources(comm, duplicate, file, datatype);
-        let primary = payload_flush.err().map(|_| primary).unwrap_or(agreement);
-        return Err(primary);
-    }
-
-    let size_ok = match ffi::file_get_size(file.raw) {
-        Ok(size) => u64::try_from(size).ok() == Some(expected_size),
-        Err(_) => false,
-    };
-    if agree_phase(comm, size_ok, "MPI-IO payload file size").is_err() {
-        let primary = IoError::WriteIncomplete {
-            stage: "payload size",
-        };
-        finish_resources(comm, duplicate, file, datatype);
-        return Err(primary);
-    }
-
     // Explicit-offset MPI-IO offsets are expressed in the current view's
-    // etypes.  Restore the byte view so the marker offset is truly at header
-    // byte 24 rather than payload_offset + 24.
-    let marker_view = ffi::file_set_view_with_info(file.raw, 0, ffi::byte_datatype(), native_info)
-        .checked_success();
-    if let Err(agreement) = agree_phase(comm, marker_view.is_ok(), "MPI-IO commit marker view") {
-        let primary = IoError::WriteIncomplete {
-            stage: "commit marker view",
+    // etypes. The shared helper restores the byte view before writing the
+    // marker at header byte 24.
+    let mut marker_attempted = false;
+    if let Err(error) = write_payload_and_commit(
+        comm,
+        file.raw,
+        native_info,
+        controls.mode,
+        header_offset,
+        &packed,
+        filetype,
+        Some((expected_size, "MPI-IO payload file size")),
+        COMMIT_OFFSET,
+        WritePhases {
+            payload_view: "MPI-IO byte-subarray view",
+            payload_write: "MPI-IO payload write",
+            payload_flush: "MPI-IO payload flush",
+            marker_view: "MPI-IO commit marker view",
+            marker_write: "MPI-IO commit marker write",
+            marker_flush: "MPI-IO commit marker flush",
+        },
+        &mut marker_attempted,
+    ) {
+        let primary = match error.step {
+            WriteStep::PayloadView => {
+                error
+                    .native
+                    .map_or(error.agreement, |_| IoError::WriteIncomplete {
+                        stage: "MPI_File_set_view",
+                    })
+            }
+            WriteStep::PayloadWrite | WriteStep::PayloadSize => IoError::WriteIncomplete {
+                stage: match error.step {
+                    WriteStep::PayloadWrite => "payload write",
+                    _ => "payload size",
+                },
+            },
+            WriteStep::PayloadFlush => {
+                error
+                    .native
+                    .map_or(error.agreement, |_| IoError::WriteIncomplete {
+                        stage: "payload flush",
+                    })
+            }
+            WriteStep::MarkerView => {
+                error
+                    .native
+                    .map_or(error.agreement, |_| IoError::WriteIncomplete {
+                        stage: "commit marker view",
+                    })
+            }
+            WriteStep::MarkerWrite => IoError::CommitUncertain {
+                stage: "commit marker write",
+            },
+            WriteStep::MarkerFlush => {
+                error
+                    .native
+                    .map_or(error.agreement, |_| IoError::CommitUncertain {
+                        stage: "commit marker flush",
+                    })
+            }
         };
         finish_resources(comm, duplicate, file, datatype);
-        let primary = marker_view.err().map(|_| primary).unwrap_or(agreement);
-        return Err(primary);
-    }
-
-    let marker = COMMIT_MARKER.to_le_bytes();
-    let marker_write = if comm.rank() == ROOT_RANK {
-        ffi::file_write_at_all(file.raw, COMMIT_OFFSET, &marker)
-    } else {
-        ffi::file_write_at_all(file.raw, COMMIT_OFFSET, &[])
-    };
-    let marker_ok = match marker_write {
-        Ok(actual) => {
-            (comm.rank() != ROOT_RANK && actual == 0)
-                || (comm.rank() == ROOT_RANK && actual == marker.len())
-        }
-        Err(_) => false,
-    };
-    if agree_phase(comm, marker_ok, "MPI-IO commit marker write").is_err() {
-        let primary = IoError::CommitUncertain {
-            stage: "commit marker write",
-        };
-        finish_resources(comm, duplicate, file, datatype);
-        return Err(primary);
-    }
-    let marker_flush = ffi::file_sync(file.raw).checked_success();
-    if let Err(agreement) = agree_phase(comm, marker_flush.is_ok(), "MPI-IO commit marker flush") {
-        let primary = IoError::CommitUncertain {
-            stage: "commit marker flush",
-        };
-        finish_resources(comm, duplicate, file, datatype);
-        let primary = marker_flush.err().map(|_| primary).unwrap_or(agreement);
         return Err(primary);
     }
 
@@ -470,7 +482,7 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    write_mpi_inner(path, view, true, None)
+    write_mpi_inner(path, view, true, None, AgreedInputs::default())
 }
 
 /// Reads one MPI-IO file collectively into a view. The destination is published
@@ -485,7 +497,13 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_mpi_inner(path, ReadTarget::Single(view), false, None)
+    read_mpi_inner(
+        path,
+        ReadTarget::Single(view),
+        false,
+        None,
+        AgreedInputs::default(),
+    )
 }
 
 /// Option-bearing additive form of [`read_mpi`]. Applies the same MPI local
@@ -499,7 +517,13 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_mpi_inner(path, ReadTarget::Single(view), false, Some(options))
+    read_mpi_inner(
+        path,
+        ReadTarget::Single(view),
+        false,
+        Some(options),
+        AgreedInputs::default(),
+    )
 }
 
 /// Reads directly into a single view or a collection of member views using one
@@ -514,7 +538,16 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_mpi_inner(path, target, false, options)
+    read_mpi_inner(
+        path,
+        target,
+        false,
+        options,
+        AgreedInputs {
+            descriptor: true,
+            options: false,
+        },
+    )
 }
 
 fn read_mpi_inner<P, T, const N: usize, const M: usize>(
@@ -522,6 +555,7 @@ fn read_mpi_inner<P, T, const N: usize, const M: usize>(
     mut target: ReadTarget<'_, '_, T, N, M>,
     inject_post_cleanup_failure: bool,
     options: Option<&MpiIoOptions>,
+    agreed: AgreedInputs,
 ) -> Result<(), IoError>
 where
     P: AsRef<Path>,
@@ -534,18 +568,20 @@ where
     let extra = target.extra();
     let grid = target.pencil().topology().process_grid();
     let permutation = target.pencil().permutation().axes();
-    descriptor_agreement(
-        comm,
-        path.as_ref(),
-        if options.is_some() { 42 } else { OP_READ_MPI },
-        global,
-        extra,
-        grid,
-        target.pencil().decomposition(),
-        permutation,
-        T::CODE,
-        T::WIDTH,
-    )?;
+    if !agreed.descriptor {
+        descriptor_agreement(
+            comm,
+            path.as_ref(),
+            if options.is_some() { 42 } else { OP_READ_MPI },
+            global,
+            extra,
+            grid,
+            target.pencil().decomposition(),
+            permutation,
+            T::CODE,
+            T::WIDTH,
+        )?;
+    }
 
     let path_result = path_bytes(path.as_ref())
         .and_then(|bytes| CString::new(bytes).map_err(|_| IoError::InvalidPath));
@@ -570,12 +606,14 @@ where
 
     let defaults = MpiIoOptions::default();
     let controls = options.unwrap_or(&defaults);
-    if options.is_some() {
+    if options.is_some() && !agreed.options {
         agree_options(comm, controls, &[])?;
     }
     let info = options
         .map(|_| {
-            crate::options::agree_decomposition(target.pencil())?;
+            if !agreed.descriptor {
+                crate::options::agree_decomposition(target.pencil())?;
+            }
             InfoGuard::new(comm, controls)
         })
         .transpose()?;
@@ -786,29 +824,27 @@ where
     let filetype = datatype
         .as_ref()
         .map_or_else(ffi::byte_datatype, |datatype| datatype.raw);
-    let set_view = ffi::file_set_view_with_info(file.raw, header_offset, filetype, native_info)
-        .checked_success();
-    if let Err(agreement) = agree_phase(comm, set_view.is_ok(), "MPI-IO byte-subarray view") {
+    if let Err(error) = read_payload(
+        comm,
+        file.raw,
+        native_info,
+        controls.mode,
+        header_offset,
+        filetype,
+        &mut staging,
+        ReadPhases {
+            view: "MPI-IO byte-subarray view",
+            payload: "MPI-IO payload read",
+        },
+    ) {
         finish_resources(comm, duplicate, file, datatype);
-        let primary = set_view
-            .err()
-            .map(|code| IoError::Mpi {
+        return Err(match error.step {
+            ReadStep::View => error.native.map_or(error.agreement, |code| IoError::Mpi {
                 operation: "MPI_File_set_view",
                 code,
-            })
-            .unwrap_or(agreement);
-        return Err(primary);
-    }
-
-    let payload_read = if controls.mode == MpiIoMode::Independent {
-        ffi::file_read_independent(file.raw, &mut staging)
-    } else {
-        ffi::file_read_all(file.raw, &mut staging)
-    };
-    let payload_ok = matches!(payload_read, Ok(actual) if actual == staging.len());
-    if let Err(agreement) = agree_phase(comm, payload_ok, "MPI-IO payload read") {
-        finish_resources(comm, duplicate, file, datatype);
-        return Err(agreement);
+            }),
+            ReadStep::Payload => error.agreement,
+        });
     }
 
     // Validate layout and allocate decode scratch before native cleanup.
@@ -845,7 +881,13 @@ where
     P: AsRef<Path>,
     T: IoElement,
 {
-    read_mpi_inner(path, ReadTarget::Single(view), true, None)
+    read_mpi_inner(
+        path,
+        ReadTarget::Single(view),
+        true,
+        None,
+        AgreedInputs::default(),
+    )
 }
 
 #[derive(Debug)]
@@ -1035,6 +1077,194 @@ pub(crate) fn mpi_preparation_error(local_error: Option<IoError>, agreement: IoE
     } else {
         local_error.unwrap_or(agreement)
     }
+}
+
+/// Native phases for one record payload and commit-marker write.
+pub(crate) struct WritePhases {
+    pub(crate) payload_view: &'static str,
+    pub(crate) payload_write: &'static str,
+    pub(crate) payload_flush: &'static str,
+    pub(crate) marker_view: &'static str,
+    pub(crate) marker_write: &'static str,
+    pub(crate) marker_flush: &'static str,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum WriteStep {
+    PayloadView,
+    PayloadWrite,
+    PayloadFlush,
+    PayloadSize,
+    MarkerView,
+    MarkerWrite,
+    MarkerFlush,
+}
+
+/// A failed step; callers map it to their format-specific error variant.
+pub(crate) struct WriteError {
+    pub(crate) step: WriteStep,
+    pub(crate) agreement: IoError,
+    pub(crate) native: Option<i32>,
+}
+
+/// Writes one payload, flushes it, writes the commit marker, then flushes the
+/// marker. The caller owns the view/datatype and the final cleanup.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_payload_and_commit<C: CommunicatorCollectives>(
+    comm: &C,
+    file: ffi::MPI_File,
+    info: ffi::MPI_Info,
+    mode: MpiIoMode,
+    payload_offset: i64,
+    payload: &[u8],
+    filetype: ffi::MPI_Datatype,
+    expected_size: Option<(u64, &'static str)>,
+    marker_offset: i64,
+    phases: WritePhases,
+    marker_attempted: &mut bool,
+) -> Result<(), WriteError> {
+    let view = ffi::file_set_view_with_info(file, payload_offset, filetype, info).checked_success();
+    if let Err(agreement) = agree_phase(comm, view.is_ok(), phases.payload_view) {
+        return Err(WriteError {
+            step: WriteStep::PayloadView,
+            agreement,
+            native: view.err(),
+        });
+    }
+    let written = if mode == MpiIoMode::Independent {
+        ffi::file_write_independent(file, payload)
+    } else {
+        ffi::file_write_all(file, payload)
+    };
+    if let Err(agreement) = agree_phase(
+        comm,
+        matches!(written, Ok(n) if n == payload.len()),
+        phases.payload_write,
+    ) {
+        return Err(WriteError {
+            step: WriteStep::PayloadWrite,
+            agreement,
+            native: written.err(),
+        });
+    }
+    let flush = ffi::file_sync(file);
+    if let Err(agreement) =
+        agree_phase(comm, flush == ffi::MPI_SUCCESS as i32, phases.payload_flush)
+    {
+        return Err(WriteError {
+            step: WriteStep::PayloadFlush,
+            agreement,
+            native: (flush != ffi::MPI_SUCCESS as i32).then_some(flush),
+        });
+    }
+    if let Some((expected, phase)) = expected_size {
+        let size_ok = match ffi::file_get_size(file) {
+            Ok(size) => u64::try_from(size).ok() == Some(expected),
+            Err(_) => false,
+        };
+        if let Err(agreement) = agree_phase(comm, size_ok, phase) {
+            return Err(WriteError {
+                step: WriteStep::PayloadSize,
+                agreement,
+                native: None,
+            });
+        }
+    }
+    let view = ffi::file_set_view_with_info(file, 0, ffi::byte_datatype(), info).checked_success();
+    if let Err(agreement) = agree_phase(comm, view.is_ok(), phases.marker_view) {
+        return Err(WriteError {
+            step: WriteStep::MarkerView,
+            agreement,
+            native: view.err(),
+        });
+    }
+    *marker_attempted = true;
+    let marker = COMMIT_MARKER.to_le_bytes();
+    let local = if comm.rank() == 0 {
+        &marker[..]
+    } else {
+        &[][..]
+    };
+    let written = ffi::file_write_at_all(file, marker_offset, local);
+    if let Err(agreement) = agree_phase(
+        comm,
+        matches!(written, Ok(n) if n == local.len()),
+        phases.marker_write,
+    ) {
+        return Err(WriteError {
+            step: WriteStep::MarkerWrite,
+            agreement,
+            native: written.err(),
+        });
+    }
+    let flush = ffi::file_sync(file);
+    if let Err(agreement) = agree_phase(comm, flush == ffi::MPI_SUCCESS as i32, phases.marker_flush)
+    {
+        return Err(WriteError {
+            step: WriteStep::MarkerFlush,
+            agreement,
+            native: (flush != ffi::MPI_SUCCESS as i32).then_some(flush),
+        });
+    }
+    Ok(())
+}
+
+/// Native phases for one record payload read.
+pub(crate) struct ReadPhases {
+    pub(crate) view: &'static str,
+    pub(crate) payload: &'static str,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ReadStep {
+    View,
+    Payload,
+}
+
+pub(crate) struct ReadError {
+    pub(crate) step: ReadStep,
+    pub(crate) agreement: IoError,
+    pub(crate) native: Option<i32>,
+}
+
+/// Reads one payload into staging after installing its view. The caller owns
+/// the view/datatype cleanup and the destination publish point.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_payload<C: CommunicatorCollectives>(
+    comm: &C,
+    file: ffi::MPI_File,
+    info: ffi::MPI_Info,
+    mode: MpiIoMode,
+    payload_offset: i64,
+    filetype: ffi::MPI_Datatype,
+    payload: &mut [u8],
+    phases: ReadPhases,
+) -> Result<(), ReadError> {
+    let view = ffi::file_set_view_with_info(file, payload_offset, filetype, info).checked_success();
+    if let Err(agreement) = agree_phase(comm, view.is_ok(), phases.view) {
+        return Err(ReadError {
+            step: ReadStep::View,
+            agreement,
+            native: view.err(),
+        });
+    }
+    let read = if mode == MpiIoMode::Independent {
+        ffi::file_read_independent(file, payload)
+    } else {
+        ffi::file_read_all(file, payload)
+    };
+    if let Err(agreement) = agree_phase(
+        comm,
+        matches!(read, Ok(n) if n == payload.len()),
+        phases.payload,
+    ) {
+        return Err(ReadError {
+            step: ReadStep::Payload,
+            agreement,
+            native: read.err(),
+        });
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

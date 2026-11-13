@@ -1106,34 +1106,38 @@ fn write_named<T: IoElement, const N: usize, const M: usize>(
     append: bool,
     inject_post_cleanup_failure: bool,
     options: Option<&MpiIoOptions>,
-    options_agreed: bool,
+    agreed: bool,
 ) -> Result<(), NamedIoError> {
     let comm = view.pencil().topology().communicator();
-    crate::mpi_io::descriptor_agreement(
-        comm,
-        path,
-        if options.is_some() {
-            if append {
-                OP_APPEND_OPTIONS
+    if !agreed {
+        crate::mpi_io::descriptor_agreement(
+            comm,
+            path,
+            if options.is_some() {
+                if append {
+                    OP_APPEND_OPTIONS
+                } else {
+                    OP_WRITE_OPTIONS
+                }
+            } else if append {
+                OP_APPEND
             } else {
-                OP_WRITE_OPTIONS
-            }
-        } else if append {
-            OP_APPEND
-        } else {
-            OP_WRITE
-        },
-        view.pencil().global_shape(),
-        view.extra_shape().dimensions(),
-        view.pencil().topology().process_grid(),
-        view.pencil().decomposition(),
-        view.pencil().permutation().axes(),
-        T::CODE,
-        T::WIDTH,
-    )?;
-    name_bytes(comm, name)?;
+                OP_WRITE
+            },
+            view.pencil().global_shape(),
+            view.extra_shape().dimensions(),
+            view.pencil().topology().process_grid(),
+            view.pencil().decomposition(),
+            view.pencil().permutation().axes(),
+            T::CODE,
+            T::WIDTH,
+        )?;
+    }
+    if !agreed {
+        name_bytes(comm, name)?;
+    }
     if let Some(options) = options
-        && !options_agreed
+        && !agreed
     {
         agree_options(comm, options, &[])?;
     }
@@ -1159,7 +1163,7 @@ fn write_named<T: IoElement, const N: usize, const M: usize>(
     let record_result = record(name, &view, 0);
     agree_phase(comm, record_result.is_ok(), "named record preparation")?;
     let (head, record_len) = record_result?;
-    if options.is_some() {
+    if options.is_some() && !agreed {
         crate::options::agree_decomposition(view.pencil())?;
     }
     let info = options
@@ -1227,48 +1231,28 @@ fn write_named<T: IoElement, const N: usize, const M: usize>(
         let ft = datatype
             .as_ref()
             .map_or_else(ffi::byte_datatype, |dt| dt.raw);
-        agree_phase(
+        if let Err(error) = crate::mpi_io::write_payload_and_commit(
             comm,
-            ffi::file_set_view_with_info(
-                file,
-                (offset + head.len()) as i64,
-                ft,
-                info.as_ref().map_or_else(ffi::info_null, |i| i.raw),
-            ) == ffi::MPI_SUCCESS as i32,
-            "named payload view",
-        )?;
-        let written = if options.is_some_and(|o| o.mode == MpiIoMode::Independent) {
-            ffi::file_write_independent(file, &packed)
-        } else {
-            ffi::file_write_all(file, &packed)
-        };
-        agree_phase(
-            comm,
-            matches!(written, Ok(n) if n == packed.len()),
-            "named payload write",
-        )?;
-        agree_phase(
-            comm,
-            ffi::file_sync(file) == ffi::MPI_SUCCESS as i32,
-            "named payload flush",
-        )?;
-        agree_phase(
-            comm,
-            ffi::file_set_view_with_info(
-                file,
-                0,
-                ffi::byte_datatype(),
-                info.as_ref().map_or_else(ffi::info_null, |i| i.raw),
-            ) == ffi::MPI_SUCCESS as i32,
-            "named marker view",
-        )?;
-        marker_attempted = true;
-        write_metadata(comm, file, end - 8, &COMMIT_MARKER.to_le_bytes())?;
-        agree_phase(
-            comm,
-            ffi::file_sync(file) == ffi::MPI_SUCCESS as i32,
-            "named marker flush",
-        )?;
+            file,
+            info.as_ref().map_or_else(ffi::info_null, |i| i.raw),
+            options.map_or(MpiIoMode::Collective, |o| o.mode),
+            (offset + head.len()) as i64,
+            &packed,
+            ft,
+            None,
+            (end - 8) as i64,
+            crate::mpi_io::WritePhases {
+                payload_view: "named payload view",
+                payload_write: "named payload write",
+                payload_flush: "named payload flush",
+                marker_view: "named marker view",
+                marker_write: "named metadata write",
+                marker_flush: "named marker flush",
+            },
+            &mut marker_attempted,
+        ) {
+            return Err(NamedIoError::Io(error.agreement));
+        }
         Ok(())
     })();
     finish_resources(
@@ -1386,30 +1370,34 @@ fn read_named_inner<T: IoElement, const N: usize, const M: usize>(
     mut target: ReadTarget<'_, '_, T, N, M>,
     inject_post_cleanup_failure: bool,
     options: Option<&MpiIoOptions>,
-    options_agreed: bool,
+    agreed: bool,
 ) -> Result<(), NamedIoError> {
     // Take the reserved staging out before borrowing the target's metadata.
     let mut packed = target.take_staging();
     let comm = target.pencil().topology().communicator();
-    crate::mpi_io::descriptor_agreement(
-        comm,
-        path,
-        if options.is_some() {
-            OP_READ_OPTIONS
-        } else {
-            OP_READ
-        },
-        target.pencil().global_shape(),
-        target.extra(),
-        target.pencil().topology().process_grid(),
-        target.pencil().decomposition(),
-        target.pencil().permutation().axes(),
-        T::CODE,
-        T::WIDTH,
-    )?;
-    name_bytes(comm, name)?;
+    if !agreed {
+        crate::mpi_io::descriptor_agreement(
+            comm,
+            path,
+            if options.is_some() {
+                OP_READ_OPTIONS
+            } else {
+                OP_READ
+            },
+            target.pencil().global_shape(),
+            target.extra(),
+            target.pencil().topology().process_grid(),
+            target.pencil().decomposition(),
+            target.pencil().permutation().axes(),
+            T::CODE,
+            T::WIDTH,
+        )?;
+    }
+    if !agreed {
+        name_bytes(comm, name)?;
+    }
     if let Some(options) = options
-        && !options_agreed
+        && !agreed
     {
         agree_options(comm, options, &[])?;
     }
@@ -1438,7 +1426,7 @@ fn read_named_inner<T: IoElement, const N: usize, const M: usize>(
     let allocation = packed.try_reserve_exact(size);
     agree_phase(comm, allocation.is_ok(), "named allocation")?;
     packed.resize(size, 0);
-    if options.is_some() {
+    if options.is_some() && !agreed {
         crate::options::agree_decomposition(target.pencil())?;
     }
     let info = options
@@ -1486,26 +1474,21 @@ fn read_named_inner<T: IoElement, const N: usize, const M: usize>(
         let ft = datatype
             .as_ref()
             .map_or_else(ffi::byte_datatype, |dt| dt.raw);
-        agree_phase(
+        if let Err(error) = crate::mpi_io::read_payload(
             comm,
-            ffi::file_set_view_with_info(
-                file,
-                record.payload_offset as i64,
-                ft,
-                info.as_ref().map_or_else(ffi::info_null, |i| i.raw),
-            ) == ffi::MPI_SUCCESS as i32,
-            "named read view",
-        )?;
-        let read = if options.is_some_and(|o| o.mode == MpiIoMode::Independent) {
-            ffi::file_read_independent(file, &mut packed)
-        } else {
-            ffi::file_read_all(file, &mut packed)
-        };
-        agree_phase(
-            comm,
-            matches!(read, Ok(n) if n == packed.len()),
-            "named payload read",
-        )?;
+            file,
+            info.as_ref().map_or_else(ffi::info_null, |i| i.raw),
+            options.map_or(MpiIoMode::Collective, |o| o.mode),
+            record.payload_offset as i64,
+            ft,
+            &mut packed,
+            crate::mpi_io::ReadPhases {
+                view: "named read view",
+                payload: "named payload read",
+            },
+        ) {
+            return Err(NamedIoError::Io(error.agreement));
+        }
         prepared(comm, target.prepare(&packed), "named physical staging")
     })();
     finish_resources(

@@ -40,11 +40,11 @@ use super::{
     AxisSelection, C2cStageTransition, Direction, DistributedLayout, FftError, FftOverlapError,
     INVALID_WORD, OPERATION_R2R_BACKWARD, OPERATION_R2R_BACKWARD_IN_PLACE, OPERATION_R2R_FORWARD,
     OPERATION_R2R_FORWARD_IN_PLACE, OPERATION_R2R_INVERSE, OPERATION_R2R_INVERSE_IN_PLACE,
-    R2rError, RouteCandidate, StagePreparation, TransformStage, TransformTiming, TransposeMethod,
-    agree_execution_descriptor_ref, agree_header, agree_result, build_route, build_transitions,
-    collective_descriptor, collective_valid, descriptor_len, execute_transition,
-    execute_transition_timed, initialized_vec, map_array_allocation, registered_pencils,
-    validate_input, validate_workspace_lengths_values,
+    R2rError, RouteCandidate, TransformTiming, TransposeMethod, agree_execution_descriptor_ref,
+    agree_header, agree_result, build_route, build_transitions, collective_descriptor,
+    collective_valid, descriptor_len, execute_transition, execute_transition_timed,
+    initialized_vec, map_array_allocation, registered_pencils, validate_input,
+    validate_workspace_lengths_values,
 };
 #[cfg(feature = "fftw")]
 use crate::PlanOptions;
@@ -847,14 +847,14 @@ pub struct R2rInPlaceWorkspace<T: R2rScalar, const N: usize, const M: usize> {
 }
 
 #[derive(Debug)]
-enum R2rLocal<T: R2rScalar> {
+pub(super) enum R2rLocal<T: R2rScalar> {
     Identity,
     Transform(LocalR2rPlan<T>),
     Hartley(LocalDhtPlan<T>),
 }
 
 impl<T: R2rScalar> R2rLocal<T> {
-    fn embedding_len(&self) -> usize {
+    pub(super) fn embedding_len(&self) -> usize {
         match self {
             Self::Identity => 0,
             Self::Transform(plan) => plan.embedding_len(),
@@ -862,11 +862,19 @@ impl<T: R2rScalar> R2rLocal<T> {
         }
     }
 
-    fn scratch_len(&self) -> usize {
+    pub(super) fn scratch_len(&self) -> usize {
         match self {
             Self::Identity => 0,
             Self::Transform(plan) => plan.scratch_len(),
             Self::Hartley(plan) => plan.scratch_len(),
+        }
+    }
+
+    pub(super) fn line_len(&self) -> usize {
+        match self {
+            Self::Identity => 0,
+            Self::Transform(plan) => plan.line_len(),
+            Self::Hartley(plan) => plan.line_len(),
         }
     }
 }
@@ -1564,40 +1572,16 @@ where
         }
         let stages = prepared.expect("collective backend preflight accepted");
 
-        let layout_stages = agree_result(
-            communicator,
-            (|| {
-                let mut layout_stages = Vec::new();
-                layout_stages
-                    .try_reserve_exact(route.stages.len())
-                    .map_err(|_| {
-                        R2rError::Fft(FftError::AllocationFailed {
-                            required: route.stages.len(),
-                        })
-                    })?;
-                for (index, pencil) in route.stages.iter().enumerate() {
-                    layout_stages.push(TransformStage {
-                        axis: N - 1 - index,
-                        input: Arc::clone(pencil),
-                        output: Arc::clone(pencil),
-                        local: super::LocalTransform::Identity,
-                    });
-                }
-                Ok::<_, R2rError>(StagePreparation {
-                    stages: layout_stages.into_boxed_slice(),
-                    fft_scratch_len: 0,
-                })
-            })(),
-        )?;
         let (
             transitions,
             transpose_send_len,
             transpose_receive_len,
             _real_send_len,
             _real_receive_len,
-        ) = build_transitions::<T::Real, N, M>(
+        ) = build_transitions::<N, M>(
             communicator,
-            &layout_stages,
+            &route.stages,
+            &route.stages,
             &route.distributed,
             &extra_shape,
             layout.transpose_method,
@@ -1956,7 +1940,7 @@ fn prepare_r2r_stages_backend<T: R2rScalar, const N: usize, const M: usize>(
     global_shape: [usize; N],
     kinds: [Option<AxisR2rKind>; N],
     backend: super::BackendChoice,
-) -> Result<R2rStagePreparation<T, N, M>, BackendInitError<R2rError>> {
+) -> Result<R2rPreparedStages<T, N, M>, BackendInitError<R2rError>> {
     if route.stages.len() != N {
         return Err(BackendInitError::Local(R2rError::Fft(
             FftError::PreparationFailed,
@@ -2014,7 +1998,7 @@ fn prepare_r2r_stages_backend<T: R2rScalar, const N: usize, const M: usize>(
             local,
         });
     }
-    Ok(R2rStagePreparation {
+    Ok(R2rPreparedStages {
         stages: stages.into_boxed_slice(),
         embedding_len,
         fft_scratch_len,
@@ -2022,7 +2006,7 @@ fn prepare_r2r_stages_backend<T: R2rScalar, const N: usize, const M: usize>(
 }
 
 #[derive(Debug)]
-struct R2rStagePreparation<T: R2rScalar, const N: usize, const M: usize> {
+struct R2rPreparedStages<T: R2rScalar, const N: usize, const M: usize> {
     stages: Box<[R2rStage<T, N, M>]>,
     embedding_len: usize,
     fft_scratch_len: usize,
@@ -2212,13 +2196,7 @@ fn execute_r2r_reverse_overlap<T: R2rScalar + Equivalence, const N: usize, const
 }
 
 fn map_r2r_overlap<E: Into<R2rError>>(error: OverlapError<E>) -> FftOverlapError<R2rError> {
-    FftOverlapError::Overlap(match error {
-        OverlapError::Transpose(error) => OverlapError::Transpose(error),
-        OverlapError::Callback(error) => OverlapError::Callback(error.into()),
-        OverlapError::PeerPanicked => OverlapError::PeerPanicked,
-        OverlapError::PeerCallbackFailed => OverlapError::PeerCallbackFailed,
-        OverlapError::CollectivePreconditionFailed => OverlapError::CollectivePreconditionFailed,
-    })
+    super::map_overlap(error)
 }
 
 fn execute_forward<T: R2rScalar + Equivalence, const N: usize, const M: usize>(
@@ -2495,8 +2473,20 @@ fn strided_r2r_line_len<T: R2rScalar, const N: usize, const M: usize>(
     Ok(required)
 }
 
-fn execute_strided_r2r_forward<T: R2rScalar, const N: usize, const M: usize>(
-    plan: &LocalR2rPlan<T>,
+fn identity_forward<T: R2rScalar, E: From<FftError>>(
+    source: &[T],
+    destination: &mut [T],
+) -> Result<(), E> {
+    if source.len() != destination.len() {
+        return Err(FftError::PreparationFailed.into());
+    }
+    destination.copy_from_slice(source);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_strided_local_forward<T, E, const N: usize, const M: usize>(
+    local: &R2rLocal<T>,
     pencil: &Pencil<N, M>,
     axis: usize,
     source: &[T],
@@ -2504,204 +2494,129 @@ fn execute_strided_r2r_forward<T: R2rScalar, const N: usize, const M: usize>(
     embedding_line: &mut [Complex<T::Real>],
     fft_scratch: &mut [Complex<T::Real>],
     line_buffer: &mut [T],
-) -> Result<(), R2rError> {
+) -> Result<(), E>
+where
+    T: R2rScalar,
+    E: From<FftError> + From<LocalR2rError>,
+{
+    if matches!(local, R2rLocal::Identity) {
+        return identity_forward(source, destination);
+    }
+    let line_len = local.line_len();
     let stride = super::memory_stride(pencil, axis)?;
     if stride <= 1 {
-        return plan
-            .forward(source, destination, embedding_line, fft_scratch)
-            .map_err(R2rError::LocalR2r);
+        return match local {
+            R2rLocal::Transform(plan) => {
+                plan.forward(source, destination, embedding_line, fft_scratch)
+            }
+            R2rLocal::Hartley(plan) => {
+                plan.forward(source, destination, embedding_line, fft_scratch)
+            }
+            R2rLocal::Identity => unreachable!("identity handled above"),
+        }
+        .map_err(E::from);
     }
-    if line_buffer.len() < plan.line_len() {
+    if line_buffer.len() < line_len {
         return Err(FftError::WorkspaceTooSmall {
             kind: "real line",
-            required: plan.line_len(),
+            required: line_len,
             actual: line_buffer.len(),
         }
         .into());
     }
-    let count =
-        super::strided_line_count(source.len(), plan.line_len(), stride).map_err(R2rError::Fft)?;
+    let count = super::strided_line_count(source.len(), line_len, stride)?;
     if destination.len() != source.len() {
         return Err(FftError::PreparationFailed.into());
     }
     if source.is_empty() {
-        return plan
-            .forward(source, destination, embedding_line, fft_scratch)
-            .map_err(R2rError::LocalR2r);
+        return match local {
+            R2rLocal::Transform(plan) => {
+                plan.forward(source, destination, embedding_line, fft_scratch)
+            }
+            R2rLocal::Hartley(plan) => {
+                plan.forward(source, destination, embedding_line, fft_scratch)
+            }
+            R2rLocal::Identity => unreachable!("identity handled above"),
+        }
+        .map_err(E::from);
     }
     super::for_each_strided_line(
         source,
         destination,
         line_buffer,
         count,
-        plan.line_len(),
+        line_len,
         stride,
         |line| {
-            plan.forward_in_place(line, embedding_line, fft_scratch)
-                .map_err(R2rError::LocalR2r)
+            match local {
+                R2rLocal::Transform(plan) => {
+                    plan.forward_in_place(line, embedding_line, fft_scratch)
+                }
+                R2rLocal::Hartley(plan) => plan.forward_in_place(line, embedding_line, fft_scratch),
+                R2rLocal::Identity => unreachable!("identity handled above"),
+            }
+            .map_err(E::from)
         },
     )
 }
 
-fn execute_strided_r2r_forward_in_place<T: R2rScalar, const N: usize, const M: usize>(
-    plan: &LocalR2rPlan<T>,
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_strided_local_forward_in_place<T, E, const N: usize, const M: usize>(
+    local: &R2rLocal<T>,
     pencil: &Pencil<N, M>,
     axis: usize,
     data: &mut [T],
     embedding_line: &mut [Complex<T::Real>],
     fft_scratch: &mut [Complex<T::Real>],
     line_buffer: &mut [T],
-) -> Result<(), R2rError> {
+) -> Result<(), E>
+where
+    T: R2rScalar,
+    E: From<FftError> + From<LocalR2rError>,
+{
+    if matches!(local, R2rLocal::Identity) {
+        return Ok(());
+    }
+    let line_len = local.line_len();
     let stride = super::memory_stride(pencil, axis)?;
     if stride <= 1 {
-        return plan
-            .forward_in_place(data, embedding_line, fft_scratch)
-            .map_err(R2rError::LocalR2r);
+        return match local {
+            R2rLocal::Transform(plan) => plan.forward_in_place(data, embedding_line, fft_scratch),
+            R2rLocal::Hartley(plan) => plan.forward_in_place(data, embedding_line, fft_scratch),
+            R2rLocal::Identity => unreachable!("identity handled above"),
+        }
+        .map_err(E::from);
     }
-    if line_buffer.len() < plan.line_len() {
+    if line_buffer.len() < line_len {
         return Err(FftError::WorkspaceTooSmall {
             kind: "real line",
-            required: plan.line_len(),
+            required: line_len,
             actual: line_buffer.len(),
         }
         .into());
     }
-    let count =
-        super::strided_line_count(data.len(), plan.line_len(), stride).map_err(R2rError::Fft)?;
+    let count = super::strided_line_count(data.len(), line_len, stride)?;
     if data.is_empty() {
-        return plan
-            .forward_in_place(data, embedding_line, fft_scratch)
-            .map_err(R2rError::LocalR2r);
+        return match local {
+            R2rLocal::Transform(plan) => plan.forward_in_place(data, embedding_line, fft_scratch),
+            R2rLocal::Hartley(plan) => plan.forward_in_place(data, embedding_line, fft_scratch),
+            R2rLocal::Identity => unreachable!("identity handled above"),
+        }
+        .map_err(E::from);
     }
-    super::for_each_strided_line_in_place(
-        data,
-        line_buffer,
-        count,
-        plan.line_len(),
-        stride,
-        |line| {
-            plan.forward_in_place(line, embedding_line, fft_scratch)
-                .map_err(R2rError::LocalR2r)
-        },
-    )
+    super::for_each_strided_line_in_place(data, line_buffer, count, line_len, stride, |line| {
+        match local {
+            R2rLocal::Transform(plan) => plan.forward_in_place(line, embedding_line, fft_scratch),
+            R2rLocal::Hartley(plan) => plan.forward_in_place(line, embedding_line, fft_scratch),
+            R2rLocal::Identity => unreachable!("identity handled above"),
+        }
+        .map_err(E::from)
+    })
 }
 
-fn execute_strided_r2r_reverse<T: R2rScalar, const N: usize, const M: usize>(
-    plan: &LocalR2rPlan<T>,
-    pencil: &Pencil<N, M>,
-    axis: usize,
-    source: &[T],
-    destination: &mut [T],
-    embedding_line: &mut [Complex<T::Real>],
-    fft_scratch: &mut [Complex<T::Real>],
-    line_buffer: &mut [T],
-    normalize: bool,
-) -> Result<(), R2rError> {
-    let stride = super::memory_stride(pencil, axis)?;
-    if stride <= 1 {
-        return if normalize {
-            plan.inverse(source, destination, embedding_line, fft_scratch)
-        } else {
-            plan.backward(source, destination, embedding_line, fft_scratch)
-        }
-        .map_err(R2rError::LocalR2r);
-    }
-    if line_buffer.len() < plan.line_len() {
-        return Err(FftError::WorkspaceTooSmall {
-            kind: "real line",
-            required: plan.line_len(),
-            actual: line_buffer.len(),
-        }
-        .into());
-    }
-    let count =
-        super::strided_line_count(source.len(), plan.line_len(), stride).map_err(R2rError::Fft)?;
-    if destination.len() != source.len() {
-        return Err(FftError::PreparationFailed.into());
-    }
-    if source.is_empty() {
-        return if normalize {
-            plan.inverse(source, destination, embedding_line, fft_scratch)
-        } else {
-            plan.backward(source, destination, embedding_line, fft_scratch)
-        }
-        .map_err(R2rError::LocalR2r);
-    }
-    super::for_each_strided_line(
-        source,
-        destination,
-        line_buffer,
-        count,
-        plan.line_len(),
-        stride,
-        |line| {
-            if normalize {
-                plan.inverse_in_place(line, embedding_line, fft_scratch)
-            } else {
-                plan.backward_in_place(line, embedding_line, fft_scratch)
-            }
-            .map_err(R2rError::LocalR2r)
-        },
-    )
-}
-
-fn execute_strided_r2r_reverse_in_place<T: R2rScalar, const N: usize, const M: usize>(
-    plan: &LocalR2rPlan<T>,
-    pencil: &Pencil<N, M>,
-    axis: usize,
-    data: &mut [T],
-    embedding_line: &mut [Complex<T::Real>],
-    fft_scratch: &mut [Complex<T::Real>],
-    line_buffer: &mut [T],
-    normalize: bool,
-) -> Result<(), R2rError> {
-    let stride = super::memory_stride(pencil, axis)?;
-    if stride <= 1 {
-        return if normalize {
-            plan.inverse_in_place(data, embedding_line, fft_scratch)
-        } else {
-            plan.backward_in_place(data, embedding_line, fft_scratch)
-        }
-        .map_err(R2rError::LocalR2r);
-    }
-    if line_buffer.len() < plan.line_len() {
-        return Err(FftError::WorkspaceTooSmall {
-            kind: "real line",
-            required: plan.line_len(),
-            actual: line_buffer.len(),
-        }
-        .into());
-    }
-    let count =
-        super::strided_line_count(data.len(), plan.line_len(), stride).map_err(R2rError::Fft)?;
-    if data.is_empty() {
-        return if normalize {
-            plan.inverse_in_place(data, embedding_line, fft_scratch)
-        } else {
-            plan.backward_in_place(data, embedding_line, fft_scratch)
-        }
-        .map_err(R2rError::LocalR2r);
-    }
-    super::for_each_strided_line_in_place(
-        data,
-        line_buffer,
-        count,
-        plan.line_len(),
-        stride,
-        |line| {
-            if normalize {
-                plan.inverse_in_place(line, embedding_line, fft_scratch)
-            } else {
-                plan.backward_in_place(line, embedding_line, fft_scratch)
-            }
-            .map_err(R2rError::LocalR2r)
-        },
-    )
-}
-
-// ponytail: DHT is self-paired; forward and raw backward both use normalize=false.
-fn execute_strided_dht_reverse<T: R2rScalar, const N: usize, const M: usize>(
-    plan: &LocalDhtPlan<T>,
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_strided_local_reverse<T, E, const N: usize, const M: usize>(
+    local: &R2rLocal<T>,
     pencil: &Pencil<N, M>,
     axis: usize,
     source: &[T],
@@ -2710,57 +2625,95 @@ fn execute_strided_dht_reverse<T: R2rScalar, const N: usize, const M: usize>(
     fft_scratch: &mut [Complex<T::Real>],
     line_buffer: &mut [T],
     normalize: bool,
-) -> Result<(), R2rError> {
+) -> Result<(), E>
+where
+    T: R2rScalar,
+    E: From<FftError> + From<LocalR2rError>,
+{
+    if matches!(local, R2rLocal::Identity) {
+        return identity_forward(source, destination);
+    }
+    let line_len = local.line_len();
     let stride = super::memory_stride(pencil, axis)?;
     if stride <= 1 {
-        return if normalize {
-            plan.inverse(source, destination, embedding_line, fft_scratch)
-        } else {
-            plan.backward(source, destination, embedding_line, fft_scratch)
+        return match local {
+            R2rLocal::Transform(plan) if normalize => {
+                plan.inverse(source, destination, embedding_line, fft_scratch)
+            }
+            R2rLocal::Transform(plan) => {
+                plan.backward(source, destination, embedding_line, fft_scratch)
+            }
+            R2rLocal::Hartley(plan) if normalize => {
+                plan.inverse(source, destination, embedding_line, fft_scratch)
+            }
+            R2rLocal::Hartley(plan) => {
+                plan.backward(source, destination, embedding_line, fft_scratch)
+            }
+            R2rLocal::Identity => unreachable!("identity handled above"),
         }
-        .map_err(R2rError::LocalR2r);
+        .map_err(E::from);
     }
-    if line_buffer.len() < plan.line_len() {
+    if line_buffer.len() < line_len {
         return Err(FftError::WorkspaceTooSmall {
             kind: "real line",
-            required: plan.line_len(),
+            required: line_len,
             actual: line_buffer.len(),
         }
         .into());
     }
-    let count =
-        super::strided_line_count(source.len(), plan.line_len(), stride).map_err(R2rError::Fft)?;
+    let count = super::strided_line_count(source.len(), line_len, stride)?;
     if destination.len() != source.len() {
         return Err(FftError::PreparationFailed.into());
     }
     if source.is_empty() {
-        return if normalize {
-            plan.inverse(source, destination, embedding_line, fft_scratch)
-        } else {
-            plan.backward(source, destination, embedding_line, fft_scratch)
+        return match local {
+            R2rLocal::Transform(plan) if normalize => {
+                plan.inverse(source, destination, embedding_line, fft_scratch)
+            }
+            R2rLocal::Transform(plan) => {
+                plan.backward(source, destination, embedding_line, fft_scratch)
+            }
+            R2rLocal::Hartley(plan) if normalize => {
+                plan.inverse(source, destination, embedding_line, fft_scratch)
+            }
+            R2rLocal::Hartley(plan) => {
+                plan.backward(source, destination, embedding_line, fft_scratch)
+            }
+            R2rLocal::Identity => unreachable!("identity handled above"),
         }
-        .map_err(R2rError::LocalR2r);
+        .map_err(E::from);
     }
     super::for_each_strided_line(
         source,
         destination,
         line_buffer,
         count,
-        plan.line_len(),
+        line_len,
         stride,
         |line| {
-            if normalize {
-                plan.inverse_in_place(line, embedding_line, fft_scratch)
-            } else {
-                plan.backward_in_place(line, embedding_line, fft_scratch)
+            match local {
+                R2rLocal::Transform(plan) if normalize => {
+                    plan.inverse_in_place(line, embedding_line, fft_scratch)
+                }
+                R2rLocal::Transform(plan) => {
+                    plan.backward_in_place(line, embedding_line, fft_scratch)
+                }
+                R2rLocal::Hartley(plan) if normalize => {
+                    plan.inverse_in_place(line, embedding_line, fft_scratch)
+                }
+                R2rLocal::Hartley(plan) => {
+                    plan.backward_in_place(line, embedding_line, fft_scratch)
+                }
+                R2rLocal::Identity => unreachable!("identity handled above"),
             }
-            .map_err(R2rError::LocalR2r)
+            .map_err(E::from)
         },
     )
 }
 
-fn execute_strided_dht_reverse_in_place<T: R2rScalar, const N: usize, const M: usize>(
-    plan: &LocalDhtPlan<T>,
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_strided_local_reverse_in_place<T, E, const N: usize, const M: usize>(
+    local: &R2rLocal<T>,
     pencil: &Pencil<N, M>,
     axis: usize,
     data: &mut [T],
@@ -2768,49 +2721,67 @@ fn execute_strided_dht_reverse_in_place<T: R2rScalar, const N: usize, const M: u
     fft_scratch: &mut [Complex<T::Real>],
     line_buffer: &mut [T],
     normalize: bool,
-) -> Result<(), R2rError> {
+) -> Result<(), E>
+where
+    T: R2rScalar,
+    E: From<FftError> + From<LocalR2rError>,
+{
+    if matches!(local, R2rLocal::Identity) {
+        return Ok(());
+    }
+    let line_len = local.line_len();
     let stride = super::memory_stride(pencil, axis)?;
     if stride <= 1 {
-        return if normalize {
-            plan.inverse_in_place(data, embedding_line, fft_scratch)
-        } else {
-            plan.backward_in_place(data, embedding_line, fft_scratch)
+        return match local {
+            R2rLocal::Transform(plan) if normalize => {
+                plan.inverse_in_place(data, embedding_line, fft_scratch)
+            }
+            R2rLocal::Transform(plan) => plan.backward_in_place(data, embedding_line, fft_scratch),
+            R2rLocal::Hartley(plan) if normalize => {
+                plan.inverse_in_place(data, embedding_line, fft_scratch)
+            }
+            R2rLocal::Hartley(plan) => plan.backward_in_place(data, embedding_line, fft_scratch),
+            R2rLocal::Identity => unreachable!("identity handled above"),
         }
-        .map_err(R2rError::LocalR2r);
+        .map_err(E::from);
     }
-    if line_buffer.len() < plan.line_len() {
+    if line_buffer.len() < line_len {
         return Err(FftError::WorkspaceTooSmall {
             kind: "real line",
-            required: plan.line_len(),
+            required: line_len,
             actual: line_buffer.len(),
         }
         .into());
     }
-    let count =
-        super::strided_line_count(data.len(), plan.line_len(), stride).map_err(R2rError::Fft)?;
+    let count = super::strided_line_count(data.len(), line_len, stride)?;
     if data.is_empty() {
-        return if normalize {
-            plan.inverse_in_place(data, embedding_line, fft_scratch)
-        } else {
-            plan.backward_in_place(data, embedding_line, fft_scratch)
-        }
-        .map_err(R2rError::LocalR2r);
-    }
-    super::for_each_strided_line_in_place(
-        data,
-        line_buffer,
-        count,
-        plan.line_len(),
-        stride,
-        |line| {
-            if normalize {
-                plan.inverse_in_place(line, embedding_line, fft_scratch)
-            } else {
-                plan.backward_in_place(line, embedding_line, fft_scratch)
+        return match local {
+            R2rLocal::Transform(plan) if normalize => {
+                plan.inverse_in_place(data, embedding_line, fft_scratch)
             }
-            .map_err(R2rError::LocalR2r)
-        },
-    )
+            R2rLocal::Transform(plan) => plan.backward_in_place(data, embedding_line, fft_scratch),
+            R2rLocal::Hartley(plan) if normalize => {
+                plan.inverse_in_place(data, embedding_line, fft_scratch)
+            }
+            R2rLocal::Hartley(plan) => plan.backward_in_place(data, embedding_line, fft_scratch),
+            R2rLocal::Identity => unreachable!("identity handled above"),
+        }
+        .map_err(E::from);
+    }
+    super::for_each_strided_line_in_place(data, line_buffer, count, line_len, stride, |line| {
+        match local {
+            R2rLocal::Transform(plan) if normalize => {
+                plan.inverse_in_place(line, embedding_line, fft_scratch)
+            }
+            R2rLocal::Transform(plan) => plan.backward_in_place(line, embedding_line, fft_scratch),
+            R2rLocal::Hartley(plan) if normalize => {
+                plan.inverse_in_place(line, embedding_line, fft_scratch)
+            }
+            R2rLocal::Hartley(plan) => plan.backward_in_place(line, embedding_line, fft_scratch),
+            R2rLocal::Identity => unreachable!("identity handled above"),
+        }
+        .map_err(E::from)
+    })
 }
 
 fn execute_local_forward<T: R2rScalar, const N: usize, const M: usize>(
@@ -2823,36 +2794,16 @@ fn execute_local_forward<T: R2rScalar, const N: usize, const M: usize>(
     fft_scratch: &mut [Complex<T::Real>],
     line_buffer: &mut [T],
 ) -> Result<(), R2rError> {
-    match local {
-        R2rLocal::Identity => {
-            if source.len() != destination.len() {
-                return Err(FftError::PreparationFailed.into());
-            }
-            destination.copy_from_slice(source);
-            Ok(())
-        }
-        R2rLocal::Transform(plan) => execute_strided_r2r_forward(
-            plan,
-            pencil,
-            axis,
-            source,
-            destination,
-            embedding_line,
-            fft_scratch,
-            line_buffer,
-        ),
-        R2rLocal::Hartley(plan) => execute_strided_dht_reverse(
-            plan,
-            pencil,
-            axis,
-            source,
-            destination,
-            embedding_line,
-            fft_scratch,
-            line_buffer,
-            false,
-        ),
-    }
+    execute_strided_local_forward(
+        local,
+        pencil,
+        axis,
+        source,
+        destination,
+        embedding_line,
+        fft_scratch,
+        line_buffer,
+    )
 }
 
 fn execute_local_forward_in_place<T: R2rScalar, const N: usize, const M: usize>(
@@ -2864,28 +2815,15 @@ fn execute_local_forward_in_place<T: R2rScalar, const N: usize, const M: usize>(
     fft_scratch: &mut [Complex<T::Real>],
     line_buffer: &mut [T],
 ) -> Result<(), R2rError> {
-    match local {
-        R2rLocal::Identity => Ok(()),
-        R2rLocal::Transform(plan) => execute_strided_r2r_forward_in_place(
-            plan,
-            pencil,
-            axis,
-            data,
-            embedding_line,
-            fft_scratch,
-            line_buffer,
-        ),
-        R2rLocal::Hartley(plan) => execute_strided_dht_reverse_in_place(
-            plan,
-            pencil,
-            axis,
-            data,
-            embedding_line,
-            fft_scratch,
-            line_buffer,
-            false,
-        ),
-    }
+    execute_strided_local_forward_in_place(
+        local,
+        pencil,
+        axis,
+        data,
+        embedding_line,
+        fft_scratch,
+        line_buffer,
+    )
 }
 
 fn execute_local_reverse<T: R2rScalar, const N: usize, const M: usize>(
@@ -2899,37 +2837,17 @@ fn execute_local_reverse<T: R2rScalar, const N: usize, const M: usize>(
     line_buffer: &mut [T],
     normalize: bool,
 ) -> Result<(), R2rError> {
-    match local {
-        R2rLocal::Identity => {
-            if source.len() != destination.len() {
-                return Err(FftError::PreparationFailed.into());
-            }
-            destination.copy_from_slice(source);
-            Ok(())
-        }
-        R2rLocal::Transform(plan) => execute_strided_r2r_reverse(
-            plan,
-            pencil,
-            axis,
-            source,
-            destination,
-            embedding_line,
-            fft_scratch,
-            line_buffer,
-            normalize,
-        ),
-        R2rLocal::Hartley(plan) => execute_strided_dht_reverse(
-            plan,
-            pencil,
-            axis,
-            source,
-            destination,
-            embedding_line,
-            fft_scratch,
-            line_buffer,
-            normalize,
-        ),
-    }
+    execute_strided_local_reverse(
+        local,
+        pencil,
+        axis,
+        source,
+        destination,
+        embedding_line,
+        fft_scratch,
+        line_buffer,
+        normalize,
+    )
 }
 
 fn execute_local_reverse_in_place<T: R2rScalar, const N: usize, const M: usize>(
@@ -2942,29 +2860,16 @@ fn execute_local_reverse_in_place<T: R2rScalar, const N: usize, const M: usize>(
     line_buffer: &mut [T],
     normalize: bool,
 ) -> Result<(), R2rError> {
-    match local {
-        R2rLocal::Identity => Ok(()),
-        R2rLocal::Transform(plan) => execute_strided_r2r_reverse_in_place(
-            plan,
-            pencil,
-            axis,
-            data,
-            embedding_line,
-            fft_scratch,
-            line_buffer,
-            normalize,
-        ),
-        R2rLocal::Hartley(plan) => execute_strided_dht_reverse_in_place(
-            plan,
-            pencil,
-            axis,
-            data,
-            embedding_line,
-            fft_scratch,
-            line_buffer,
-            normalize,
-        ),
-    }
+    execute_strided_local_reverse_in_place(
+        local,
+        pencil,
+        axis,
+        data,
+        embedding_line,
+        fft_scratch,
+        line_buffer,
+        normalize,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3226,10 +3131,7 @@ fn map_overwrite_error<E>(error: OverwriteError<E>) -> R2rError
 where
     E: Into<R2rError>,
 {
-    match error {
-        OverwriteError::Array(error) => FftError::Array(error).into(),
-        OverwriteError::Writer(error) => error.into(),
-    }
+    super::map_overwrite(error, |error| R2rError::Fft(FftError::Array(error)))
 }
 
 fn zero_complex<R: super::FftReal>() -> Complex<R> {

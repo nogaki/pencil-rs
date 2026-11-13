@@ -3,7 +3,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::{
-    ArrayError, ExtraShape, Pencil, PencilArrayView, PencilArrayViewMut, checked::checked_product,
+    ArrayError, ExtraShape, Pencil, PencilArrayView, PencilArrayViewMut,
+    checked::{check_storage_len, local_storage_len},
 };
 
 #[derive(Debug, Error)]
@@ -67,14 +68,8 @@ impl<T, const N: usize, const M: usize> ManyPencilArray<T, N, M> {
             Ok(required) => required,
             Err(error) => return Err((error, storage)),
         };
-        if storage.len() != required {
-            return Err((
-                ArrayError::StorageLengthMismatch {
-                    required,
-                    actual: storage.len(),
-                },
-                storage,
-            ));
+        if let Err(error) = check_storage_len(required, storage.len()) {
+            return Err((error, storage));
         }
 
         Ok(Self {
@@ -261,10 +256,10 @@ impl<T, const N: usize, const M: usize> ManyPencilArray<T, N, M> {
                 index,
                 layout_count: self.pencils.len(),
             })?;
-        Ok(checked_product(&[
+        Ok(local_storage_len(
             pencil.local_len(),
             self.extra_shape.element_count(),
-        ])?)
+        )?)
     }
 }
 
@@ -340,8 +335,8 @@ fn validate_registry<const N: usize, const M: usize>(
         .map(|pencil| pencil.local_len())
         .max()
         .expect("non-empty registry was checked");
-    Ok(checked_product(&[
+    Ok(local_storage_len(
         max_local_len,
         extra_shape.element_count(),
-    ])?)
+    )?)
 }
