@@ -4,8 +4,8 @@ use mpi::collective::CommunicatorCollectives;
 use mpi::traits::Communicator;
 use pencil_array::{ExtraShape, MpiTopology, Pencil, PencilArray};
 use pencil_io::{
-    DatasetInfo, MpiFileSession, MpiIoOptions, append_mpi_named, read_mpi_named,
-    read_mpi_named_catalog,
+    DatasetInfo, IoError, MpiFileSession, MpiIoOptions, MpiSessionError, append_mpi_named,
+    read_mpi_named, read_mpi_named_catalog,
 };
 
 mod support;
@@ -253,6 +253,25 @@ fn mpi_file_session_lifecycle_and_collective_errors() {
     assert!(prefix.catalog().is_err());
     prefix.close().unwrap();
     assert!(MpiFileSession::open_append(comm, &path, &options).is_err());
+
+    // Run after the normal lifecycle control so an overlong-path native failure
+    // cannot prevent the control case from exercising this process environment.
+    let oversized_path = std::path::PathBuf::from("p".repeat(64 * 1024 + 1));
+    match MpiFileSession::create(comm, &oversized_path, &options) {
+        Err(error) => assert!(
+            matches!(
+                &error,
+                MpiSessionError::Io(IoError::CollectivePrecondition {
+                    phase: "session path validation"
+                })
+            ),
+            "64 KiB session path must fail collective path preflight, got {error:?}"
+        ),
+        Ok(mut session) => {
+            session.close().unwrap();
+            panic!("64 KiB session path unexpectedly reached native create");
+        }
+    }
 
     cleanup_owned_temp_dir(&world, Path::new(&dir));
 }

@@ -168,6 +168,10 @@ use crate::BackendInitError;
 #[cfg(feature = "fftw")]
 use crate::PlanOptions;
 
+#[cfg(test)]
+#[path = "distributed/tests/mod.rs"]
+mod regression_tests;
+
 #[derive(Clone, Copy, Debug)]
 enum BackendChoice {
     RustFft,
@@ -470,11 +474,16 @@ impl From<FftError> for BackendInitError<R2rError> {
 
 pub mod collections;
 pub use collections::CollectionError;
+#[cfg(test)]
+#[path = "distributed/r2c/tests/boundary.rs"]
+mod boundary_regression_tests;
 mod c2r;
 #[cfg(all(test, feature = "fftw"))]
 pub(crate) mod fftw_tests;
 pub mod mixed;
 mod r2c;
+#[cfg(test)]
+use r2c::for_each_boundary_endpoint;
 mod r2r;
 
 #[cfg(test)]
@@ -895,6 +904,64 @@ enum C2cTransition<const N: usize, const M: usize> {
     Local(LocalTransposePlan<N, M>),
     AllToAllv(AllToAllvTransposePlan<N, M>),
     PointToPoint(PointToPointTransposePlan<N, M>),
+}
+
+impl<const N: usize, const M: usize> C2cTransition<N, M> {
+    fn supports_overlap(&self) -> bool {
+        !matches!(self, Self::AllToAllv(_))
+    }
+}
+
+pub(super) struct ComplexWorkspaceBuffers<R: FftReal> {
+    pub(super) transpose: TransposeWorkspace<Complex<R>>,
+    pub(super) fft_scratch: Vec<Complex<R>>,
+    pub(super) line_buffer: Vec<Complex<R>>,
+}
+
+pub(super) fn allocate_complex_workspace_buffers<R: FftReal>(
+    send_len: usize,
+    receive_len: usize,
+    scratch_len: usize,
+    line_len: usize,
+) -> Result<ComplexWorkspaceBuffers<R>, FftError> {
+    Ok(ComplexWorkspaceBuffers {
+        transpose: TransposeWorkspace::from_vecs(
+            initialized_vec(send_len, zero_complex::<R>())?,
+            initialized_vec(receive_len, zero_complex::<R>())?,
+        ),
+        fft_scratch: initialized_vec(scratch_len, zero_complex::<R>())?,
+        line_buffer: initialized_vec(line_len, zero_complex::<R>())?,
+    })
+}
+
+pub(super) struct R2rTransposeBuffers<T> {
+    pub(super) send_buffer: Vec<T>,
+    pub(super) receive_buffer: Vec<T>,
+}
+
+pub(super) struct R2rWorkspaceBuffers<T: crate::R2rScalar> {
+    pub(super) transpose: R2rTransposeBuffers<T>,
+    pub(super) embedding_line: Vec<Complex<T::Real>>,
+    pub(super) fft_scratch: Vec<Complex<T::Real>>,
+    pub(super) line_buffer: Vec<T>,
+}
+
+pub(super) fn allocate_r2r_workspace_buffers<T: crate::R2rScalar>(
+    send_len: usize,
+    receive_len: usize,
+    embedding_len: usize,
+    scratch_len: usize,
+    line_len: usize,
+) -> Result<R2rWorkspaceBuffers<T>, FftError> {
+    Ok(R2rWorkspaceBuffers {
+        transpose: R2rTransposeBuffers {
+            send_buffer: initialized_vec(send_len, crate::r2r::r2r_zero::<T>())?,
+            receive_buffer: initialized_vec(receive_len, crate::r2r::r2r_zero::<T>())?,
+        },
+        embedding_line: initialized_vec(embedding_len, zero_complex::<T::Real>())?,
+        fft_scratch: initialized_vec(scratch_len, zero_complex::<T::Real>())?,
+        line_buffer: initialized_vec(line_len, crate::r2r::r2r_zero::<T>())?,
+    })
 }
 
 #[derive(Debug)]
@@ -1328,14 +1395,17 @@ where
     /// This method is noncollective. If allocation fails on one rank, callers
     /// must coordinate that failure before the next collective call.
     pub fn allocate_in_place_workspace(&self) -> Result<C2cInPlaceWorkspace<R, N, M>, FftError> {
+        let buffers = allocate_complex_workspace_buffers::<R>(
+            self.core.transpose_send_len,
+            self.core.transpose_receive_len,
+            self.core.fft_scratch_len,
+            self.core.strided_line_len,
+        )?;
         Ok(C2cInPlaceWorkspace {
             core: Arc::clone(&self.core),
-            transpose: TransposeWorkspace::from_vecs(
-                initialized_vec(self.core.transpose_send_len, zero_complex::<R>())?,
-                initialized_vec(self.core.transpose_receive_len, zero_complex::<R>())?,
-            ),
-            fft_scratch: initialized_vec(self.core.fft_scratch_len, zero_complex::<R>())?,
-            line_buffer: initialized_vec(self.core.strided_line_len, zero_complex::<R>())?,
+            transpose: buffers.transpose,
+            fft_scratch: buffers.fft_scratch,
+            line_buffer: buffers.line_buffer,
         })
     }
 
@@ -1351,18 +1421,18 @@ where
         )
         .map_err(map_array_allocation)?;
 
-        let transpose = TransposeWorkspace::from_vecs(
-            initialized_vec(self.core.transpose_send_len, zero_complex::<R>())?,
-            initialized_vec(self.core.transpose_receive_len, zero_complex::<R>())?,
-        );
-        let fft_scratch = initialized_vec(self.core.fft_scratch_len, zero_complex::<R>())?;
-        let line_buffer = initialized_vec(self.core.strided_line_len, zero_complex::<R>())?;
+        let buffers = allocate_complex_workspace_buffers::<R>(
+            self.core.transpose_send_len,
+            self.core.transpose_receive_len,
+            self.core.fft_scratch_len,
+            self.core.strided_line_len,
+        )?;
         Ok(C2cOutOfPlaceWorkspace {
             core: Arc::clone(&self.core),
             intermediate,
-            transpose,
-            fft_scratch,
-            line_buffer,
+            transpose: buffers.transpose,
+            fft_scratch: buffers.fft_scratch,
+            line_buffer: buffers.line_buffer,
         })
     }
 
@@ -1991,8 +2061,7 @@ where
                 .into());
         }
         let overlap_supported = self.core.transitions.iter().all(|transition| {
-            !matches!(transition.forward, C2cTransition::AllToAllv(_))
-                && !matches!(transition.backward, C2cTransition::AllToAllv(_))
+            transition.forward.supports_overlap() && transition.backward.supports_overlap()
         });
         // This agreement is deliberately before stage-zero writes or payload.
         if !collective_valid(communicator, overlap_supported) {
@@ -2782,34 +2851,60 @@ fn for_each_strided_line_differing_in_place<S, T: Copy, U: Copy, E: From<FftErro
     write: impl Fn(&mut S, U),
     mut transform: impl FnMut(&[T], &mut [U]) -> Result<(), E>,
 ) -> Result<(), E> {
+    let expected_source_block = source_line
+        .len()
+        .checked_mul(stride)
+        .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+    let expected_destination_block = destination_line
+        .len()
+        .checked_mul(stride)
+        .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+    let source_span = count
+        .checked_mul(source_block)
+        .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+    let destination_span = count
+        .checked_mul(destination_block)
+        .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+    if stride == 0
+        || source_block < expected_source_block
+        || destination_block < expected_destination_block
+        || source_span > storage.len()
+        || destination_span > storage.len()
+    {
+        return Err(E::from(FftError::PreparationFailed));
+    }
     for outer in 0..count {
         let source_base = outer
             .checked_mul(source_block)
             .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+        let source_end = source_base
+            .checked_add(source_block)
+            .ok_or_else(|| E::from(FftError::PreparationFailed))?;
         let destination_base = outer
             .checked_mul(destination_block)
             .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+        let destination_end = destination_base
+            .checked_add(destination_block)
+            .ok_or_else(|| E::from(FftError::PreparationFailed))?;
         for inner in 0..stride {
-            for (k, slot) in source_line.iter_mut().enumerate() {
-                let index = source_base
-                    .checked_add(
-                        k.checked_mul(stride)
-                            .ok_or_else(|| E::from(FftError::PreparationFailed))?,
-                    )
-                    .and_then(|value| value.checked_add(inner))
-                    .ok_or_else(|| E::from(FftError::PreparationFailed))?;
-                *slot = read(&storage[index]);
+            let source_group = storage
+                .get(source_base..source_end)
+                .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+            for (slot, chunk) in source_line
+                .iter_mut()
+                .zip(source_group.chunks_exact(stride))
+            {
+                *slot = read(&chunk[inner]);
             }
             transform(source_line, destination_line)?;
-            for (k, element) in destination_line.iter().enumerate() {
-                let index = destination_base
-                    .checked_add(
-                        k.checked_mul(stride)
-                            .ok_or_else(|| E::from(FftError::PreparationFailed))?,
-                    )
-                    .and_then(|value| value.checked_add(inner))
-                    .ok_or_else(|| E::from(FftError::PreparationFailed))?;
-                write(&mut storage[index], *element);
+            let destination_group = storage
+                .get_mut(destination_base..destination_end)
+                .ok_or_else(|| E::from(FftError::PreparationFailed))?;
+            for (element, chunk) in destination_line
+                .iter()
+                .zip(destination_group.chunks_exact_mut(stride))
+            {
+                write(&mut chunk[inner], *element);
             }
         }
     }

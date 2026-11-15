@@ -71,12 +71,7 @@ fn header(
     count: usize,
 ) -> Result<(), CollectionIoError> {
     let fixed = [IO_NAMESPACE, operation, FORMAT_VERSION, count as u64, 1];
-    let (mut min, mut max) = ([0u64; 5], [0u64; 5]);
-    comm.all_reduce_into(&fixed, &mut min, SystemOperation::min());
-    comm.all_reduce_into(&fixed, &mut max, SystemOperation::max());
-    if min != max {
-        return Err(IoError::CollectiveDescriptorMismatch.into());
-    }
+    crate::options::agree_values(comm, &fixed)?;
     if count == 0 {
         return Err(CollectionIoError::Empty);
     }

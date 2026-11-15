@@ -11,7 +11,7 @@ use crate::{
     DatasetInfo, IoElement, IoError, MAX_HEADER_BYTES, MAX_PROTOCOL_RANK, MpiIoMode, MpiIoOptions,
     ScalarType, ffi,
 };
-use mpi::{collective::SystemOperation, topology::CartesianCommunicator, traits::*};
+use mpi::{topology::CartesianCommunicator, traits::*};
 use pencil_array::{PencilArrayView, PencilArrayViewMut, partition_range};
 use std::{ffi::CString, path::Path};
 
@@ -51,13 +51,7 @@ fn prepared<T>(c: &CartesianCommunicator, r: Result<T, IoError>) -> Result<T, Io
 // The common two five-u64 reductions are always first, on the original comm.
 fn entry(c: &CartesianCommunicator, op: u64) -> Result<(), IoError> {
     let h = [NAMESPACE, op, VERSION, 0, 1];
-    let (mut lo, mut hi) = ([0u64; 5], [0u64; 5]);
-    c.all_reduce_into(&h, &mut lo, SystemOperation::min());
-    c.all_reduce_into(&h, &mut hi, SystemOperation::max());
-    if lo != hi {
-        return Err(IoError::CollectiveDescriptorMismatch);
-    }
-    Ok(())
+    crate::options::agree_values(c, &h)
 }
 fn bytes_agree(c: &CartesianCommunicator, b: &[u8]) -> Result<(), IoError> {
     crate::catalog::agree_bytes(c, b).map_err(|_| IoError::CollectiveDescriptorMismatch)

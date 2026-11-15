@@ -34,11 +34,12 @@ use super::{
     OPERATION_R2C_BACKWARD_IN_PLACE, OPERATION_R2C_FORWARD, OPERATION_R2C_FORWARD_IN_PLACE,
     OPERATION_R2C_INVERSE, OPERATION_R2C_INVERSE_IN_PLACE, OPERATION_R2C_PLAN, R2cError,
     StagePreparation, TransformPlanCore, TransformStage, TransformTiming, TransposeMethod,
-    VALUE_KIND_R2C, agree_execution_descriptor_ref, agree_header, agree_result, build_descriptor,
-    build_route, build_transitions, collective_valid, convert_strided_complex_reverse,
-    convert_strided_real_forward, descriptor_len, initialized_vec, map_array_allocation,
-    prepare_complex_stage_for_backend, registered_pencils, strided_complex_line_len,
-    validate_out_of_place, validate_workspace_lengths_values, zero_complex,
+    VALUE_KIND_R2C, agree_execution_descriptor_ref, agree_header, agree_result,
+    allocate_complex_workspace_buffers, build_descriptor, build_route, build_transitions,
+    collective_valid, convert_strided_complex_reverse, convert_strided_real_forward,
+    descriptor_len, initialized_vec, map_array_allocation, prepare_complex_stage_for_backend,
+    registered_pencils, strided_complex_line_len, validate_out_of_place,
+    validate_workspace_lengths_values, zero_complex,
 };
 
 #[cfg(test)]
@@ -64,6 +65,15 @@ const OPERATION_R2C_BACKWARD_TIMED: u64 = 81;
 const OPERATION_R2C_FORWARD_IN_PLACE_TIMED: u64 = 82;
 const OPERATION_R2C_INVERSE_IN_PLACE_TIMED: u64 = 83;
 const OPERATION_R2C_BACKWARD_IN_PLACE_TIMED: u64 = 84;
+
+/// Direction retained when rebuilding a shared real-transform core.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum RealOrientation {
+    /// Real input to reduced complex output.
+    R2c,
+    /// Canonical complex input to real output with the explicit original length.
+    C2r { real_len: usize },
+}
 
 /// An immutable, checked distributed real-to-half-complex FFT plan.
 ///
@@ -247,7 +257,7 @@ pub struct R2cPlan<R: FftReal, const N: usize, const M: usize> {
     raw_absolute_threshold: f64,
     // Preserve the private core's orientation when rebuilding native plans.
     #[cfg(feature = "fftw")]
-    c2r_real_len: Option<usize>,
+    orientation: RealOrientation,
 }
 
 /// Reusable storage for [`R2cPlan`] forward, inverse, and backward execution.
@@ -726,10 +736,12 @@ where
                 .map_err(map_array_allocation)?,
             )
         };
-        let transpose = TransposeWorkspace::from_vecs(
-            initialized_vec(self.core.transpose_send_len, zero_complex::<R>())?,
-            initialized_vec(self.core.transpose_receive_len, zero_complex::<R>())?,
-        );
+        let complex_buffers = allocate_complex_workspace_buffers::<R>(
+            self.core.transpose_send_len,
+            self.core.transpose_receive_len,
+            self.core.fft_scratch_len,
+            self.core.strided_line_len,
+        )?;
         let real_transpose = if boundary == 0 {
             None
         } else {
@@ -738,7 +750,6 @@ where
                 initialized_vec(self.core.real_transpose_receive_len, R::zero())?,
             ))
         };
-        let fft_scratch = initialized_vec(self.core.fft_scratch_len, zero_complex::<R>())?;
         let boundary_stride = super::memory_stride(
             self.core.stages[boundary].input.as_ref(),
             self.core.stages[boundary].axis,
@@ -750,19 +761,17 @@ where
         };
         let real_line = initialized_vec(real_len, R::zero())?;
         let complex_line = initialized_vec(complex_len, zero_complex::<R>())?;
-        let complex_strided_line =
-            initialized_vec(self.core.strided_line_len, zero_complex::<R>())?;
         Ok(R2cWorkspace {
             core: Arc::clone(&self.core),
             intermediate,
-            transpose,
+            transpose: complex_buffers.transpose,
             real_intermediate,
             real_transpose,
-            fft_scratch,
+            fft_scratch: complex_buffers.fft_scratch,
             real_source_line,
             real_line,
             complex_line,
-            complex_strided_line,
+            complex_strided_line: complex_buffers.line_buffer,
         })
     }
 
@@ -826,14 +835,17 @@ where
             self.core.stages[boundary].input.as_ref(),
             self.core.stages[boundary].axis,
         )?;
+        let complex_buffers = allocate_complex_workspace_buffers::<R>(
+            self.core.transpose_send_len,
+            self.core.transpose_receive_len,
+            self.core.fft_scratch_len,
+            self.core.strided_line_len,
+        )?;
         Ok(R2cInPlaceWorkspace {
             core: Arc::clone(&self.core),
-            transpose: TransposeWorkspace::from_vecs(
-                initialized_vec(self.core.transpose_send_len, zero_complex::<R>())?,
-                initialized_vec(self.core.transpose_receive_len, zero_complex::<R>())?,
-            ),
+            transpose: complex_buffers.transpose,
             real_transpose,
-            fft_scratch: initialized_vec(self.core.fft_scratch_len, zero_complex::<R>())?,
+            fft_scratch: complex_buffers.fft_scratch,
             real_source_line: if boundary_stride > 1 {
                 Some(initialized_vec(real_len, R::zero())?)
             } else {
@@ -842,7 +854,7 @@ where
             real_line: initialized_vec(real_len, R::zero())?,
             complex_source_line: initialized_vec(complex_len, zero_complex::<R>())?,
             complex_line: initialized_vec(complex_len, zero_complex::<R>())?,
-            complex_strided_line: initialized_vec(self.core.strided_line_len, zero_complex::<R>())?,
+            complex_strided_line: complex_buffers.line_buffer,
         })
     }
 
@@ -1118,10 +1130,9 @@ where
     /// and in-place arrays. See the [crate-level contract](crate#distributed-compatibility-and-failure-contract).
     #[cfg(feature = "fftw")]
     pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<R2cError>> {
-        let canonical = if self.c2r_real_len.is_some() {
-            self.output_pencil()
-        } else {
-            self.input_pencil()
+        let canonical = match self.orientation {
+            RealOrientation::R2c => self.input_pencil(),
+            RealOrientation::C2r { .. } => self.output_pencil(),
         };
         let topology = Arc::clone(canonical.topology());
         let shape = *canonical.global_shape();
@@ -1139,7 +1150,7 @@ where
             self.core.selection,
             self.core.layout,
             super::BackendChoice::Fftw(options),
-            self.c2r_real_len,
+            self.orientation,
         )?;
         Arc::get_mut(&mut plan.core)
             .expect("fresh core")
@@ -1192,7 +1203,7 @@ where
             selection,
             layout,
             backend,
-            None,
+            RealOrientation::R2c,
         )
     }
 
@@ -1204,9 +1215,12 @@ where
         selection: AxisSelection<N>,
         layout: DistributedLayout,
         backend: super::BackendChoice,
-        c2r_real_len: Option<usize>,
+        orientation: RealOrientation,
     ) -> Result<Self, BackendInitError<R2cError>> {
-        let c2r = c2r_real_len.is_some();
+        let (c2r, c2r_real_len) = match orientation {
+            RealOrientation::R2c => (false, None),
+            RealOrientation::C2r { real_len } => (true, Some(real_len)),
+        };
         let communicator = topology.communicator();
         let suffix_len = super::BACKEND_DESCRIPTOR_WORDS + usize::from(c2r);
         let expected_len =
@@ -1350,7 +1364,7 @@ where
             selection,
             real_len,
             backend,
-            c2r,
+            orientation,
         );
         if !collective_valid(communicator, prepared.is_ok()) {
             return Err(match prepared {
@@ -1435,7 +1449,7 @@ where
             core: Arc::new(core),
             raw_absolute_threshold,
             #[cfg(feature = "fftw")]
-            c2r_real_len,
+            orientation,
         })
     }
 }
@@ -1449,8 +1463,9 @@ fn prepare_r2c_stages<R: FftReal, const N: usize, const M: usize>(
     selection: AxisSelection<N>,
     real_len: usize,
     backend: super::BackendChoice,
-    c2r: bool,
+    orientation: RealOrientation,
 ) -> Result<StagePreparation<R, N, M>, BackendInitError<R2cError>> {
+    let c2r = matches!(orientation, RealOrientation::C2r { .. });
     let boundary = if c2r {
         reduction_axis
     } else {
@@ -2871,10 +2886,7 @@ fn overlap_supported<R: FftReal, const N: usize, const M: usize>(
             Direction::Forward => &transition.forward,
             Direction::Inverse | Direction::Backward => &transition.backward,
         };
-        matches!(
-            item,
-            C2cTransition::Identity | C2cTransition::Local(_) | C2cTransition::PointToPoint(_)
-        )
+        item.supports_overlap()
     })
 }
 
@@ -4530,7 +4542,7 @@ struct R2cEndpointStatistics {
     stride: usize,
     local_axis_len: usize,
     global_axis_start: usize,
-    complex_len: usize,
+    real_len: usize,
     statistics: super::EndpointStatistics,
 }
 
@@ -4545,6 +4557,142 @@ pub(super) fn endpoint_plane(k: usize, complex_len: usize, plane_count: usize) -
     } else {
         None
     }
+}
+
+pub(super) fn validate_boundary_endpoint_layout(
+    values_len: usize,
+    local_len: usize,
+    local_axis_len: usize,
+    global_axis_start: usize,
+    stride: usize,
+    real_len: usize,
+) -> Result<(), FftError> {
+    if values_len == 0 {
+        return Ok(());
+    }
+    if local_len == 0
+        || local_axis_len == 0
+        || stride == 0
+        || real_len == 0
+        || !values_len.is_multiple_of(local_len)
+    {
+        return Err(FftError::PreparationFailed);
+    }
+    let complex_len = real_len / 2 + 1;
+    let axis_end = global_axis_start
+        .checked_add(local_axis_len)
+        .ok_or(FftError::PreparationFailed)?;
+    let line_block = local_axis_len
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
+    if axis_end > complex_len || line_block == 0 || !local_len.is_multiple_of(line_block) {
+        return Err(FftError::PreparationFailed);
+    }
+    Ok(())
+}
+
+fn for_each_boundary_endpoint_offset(
+    values_len: usize,
+    local_len: usize,
+    local_axis_len: usize,
+    global_axis_start: usize,
+    stride: usize,
+    real_len: usize,
+    mut visit: impl FnMut(usize, usize, usize),
+) -> Result<(), FftError> {
+    validate_boundary_endpoint_layout(
+        values_len,
+        local_len,
+        local_axis_len,
+        global_axis_start,
+        stride,
+        real_len,
+    )?;
+    if values_len == 0 {
+        return Ok(());
+    }
+    let complex_len = real_len / 2 + 1;
+    let line_block = local_axis_len
+        .checked_mul(stride)
+        .ok_or(FftError::PreparationFailed)?;
+    let outer_count = local_len / line_block;
+    let batch_count = values_len / local_len;
+    let axis_end = global_axis_start
+        .checked_add(local_axis_len)
+        .ok_or(FftError::PreparationFailed)?;
+    let plane_count = if real_len.is_multiple_of(2) { 2 } else { 1 };
+    for batch in 0..batch_count {
+        let batch_base = batch
+            .checked_mul(local_len)
+            .ok_or(FftError::PreparationFailed)?;
+        for outer in 0..outer_count {
+            let outer_base = outer
+                .checked_mul(line_block)
+                .and_then(|offset| batch_base.checked_add(offset))
+                .ok_or(FftError::PreparationFailed)?;
+            for plane in 0..plane_count {
+                let k = if plane == 0 { 0 } else { complex_len - 1 };
+                if endpoint_plane(k, complex_len, plane_count) != Some(plane)
+                    || k < global_axis_start
+                    || k >= axis_end
+                {
+                    continue;
+                }
+                let plane_base = (k - global_axis_start)
+                    .checked_mul(stride)
+                    .and_then(|offset| outer_base.checked_add(offset))
+                    .ok_or(FftError::PreparationFailed)?;
+                for inner in 0..stride {
+                    let offset = plane_base
+                        .checked_add(inner)
+                        .filter(|&offset| offset < values_len)
+                        .ok_or(FftError::PreparationFailed)?;
+                    visit(offset, k, plane);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn for_each_boundary_endpoint<R: FftReal>(
+    values: &mut [Complex<R>],
+    local_len: usize,
+    local_axis_len: usize,
+    global_axis_start: usize,
+    stride: usize,
+    real_len: usize,
+    mut visit: impl FnMut(usize, usize, usize, &mut Complex<R>),
+) -> Result<(), FftError> {
+    for_each_boundary_endpoint_offset(
+        values.len(),
+        local_len,
+        local_axis_len,
+        global_axis_start,
+        stride,
+        real_len,
+        |offset, k, plane| visit(offset, k, plane, &mut values[offset]),
+    )
+}
+
+pub(super) fn for_each_boundary_endpoint_ref<R: FftReal>(
+    values: &[Complex<R>],
+    local_len: usize,
+    local_axis_len: usize,
+    global_axis_start: usize,
+    stride: usize,
+    real_len: usize,
+    mut visit: impl FnMut(usize, usize, usize, &Complex<R>),
+) -> Result<(), FftError> {
+    for_each_boundary_endpoint_offset(
+        values.len(),
+        local_len,
+        local_axis_len,
+        global_axis_start,
+        stride,
+        real_len,
+        |offset, k, plane| visit(offset, k, plane, &values[offset]),
+    )
 }
 
 fn validate_boundary<R: FftReal, const N: usize, const M: usize>(
@@ -4564,7 +4712,7 @@ where
     let preparation = (|| {
         let view = intermediate.active_view().map_err(FftError::Array)?;
         let local_len = view.pencil().local_len();
-        let (real_len, complex_len) = r2c_lengths(core);
+        let (real_len, _) = r2c_lengths(core);
         let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
         let reduction_axis = core.stages[boundary].axis;
         let stride = super::memory_stride(view.pencil(), reduction_axis)?;
@@ -4589,17 +4737,14 @@ where
         if data.len() < required_len {
             return Err(R2cError::Fft(FftError::PreparationFailed));
         }
-        if local_len != 0 {
-            if stride == 0 || local_axis_len == 0 || complex_len == 0 {
-                return Err(R2cError::Fft(FftError::PreparationFailed));
-            }
-            // The reduced-axis coordinate of every scanned offset must stay in
-            // range without wrapping; the plane match itself tolerates other k.
-            let last_coord = local_axis_len - 1;
-            let _last_k = global_axis_start
-                .checked_add(last_coord)
-                .ok_or(FftError::PreparationFailed)?;
-        }
+        validate_boundary_endpoint_layout(
+            local_len,
+            local_len,
+            local_axis_len,
+            global_axis_start,
+            stride,
+            real_len,
+        )?;
         let statistics =
             super::EndpointStatistics::new(batch_count, plane_count, relative, absolute)?;
         Ok(R2cEndpointStatistics {
@@ -4607,7 +4752,7 @@ where
             stride,
             local_axis_len,
             global_axis_start,
-            complex_len,
+            real_len,
             statistics,
         })
     })();
@@ -4618,10 +4763,9 @@ where
         stride,
         local_axis_len,
         global_axis_start,
-        complex_len,
+        real_len,
         mut statistics,
     } = agree_result(communicator, preparation)?;
-    let plane_count = statistics.plane_count;
     let view = intermediate
         .active_view()
         .expect("validated R2C boundary active layout");
@@ -4633,13 +4777,16 @@ where
         data,
         local_len,
         |values, visit| {
-            for (offset, value) in values.iter().enumerate() {
-                let coord = (offset / stride) % local_axis_len;
-                let k = global_axis_start + coord;
-                let plane = endpoint_plane(k, complex_len, plane_count);
-                let Some(plane) = plane else { continue };
-                visit(plane * 2, *value);
-            }
+            for_each_boundary_endpoint_ref(
+                values,
+                local_len,
+                local_axis_len,
+                global_axis_start,
+                stride,
+                real_len,
+                |_, _, plane, value| visit(plane * 2, *value),
+            )
+            .expect("validated R2C boundary endpoint layout");
         },
     );
     if !statistics.accepted(communicator) {
@@ -4654,13 +4801,12 @@ fn zero_accepted_boundary<R: FftReal, const N: usize, const M: usize>(
 ) -> Result<(), R2cError> {
     let mut view = intermediate.active_view_mut().map_err(FftError::Array)?;
     let local_len = view.pencil().local_len();
-    let (real_len, complex_len) = r2c_lengths(core);
+    let (real_len, _) = r2c_lengths(core);
     let boundary = core.real_stage_index.ok_or(FftError::PreparationFailed)?;
     let reduction_axis = core.stages[boundary].axis;
     let stride = super::memory_stride(view.pencil(), reduction_axis)?;
     let local_axis_len = view.pencil().local_shape_logical()[reduction_axis];
     let global_axis_start = view.pencil().local_ranges()[reduction_axis].start;
-    let plane_count = if real_len % 2 == 0 { 2 } else { 1 };
     for batch in 0..core.extra_shape.element_count() {
         let start = batch
             .checked_mul(local_len)
@@ -4668,16 +4814,15 @@ fn zero_accepted_boundary<R: FftReal, const N: usize, const M: usize>(
         let end = start
             .checked_add(local_len)
             .expect("validated extra and local lengths fit the intermediate");
-        let values = &mut view.as_mut_slice()[start..end];
-        if local_len != 0 {
-            for (offset, value) in values.iter_mut().enumerate() {
-                let coord = (offset / stride) % local_axis_len;
-                let k = global_axis_start + coord;
-                if endpoint_plane(k, complex_len, plane_count).is_some() {
-                    value.im = R::zero();
-                }
-            }
-        }
+        for_each_boundary_endpoint(
+            &mut view.as_mut_slice()[start..end],
+            local_len,
+            local_axis_len,
+            global_axis_start,
+            stride,
+            real_len,
+            |_, _, _, value| value.im = R::zero(),
+        )?;
     }
     Ok(())
 }

@@ -94,15 +94,7 @@ pub struct Hdf5FileSession<'c> {
 
 fn entry_header(comm: &CartesianCommunicator, op: u64) -> Result<(), IoError> {
     let fixed = [0x494f_0000_0006, op, 1, 0, 1];
-    let mut lo = [0u64; 5];
-    let mut hi = [0u64; 5];
-    comm.all_reduce_into(&fixed, &mut lo, SystemOperation::min());
-    comm.all_reduce_into(&fixed, &mut hi, SystemOperation::max());
-    if lo != hi {
-        Err(IoError::CollectiveDescriptorMismatch)
-    } else {
-        Ok(())
-    }
+    crate::options::agree_values(comm, &fixed)
 }
 
 fn agree_bytes(comm: &CartesianCommunicator, bytes: &[u8]) -> Result<(), IoError> {
@@ -111,20 +103,9 @@ fn agree_bytes(comm: &CartesianCommunicator, bytes: &[u8]) -> Result<(), IoError
         bytes.len() <= crate::MAX_DESCRIPTOR_BYTES,
         "session descriptor bound",
     )?;
-    let mut len = bytes.len() as u64;
-    comm.process_at_rank(0).broadcast_into(&mut len);
-    // Fixed storage means root-controlled lengths never trigger allocations.
-    let mut root = [0u8; crate::MAX_DESCRIPTOR_BYTES];
-    if comm.rank() == 0 {
-        root[..bytes.len()].copy_from_slice(bytes);
-    }
-    comm.process_at_rank(0)
-        .broadcast_into(&mut root[..len as usize]);
-    agree_phase(
-        comm,
-        bytes == &root[..len as usize],
-        "session descriptor agreement",
-    )
+    crate::mpi_io::agree_bytes(comm, bytes).map_err(|_| IoError::CollectivePrecondition {
+        phase: "session descriptor agreement",
+    })
 }
 
 fn valid_path(path: &str) -> bool {

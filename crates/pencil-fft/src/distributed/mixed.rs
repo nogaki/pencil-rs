@@ -43,13 +43,12 @@ use super::{
     OPERATION_MIXED_R2C_FORWARD_IN_PLACE, OPERATION_MIXED_R2C_INVERSE,
     OPERATION_MIXED_R2C_INVERSE_IN_PLACE, RouteCandidate, TransformTiming, TransposeMethod,
     VALUE_KIND_C2C, VALUE_KIND_R2C, agree_execution_descriptor_ref, agree_header, agree_result,
-    build_route, build_transitions, collective_descriptor, collective_valid,
-    convert_strided_complex_reverse, convert_strided_real_forward, initialized_vec,
-    map_array_allocation, memory_stride,
+    allocate_complex_workspace_buffers, build_route, build_transitions, collective_descriptor,
+    collective_valid, convert_strided_complex_reverse, convert_strided_real_forward,
+    initialized_vec, map_array_allocation, memory_stride,
     r2c::{allocate_in_place_storage, in_place_storage_requirements, validate_recast_capacity},
     r2r::R2rLocal,
-    registered_pencils, strided_line_count, validate_input, validate_workspace_lengths_values,
-    zero_complex,
+    registered_pencils, validate_input, validate_workspace_lengths_values, zero_complex,
 };
 
 #[cfg(test)]
@@ -780,16 +779,19 @@ where
             zero_complex::<R>(),
         )
         .map_err(map_array_allocation)?;
+        let buffers = allocate_complex_workspace_buffers::<R>(
+            self.core.transpose_send_len,
+            self.core.transpose_receive_len,
+            self.core.fft_scratch_len,
+            self.core.strided_line_len,
+        )?;
         Ok(MixedC2cWorkspace {
             core: Arc::clone(&self.core),
             intermediate,
-            transpose: TransposeWorkspace::from_vecs(
-                initialized_vec(self.core.transpose_send_len, zero_complex::<R>())?,
-                initialized_vec(self.core.transpose_receive_len, zero_complex::<R>())?,
-            ),
+            transpose: buffers.transpose,
             embedding_line: initialized_vec(self.core.embedding_len, zero_complex::<R>())?,
-            fft_scratch: initialized_vec(self.core.fft_scratch_len, zero_complex::<R>())?,
-            line_buffer: initialized_vec(self.core.strided_line_len, zero_complex::<R>())?,
+            fft_scratch: buffers.fft_scratch,
+            line_buffer: buffers.line_buffer,
         })
     }
 
@@ -822,15 +824,18 @@ where
     pub fn allocate_in_place_workspace(
         &self,
     ) -> Result<MixedC2cInPlaceWorkspace<R, N, M>, MixedError> {
+        let buffers = allocate_complex_workspace_buffers::<R>(
+            self.core.transpose_send_len,
+            self.core.transpose_receive_len,
+            self.core.fft_scratch_len,
+            self.core.strided_line_len,
+        )?;
         Ok(MixedC2cInPlaceWorkspace {
             core: Arc::clone(&self.core),
-            transpose: TransposeWorkspace::from_vecs(
-                initialized_vec(self.core.transpose_send_len, zero_complex::<R>())?,
-                initialized_vec(self.core.transpose_receive_len, zero_complex::<R>())?,
-            ),
+            transpose: buffers.transpose,
             embedding_line: initialized_vec(self.core.embedding_len, zero_complex::<R>())?,
-            fft_scratch: initialized_vec(self.core.fft_scratch_len, zero_complex::<R>())?,
-            line_buffer: initialized_vec(self.core.strided_line_len, zero_complex::<R>())?,
+            fft_scratch: buffers.fft_scratch,
+            line_buffer: buffers.line_buffer,
         })
     }
 
@@ -1280,16 +1285,11 @@ where
         if !collective_valid(
             communicator,
             self.core.transitions.iter().all(|t| {
-                matches!(
-                    if matches!(direction, Direction::Forward) {
-                        &t.forward
-                    } else {
-                        &t.backward
-                    },
-                    super::C2cTransition::Identity
-                        | super::C2cTransition::Local(_)
-                        | super::C2cTransition::PointToPoint(_)
-                )
+                if matches!(direction, Direction::Forward) {
+                    t.forward.supports_overlap()
+                } else {
+                    t.backward.supports_overlap()
+                }
             }),
         ) {
             return Err(FftOverlapError::UnsupportedTransport);
@@ -2489,7 +2489,9 @@ where
                         &mut workspace.line_buffer,
                     )?;
                 }
-                super::C2cTransition::AllToAllv(_) => unreachable!(),
+                super::C2cTransition::AllToAllv(_) => {
+                    return Err(FftOverlapError::UnsupportedTransport);
+                }
             }
         }
     } else {
@@ -2557,7 +2559,9 @@ where
                         matches!(direction, Direction::Inverse),
                     )?;
                 }
-                super::C2cTransition::AllToAllv(_) => unreachable!(),
+                super::C2cTransition::AllToAllv(_) => {
+                    return Err(FftOverlapError::UnsupportedTransport);
+                }
             }
         }
     }
@@ -3088,17 +3092,20 @@ where
                 initialized_vec(self.core.real_transpose_receive_len, R::zero())?,
             ))
         };
+        let buffers = allocate_complex_workspace_buffers::<R>(
+            self.core.transpose_send_len,
+            self.core.transpose_receive_len,
+            self.core.fft_scratch_len,
+            self.core.complex_line_len,
+        )?;
         Ok(MixedR2cWorkspace {
             core: Arc::clone(&self.core),
             intermediate,
             real_intermediate,
-            transpose: TransposeWorkspace::from_vecs(
-                initialized_vec(self.core.transpose_send_len, zero_complex::<R>())?,
-                initialized_vec(self.core.transpose_receive_len, zero_complex::<R>())?,
-            ),
+            transpose: buffers.transpose,
             real_transpose,
             embedding_line: initialized_vec(self.core.embedding_len, zero_complex::<R>())?,
-            fft_scratch: initialized_vec(self.core.fft_scratch_len, zero_complex::<R>())?,
+            fft_scratch: buffers.fft_scratch,
             real_source_line: initialized_vec(self.core.real_len, R::zero())?,
             real_line: initialized_vec(self.core.real_line_len.max(self.core.real_len), R::zero())?,
             complex_source_line: initialized_vec(self.core.complex_len, zero_complex::<R>())?,
@@ -3107,7 +3114,7 @@ where
                 zero_complex::<R>(),
             )?,
             real_strided_line: initialized_vec(self.core.real_line_len, R::zero())?,
-            complex_strided_line: initialized_vec(self.core.complex_line_len, zero_complex::<R>())?,
+            complex_strided_line: buffers.line_buffer,
         })
     }
 
@@ -3141,12 +3148,15 @@ where
     pub fn allocate_in_place_workspace(
         &self,
     ) -> Result<MixedR2cInPlaceWorkspace<R, N, M>, MixedError> {
+        let buffers = allocate_complex_workspace_buffers::<R>(
+            self.core.transpose_send_len,
+            self.core.transpose_receive_len,
+            self.core.fft_scratch_len,
+            self.core.complex_line_len,
+        )?;
         Ok(MixedR2cInPlaceWorkspace {
             core: Arc::clone(&self.core),
-            transpose: TransposeWorkspace::from_vecs(
-                initialized_vec(self.core.transpose_send_len, zero_complex::<R>())?,
-                initialized_vec(self.core.transpose_receive_len, zero_complex::<R>())?,
-            ),
+            transpose: buffers.transpose,
             real_transpose: if self.core.real_stage_index == 0 {
                 None
             } else {
@@ -3156,7 +3166,7 @@ where
                 ))
             },
             embedding_line: initialized_vec(self.core.embedding_len, zero_complex::<R>())?,
-            fft_scratch: initialized_vec(self.core.fft_scratch_len, zero_complex::<R>())?,
+            fft_scratch: buffers.fft_scratch,
             real_source_line: initialized_vec(self.core.real_len, R::zero())?,
             real_line: initialized_vec(self.core.real_line_len.max(self.core.real_len), R::zero())?,
             complex_source_line: initialized_vec(self.core.complex_len, zero_complex::<R>())?,
@@ -3165,7 +3175,7 @@ where
                 zero_complex::<R>(),
             )?,
             real_strided_line: initialized_vec(self.core.real_line_len, R::zero())?,
-            complex_strided_line: initialized_vec(self.core.complex_line_len, zero_complex::<R>())?,
+            complex_strided_line: buffers.line_buffer,
         })
     }
 
@@ -3742,14 +3752,10 @@ where
         result?;
         if !collective_valid(
             communicator,
-            self.core.transitions.iter().all(|t| {
-                matches!(
-                    t.forward,
-                    super::C2cTransition::Identity
-                        | super::C2cTransition::Local(_)
-                        | super::C2cTransition::PointToPoint(_)
-                )
-            }),
+            self.core
+                .transitions
+                .iter()
+                .all(|t| t.forward.supports_overlap()),
         ) {
             return Err(FftOverlapError::UnsupportedTransport);
         }
@@ -3786,14 +3792,10 @@ where
         result?;
         if !collective_valid(
             communicator,
-            self.core.transitions.iter().all(|t| {
-                matches!(
-                    t.backward,
-                    super::C2cTransition::Identity
-                        | super::C2cTransition::Local(_)
-                        | super::C2cTransition::PointToPoint(_)
-                )
-            }),
+            self.core
+                .transitions
+                .iter()
+                .all(|t| t.backward.supports_overlap()),
         ) {
             return Err(FftOverlapError::UnsupportedTransport);
         }
@@ -5089,10 +5091,13 @@ where
     let stage = &core.stages[boundary];
     let mut convert = |data: &mut [Complex<R>]| {
         validate_mixed_boundary_data(core, Ok((stage.output.as_ref(), data)), normalize)?;
+        let axis = stage.axis;
         zero_mixed_boundary_data(
             core,
             stage.output.local_len(),
-            memory_stride(stage.output.as_ref(), stage.axis)?,
+            stage.output.local_shape_logical()[axis],
+            stage.output.local_ranges()[axis].start,
+            memory_stride(stage.output.as_ref(), axis)?,
             data,
         )?;
         let mut transform = |out: &mut [R]| {
@@ -5425,9 +5430,9 @@ where
 struct MixedEndpointStatistics<'a, R: FftReal> {
     data: &'a [Complex<R>],
     local_len: usize,
+    local_axis_len: usize,
+    global_axis_start: usize,
     stride: usize,
-    line_count: usize,
-    line_block: usize,
     statistics: super::EndpointStatistics,
 }
 
@@ -5447,12 +5452,10 @@ where
     let preparation = (|| {
         let (pencil, data) = input?;
         let local_len = pencil.local_len();
-        let stride = memory_stride(pencil, core.stages[core.real_stage_index].axis)?;
-        let line_count = strided_line_count(local_len, core.complex_len, stride)?;
-        let line_block = core
-            .complex_len
-            .checked_mul(stride)
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
+        let axis = core.stages[core.real_stage_index].axis;
+        let local_axis_len = pencil.local_shape_logical()[axis];
+        let global_axis_start = pencil.local_ranges()[axis].start;
+        let stride = memory_stride(pencil, axis)?;
         let (depth, _normalization) = mixed_endpoint_policy(core)?;
         let relative = 128.0 * <R as crate::private::Sealed>::pencil_fft_epsilon_f64() * depth;
         let absolute = if normalize {
@@ -5471,37 +5474,23 @@ where
         if data.len() < required_len {
             return Err(MixedError::Fft(FftError::PreparationFailed));
         }
-        if local_len != 0 {
-            let plane_offset = if plane_count == 2 {
-                core.complex_len
-                    .checked_sub(1)
-                    .and_then(|last| last.checked_mul(stride))
-            } else {
-                Some(0)
-            }
-            .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-            let last_inner = stride
-                .checked_sub(1)
-                .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-            let last_index = line_count
-                .checked_sub(1)
-                .and_then(|last| last.checked_mul(line_block))
-                .and_then(|base| base.checked_add(plane_offset))
-                .and_then(|base| base.checked_add(last_inner))
-                .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-            if last_index >= local_len {
-                return Err(MixedError::Fft(FftError::PreparationFailed));
-            }
-        }
+        super::r2c::validate_boundary_endpoint_layout(
+            local_len,
+            local_len,
+            local_axis_len,
+            global_axis_start,
+            stride,
+            core.real_len,
+        )?;
         let mut statistics =
             super::EndpointStatistics::new(batch_count, plane_count, relative, absolute)?;
         statistics.invalid = !relative.is_finite() || !absolute.is_finite();
         Ok(MixedEndpointStatistics {
             data,
             local_len,
+            local_axis_len,
+            global_axis_start,
             stride,
-            line_count,
-            line_block,
             statistics,
         })
     })();
@@ -5510,13 +5499,11 @@ where
     let MixedEndpointStatistics {
         data,
         local_len,
+        local_axis_len,
+        global_axis_start,
         stride,
-        line_count,
-        line_block,
         mut statistics,
     } = agree_result(communicator, preparation)?;
-    let plane_count = statistics.plane_count;
-    let complex_len = core.complex_len;
 
     statistics.reduce_chunks(
         communicator,
@@ -5524,27 +5511,16 @@ where
         data,
         local_len,
         |values, visit| {
-            for outer in 0..line_count {
-                let base = outer
-                    .checked_mul(line_block)
-                    .expect("validated mixed boundary line offset");
-                for inner in 0..stride {
-                    for plane in 0..plane_count {
-                        let k = if plane == 0 { 0 } else { complex_len - 1 };
-                        if super::r2c::endpoint_plane(k, complex_len, plane_count) != Some(plane) {
-                            continue;
-                        }
-                        let index = base
-                            .checked_add(
-                                k.checked_mul(stride)
-                                    .expect("validated mixed boundary plane offset"),
-                            )
-                            .and_then(|value| value.checked_add(inner))
-                            .expect("validated mixed boundary endpoint index");
-                        visit(plane * 2, values[index]);
-                    }
-                }
-            }
+            super::r2c::for_each_boundary_endpoint_ref(
+                values,
+                local_len,
+                local_axis_len,
+                global_axis_start,
+                stride,
+                core.real_len,
+                |_, _, plane, value| visit(plane * 2, *value),
+            )
+            .expect("validated mixed boundary endpoint layout");
         },
     );
     if !statistics.accepted(communicator) {
@@ -5558,27 +5534,34 @@ fn zero_mixed_boundary<R: FftReal, const N: usize, const M: usize>(
     intermediate: &mut ManyPencilArray<Complex<R>, N, M>,
 ) -> Result<(), MixedError> {
     let mut view = intermediate.active_view_mut().map_err(FftError::Array)?;
-    let local_len = view.pencil().local_len();
-    let stride = memory_stride(view.pencil(), core.stages[core.real_stage_index].axis)?;
-    zero_mixed_boundary_data(core, local_len, stride, view.as_mut_slice())
+    let axis = core.stages[core.real_stage_index].axis;
+    let (local_len, local_axis_len, global_axis_start, stride) = {
+        let pencil = view.pencil();
+        (
+            pencil.local_len(),
+            pencil.local_shape_logical()[axis],
+            pencil.local_ranges()[axis].start,
+            memory_stride(pencil, axis)?,
+        )
+    };
+    zero_mixed_boundary_data(
+        core,
+        local_len,
+        local_axis_len,
+        global_axis_start,
+        stride,
+        view.as_mut_slice(),
+    )
 }
 
 fn zero_mixed_boundary_data<R: FftReal, const N: usize, const M: usize>(
     core: &MixedR2cCore<R, N, M>,
     local_len: usize,
+    local_axis_len: usize,
+    global_axis_start: usize,
     stride: usize,
     data: &mut [Complex<R>],
 ) -> Result<(), MixedError> {
-    let line_count = strided_line_count(local_len, core.complex_len, stride)?;
-    let line_block = core
-        .complex_len
-        .checked_mul(stride)
-        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-    let plane_count = if core.real_len.is_multiple_of(2) {
-        2
-    } else {
-        1
-    };
     for batch in 0..core.extra_shape.element_count() {
         let start = batch
             .checked_mul(local_len)
@@ -5586,20 +5569,15 @@ fn zero_mixed_boundary_data<R: FftReal, const N: usize, const M: usize>(
         let end = start
             .checked_add(local_len)
             .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-        let values = &mut data[start..end];
-        for outer in 0..line_count {
-            let base = outer
-                .checked_mul(line_block)
-                .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
-            for inner in 0..stride {
-                for plane in 0..plane_count {
-                    let k = if plane == 0 { 0 } else { core.complex_len - 1 };
-                    if super::r2c::endpoint_plane(k, core.complex_len, plane_count) == Some(plane) {
-                        values[base + k * stride + inner].im = R::zero();
-                    }
-                }
-            }
-        }
+        super::r2c::for_each_boundary_endpoint(
+            &mut data[start..end],
+            local_len,
+            local_axis_len,
+            global_axis_start,
+            stride,
+            core.real_len,
+            |_, _, _, value| value.im = R::zero(),
+        )?;
     }
     Ok(())
 }

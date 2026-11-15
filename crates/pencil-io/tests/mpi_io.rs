@@ -83,6 +83,25 @@ fn mpi_io_preserves_logical_order_and_rejects_bad_files() {
             }
         }
     }
+
+    let oversized_path = std::path::PathBuf::from("p".repeat(100 * 1024));
+    let oversized_write = write_mpi(&oversized_path, source.view());
+    assert!(
+        matches!(
+            &oversized_write,
+            Err(IoError::SizeLimit { what: "descriptor" })
+        ),
+        "oversized write path should fail descriptor preflight, got {oversized_write:?}"
+    );
+    let oversized_read = read_mpi(&oversized_path, source.view_mut());
+    assert!(
+        matches!(
+            &oversized_read,
+            Err(IoError::SizeLimit { what: "descriptor" })
+        ),
+        "oversized read path should fail descriptor preflight, got {oversized_read:?}"
+    );
+
     let path = directory.join("array.pio");
     write_mpi(&path, source.view()).unwrap();
     world.barrier();

@@ -415,45 +415,7 @@ where
         },
         &mut marker_attempted,
     ) {
-        let primary = match error.step {
-            WriteStep::PayloadView => {
-                error
-                    .native
-                    .map_or(error.agreement, |_| IoError::WriteIncomplete {
-                        stage: "MPI_File_set_view",
-                    })
-            }
-            WriteStep::PayloadWrite | WriteStep::PayloadSize => IoError::WriteIncomplete {
-                stage: match error.step {
-                    WriteStep::PayloadWrite => "payload write",
-                    _ => "payload size",
-                },
-            },
-            WriteStep::PayloadFlush => {
-                error
-                    .native
-                    .map_or(error.agreement, |_| IoError::WriteIncomplete {
-                        stage: "payload flush",
-                    })
-            }
-            WriteStep::MarkerView => {
-                error
-                    .native
-                    .map_or(error.agreement, |_| IoError::WriteIncomplete {
-                        stage: "commit marker view",
-                    })
-            }
-            WriteStep::MarkerWrite => IoError::CommitUncertain {
-                stage: "commit marker write",
-            },
-            WriteStep::MarkerFlush => {
-                error
-                    .native
-                    .map_or(error.agreement, |_| IoError::CommitUncertain {
-                        stage: "commit marker flush",
-                    })
-            }
-        };
+        let primary = write_payload_error(error);
         finish_resources(comm, duplicate, file, datatype);
         return Err(primary);
     }
@@ -1048,6 +1010,38 @@ where
     }
 }
 
+const AGREEMENT_CHUNK_BYTES: usize = 512;
+
+pub(crate) fn agree_bytes<C: CommunicatorCollectives>(
+    comm: &C,
+    bytes: &[u8],
+) -> Result<(), IoError> {
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let (mut minimum, mut maximum) = (0u64, 0u64);
+    comm.all_reduce_into(&len, &mut minimum, SystemOperation::min());
+    comm.all_reduce_into(&len, &mut maximum, SystemOperation::max());
+    if minimum != maximum {
+        return Err(IoError::CollectiveDescriptorMismatch);
+    }
+    agree_byte_content(comm, bytes)
+}
+
+pub(crate) fn agree_byte_content<C: CommunicatorCollectives>(
+    comm: &C,
+    bytes: &[u8],
+) -> Result<(), IoError> {
+    for chunk in bytes.chunks(AGREEMENT_CHUNK_BYTES) {
+        let (mut minimum, mut maximum) =
+            ([0u8; AGREEMENT_CHUNK_BYTES], [0u8; AGREEMENT_CHUNK_BYTES]);
+        comm.all_reduce_into(chunk, &mut minimum[..chunk.len()], SystemOperation::min());
+        comm.all_reduce_into(chunk, &mut maximum[..chunk.len()], SystemOperation::max());
+        if minimum[..chunk.len()] != maximum[..chunk.len()] {
+            return Err(IoError::CollectiveDescriptorMismatch);
+        }
+    }
+    Ok(())
+}
+
 /// Agrees a preparation failure in one maximum reduction.  A local byte-limit
 /// failure takes precedence over every other local preparation error.
 pub(crate) fn agree_mpi_preparation<C: CommunicatorCollectives>(
@@ -1105,6 +1099,48 @@ pub(crate) struct WriteError {
     pub(crate) step: WriteStep,
     pub(crate) agreement: IoError,
     pub(crate) native: Option<i32>,
+}
+
+pub(crate) fn write_payload_error(error: WriteError) -> IoError {
+    match error.step {
+        WriteStep::PayloadView => {
+            error
+                .native
+                .map_or(error.agreement, |_| IoError::WriteIncomplete {
+                    stage: "MPI_File_set_view",
+                })
+        }
+        WriteStep::PayloadWrite => IoError::WriteIncomplete {
+            stage: "payload write",
+        },
+        WriteStep::PayloadSize => IoError::WriteIncomplete {
+            stage: "payload size",
+        },
+        WriteStep::PayloadFlush => {
+            error
+                .native
+                .map_or(error.agreement, |_| IoError::WriteIncomplete {
+                    stage: "payload flush",
+                })
+        }
+        WriteStep::MarkerView => {
+            error
+                .native
+                .map_or(error.agreement, |_| IoError::WriteIncomplete {
+                    stage: "commit marker view",
+                })
+        }
+        WriteStep::MarkerWrite => IoError::CommitUncertain {
+            stage: "commit marker write",
+        },
+        WriteStep::MarkerFlush => {
+            error
+                .native
+                .map_or(error.agreement, |_| IoError::CommitUncertain {
+                    stage: "commit marker flush",
+                })
+        }
+    }
 }
 
 /// Writes one payload, flushes it, writes the commit marker, then flushes the
@@ -1196,6 +1232,10 @@ pub(crate) fn write_payload_and_commit<C: CommunicatorCollectives>(
             agreement,
             native: written.err(),
         });
+    }
+    #[cfg(test)]
+    if crate::tests::FAIL_NEXT_MARKER_FLUSH.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        ffi::FAIL_FILE_SYNC.with(|fault| fault.set(true));
     }
     let flush = ffi::file_sync(file);
     if let Err(agreement) = agree_phase(comm, flush == ffi::MPI_SUCCESS as i32, phases.marker_flush)
@@ -1300,17 +1340,11 @@ pub(crate) fn descriptor_agreement<const N: usize, const M: usize>(
         u64::try_from(local_len).unwrap_or(u64::MAX),
         u64::from(local_valid),
     ];
-    let mut minimum = [0u64; 5];
-    let mut maximum = [0u64; 5];
-    comm.all_reduce_into(&fixed, &mut minimum, SystemOperation::min());
-    comm.all_reduce_into(&fixed, &mut maximum, SystemOperation::max());
-    if minimum != maximum {
+    if let Err(mismatch) = crate::options::agree_values(comm, &fixed) {
         return Err(if local_valid {
-            IoError::CollectiveDescriptorMismatch
+            mismatch
         } else {
-            descriptor
-                .err()
-                .unwrap_or(IoError::CollectiveDescriptorMismatch)
+            descriptor.err().unwrap_or(mismatch)
         });
     }
     if !local_valid {
@@ -1578,6 +1612,7 @@ impl Header {
         V1Fields::check_identity(bytes).map_err(header_error)?;
         if fields.n > MAX_PROTOCOL_RANK as u64
             || fields.extra_rank > MAX_PROTOCOL_RANK as u64
+            || !fields.metadata_rank_is_bounded()
             || fields.grid_rank > MAX_PROTOCOL_RANK as u64
             || fields.grid_rank > fields.n
         {
@@ -1748,6 +1783,12 @@ impl V1Fields {
             INCOMPLETE_MARKER => Err(Incomplete),
             _ => Err(Invalid("commit marker")),
         }
+    }
+
+    pub(crate) fn metadata_rank_is_bounded(&self) -> bool {
+        self.n
+            .checked_add(self.extra_rank)
+            .is_some_and(|rank| rank <= MAX_PROTOCOL_RANK as u64)
     }
 
     pub(crate) fn expected_header_len(&self) -> Result<u64, V1HeaderDefect> {

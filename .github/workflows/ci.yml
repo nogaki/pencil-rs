@@ -453,7 +453,7 @@ jobs:
               --exact --nocapture --test-threads=1
           run_one timeout --kill-after=5s 240s \
             cargo test -p pencil-io --features parallel-hdf5 --lib --locked \
-              named_mpi::session::native_cleanup_failstop_children -- --exact --ignored --nocapture --test-threads=1
+              named_mpi::session::tests::native_cleanup_failstop_children -- --exact --ignored --nocapture --test-threads=1
           run_one timeout --kill-after=5s 120s \
             cargo test -p pencil-io --features parallel-hdf5 --test mpi_session --locked \
               mpi_file_session_active_drop_is_failstop -- --exact --ignored --nocapture --test-threads=1
@@ -751,7 +751,7 @@ jobs:
           }
           run_one timeout --kill-after=5s 240s \
             cargo test -p pencil-io --no-default-features --features mpi --lib --locked \
-              named_mpi::session::native_cleanup_failstop_children -- --exact --ignored --nocapture --test-threads=1
+              named_mpi::session::tests::native_cleanup_failstop_children -- --exact --ignored --nocapture --test-threads=1
           run_one timeout --kill-after=5s 120s \
             cargo test -p pencil-io --no-default-features --features mpi --test mpi_session --locked \
               mpi_file_session_active_drop_is_failstop -- --exact --ignored --nocapture --test-threads=1

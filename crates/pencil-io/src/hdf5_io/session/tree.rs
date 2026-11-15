@@ -160,7 +160,7 @@ fn leaf(
         };
         ($attribute:expr, $n:expr, $er:expr) => {{
             let (expected, max) = $attribute.read_len($n, $er);
-            let value = read_attr_phase(
+            read_agreed_attr_phase(
                 comm,
                 duplicate,
                 dataset,
@@ -168,13 +168,14 @@ fn leaf(
                 expected,
                 max,
                 "session catalog attribute",
-            )?;
-            let mut bytes = [0u8; MAX_PROTOCOL_RANK * 8];
-            for (slot, value) in bytes.chunks_exact_mut(8).zip(&value) {
-                slot.copy_from_slice(&value.to_le_bytes());
-            }
-            agree_bytes(comm, &bytes[..value.len() * 8])?;
-            value
+                |comm, bytes| {
+                    crate::mpi_io::agree_bytes(comm, bytes).map_err(|_| {
+                        IoError::CollectivePrecondition {
+                            phase: "session descriptor agreement",
+                        }
+                    })
+                },
+            )?
         }};
     }
     let version = attr!(Attribute::Version);

@@ -4,7 +4,9 @@ use crate::mpi_io::{
     collective_state, duplicate_comm, finish_resources, is_permutation, path_bytes,
 };
 use crate::named_mpi::scan_file_bounded;
-use crate::{FORMAT_VERSION, IoError, MAX_HEADER_BYTES, MAX_PROTOCOL_RANK, ffi};
+use crate::{
+    FORMAT_VERSION, IoError, MAX_DESCRIPTOR_BYTES, MAX_HEADER_BYTES, MAX_PROTOCOL_RANK, ffi,
+};
 use mpi::collective::{CommunicatorCollectives, Root, SystemOperation};
 use mpi::raw::AsRaw;
 use mpi::topology::{CartesianCommunicator, Communicator};
@@ -156,13 +158,7 @@ fn path<P: AsRef<Path>>(p: P) -> Result<CString, CatalogError> {
 }
 fn catalog_header(c: &CartesianCommunicator, op: u64) -> Result<(), CatalogError> {
     let fixed = [CATALOG_NAMESPACE, op, FORMAT_VERSION, 0, 0];
-    let (mut min, mut max) = ([0u64; 5], [0u64; 5]);
-    c.all_reduce_into(&fixed, &mut min, SystemOperation::min());
-    c.all_reduce_into(&fixed, &mut max, SystemOperation::max());
-    if min != max {
-        return Err(IoError::CollectiveDescriptorMismatch.into());
-    }
-    Ok(())
+    crate::options::agree_values(c, &fixed).map_err(Into::into)
 }
 
 fn agree<C: CommunicatorCollectives>(
@@ -183,7 +179,7 @@ fn agree_path(c: &CartesianCommunicator, p: &Path) -> Result<CString, CatalogErr
     let local = path_bytes(p);
     let valid = local
         .as_ref()
-        .is_ok_and(|s| !s.is_empty() && s.len() <= MAX_HEADER_BYTES && !s.contains(&0));
+        .is_ok_and(|s| !s.is_empty() && s.len() <= MAX_DESCRIPTOR_BYTES && !s.contains(&0));
     let flag = i32::from(valid);
     let mut all_valid = 0;
     c.all_reduce_into(&flag, &mut all_valid, SystemOperation::min());
@@ -200,29 +196,14 @@ fn agree_path(c: &CartesianCommunicator, p: &Path) -> Result<CString, CatalogErr
     let mut hi = 0;
     c.all_reduce_into(&(n as u64), &mut lo, SystemOperation::min());
     c.all_reduce_into(&(n as u64), &mut hi, SystemOperation::max());
-    if lo != hi || n > MAX_HEADER_BYTES {
+    if lo != hi || n > MAX_DESCRIPTOR_BYTES {
         return Err(IoError::CollectiveDescriptorMismatch.into());
     }
     agree_bytes(c, s)?;
     path(p)
 }
 pub(crate) fn agree_bytes(c: &CartesianCommunicator, bytes: &[u8]) -> Result<(), CatalogError> {
-    let len = bytes.len() as u64;
-    let (mut lo, mut hi) = (0u64, 0u64);
-    c.all_reduce_into(&len, &mut lo, SystemOperation::min());
-    c.all_reduce_into(&len, &mut hi, SystemOperation::max());
-    if lo != hi {
-        return Err(IoError::CollectiveDescriptorMismatch.into());
-    }
-    for chunk in bytes.chunks(512) {
-        let (mut low, mut high) = ([0u8; 512], [0u8; 512]);
-        c.all_reduce_into(chunk, &mut low[..chunk.len()], SystemOperation::min());
-        c.all_reduce_into(chunk, &mut high[..chunk.len()], SystemOperation::max());
-        if low != high {
-            return Err(IoError::CollectiveDescriptorMismatch.into());
-        }
-    }
-    Ok(())
+    crate::mpi_io::agree_bytes(c, bytes).map_err(Into::into)
 }
 
 fn read_at(
@@ -330,7 +311,7 @@ pub fn read_mpi_catalog<P: AsRef<Path>>(
         if n == 0
             || n > MAX_PROTOCOL_RANK
             || er > MAX_PROTOCOL_RANK
-            || n + er > MAX_PROTOCOL_RANK
+            || !fields.metadata_rank_is_bounded()
             || gr == 0
             || gr > MAX_PROTOCOL_RANK
         {

@@ -68,12 +68,11 @@ fn name_bytes<C: CommunicatorCollectives>(comm: &C, name: &str) -> Result<(), Na
     if lo != hi {
         return Err(IoError::CollectiveDescriptorMismatch.into());
     }
-    let mut root = allocate(comm, name.len())?;
-    if comm.rank() == 0 {
-        root.copy_from_slice(name.as_bytes());
-    }
-    comm.process_at_rank(0).broadcast_into(&mut root[..]);
-    agree_phase(comm, root == name.as_bytes(), "named key agreement")?;
+    crate::mpi_io::agree_byte_content(comm, name.as_bytes()).map_err(|_| {
+        IoError::CollectivePrecondition {
+            phase: "named key agreement",
+        }
+    })?;
     Ok(())
 }
 
@@ -1251,7 +1250,7 @@ fn write_named<T: IoElement, const N: usize, const M: usize>(
             },
             &mut marker_attempted,
         ) {
-            return Err(NamedIoError::Io(error.agreement));
+            return Err(crate::mpi_io::write_payload_error(error).into());
         }
         Ok(())
     })();
@@ -1270,13 +1269,13 @@ fn write_named<T: IoElement, const N: usize, const M: usize>(
     };
     drop(info);
     let cleanup = crate::mpi_io::aggregate_cleanup_result(comm, cleanup);
-    if marker_attempted && (result.is_err() || cleanup.is_some()) {
+    result?;
+    if marker_attempted && cleanup.is_some() {
         return Err(IoError::CommitUncertain {
             stage: "named commit or cleanup",
         }
         .into());
     }
-    result?;
     if let Some(error) = cleanup {
         return Err(error.into());
     }
