@@ -535,10 +535,10 @@ available.
 pencil-io = { version = "0.1.0", default-features = false, features = ["hdf5"] }
 ```
 
-A native HDF5 library and headers at version 1.12 or newer are required whenever
-`hdf5` or `parallel-hdf5` is enabled. For this serial-only setup, select the
-serial HDF5 variant (e.g. Debian/Ubuntu's `libhdf5-dev` package at version
-1.12 or newer); discovery uses `pkg-config` or `HDF5_DIR`.
+A native HDF5 library and headers at version 1.12.1 or newer are required
+whenever `hdf5` or `parallel-hdf5` is enabled. For this serial-only setup,
+select the serial HDF5 variant (e.g. Debian/Ubuntu's `libhdf5-dev` package at
+version 1.12.1 or newer); discovery uses `pkg-config` or `HDF5_DIR`.
 The default `mpi` feature preserves the existing collective API.
 `parallel-hdf5` enables both `mpi` and `hdf5` plus native MPIO support, and
 requires the parallel HDF5 variant built against the same MPI implementation.
@@ -554,7 +554,10 @@ order. Both return `Result<(), IoError>`. They use the same single-dataset
 create new files without overwriting; a returned read error leaves the
 destination unchanged. Failed writes may leave a file behind; no rollback or
 crash recovery is promised. Named datasets, collections, catalogs, sessions,
-and raw input are not part of this serial API. See the
+and raw input are not part of this serial API. Serial file handles disable HDF5
+file locking through a per-file FAPL, but same-file access still requires
+external serialization. `HDF5_USE_FILE_LOCKING` can override the per-file
+setting; this library does not modify that environment variable. See the
 [working slice example](crates/pencil-io/README.md#serial-hdf5-without-mpi).
 
 The focused serial CI checks select only `pencil-io`, not the MPI workspace:
@@ -603,8 +606,8 @@ Enable the optional native parallel HDF5 backend with
 compound little-endian type, with typed metadata attributes and the same
 incomplete/committed protocol. This is a native self-describing representation,
 not Julia PencilIO wire compatibility. The feature requires native parallel
-HDF5 >=1.12, discoverable by `pkg-config` or `HDF5_DIR`; it is intentionally not
-enabled by default. Both APIs are
+HDF5 >=1.12.1, discoverable by `pkg-config` or `HDF5_DIR`; it is intentionally
+not enabled by default. Both APIs are
 collective over the view's Cartesian communicator, and every rank must enter
 calls in the same order without overlapping another operation on that
 communicator. The HDF5 path explicitly creates a dataset-transfer property
