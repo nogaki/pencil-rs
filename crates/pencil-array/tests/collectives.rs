@@ -7,8 +7,9 @@ use mpi::{
 use num_complex::{Complex32, Complex64};
 use pencil_array::{
     AllToAllvTransposePlan, AxisPermutation, CollectiveError, ExtraShape, MpiTopology, Pencil,
-    PencilArray, SupportedScalar, TransposeError, all, all_by, any, any_by, gather, global_max,
-    global_min, global_sum, l2_norm, map_reduce_many, max_by, min_by, norm_by, sum_by,
+    PencilArray, PencilArrayView, SupportedScalar, TransposeError, all, all_by, any, any_by,
+    gather, global_max, global_min, global_sum, l2_norm, map_reduce_many, map_reduce3, max_by,
+    max_many_by, min_by, min_many_by, norm_by, norm_many_by, sum_by, sum_many_by,
 };
 
 fn check_all<C: CommunicatorCollectives>(communicator: &C, local: bool) {
@@ -615,6 +616,190 @@ fn run_mapped_reduction_tests<C: CommunicatorCollectives>(
     );
 }
 
+fn run_zero_final_broadcast_product_tests(topology: &Arc<MpiTopology<2>>, grid: [usize; 2]) {
+    let pencil = Pencil::<2, 2>::new(Arc::clone(topology), grid, [0, 1]).unwrap();
+    assert_eq!(pencil.local_len(), 1);
+    let communicator = pencil.topology().communicator();
+
+    let large_shape = ExtraShape::new([usize::MAX / 2, 1, 1]).unwrap();
+    // ZST storage has no payload allocation; these huge lengths are never traversed.
+    let large_storage = vec![(); usize::MAX / 2];
+    let three_shape = ExtraShape::new([1, 3, 1]).unwrap();
+    let three_storage = [(); 3];
+    let zero_shape = ExtraShape::new([1, 1, 0]).unwrap();
+    let zero_storage: [(); 0] = [];
+    let final_empty = [
+        PencilArrayView::from_slice(&pencil, &large_shape, &large_storage).unwrap(),
+        PencilArrayView::from_slice(&pencil, &three_shape, &three_storage).unwrap(),
+        PencilArrayView::from_slice(&pencil, &zero_shape, &zero_storage).unwrap(),
+    ];
+
+    let calls = Cell::new(0usize);
+    let mapped3 = map_reduce3(
+        communicator,
+        &final_empty[0],
+        &final_empty[1],
+        &final_empty[2],
+        0_i64,
+        |_, _, _| {
+            calls.set(calls.get() + 1);
+            1_i64
+        },
+        |left, right| left + right,
+    );
+    let map3_empty = mapped3 == Ok(0) && calls.get() == 0;
+
+    let calls = Cell::new(0usize);
+    let mapped_many = map_reduce_many(
+        communicator,
+        &final_empty,
+        0_i64,
+        |_| {
+            calls.set(calls.get() + 1);
+            1_i64
+        },
+        |left, right| left + right,
+    );
+    let many_empty = mapped_many == Ok(0) && calls.get() == 0;
+
+    let empty_shape = ExtraShape::new([0]).unwrap();
+    let empty_storage: [(); 0] = [];
+    let empty_view = PencilArrayView::from_slice(&pencil, &empty_shape, &empty_storage).unwrap();
+    let sum_calls = Cell::new(0usize);
+    let mapped_sum = sum_many_by(communicator, &final_empty, |_| {
+        sum_calls.set(sum_calls.get() + 1);
+        5_i64
+    });
+    let sum_oracle_calls = Cell::new(0usize);
+    let sum_oracle = sum_by(&empty_view, |_| {
+        sum_oracle_calls.set(sum_oracle_calls.get() + 1);
+        5_i64
+    });
+    let sum_empty = mapped_sum == sum_oracle && sum_calls.get() == 0 && sum_oracle_calls.get() == 0;
+
+    let norm_calls = Cell::new(0usize);
+    let mapped_norm = norm_many_by(communicator, &final_empty, |_| {
+        norm_calls.set(norm_calls.get() + 1);
+        5.0_f64
+    });
+    let norm_oracle_calls = Cell::new(0usize);
+    let norm_oracle = norm_by(&empty_view, |_| {
+        norm_oracle_calls.set(norm_oracle_calls.get() + 1);
+        5.0_f64
+    });
+    let norm_empty =
+        mapped_norm == norm_oracle && norm_calls.get() == 0 && norm_oracle_calls.get() == 0;
+
+    let min_calls = Cell::new(0usize);
+    let mapped_min = min_many_by(communicator, &final_empty, |_| {
+        min_calls.set(min_calls.get() + 1);
+        5_i64
+    });
+    let min_oracle_calls = Cell::new(0usize);
+    let min_oracle = min_by(&empty_view, |_| {
+        min_oracle_calls.set(min_oracle_calls.get() + 1);
+        5_i64
+    });
+    let min_empty = mapped_min == min_oracle && min_calls.get() == 0 && min_oracle_calls.get() == 0;
+
+    let max_calls = Cell::new(0usize);
+    let mapped_max = max_many_by(communicator, &final_empty, |_| {
+        max_calls.set(max_calls.get() + 1);
+        5_i64
+    });
+    let max_oracle_calls = Cell::new(0usize);
+    let max_oracle = max_by(&empty_view, |_| {
+        max_oracle_calls.set(max_oracle_calls.get() + 1);
+        5_i64
+    });
+    let max_empty = mapped_max == max_oracle && max_calls.get() == 0 && max_oracle_calls.get() == 0;
+    check_all(communicator, map3_empty);
+    check_all(communicator, many_empty);
+    check_all(communicator, sum_empty);
+    check_all(communicator, norm_empty);
+    check_all(communicator, min_empty);
+    check_all(communicator, max_empty);
+
+    let one_shape = ExtraShape::new([1, 1, 1]).unwrap();
+    let one_storage = [()];
+    let final_overflow = [
+        PencilArrayView::from_slice(&pencil, &large_shape, &large_storage).unwrap(),
+        PencilArrayView::from_slice(&pencil, &three_shape, &three_storage).unwrap(),
+        PencilArrayView::from_slice(&pencil, &one_shape, &one_storage).unwrap(),
+    ];
+    let calls = Cell::new(0usize);
+    let overflow3 = map_reduce3(
+        communicator,
+        &final_overflow[0],
+        &final_overflow[1],
+        &final_overflow[2],
+        0_i64,
+        |_, _, _| {
+            calls.set(calls.get() + 1);
+            1_i64
+        },
+        |left, right| left + right,
+    );
+    let overflow3_rejected = overflow3.is_err() && calls.get() == 0;
+    let calls = Cell::new(0usize);
+    let overflow_many = map_reduce_many(
+        communicator,
+        &final_overflow,
+        0_i64,
+        |_| {
+            calls.set(calls.get() + 1);
+            1_i64
+        },
+        |left, right| left + right,
+    );
+    let overflow_many_rejected = overflow_many.is_err() && calls.get() == 0;
+
+    let two_shape = ExtraShape::new([2, 1, 1]).unwrap();
+    let two_storage = [(); 2];
+    let incompatible_shape = ExtraShape::new([3, 1, 1]).unwrap();
+    let incompatible_storage = [(); 3];
+    let incompatible = [
+        PencilArrayView::from_slice(&pencil, &two_shape, &two_storage).unwrap(),
+        PencilArrayView::from_slice(&pencil, &incompatible_shape, &incompatible_storage).unwrap(),
+        PencilArrayView::from_slice(&pencil, &one_shape, &one_storage).unwrap(),
+    ];
+    let calls = Cell::new(0usize);
+    let incompatible3 = map_reduce3(
+        communicator,
+        &incompatible[0],
+        &incompatible[1],
+        &incompatible[2],
+        0_i64,
+        |_, _, _| {
+            calls.set(calls.get() + 1);
+            1_i64
+        },
+        |left, right| left + right,
+    );
+    let incompatible3_rejected =
+        incompatible3 == Err(CollectiveError::CollectivePreconditionFailed) && calls.get() == 0;
+    let calls = Cell::new(0usize);
+    let incompatible_many = map_reduce_many(
+        communicator,
+        &incompatible,
+        0_i64,
+        |_| {
+            calls.set(calls.get() + 1);
+            1_i64
+        },
+        |left, right| left + right,
+    );
+    let incompatible_many_rejected =
+        incompatible_many == Err(CollectiveError::CollectivePreconditionFailed) && calls.get() == 0;
+    check_all(
+        communicator,
+        overflow3_rejected
+            && overflow_many_rejected
+            && incompatible3_rejected
+            && incompatible_many_rejected,
+    );
+}
+
 fn run_many_error_precedence_tests(
     topology: &Arc<MpiTopology<2>>,
     pencil: &Arc<Pencil<2, 2>>,
@@ -844,4 +1029,5 @@ fn reductions_and_logical_gather_cover_permuted_pencils() {
         &empty_rank_array,
     );
     run_many_error_precedence_tests(&topology, &pencil, rank, size);
+    run_zero_final_broadcast_product_tests(&topology, grid);
 }

@@ -327,25 +327,11 @@ function r2c_values(::Type{T}, item::ReferenceCase) where {T}
 end
 
 function r2r_julia_kind(kind::Symbol)
-    return Dict(
-        :dcti => FFTW.REDFT00,
-        :dctii => FFTW.REDFT10,
-        :dctiii => FFTW.REDFT01,
-        :dctiv => FFTW.REDFT11,
-        :dsti => FFTW.RODFT00,
-        :dstii => FFTW.RODFT10,
-        :dstiii => FFTW.RODFT01,
-        :dstiv => FFTW.RODFT11,
-    )[kind]
+    return _R2R_CODES[kind]
 end
 
 function r2r_pair_kind(kind::Symbol)
-    kind in (:dcti, :dctiv, :dsti, :dstiv) && return kind
-    kind == :dctii && return :dctiii
-    kind == :dctiii && return :dctii
-    kind == :dstii && return :dstiii
-    kind == :dstiii && return :dstii
-    error("unknown R2R kind: ", kind)
+    return _r2r_pair(kind)
 end
 
 function r2r_logical_factor(item::ReferenceCase)
@@ -353,13 +339,7 @@ function r2r_logical_factor(item::ReferenceCase)
     for (axis, kind) in enumerate(item.axis_kinds)
         kind === nothing && continue
         n = item.spatial[axis]
-        factor *= if kind == :dcti
-            2 * (n - 1)
-        elseif kind == :dsti
-            2 * (n + 1)
-        else
-            2 * n
-        end
+        factor *= _r2r_factor(kind, n)
     end
     return factor
 end

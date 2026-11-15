@@ -337,6 +337,17 @@ const MAX_DESCRIPTOR_BYTES: usize = 64 * 1024;
 const MAX_PROTOCOL_RANK: usize = 1024;
 
 #[cfg(feature = "mpi")]
+pub(crate) const MAX_NAME: usize = 1024;
+
+#[cfg(feature = "mpi")]
+pub(crate) fn valid_name_bytes(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+        && bytes.len() <= MAX_NAME
+        && !bytes.contains(&0)
+        && std::str::from_utf8(bytes).is_ok()
+}
+
+#[cfg(feature = "mpi")]
 const OP_WRITE_MPI: u64 = 1;
 #[cfg(feature = "mpi")]
 const OP_READ_MPI: u64 = 2;

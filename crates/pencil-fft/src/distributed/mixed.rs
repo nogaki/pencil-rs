@@ -306,6 +306,15 @@ pub struct MixedC2cInPlaceWorkspace<R: FftReal, const N: usize, const M: usize> 
     line_buffer: Vec<Complex<R>>,
 }
 
+struct MixedR2cLineBuffers<R: FftReal> {
+    embedding_line: Vec<Complex<R>>,
+    real_source_line: Vec<R>,
+    real_line: Vec<R>,
+    complex_source_line: Vec<Complex<R>>,
+    complex_line: Vec<Complex<R>>,
+    real_strided_line: Vec<R>,
+}
+
 /// Reusable out-of-place workspace for [`MixedR2cPlan`].
 #[derive(Debug)]
 pub struct MixedR2cWorkspace<R: FftReal, const N: usize, const M: usize> {
@@ -1590,10 +1599,7 @@ fn validate_c2c_graph<const N: usize>(transforms: [AxisTransform; N]) -> Result<
     Ok(())
 }
 
-fn validate_r2c_graph<const N: usize>(
-    global_shape: [usize; N],
-    transforms: [AxisTransform; N],
-) -> Result<usize, MixedError> {
+fn validate_r2c_graph<const N: usize>(transforms: [AxisTransform; N]) -> Result<usize, MixedError> {
     let mut boundary = None;
     for (axis, transform) in transforms.into_iter().enumerate() {
         if matches!(transform, AxisTransform::Rfft) && boundary.replace(axis).is_some() {
@@ -1612,7 +1618,7 @@ fn validate_r2c_graph<const N: usize>(
                 AxisTransform::None | AxisTransform::Fft | AxisTransform::R2r(_)
             )
         };
-        if !valid || global_shape[axis] == 0 {
+        if !valid {
             return Err(MixedError::InvalidGraph);
         }
     }
@@ -3098,22 +3104,20 @@ where
             self.core.fft_scratch_len,
             self.core.complex_line_len,
         )?;
+        let line_buffers = mixed_r2c_line_buffers(&self.core)?;
         Ok(MixedR2cWorkspace {
             core: Arc::clone(&self.core),
             intermediate,
             real_intermediate,
             transpose: buffers.transpose,
             real_transpose,
-            embedding_line: initialized_vec(self.core.embedding_len, zero_complex::<R>())?,
+            embedding_line: line_buffers.embedding_line,
             fft_scratch: buffers.fft_scratch,
-            real_source_line: initialized_vec(self.core.real_len, R::zero())?,
-            real_line: initialized_vec(self.core.real_line_len.max(self.core.real_len), R::zero())?,
-            complex_source_line: initialized_vec(self.core.complex_len, zero_complex::<R>())?,
-            complex_line: initialized_vec(
-                self.core.complex_line_len.max(self.core.complex_len),
-                zero_complex::<R>(),
-            )?,
-            real_strided_line: initialized_vec(self.core.real_line_len, R::zero())?,
+            real_source_line: line_buffers.real_source_line,
+            real_line: line_buffers.real_line,
+            complex_source_line: line_buffers.complex_source_line,
+            complex_line: line_buffers.complex_line,
+            real_strided_line: line_buffers.real_strided_line,
             complex_strided_line: buffers.line_buffer,
         })
     }
@@ -3154,27 +3158,26 @@ where
             self.core.fft_scratch_len,
             self.core.complex_line_len,
         )?;
+        let real_transpose = if self.core.real_stage_index == 0 {
+            None
+        } else {
+            Some(TransposeWorkspace::from_vecs(
+                initialized_vec(self.core.real_transpose_send_len, R::zero())?,
+                initialized_vec(self.core.real_transpose_receive_len, R::zero())?,
+            ))
+        };
+        let line_buffers = mixed_r2c_line_buffers(&self.core)?;
         Ok(MixedR2cInPlaceWorkspace {
             core: Arc::clone(&self.core),
             transpose: buffers.transpose,
-            real_transpose: if self.core.real_stage_index == 0 {
-                None
-            } else {
-                Some(TransposeWorkspace::from_vecs(
-                    initialized_vec(self.core.real_transpose_send_len, R::zero())?,
-                    initialized_vec(self.core.real_transpose_receive_len, R::zero())?,
-                ))
-            },
-            embedding_line: initialized_vec(self.core.embedding_len, zero_complex::<R>())?,
+            real_transpose,
+            embedding_line: line_buffers.embedding_line,
             fft_scratch: buffers.fft_scratch,
-            real_source_line: initialized_vec(self.core.real_len, R::zero())?,
-            real_line: initialized_vec(self.core.real_line_len.max(self.core.real_len), R::zero())?,
-            complex_source_line: initialized_vec(self.core.complex_len, zero_complex::<R>())?,
-            complex_line: initialized_vec(
-                self.core.complex_line_len.max(self.core.complex_len),
-                zero_complex::<R>(),
-            )?,
-            real_strided_line: initialized_vec(self.core.real_line_len, R::zero())?,
+            real_source_line: line_buffers.real_source_line,
+            real_line: line_buffers.real_line,
+            complex_source_line: line_buffers.complex_source_line,
+            complex_line: line_buffers.complex_line,
+            real_strided_line: line_buffers.real_strided_line,
             complex_strided_line: buffers.line_buffer,
         })
     }
@@ -3442,7 +3445,7 @@ where
         backend: BackendChoice,
     ) -> Result<Self, BackendInitError<MixedError>> {
         let communicator = topology.communicator();
-        let local_boundary = validate_r2c_graph(global_shape, transforms).ok();
+        let local_boundary = validate_r2c_graph(transforms).ok();
         let mut reduced_shape = global_shape;
         let original_len = local_boundary.map(|axis| global_shape[axis]).unwrap_or(0);
         if let Some(axis) = local_boundary {
@@ -3491,8 +3494,7 @@ where
             communicator,
             validate_r2c_directions(transforms, directions),
         )?;
-        let reduction_axis =
-            agree_result(communicator, validate_r2c_graph(global_shape, transforms))?;
+        let reduction_axis = agree_result(communicator, validate_r2c_graph(transforms))?;
         let boundary = N
             .checked_sub(1 + reduction_axis)
             .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
@@ -4012,44 +4014,43 @@ fn mixed_r2c_real_pencils<R: FftReal, const N: usize, const M: usize>(
     stages: &[MixedR2cStage<R, N, M>],
     boundary: usize,
 ) -> Result<Box<[Arc<Pencil<N, M>>]>, MixedError> {
-    let mut pencils = Vec::new();
-    pencils.try_reserve_exact(boundary + 1).map_err(|_| {
-        MixedError::Fft(FftError::AllocationFailed {
-            required: boundary + 1,
-        })
-    })?;
-    for stage in &stages[..=boundary] {
-        if !pencils
-            .iter()
-            .any(|p: &Arc<Pencil<N, M>>| p.same_layout(stage.input.as_ref()))
-        {
-            pencils.push(Arc::clone(&stage.input));
-        }
+    let count = boundary
+        .checked_add(1)
+        .ok_or(MixedError::Fft(FftError::PreparationFailed))?;
+    if count > stages.len() {
+        return Err(MixedError::Fft(FftError::PreparationFailed));
     }
-    Ok(pencils.into_boxed_slice())
+    Ok(registered_pencils(
+        stages[..count].iter().map(|stage| &stage.input),
+    )?)
 }
 
 fn mixed_r2c_complex_pencils<R: FftReal, const N: usize, const M: usize>(
     stages: &[MixedR2cStage<R, N, M>],
     boundary: usize,
 ) -> Result<Box<[Arc<Pencil<N, M>>]>, MixedError> {
-    let mut pencils = Vec::new();
-    pencils
-        .try_reserve_exact(stages.len() - boundary)
-        .map_err(|_| {
-            MixedError::Fft(FftError::AllocationFailed {
-                required: stages.len() - boundary,
-            })
-        })?;
-    for stage in &stages[boundary..] {
-        if !pencils
-            .iter()
-            .any(|p: &Arc<Pencil<N, M>>| p.same_layout(stage.output.as_ref()))
-        {
-            pencils.push(Arc::clone(&stage.output));
-        }
+    if boundary >= stages.len() {
+        return Err(MixedError::Fft(FftError::PreparationFailed));
     }
-    Ok(pencils.into_boxed_slice())
+    Ok(registered_pencils(
+        stages[boundary..].iter().map(|stage| &stage.output),
+    )?)
+}
+
+fn mixed_r2c_line_buffers<R: FftReal, const N: usize, const M: usize>(
+    core: &MixedR2cCore<R, N, M>,
+) -> Result<MixedR2cLineBuffers<R>, FftError> {
+    Ok(MixedR2cLineBuffers {
+        embedding_line: initialized_vec(core.embedding_len, zero_complex::<R>())?,
+        real_source_line: initialized_vec(core.real_len, R::zero())?,
+        real_line: initialized_vec(core.real_line_len.max(core.real_len), R::zero())?,
+        complex_source_line: initialized_vec(core.complex_len, zero_complex::<R>())?,
+        complex_line: initialized_vec(
+            core.complex_line_len.max(core.complex_len),
+            zero_complex::<R>(),
+        )?,
+        real_strided_line: initialized_vec(core.real_line_len, R::zero())?,
+    })
 }
 
 fn mixed_r2c_storage_requirements<R: FftReal, const N: usize, const M: usize>(

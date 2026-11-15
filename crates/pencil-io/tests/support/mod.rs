@@ -209,6 +209,105 @@ pub(crate) fn record_case<C>(
     }
 }
 
+#[allow(dead_code)]
+pub(crate) fn run_decomposition_mismatch_scenario<C, W, R, E, P>(
+    world: &C,
+    directory: &Path,
+    extension: &str,
+    diagnostic_prefix: &str,
+    write: W,
+    read: R,
+    is_descriptor_mismatch: P,
+) -> Vec<String>
+where
+    C: Communicator + CommunicatorCollectives,
+    W: for<'a> Fn(&Path, PencilArrayView<'a, i32, 2, 2>) -> Result<(), E>,
+    R: for<'a> Fn(&Path, PencilArrayViewMut<'a, i32, 2, 2>) -> Result<(), E>,
+    E: Debug,
+    P: Fn(&E) -> bool,
+{
+    let mut failures = Vec::new();
+    let size = usize::try_from(world.size()).unwrap();
+    if size == 1 {
+        if world.rank() == 0 {
+            eprintln!("issue38 skipped: 1 rank");
+        }
+        return failures;
+    }
+
+    let read_path = directory
+        .join("issue38-default-read")
+        .with_extension(extension);
+    reset_file(world, &read_path);
+    let source = decomposition_array(world, [0, 1], None);
+    write(&read_path, source.view()).unwrap();
+    world.barrier();
+
+    let mut destination = decomposition_array(world, mismatched_decomposition(world), Some(-888));
+    let before = destination.as_slice().to_vec();
+    let result = read(&read_path, destination.view_mut());
+    let ok = result.as_ref().is_err_and(&is_descriptor_mismatch)
+        && destination.as_slice() == before.as_slice();
+    record_case(
+        world,
+        &mut failures,
+        &format!("{diagnostic_prefix}_read_decomposition_mismatch"),
+        ok,
+        &format!("{result:?}"),
+    );
+
+    let mut recovered = decomposition_array(world, [1, 0], Some(-888));
+    let result = read(&read_path, recovered.view_mut());
+    let ok = result.is_ok() && decomposition_values_match(&recovered);
+    record_case(
+        world,
+        &mut failures,
+        &format!("{diagnostic_prefix}_read_decomposition_mismatch/recovery"),
+        ok,
+        &format!("{result:?}"),
+    );
+
+    let write_path = directory
+        .join("issue38-default-write")
+        .with_extension(extension);
+    reset_file(world, &write_path);
+    let source = decomposition_array(world, mismatched_decomposition(world), None);
+    let result = write(&write_path, source.view());
+    let local_ok = result.as_ref().is_err_and(&is_descriptor_mismatch);
+    world.barrier();
+    let absent = if world.rank() == 0 {
+        write_path
+            .try_exists()
+            .map(|exists| !exists)
+            .unwrap_or(false)
+    } else {
+        true
+    };
+    record_case(
+        world,
+        &mut failures,
+        &format!("{diagnostic_prefix}_write_decomposition_mismatch"),
+        local_ok && absent,
+        &format!("{result:?} file_absent={absent}"),
+    );
+
+    let recovery_path = directory
+        .join("issue38-default-write-recovery")
+        .with_extension(extension);
+    reset_file(world, &recovery_path);
+    let source = decomposition_array(world, [0, 1], None);
+    let result = write(&recovery_path, source.view());
+    record_case(
+        world,
+        &mut failures,
+        &format!("{diagnostic_prefix}_write_decomposition_mismatch/recovery"),
+        result.is_ok(),
+        &format!("{result:?}"),
+    );
+
+    failures
+}
+
 pub(crate) fn owned_temp_dir<C>(world: &C, prefix: &str) -> PathBuf
 where
     C: Communicator + CommunicatorCollectives,

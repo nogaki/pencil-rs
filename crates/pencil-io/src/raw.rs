@@ -1,11 +1,11 @@
 use crate::format::{IoElement, element_count, prepare_physical_decode};
 use crate::mpi_io::{
-    DatatypeGuard, FileGuard, abort_unrecoverable, aggregate_cleanup_result, agree_mpi_preparation,
-    agree_phase, build_layout, checked_local_byte_count, collective_state, descriptor_agreement,
-    duplicate_comm, finish_comm, finish_resources, mpi_preparation_error, path_bytes,
-    set_file_errors_return,
+    DatatypeGuard, FileGuard, ReadPhases, abort_unrecoverable, aggregate_cleanup_result,
+    agree_mpi_preparation, agree_phase, build_layout, checked_local_byte_count, collective_state,
+    descriptor_agreement, duplicate_comm, finish_comm, finish_resources, mpi_preparation_error,
+    path_bytes, read_payload, set_file_errors_return,
 };
-use crate::options::{InfoGuard, MpiIoMode, RawByteOrder, RawReadOptions, agree_options};
+use crate::options::{InfoGuard, RawByteOrder, RawReadOptions, agree_options};
 use crate::{IoError, OP_READ_RAW_MPI, ffi};
 use mpi::traits::{AsRaw, Communicator};
 use pencil_array::PencilArrayViewMut;
@@ -186,22 +186,20 @@ fn read_raw_inner<P: AsRef<Path>, T: IoElement, const N: usize, const M: usize>(
                 phase: "raw datatype",
             });
         }
-        let code = ffi::file_set_view_with_info(
+        read_payload(
+            comm,
             file.raw,
+            info.raw,
+            options.mpi.mode,
             offset,
             datatype.as_ref().map_or_else(ffi::byte_datatype, |d| d.raw),
-            info.raw,
-        );
-        agree_phase(comm, code == ffi::MPI_SUCCESS as i32, "raw file view")?;
-        let read = match options.mpi.mode {
-            MpiIoMode::Collective => ffi::file_read_all(file.raw, &mut staging),
-            MpiIoMode::Independent => ffi::file_read_independent(file.raw, &mut staging),
-        };
-        agree_phase(
-            comm,
-            matches!(read,Ok(n) if n==staging.len()),
-            "raw payload read",
-        )?;
+            &mut staging,
+            ReadPhases {
+                view: "raw file view",
+                payload: "raw payload read",
+            },
+        )
+        .map_err(|error| error.agreement)?;
         // Existing v1 decoding is little endian, not native endian. Reverse each
         // real component independently; never reverse a whole complex number.
         if options.endian.effective() == RawByteOrder::Big {

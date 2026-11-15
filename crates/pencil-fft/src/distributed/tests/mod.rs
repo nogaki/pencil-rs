@@ -153,6 +153,15 @@ fn strided_differing_line_size_overflow_keeps_preparation_error() {
         |_, _| Ok(()),
     );
     assert!(matches!(result, Err(FftError::PreparationFailed)));
+    assert!(matches!(strided_line_count(0, 2, 0), Ok(0)));
+    assert!(matches!(
+        strided_line_count(1, 2, 0),
+        Err(FftError::PreparationFailed)
+    ));
+    assert!(matches!(
+        strided_line_count(0, 2, usize::MAX),
+        Err(FftError::PreparationFailed)
+    ));
 }
 
 #[test]
@@ -180,6 +189,20 @@ fn r2c_storage_requirements_keep_contiguous_strided_and_empty_capacities() {
             1,
         ),
         Err(FftError::PreparationFailed)
+    ));
+    let beyond_isize = isize::MAX as usize / std::mem::size_of::<f64>() + 1;
+    assert!(matches!(
+        r2c::in_place_storage_requirements::<f64, _, _>(
+            [beyond_isize].into_iter(),
+            std::iter::empty(),
+            1,
+            1,
+        ),
+        Err(FftError::PreparationFailed)
+    ));
+    assert!(matches!(
+        r2c::validate_recast_capacity::<f64, Complex<f64>>(usize::MAX, 0),
+        Err(FftError::StorageLayoutMismatch)
     ));
 }
 
@@ -262,4 +285,178 @@ fn r2r_workspace_buffer_allocator_preserves_typed_lengths_and_zeroes() {
             }
         }
     }
+}
+
+#[test]
+#[ignore = "MPI must be initialized in a fresh one-rank test process"]
+fn strided_c2c_wrappers_and_r2c_registry_preserve_contracts() {
+    let universe = mpi::initialize().expect("MPI initialization failed");
+    let world = universe.world();
+    assert_eq!(world.size(), 1, "run this test with one MPI rank");
+    // MPI topology is intentionally !Send/!Sync; the public Pencil API uses Arc,
+    // and the equivalent pencil below checks pointer-identity deduplication.
+    #[allow(clippy::arc_with_non_send_sync)]
+    let topology = Arc::new(MpiTopology::<1>::new(&world, [1]).unwrap());
+    let pencil = Pencil::<2, 1>::new(Arc::clone(&topology), [2, 3], [0]).unwrap();
+    let plan = LocalC2cPlan::<f64>::new(2).unwrap();
+    let scratch_len = plan.scratch_len();
+    let zero = Complex::new(0.0, 0.0);
+    let source = vec![zero; 5];
+    let mut destination = vec![zero; 6];
+    let mut short_line = [zero; 1];
+    let mut scratch = vec![zero; scratch_len];
+
+    for result in [
+        execute_strided_complex_forward(
+            &plan,
+            &pencil,
+            0,
+            &source,
+            &mut destination,
+            &mut scratch,
+            &mut short_line,
+        ),
+        execute_strided_complex_forward_in_place(
+            &plan,
+            &pencil,
+            0,
+            &mut source.clone(),
+            &mut scratch,
+            &mut short_line,
+        ),
+        execute_strided_complex_reverse(
+            &plan,
+            &pencil,
+            0,
+            &source,
+            &mut destination,
+            &mut scratch,
+            &mut short_line,
+            true,
+        ),
+        execute_strided_complex_reverse_in_place(
+            &plan,
+            &pencil,
+            0,
+            &mut source.clone(),
+            &mut scratch,
+            &mut short_line,
+            false,
+        ),
+    ] {
+        assert!(matches!(
+            result,
+            Err(FftError::WorkspaceTooSmall {
+                required: 2,
+                actual: 1,
+                ..
+            })
+        ));
+    }
+
+    let mut line = [zero; 2];
+    assert!(matches!(
+        execute_strided_complex_forward(
+            &plan,
+            &pencil,
+            0,
+            &source,
+            &mut destination,
+            &mut scratch,
+            &mut line,
+        ),
+        Err(FftError::LocalC2c(LocalC2cError::NonIntegralBatch))
+    ));
+    let source = vec![zero; 6];
+    let mut short_destination = vec![zero; 5];
+    assert!(matches!(
+        execute_strided_complex_forward(
+            &plan,
+            &pencil,
+            0,
+            &source,
+            &mut short_destination,
+            &mut scratch,
+            &mut line,
+        ),
+        Err(FftError::LocalC2c(LocalC2cError::BufferLengthMismatch))
+    ));
+    assert!(matches!(
+        execute_strided_complex_reverse(
+            &plan,
+            &pencil,
+            0,
+            &source,
+            &mut short_destination,
+            &mut scratch,
+            &mut line,
+            false,
+        ),
+        Err(FftError::LocalC2c(LocalC2cError::BufferLengthMismatch))
+    ));
+
+    let contiguous = pencil
+        .with_permutation(AxisPermutation::new([1, 0]).unwrap())
+        .unwrap();
+    let source = [Complex::new(1.0, 0.5), Complex::new(-0.25, 0.75)];
+    let mut destination = [zero; 2];
+    let mut no_line = [];
+    assert!(
+        execute_strided_complex_forward(
+            &plan,
+            &contiguous,
+            0,
+            &source,
+            &mut destination,
+            &mut scratch,
+            &mut no_line,
+        )
+        .is_ok()
+    );
+    let mut data = source;
+    assert!(
+        execute_strided_complex_forward_in_place(
+            &plan,
+            &contiguous,
+            0,
+            &mut data,
+            &mut scratch,
+            &mut no_line,
+        )
+        .is_ok()
+    );
+    assert!(
+        execute_strided_complex_reverse(
+            &plan,
+            &contiguous,
+            0,
+            &source,
+            &mut destination,
+            &mut scratch,
+            &mut no_line,
+            true,
+        )
+        .is_ok()
+    );
+    assert!(
+        execute_strided_complex_reverse_in_place(
+            &plan,
+            &contiguous,
+            0,
+            &mut data,
+            &mut scratch,
+            &mut no_line,
+            false,
+        )
+        .is_ok()
+    );
+
+    let equivalent = Pencil::<2, 1>::new(Arc::clone(&topology), [2, 3], [0]).unwrap();
+    let alternate = pencil
+        .with_permutation(AxisPermutation::new([1, 0]).unwrap())
+        .unwrap();
+    let registered = registered_pencils([&pencil, &equivalent, &alternate].into_iter()).unwrap();
+    assert_eq!(registered.len(), 2);
+    assert!(Arc::ptr_eq(&registered[0], &pencil));
+    assert!(Arc::ptr_eq(&registered[1], &alternate));
 }

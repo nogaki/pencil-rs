@@ -7,15 +7,15 @@ use mpi::traits::*;
 use num_complex::Complex;
 use pencil_array::{AxisPermutation, ExtraShape, MpiTopology, Pencil, PencilArray};
 use pencil_io::{
-    CatalogError, IoError, ScalarType, read_hdf5, read_hdf5_catalog, read_hdf5_serial, write_hdf5,
-    write_hdf5_serial,
+    CatalogError, Hdf5FileSession, Hdf5SessionError, Hdf5WriteOptions, IoError, MpiIoMode,
+    MpiIoOptions, ScalarType, read_hdf5, read_hdf5_catalog, read_hdf5_serial, write_hdf5,
+    write_hdf5_serial, write_hdf5_with_options,
 };
 
 mod support;
 use support::{
-    cleanup_owned_temp_dir, decomposition_array, decomposition_values_match,
-    mismatched_decomposition, owned_temp_dir, record_case, reset_file, root_read, root_status,
-    run_scalar_case,
+    cleanup_owned_temp_dir, owned_temp_dir, reset_file, root_read, root_status,
+    run_decomposition_mismatch_scenario, run_scalar_case,
 };
 
 const COMMIT_MARKER: u64 = 0x434f_4d4d_4954_5445;
@@ -129,6 +129,194 @@ fn assert_hdf5_failure<C, F>(
     assert!(expected(&error), "unexpected HDF5 error: {error:?}");
     assert_eq!(destination.as_slice(), before.as_slice());
     world.barrier();
+}
+
+fn record_issue143<C: mpi::collective::CommunicatorCollectives>(
+    world: &C,
+    failures: &mut Vec<String>,
+    name: &str,
+    ok: bool,
+    detail: &str,
+) {
+    if !ok {
+        eprintln!("issue143 {name} rank={}: {detail}", world.rank());
+    }
+    let local_ok = i32::from(ok);
+    let mut all_ok = 0;
+    world.all_reduce_into(
+        &local_ok,
+        &mut all_ok,
+        mpi::collective::SystemOperation::min(),
+    );
+    if world.rank() == 0 {
+        eprintln!(
+            "issue143 {name}: {}",
+            if all_ok == 1 { "PASS" } else { "FAIL" }
+        );
+    }
+    if all_ok == 0 {
+        failures.push(name.to_owned());
+    }
+}
+
+// N=32 spatial axes plus ExtraShape([1]) make the physical HDF5 dataspace
+// rank 33 while each rank owns only one i32 element.
+fn issue143_rank33_cases<
+    C: mpi::traits::Communicator + mpi::collective::CommunicatorCollectives,
+>(
+    world: &C,
+    directory: &Path,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let size = usize::try_from(world.size()).unwrap();
+    let topology = MpiTopology::<1>::new(world, [size]).unwrap();
+    let global: [usize; 32] = std::array::from_fn(|axis| if axis == 0 { size } else { 1 });
+    let rank33_pencil = Pencil::<32, 1>::new(topology.clone(), global, [0]).unwrap();
+    let extra = ExtraShape::new([1]).unwrap();
+    let rank33_source =
+        PencilArray::from_elem(rank33_pencil.clone(), extra.clone(), 17i32).unwrap();
+    assert_eq!(rank33_source.as_slice().len(), 1);
+
+    let rank32_path = directory.join("issue143-rank32-control.h5");
+    reset_file(world, &rank32_path);
+    let rank32_source =
+        PencilArray::from_elem(rank33_pencil.clone(), ExtraShape::scalar(), 13i32).unwrap();
+    let rank32_write = write_hdf5(&rank32_path, rank32_source.view());
+    world.barrier();
+    let mut rank32_destination =
+        PencilArray::from_elem(rank33_pencil.clone(), ExtraShape::scalar(), -1i32).unwrap();
+    let rank32_read = read_hdf5(&rank32_path, rank32_destination.view_mut());
+    record_issue143(
+        world,
+        &mut failures,
+        "rank32_write_read_control",
+        rank32_write.is_ok()
+            && rank32_read.is_ok()
+            && rank32_destination.as_slice() == rank32_source.as_slice(),
+        &format!("write={rank32_write:?} read={rank32_read:?}"),
+    );
+
+    let default_path = directory.join("issue143-rank33-default.h5");
+    reset_file(world, &default_path);
+    let result = write_hdf5(&default_path, rank33_source.view());
+    world.barrier();
+    let absent = if world.rank() == 0 {
+        default_path
+            .try_exists()
+            .map(|exists| !exists)
+            .unwrap_or(false)
+    } else {
+        true
+    };
+    record_issue143(
+        world,
+        &mut failures,
+        "rank33_default_write_preflight_no_file",
+        matches!(&result, Err(IoError::SizeLimit { what: "HDF5 rank" })) && absent,
+        &format!("{result:?} file_absent={absent}"),
+    );
+
+    let unchunked_path = directory.join("issue143-rank33-unchunked.h5");
+    reset_file(world, &unchunked_path);
+    let unchunked = Hdf5WriteOptions::default().mode(MpiIoMode::Collective);
+    let result = write_hdf5_with_options(&unchunked_path, rank33_source.view(), &unchunked);
+    world.barrier();
+    let absent = if world.rank() == 0 {
+        unchunked_path
+            .try_exists()
+            .map(|exists| !exists)
+            .unwrap_or(false)
+    } else {
+        true
+    };
+    record_issue143(
+        world,
+        &mut failures,
+        "rank33_unchunked_write_preflight_no_file",
+        matches!(&result, Err(IoError::SizeLimit { what: "HDF5 rank" })) && absent,
+        &format!("{result:?} file_absent={absent}"),
+    );
+
+    let read_path = directory.join("issue143-rank33-read.h5");
+    reset_file(world, &read_path);
+    let valid_pencil = Pencil::<2, 1>::new(topology.clone(), [size, 1], [0]).unwrap();
+    let valid_source = PencilArray::from_elem(valid_pencil, ExtraShape::scalar(), 23i32).unwrap();
+    write_hdf5(&read_path, valid_source.view()).unwrap();
+    world.barrier();
+    let mut destination =
+        PencilArray::from_elem(rank33_pencil.clone(), extra.clone(), -77i32).unwrap();
+    let before = destination.as_slice().to_vec();
+    let result = read_hdf5(&read_path, destination.view_mut());
+    record_issue143(
+        world,
+        &mut failures,
+        "rank33_read_preflight_before_dataset_open",
+        matches!(&result, Err(IoError::SizeLimit { what: "HDF5 rank" }))
+            && destination.as_slice() == before.as_slice(),
+        &format!(
+            "{result:?} destination_unchanged={}",
+            destination.as_slice() == before
+        ),
+    );
+
+    let session_path = directory.join("issue143-rank33-session.h5");
+    reset_file(world, &session_path);
+    let comm = topology.communicator();
+    let mut session =
+        Hdf5FileSession::create(&session_path, comm, &MpiIoOptions::default()).unwrap();
+    let result = session.write("rank33", rank33_source.view(), &Hdf5WriteOptions::default());
+    record_issue143(
+        world,
+        &mut failures,
+        "rank33_session_write_preflight",
+        matches!(
+            &result,
+            Err(Hdf5SessionError::Io(IoError::SizeLimit {
+                what: "HDF5 rank"
+            }))
+        ),
+        &format!("{result:?}"),
+    );
+    let empty = session.catalog().is_ok_and(|entries| entries.is_empty());
+    record_issue143(
+        world,
+        &mut failures,
+        "rank33_session_no_dataset_or_poison",
+        empty,
+        &format!("catalog_empty={empty}"),
+    );
+    let recovery_pencil = Pencil::<2, 1>::new(topology.clone(), [size, 1], [0]).unwrap();
+    let recovery_source =
+        PencilArray::from_elem(recovery_pencil, ExtraShape::scalar(), 31i32).unwrap();
+    let recovery = session.write(
+        "recovery",
+        recovery_source.view(),
+        &Hdf5WriteOptions::default(),
+    );
+    record_issue143(
+        world,
+        &mut failures,
+        "rank33_session_valid_write_recovery",
+        recovery.is_ok(),
+        &format!("{recovery:?}"),
+    );
+    let recovered_catalog = session.catalog().is_ok_and(|entries| entries.len() == 1);
+    record_issue143(
+        world,
+        &mut failures,
+        "rank33_session_recovery_catalog",
+        recovered_catalog,
+        &format!("one_dataset={recovered_catalog}"),
+    );
+    let closed = session.close();
+    record_issue143(
+        world,
+        &mut failures,
+        "rank33_session_close",
+        closed.is_ok(),
+        &format!("{closed:?}"),
+    );
+    failures
 }
 
 #[test]
@@ -600,10 +788,11 @@ fn parallel_hdf5_preserves_logical_order_and_rejects_bad_files() {
         (x as f64) - (y as f64),
     ));
 
-    let issue38_failures = issue38_decomposition_cases(&world, &directory);
+    let mut failures = issue38_decomposition_cases(&world, &directory);
+    failures.extend(issue143_rank33_cases(&world, &directory));
     cleanup_owned_temp_dir(&world, &directory);
-    if !issue38_failures.is_empty() {
-        panic!("issue38 failures: {issue38_failures:?}");
+    if !failures.is_empty() {
+        panic!("I/O regressions: {failures:?}");
     }
 }
 
@@ -614,80 +803,15 @@ fn issue38_decomposition_cases<C>(world: &C, directory: &Path) -> Vec<String>
 where
     C: Communicator + CommunicatorCollectives,
 {
-    let mut failures = Vec::new();
-    let size = usize::try_from(world.size()).unwrap();
-    if size == 1 {
-        if world.rank() == 0 {
-            eprintln!("issue38 skipped: 1 rank");
-        }
-        return failures;
-    }
-
-    let read_path = directory.join("issue38-default-read.h5");
-    reset_file(world, &read_path);
-    let source = decomposition_array(world, [0, 1], None);
-    write_hdf5(&read_path, source.view()).unwrap();
-    world.barrier();
-
-    let mut destination = decomposition_array(world, mismatched_decomposition(world), Some(-888));
-    let before = destination.as_slice().to_vec();
-    let result = read_hdf5(&read_path, destination.view_mut());
-    let ok = matches!(result, Err(IoError::CollectiveDescriptorMismatch))
-        && destination.as_slice() == before.as_slice();
-    record_case(
+    run_decomposition_mismatch_scenario(
         world,
-        &mut failures,
-        "default_hdf5_read_decomposition_mismatch",
-        ok,
-        &format!("{result:?}"),
-    );
-
-    let mut recovered = decomposition_array(world, [1, 0], Some(-888));
-    let result = read_hdf5(&read_path, recovered.view_mut());
-    let ok = result.is_ok() && decomposition_values_match(&recovered);
-    record_case(
-        world,
-        &mut failures,
-        "default_hdf5_read_decomposition_mismatch/recovery",
-        ok,
-        &format!("{result:?}"),
-    );
-
-    let write_path = directory.join("issue38-default-write.h5");
-    reset_file(world, &write_path);
-    let source = decomposition_array(world, mismatched_decomposition(world), None);
-    let result = write_hdf5(&write_path, source.view());
-    let local_ok = matches!(result, Err(IoError::CollectiveDescriptorMismatch));
-    world.barrier();
-    let absent = if world.rank() == 0 {
-        write_path
-            .try_exists()
-            .map(|exists| !exists)
-            .unwrap_or(false)
-    } else {
-        true
-    };
-    record_case(
-        world,
-        &mut failures,
-        "default_hdf5_write_decomposition_mismatch",
-        local_ok && absent,
-        &format!("{result:?} file_absent={absent}"),
-    );
-
-    let recovery_path = directory.join("issue38-default-write-recovery.h5");
-    reset_file(world, &recovery_path);
-    let source = decomposition_array(world, [0, 1], None);
-    let result = write_hdf5(&recovery_path, source.view());
-    record_case(
-        world,
-        &mut failures,
-        "default_hdf5_write_decomposition_mismatch/recovery",
-        result.is_ok(),
-        &format!("{result:?}"),
-    );
-
-    failures
+        directory,
+        "h5",
+        "default_hdf5",
+        |path, view| write_hdf5(path, view),
+        |path, view| read_hdf5(path, view),
+        |error| matches!(error, IoError::CollectiveDescriptorMismatch),
+    )
 }
 
 fn assert_i32_values(array: &PencilArray<i32, 2, 2>) {

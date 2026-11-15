@@ -166,14 +166,7 @@ fn agree<C: CommunicatorCollectives>(
     ok: bool,
     why: &'static str,
 ) -> Result<(), CatalogError> {
-    let x = i32::from(ok);
-    let mut y = 0;
-    c.all_reduce_into(&x, &mut y, SystemOperation::min());
-    if y == 0 {
-        Err(IoError::CollectivePrecondition { phase: why }.into())
-    } else {
-        Ok(())
-    }
+    crate::mpi_io::agree_phase(c, ok, why).map_err(Into::into)
 }
 fn agree_path(c: &CartesianCommunicator, p: &Path) -> Result<CString, CatalogError> {
     let local = path_bytes(p);

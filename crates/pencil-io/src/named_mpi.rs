@@ -24,14 +24,15 @@ use crate::mpi_io::{
     path_bytes,
 };
 use crate::options::{InfoGuard, MpiIoMode, MpiIoOptions, agree_options};
-use crate::{COMMIT_MARKER, IoError, MAX_PROTOCOL_RANK, NamedIoError, ScalarType};
+use crate::{
+    COMMIT_MARKER, IoError, MAX_NAME, MAX_PROTOCOL_RANK, NamedIoError, ScalarType, valid_name_bytes,
+};
 
 const MAGIC: &[u8; 8] = b"PIONAM02";
 const RECORD_MAGIC: &[u8; 8] = b"PIOREC02";
 const VERSION: u64 = 2;
 const CONTAINER_BYTES: usize = 32;
 const RECORD_HEADER_BYTES: usize = 72;
-const MAX_NAME: usize = 1024;
 const OP_WRITE: u64 = 0x101;
 const OP_READ: u64 = 0x102;
 const OP_APPEND: u64 = 0x103;
@@ -56,7 +57,7 @@ pub(crate) fn agree_name<C: CommunicatorCollectives>(
 }
 
 fn name_bytes<C: CommunicatorCollectives>(comm: &C, name: &str) -> Result<(), NamedIoError> {
-    let valid = !name.is_empty() && name.len() <= MAX_NAME && !name.as_bytes().contains(&0);
+    let valid = valid_name_bytes(name.as_bytes());
     if agree_phase(comm, valid, "named key validation").is_err() {
         return Err(NamedIoError::InvalidName);
     }
@@ -404,7 +405,7 @@ fn scan_root(
         body.resize(body_len, 0);
         root_read(file, p + RECORD_HEADER_BYTES, &mut body)?;
         let name = &body[..nl];
-        if std::str::from_utf8(name).is_err() || name.contains(&0) || names.contains(name) {
+        if !valid_name_bytes(name) || names.contains(name) {
             break;
         }
         let meta = &body[nl..];
@@ -580,7 +581,7 @@ fn decode_catalog(bytes: &[u8], count: usize, tail: usize, size: usize) -> Optio
             return None;
         }
         let name = catalog_slice(bytes, &mut at, name_len)?;
-        if std::str::from_utf8(name).is_err() || name.contains(&0) {
+        if !valid_name_bytes(name) {
             return None;
         }
         let metadata_len = 16usize.checked_add(rank.checked_mul(8)?)?;
@@ -896,9 +897,7 @@ fn record<T: IoElement, const N: usize, const M: usize>(
         .ok_or(NamedIoError::Io(IoError::SizeLimit {
             what: "logical rank",
         }))?;
-    if name.is_empty()
-        || name.len() > MAX_NAME
-        || name.as_bytes().contains(&0)
+    if !valid_name_bytes(name.as_bytes())
         || N == 0
         || N > MAX_PROTOCOL_RANK
         || extra.len() > MAX_PROTOCOL_RANK

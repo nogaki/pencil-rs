@@ -1407,15 +1407,17 @@ where
     // may overflow without affecting the reduction.
     let strides = if empty {
         [Ok(Vec::new()), Ok(Vec::new()), Ok(Vec::new())]
-    } else {
+    } else if extra.is_some() {
         dims.map(strides_for_dims)
+    } else {
+        [Ok(Vec::new()), Ok(Vec::new()), Ok(Vec::new())]
     };
-    let output_strides = if empty {
+    let output_strides = if empty || extra.is_none() {
         Ok(Vec::new())
     } else {
         strides_for_dims(&shape)
     };
-    let ok = strides.iter().all(Result::is_ok) && output_strides.is_ok();
+    let ok = extra.is_some() && strides.iter().all(Result::is_ok) && output_strides.is_ok();
     if !collective_valid(c, ok) || !ok {
         return Err(CollectiveError::PreparationFailed);
     }
@@ -1440,11 +1442,9 @@ fn broadcast_shape3(
     b: &ExtraShape,
     d: &ExtraShape,
 ) -> Result<Option<Vec<usize>>, CollectiveError> {
-    let ab = broadcast_shape(a, b)?.ok_or(CollectiveError::CollectivePreconditionFailed)?;
-    broadcast_shape(
-        &ExtraShape::new(ab).map_err(|_| CollectiveError::PreparationFailed)?,
-        d,
-    )
+    let ab = broadcast_shape_dims(a.dimensions(), b.dimensions())?
+        .ok_or(CollectiveError::CollectivePreconditionFailed)?;
+    broadcast_shape_dims(&ab, d.dimensions())
 }
 
 fn strides_for_dims(dims: &[usize]) -> Result<Vec<usize>, CollectiveError> {
@@ -1579,11 +1579,8 @@ where
             })?;
         shape.extend_from_slice(inputs[0].extra_shape().dimensions());
         for input in &inputs[1..] {
-            shape = broadcast_shape(
-                &ExtraShape::new(shape).map_err(|_| CollectiveError::PreparationFailed)?,
-                input.extra_shape(),
-            )?
-            .ok_or(CollectiveError::CollectivePreconditionFailed)?;
+            shape = broadcast_shape_dims(&shape, input.extra_shape().dimensions())?
+                .ok_or(CollectiveError::CollectivePreconditionFailed)?;
         }
         let extra = extra_count(&shape)?;
         let (strides, output_strides) = if extra == 0 {
@@ -1852,16 +1849,23 @@ fn broadcast_shape(
     left: &ExtraShape,
     right: &ExtraShape,
 ) -> Result<Option<Vec<usize>>, CollectiveError> {
-    if left.dimensions().len() != right.dimensions().len() {
+    broadcast_shape_dims(left.dimensions(), right.dimensions())
+}
+
+fn broadcast_shape_dims(
+    left: &[usize],
+    right: &[usize],
+) -> Result<Option<Vec<usize>>, CollectiveError> {
+    if left.len() != right.len() {
         return Ok(None);
     }
     let mut shape = Vec::new();
     shape
-        .try_reserve_exact(left.dimensions().len())
+        .try_reserve_exact(left.len())
         .map_err(|_| CollectiveError::AllocationFailed {
-            elements: left.dimensions().len(),
+            elements: left.len(),
         })?;
-    for (&a, &b) in left.dimensions().iter().zip(right.dimensions()) {
+    for (&a, &b) in left.iter().zip(right) {
         let dimension = if a == b {
             a
         } else if a == 1 {

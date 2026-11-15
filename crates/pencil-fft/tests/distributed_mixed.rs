@@ -7,10 +7,10 @@ use mpi::{
     collective::{CommunicatorCollectives, SystemOperation},
     topology::Communicator,
 };
-use pencil_array::{ExtraShape, MpiTopology, PencilArray};
+use pencil_array::{ExtraShape, MpiTopology, PencilArray, PencilError};
 use pencil_fft::{
-    AxisR2rKind, AxisTransform, Complex, DistributedLayout, FftError, FftReal, MixedC2cPlan,
-    MixedError, MixedR2cPlan, R2cState, R2rKind, TransposeMethod,
+    AxisR2rKind, AxisTransform, Complex, DistributedLayout, FftError, FftReal, FourierDirection,
+    FourierDirections, MixedC2cPlan, MixedError, MixedR2cPlan, R2cState, R2rKind, TransposeMethod,
 };
 
 type C64 = Complex<f64>;
@@ -1103,6 +1103,79 @@ fn mixed_tensor_oracles_and_collective_failures() {
         [AxisTransform::Rfft, AxisTransform::Rfft],
     );
     assert!(matches!(bad_graph, Err(MixedError::InvalidGraph)));
+    let bad_axis_graph = MixedR2cPlan::<f64, 2, 1>::from_shape(
+        Arc::clone(&topology),
+        [2, 3],
+        ExtraShape::scalar(),
+        [AxisTransform::Rfft, AxisTransform::Fft],
+    );
+    assert!(matches!(bad_axis_graph, Err(MixedError::InvalidGraph)));
+
+    let invalid_directions = MixedR2cPlan::<f64, 2, 1>::from_shape_with_fft_directions(
+        Arc::clone(&topology),
+        [2, 0],
+        ExtraShape::scalar(),
+        [AxisTransform::None, AxisTransform::Rfft],
+        FourierDirections::new([FourierDirection::Backward, FourierDirection::Forward]),
+    );
+    assert!(matches!(
+        invalid_directions,
+        Err(MixedError::Fft(FftError::PreparationFailed))
+    ));
+
+    if size > 1 {
+        let rank_dependent_graph = if rank == 0 {
+            [AxisTransform::None, AxisTransform::Rfft]
+        } else {
+            [AxisTransform::Fft, AxisTransform::Rfft]
+        };
+        let result = MixedR2cPlan::<f64, 2, 1>::from_shape(
+            Arc::clone(&topology),
+            [2, 0],
+            ExtraShape::scalar(),
+            rank_dependent_graph,
+        );
+        assert!(result.as_ref().is_err_and(is_descriptor_mismatch));
+    }
+
+    for (zero_shape, zero_axis) in [([0, 3], 0), ([2, 0], 1)] {
+        let result = MixedR2cPlan::<f64, 2, 1>::from_shape(
+            Arc::clone(&topology),
+            zero_shape,
+            ExtraShape::scalar(),
+            [AxisTransform::None, AxisTransform::Rfft],
+        );
+        assert!(
+            matches!(
+                result,
+                Err(MixedError::Fft(FftError::Pencil(
+                    PencilError::ZeroGlobalExtent { axis }
+                ))) if axis == zero_axis
+            ),
+            "zero global extent on axis {zero_axis} returned {result:?}"
+        );
+    }
+
+    #[cfg(feature = "fftw")]
+    for (zero_shape, zero_axis) in [([0, 3], 0), ([2, 0], 1)] {
+        let result = MixedR2cPlan::<f64, 2, 1>::from_shape_with_fftw(
+            Arc::clone(&topology),
+            zero_shape,
+            ExtraShape::scalar(),
+            [AxisTransform::None, AxisTransform::Rfft],
+            pencil_fft::PlanOptions::default(),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(pencil_fft::BackendInitError::Local(MixedError::Fft(
+                    FftError::Pencil(PencilError::ZeroGlobalExtent { axis })
+                ))) if axis == zero_axis
+            ),
+            "FFTW zero global extent on axis {zero_axis} returned {result:?}"
+        );
+    }
+
     let good_r2c = MixedR2cPlan::<f64, 2, 1>::from_shape(
         Arc::clone(&topology),
         [2, 3],

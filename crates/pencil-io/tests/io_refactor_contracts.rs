@@ -19,6 +19,11 @@
 //! nonzero overflow stays rejected; (2) a `H5S_NULL` u64 attribute must be
 //! rejected as malformed instead of being mistaken for a scalar.
 
+#[cfg(feature = "parallel-hdf5")]
+mod support {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/mod.rs"));
+}
+
 /// Collective hand-off primitives a caller has already executed.
 /// `agree_named_options` is excluded (it decides internally).
 const AGREEMENT_TOKENS: [&str; 6] = [
@@ -240,11 +245,11 @@ fn hdf5_readers_use_one_metadata_acceptance_predicate() {
 
 #[cfg(feature = "parallel-hdf5")]
 mod hdf5_metadata_regressions {
-    use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::path::Path;
 
+    use super::support::{cleanup_owned_temp_dir, owned_temp_dir, root_status};
     use hdf5_metno::{Dataset, Extents, File};
-    use mpi::collective::{CommunicatorCollectives, SystemOperation};
+    use mpi::collective::{CommunicatorCollectives, Root};
     use mpi::traits::*;
     use pencil_array::{ExtraShape, MpiTopology, Pencil, PencilArray};
     use pencil_io::{
@@ -253,96 +258,6 @@ mod hdf5_metadata_regressions {
     };
 
     const COMMIT_MARKER: u64 = 0x434f_4d4d_4954_5445;
-
-    /// Runs a root-only fixture operation; every rank panics together when it
-    /// fails, matching the existing HDF5 test fixtures.
-    fn root_status<C, F>(world: &C, operation: F)
-    where
-        C: Communicator + CommunicatorCollectives,
-        F: FnOnce() -> Result<(), String>,
-    {
-        let result = if world.rank() == 0 {
-            operation()
-        } else {
-            Ok(())
-        };
-        let local_ok = i32::from(result.is_ok());
-        let mut all_ok = 0;
-        world.all_reduce_into(&local_ok, &mut all_ok, SystemOperation::min());
-        if all_ok != 1 {
-            panic!(
-                "root fixture operation failed: {}",
-                result.err().unwrap_or_default()
-            );
-        }
-    }
-
-    fn owned_temp_dir<C>(world: &C, prefix: &str) -> PathBuf
-    where
-        C: Communicator + CommunicatorCollectives,
-    {
-        let setup = if world.rank() == 0 {
-            (|| -> Result<String, String> {
-                let nanos = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|error| error.to_string())?
-                    .as_nanos();
-                let path =
-                    std::env::temp_dir().join(format!("{prefix}-{nanos}-{}", std::process::id()));
-                std::fs::create_dir(&path)
-                    .map(|()| path.to_string_lossy().into_owned())
-                    .map_err(|error| error.to_string())
-            })()
-        } else {
-            Ok(String::new())
-        };
-        let mut status = i32::from(setup.is_ok());
-        world.process_at_rank(0).broadcast_into(&mut status);
-        let mut all_ok = 0;
-        world.all_reduce_into(&status, &mut all_ok, SystemOperation::min());
-        if all_ok != 1 {
-            panic!(
-                "owned test directory setup failed: {}",
-                setup.err().unwrap_or_default()
-            );
-        }
-        let mut path = if world.rank() == 0 {
-            setup.expect("directory setup agreement").into_bytes()
-        } else {
-            Vec::new()
-        };
-        let mut length = i32::try_from(path.len()).expect("temporary path fits MPI count");
-        world.process_at_rank(0).broadcast_into(&mut length);
-        path.resize(
-            usize::try_from(length).expect("non-negative path length"),
-            0,
-        );
-        world.process_at_rank(0).broadcast_into(&mut path[..]);
-        PathBuf::from(String::from_utf8(path).expect("temporary path is UTF-8"))
-    }
-
-    fn cleanup_owned_temp_dir<C>(world: &C, path: &Path)
-    where
-        C: Communicator + CommunicatorCollectives,
-    {
-        world.barrier();
-        let cleanup = if world.rank() == 0 {
-            std::fs::remove_dir_all(path).map_err(|error| error.to_string())
-        } else {
-            Ok(())
-        };
-        let mut status = i32::from(cleanup.is_ok());
-        world.process_at_rank(0).broadcast_into(&mut status);
-        let mut all_ok = 0;
-        world.all_reduce_into(&status, &mut all_ok, SystemOperation::min());
-        if all_ok != 1 {
-            panic!(
-                "owned test directory cleanup failed: {}",
-                cleanup.err().unwrap_or_default()
-            );
-        }
-        world.barrier();
-    }
 
     fn h5<T>(result: hdf5_metno::Result<T>) -> Result<T, String> {
         result.map_err(|error| error.to_string())

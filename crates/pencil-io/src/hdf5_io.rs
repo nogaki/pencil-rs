@@ -22,8 +22,8 @@ use crate::mpi_io::{
     descriptor_agreement, duplicate_comm, first_error2, try_u64_values,
 };
 use crate::{
-    COMMIT_MARKER, IoError, MAX_PROTOCOL_RANK, NamedIoError, OP_APPEND_HDF5_NAMED, OP_READ_HDF5,
-    OP_READ_HDF5_NAMED, OP_WRITE_HDF5, OP_WRITE_HDF5_NAMED,
+    COMMIT_MARKER, IoError, MAX_NAME, MAX_PROTOCOL_RANK, NamedIoError, OP_APPEND_HDF5_NAMED,
+    OP_READ_HDF5, OP_READ_HDF5_NAMED, OP_WRITE_HDF5, OP_WRITE_HDF5_NAMED, valid_name_bytes,
 };
 
 mod session;
@@ -31,7 +31,6 @@ mod session;
 pub(crate) use session::native_contracts as test_session_native_contracts;
 pub use session::{Hdf5FileSession, Hdf5SessionError};
 
-const MAX_NAME: usize = 1024;
 const OP_OPTIONS_WRITE_HDF5: u64 = 13;
 const OP_OPTIONS_READ_HDF5: u64 = 14;
 
@@ -66,7 +65,7 @@ impl Default for Hdf5Settings<'_> {
 }
 
 fn named_link<C: CommunicatorCollectives>(comm: &C, name: &str) -> Result<CString, NamedIoError> {
-    let valid = !name.is_empty() && name.len() <= MAX_NAME && !name.as_bytes().contains(&0);
+    let valid = valid_name_bytes(name.as_bytes());
     let n = name.len() as i64;
     let mut lo = 0;
     let mut hi = 0;
@@ -105,7 +104,7 @@ fn named_link_component<C: CommunicatorCollectives>(
     comm: &C,
     name: &str,
 ) -> Result<CString, NamedIoError> {
-    if name.is_empty() || name.len() > MAX_NAME || name.as_bytes().contains(&0) {
+    if !valid_name_bytes(name.as_bytes()) {
         return Err(NamedIoError::InvalidName);
     }
     let hex_len = name
@@ -2678,6 +2677,9 @@ fn build_layout<const N: usize>(
     if rank == 0 || rank > MAX_PROTOCOL_RANK {
         return Err(IoError::SizeLimit { what: "HDF5 rank" });
     }
+    if rank > hdf5_metno_sys::h5s::H5S_MAX_RANK as usize {
+        return Err(IoError::SizeLimit { what: "HDF5 rank" });
+    }
     let mut global_dims = Vec::new();
     let mut local_dims = Vec::new();
     let mut starts = Vec::new();
@@ -3082,11 +3084,7 @@ pub(crate) fn inspect_catalog(
                     let original = read_original_name(comm, dataset, "HDF5 catalog original name")
                         .map_err(CatalogError::Io)?;
                     catalog_agree_bytes(comm, &original)?;
-                    let original_ok = !original.is_empty()
-                        && original.len() <= MAX_NAME
-                        && !original.contains(&0)
-                        && std::str::from_utf8(&original).is_ok()
-                        && original == decoded;
+                    let original_ok = valid_name_bytes(&original) && original == decoded;
                     catalog_valid(comm, original_ok, "HDF5 catalog original name")?;
                     Some(String::from_utf8(decoded).expect("UTF-8 name agreement"))
                 } else {
