@@ -17,7 +17,7 @@ availability. No Julia/GPU helper packages are part of this release.
   `RUSTC`/`RUSTDOC` to the installed 1.96.0 binaries to verify the archives with
   the MSRV compiler; do not substitute workspace paths for packaged dependencies.
 - Native MPI checks need MPI headers, `mpicc`, and libclang. HDF5 checks require
-  native HDF5 1.12 or newer: serial tests select the serial variant, and parallel
+  native HDF5 1.12.1 or newer: serial tests select the serial variant, and parallel
   tests select parallel HDF5 built with the same MPI. Use the same MPI at runtime.
   FFTW checks need separately installed f32/f64 base and thread runtimes. Default
   `pencil-fft` is RustFFT/RealFFT and

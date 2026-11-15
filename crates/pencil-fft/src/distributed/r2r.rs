@@ -41,9 +41,9 @@ use super::{
     INVALID_WORD, OPERATION_R2R_BACKWARD, OPERATION_R2R_BACKWARD_IN_PLACE, OPERATION_R2R_FORWARD,
     OPERATION_R2R_FORWARD_IN_PLACE, OPERATION_R2R_INVERSE, OPERATION_R2R_INVERSE_IN_PLACE,
     R2rError, RouteCandidate, TransformTiming, TransposeMethod, agree_execution_descriptor_ref,
-    agree_header, agree_result, build_route, build_transitions, collective_descriptor,
-    collective_valid, descriptor_len, execute_transition, execute_transition_timed,
-    initialized_vec, map_array_allocation, registered_pencils, validate_input,
+    agree_header, agree_result, allocate_r2r_workspace_buffers, build_route, build_transitions,
+    collective_descriptor, collective_valid, descriptor_len, execute_transition,
+    execute_transition_timed, map_array_allocation, registered_pencils, validate_input,
     validate_workspace_lengths_values,
 };
 #[cfg(feature = "fftw")]
@@ -930,20 +930,23 @@ impl<T: R2rScalar, const N: usize, const M: usize> R2rCore<T, N, M> {
 impl<T: R2rScalar, const N: usize, const M: usize> R2rWorkspace<T, N, M> {
     fn new(core: Arc<R2rCore<T, N, M>>) -> Result<Self, R2rError> {
         let intermediate = core.allocate_many()?;
-        let transpose = TransposeWorkspace::from_vecs(
-            initialized_vec(core.transpose_send_len, crate::r2r::r2r_zero::<T>())?,
-            initialized_vec(core.transpose_receive_len, crate::r2r::r2r_zero::<T>())?,
-        );
-        let embedding_line = initialized_vec(core.embedding_len, zero_complex::<T::Real>())?;
-        let fft_scratch = initialized_vec(core.fft_scratch_len, zero_complex::<T::Real>())?;
-        let line_buffer = initialized_vec(core.strided_line_len, crate::r2r::r2r_zero::<T>())?;
+        let buffers = allocate_r2r_workspace_buffers::<T>(
+            core.transpose_send_len,
+            core.transpose_receive_len,
+            core.embedding_len,
+            core.fft_scratch_len,
+            core.strided_line_len,
+        )?;
         Ok(Self {
             core,
             intermediate,
-            transpose,
-            embedding_line,
-            fft_scratch,
-            line_buffer,
+            transpose: TransposeWorkspace::from_vecs(
+                buffers.transpose.send_buffer,
+                buffers.transpose.receive_buffer,
+            ),
+            embedding_line: buffers.embedding_line,
+            fft_scratch: buffers.fft_scratch,
+            line_buffer: buffers.line_buffer,
         })
     }
 }
@@ -961,19 +964,22 @@ impl<T: R2rScalar, const N: usize, const M: usize> R2rInPlaceArray<T, N, M> {
 
 impl<T: R2rScalar, const N: usize, const M: usize> R2rInPlaceWorkspace<T, N, M> {
     fn new(core: Arc<R2rCore<T, N, M>>) -> Result<Self, R2rError> {
-        let transpose = TransposeWorkspace::from_vecs(
-            initialized_vec(core.transpose_send_len, crate::r2r::r2r_zero::<T>())?,
-            initialized_vec(core.transpose_receive_len, crate::r2r::r2r_zero::<T>())?,
-        );
-        let embedding_line = initialized_vec(core.embedding_len, zero_complex::<T::Real>())?;
-        let fft_scratch = initialized_vec(core.fft_scratch_len, zero_complex::<T::Real>())?;
-        let line_buffer = initialized_vec(core.strided_line_len, crate::r2r::r2r_zero::<T>())?;
+        let buffers = allocate_r2r_workspace_buffers::<T>(
+            core.transpose_send_len,
+            core.transpose_receive_len,
+            core.embedding_len,
+            core.fft_scratch_len,
+            core.strided_line_len,
+        )?;
         Ok(Self {
             core,
-            transpose,
-            embedding_line,
-            fft_scratch,
-            line_buffer,
+            transpose: TransposeWorkspace::from_vecs(
+                buffers.transpose.send_buffer,
+                buffers.transpose.receive_buffer,
+            ),
+            embedding_line: buffers.embedding_line,
+            fft_scratch: buffers.fft_scratch,
+            line_buffer: buffers.line_buffer,
         })
     }
 }
@@ -1866,17 +1872,7 @@ fn execute_r2r_overlap<T: R2rScalar + Equivalence, const N: usize, const M: usiz
     )
     .map_err(FftOverlapError::Operation)?;
     let supported = core.transitions.iter().all(|transition| {
-        matches!(
-            transition.forward,
-            super::C2cTransition::Identity
-                | super::C2cTransition::Local(_)
-                | super::C2cTransition::PointToPoint(_)
-        ) && matches!(
-            transition.backward,
-            super::C2cTransition::Identity
-                | super::C2cTransition::Local(_)
-                | super::C2cTransition::PointToPoint(_)
-        )
+        transition.forward.supports_overlap() && transition.backward.supports_overlap()
     });
     if !collective_valid(communicator, supported) {
         return Err(FftOverlapError::UnsupportedTransport);
@@ -3132,10 +3128,6 @@ where
     E: Into<R2rError>,
 {
     super::map_overwrite(error, |error| R2rError::Fft(FftError::Array(error)))
-}
-
-fn zero_complex<R: super::FftReal>() -> Complex<R> {
-    Complex::new(R::zero(), R::zero())
 }
 
 #[cfg(test)]

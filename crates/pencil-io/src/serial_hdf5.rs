@@ -1,9 +1,19 @@
 //! Single-process access to the existing HDF5 v1 dataset format.
 
-use std::{ffi::CStr, path::Path};
+#[rustfmt::skip]
+mod global_id;
 
-use hdf5_metno::{Attribute as Hdf5Attribute, Dataset, Dataspace, Datatype, File};
-use hdf5_metno_sys::{h5a, h5d, h5p::H5P_DEFAULT, h5s::H5S_MAX_RANK, h5t};
+use std::{
+    ffi::{CStr, CString, c_void},
+    os::raw::c_uint,
+    path::Path,
+};
+
+use hdf5_metno::{
+    Attribute as Hdf5Attribute, Dataset, Dataspace, Datatype, File, globals::H5E_FILE,
+    plist::FileAccess,
+};
+use hdf5_metno_sys::{h5a, h5d, h5e, h5f, h5i::hid_t, h5p::H5P_DEFAULT, h5s::H5S_MAX_RANK, h5t};
 
 use crate::hdf5_schema::{
     Attribute, Metadata, MetadataIssue, ShapeMetadata, ShapeRule, metadata_acceptance,
@@ -38,7 +48,7 @@ pub fn write_hdf5_serial<P: AsRef<Path>, T: IoElement>(
     hdf5_metno::sync::sync(|| {
         let datatype = datatype::<T>()?;
         let space = native(Dataspace::try_new(shape), "HDF5 serial dataspace")?;
-        let file = native(File::create_excl(path), "HDF5 serial create")?;
+        let file = create_file_without_locking(path)?;
         let result = (|| {
             let group = native(file.create_group("pencil_io_v1"), "HDF5 serial group")?;
             // SAFETY: live group/type/space, static NUL-terminated name, default
@@ -152,7 +162,7 @@ pub fn read_hdf5_serial<P: AsRef<Path>, T: IoElement>(
     let mut packed = buffer(bytes)?;
     packed.resize(bytes, 0);
     hdf5_metno::sync::sync(|| {
-        let file = native(File::open(path), "HDF5 serial open")?;
+        let file = open_file_without_locking(path)?;
         let result = (|| {
             let dataset = native(file.dataset(DATASET), "HDF5 serial dataset open")?;
             validate_metadata::<T>(&dataset, global_shape, extra_shape)?;
@@ -245,6 +255,134 @@ fn native<T>(result: hdf5_metno::Result<T>, operation: &'static str) -> Result<T
         operation,
         code: -1,
     })
+}
+
+fn file_access_without_locking(operation: &'static str) -> Result<FileAccess, IoError> {
+    let fapl = native(FileAccess::try_new(), operation)?;
+    if unsafe { hdf5_metno_sys::h5p::H5Pset_file_locking(fapl.id(), 0, 1) } < 0 {
+        return Err(IoError::Native {
+            operation,
+            code: -1,
+        });
+    }
+    Ok(fapl)
+}
+
+fn create_file_without_locking<P: AsRef<Path>>(path: P) -> Result<File, IoError> {
+    let fapl = file_access_without_locking("HDF5 serial create")?;
+    let filename = hdf5_filename(path.as_ref()).ok_or(IoError::Native {
+        operation: "HDF5 serial create",
+        code: -1,
+    })?;
+    // SAFETY: filename is NUL-terminated, the FAPL is live, and the new ID is
+    // immediately transferred to an RAII File. H5P_DEFAULT preserves the
+    // default file-creation properties and EXCL preserves non-overwrite.
+    let file_id =
+        unsafe { h5f::H5Fcreate(filename.as_ptr(), h5f::H5F_ACC_EXCL, H5P_DEFAULT, fapl.id()) };
+    if file_id < 0 {
+        return Err(file_open_error("HDF5 serial create"));
+    }
+    // SAFETY: H5Fcreate returned a fresh file identifier with one owned ref.
+    native(
+        unsafe { hdf5_metno::from_id(file_id) },
+        "HDF5 serial create",
+    )
+}
+
+fn open_file_without_locking<P: AsRef<Path>>(path: P) -> Result<File, IoError> {
+    let fapl = file_access_without_locking("HDF5 serial open")?;
+    let filename = hdf5_filename(path.as_ref()).ok_or(IoError::Native {
+        operation: "HDF5 serial open",
+        code: -1,
+    })?;
+    // SAFETY: filename is NUL-terminated and the FAPL remains live through open.
+    let file_id = unsafe { h5f::H5Fopen(filename.as_ptr(), h5f::H5F_ACC_RDONLY, fapl.id()) };
+    if file_id < 0 {
+        return Err(file_open_error("HDF5 serial open"));
+    }
+    // SAFETY: H5Fopen returned a fresh file identifier with one owned ref.
+    native(unsafe { hdf5_metno::from_id(file_id) }, "HDF5 serial open")
+}
+
+fn hdf5_filename(path: &Path) -> Option<CString> {
+    path.to_str().and_then(|path| CString::new(path).ok())
+}
+
+fn file_open_error(operation: &'static str) -> IoError {
+    if current_error_is_file_lock() {
+        IoError::Native {
+            operation: "HDF5 serial file lock",
+            code: -1,
+        }
+    } else {
+        IoError::Native {
+            operation,
+            code: -1,
+        }
+    }
+}
+
+struct Hdf5ErrorStack(hdf5_metno_sys::h5i::hid_t);
+
+impl Drop for Hdf5ErrorStack {
+    fn drop(&mut self) {
+        unsafe {
+            h5e::H5Eclose_stack(self.0);
+        }
+    }
+}
+
+struct FileLockProbe {
+    major: hid_t,
+    minor: hid_t,
+    found: bool,
+}
+
+unsafe extern "C" fn record_file_lock_error(
+    _index: c_uint,
+    error: *const h5e::H5E_error2_t,
+    client_data: *mut c_void,
+) -> hdf5_metno_sys::h5::herr_t {
+    if error.is_null() || client_data.is_null() {
+        return -1;
+    }
+    let error = unsafe { &*error };
+    let probe = unsafe { &mut *client_data.cast::<FileLockProbe>() };
+    if error.maj_num == probe.major && error.min_num == probe.minor {
+        probe.found = true;
+    }
+    0
+}
+
+// hdf5-metno 0.12.0 does not wrap this newer minor ID in H5GlobalConstant.
+fn cant_lock_file_minor_id() -> hid_t {
+    // SAFETY: H5E_FILE above initializes HDF5 first. The sys binding's declared
+    // type selects direct hid_t access or a live, aligned DLL-import hid_t pointer.
+    unsafe { global_id::resolve(h5e::H5E_CANTLOCKFILE) }
+}
+
+fn current_error_is_file_lock() -> bool {
+    // Snapshot before resolving globals: H5GlobalConstant may initialize HDF5,
+    // replacing the current stack, but this owned copy remains intact.
+    let stack_id = unsafe { h5e::H5Eget_current_stack() };
+    if stack_id < 0 {
+        return false;
+    }
+    let stack = Hdf5ErrorStack(stack_id);
+    let mut probe = FileLockProbe {
+        major: *H5E_FILE,
+        minor: cant_lock_file_minor_id(),
+        found: false,
+    };
+    unsafe {
+        h5e::H5Ewalk2(
+            stack.0,
+            h5e::H5E_WALK_DOWNWARD,
+            Some(record_file_lock_error),
+            (&mut probe as *mut FileLockProbe).cast(),
+        ) >= 0
+            && probe.found
+    }
 }
 
 // These helpers are private and always run under hdf5_metno's reentrant lock,

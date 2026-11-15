@@ -4,7 +4,8 @@ use mpi::traits::*;
 use num_complex::{Complex32, Complex64};
 use pencil_array::{ExtraShape, MpiTopology, Pencil, PencilArray};
 use pencil_io::{
-    Hdf5FileSession, Hdf5ReadOptions, Hdf5WriteOptions, IoElement, MpiIoMode, MpiIoOptions,
+    Hdf5FileSession, Hdf5ReadOptions, Hdf5SessionError, Hdf5WriteOptions, IoElement, IoError,
+    MpiIoMode, MpiIoOptions,
 };
 use std::path::Path;
 
@@ -411,5 +412,23 @@ fn persistent_native_hierarchy_and_protocol() {
     );
     assert!(untouched.as_slice().iter().all(|&v| v == -5));
     bad.close().unwrap();
+    // Run after the normal HDF5 session control to separate native path failures
+    // from failures in the existing lifecycle/protocol coverage.
+    let oversized_path = std::path::PathBuf::from("h".repeat(64 * 1024 + 1));
+    match Hdf5FileSession::create(&oversized_path, comm, &MpiIoOptions::default()) {
+        Err(error) => assert!(
+            matches!(
+                &error,
+                Hdf5SessionError::Io(IoError::CollectivePrecondition {
+                    phase: "session descriptor bound"
+                })
+            ),
+            "64 KiB HDF5 session path must fail collective path preflight, got {error:?}"
+        ),
+        Ok(mut session) => {
+            session.close().unwrap();
+            panic!("64 KiB HDF5 session path unexpectedly reached native create");
+        }
+    }
     cleanup_owned_temp_dir(&world, &directory);
 }

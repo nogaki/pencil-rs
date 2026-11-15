@@ -10,6 +10,444 @@ use hdf5_metno::{Dataset, File, H5Type, datatype::ByteOrder};
 use num_complex::Complex;
 use pencil_io::{IoElement, IoError, read_hdf5_serial, write_hdf5_serial};
 
+#[cfg(target_os = "linux")]
+mod serial_lock_tests {
+    use super::{File, IoError, read_hdf5_serial, write_hdf5_serial};
+    use std::{
+        fs,
+        io::{self, BufRead, BufReader, Read, Write},
+        os::{
+            fd::{AsRawFd, RawFd},
+            raw::c_int,
+            unix::fs::MetadataExt,
+        },
+        path::{Path, PathBuf},
+        process::{Child, Command, ExitStatus, Stdio},
+        sync::{Arc, Mutex},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    const CHILD_MODE: &str = "PENCIL_SERIAL_LOCK_CHILD";
+    const CHILD_FD: &str = "PENCIL_SERIAL_LOCK_FD";
+    const CHILD_PATH: &str = "PENCIL_SERIAL_LOCK_PATH";
+    const F_GETFD: c_int = 1;
+    const FD_CLOEXEC: c_int = 1;
+    const LOCK_SH: c_int = 1;
+    const LOCK_NB: c_int = 4;
+    const LOCK_UN: c_int = 8;
+
+    unsafe extern "C" {
+        fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
+        fn flock(fd: c_int, operation: c_int) -> c_int;
+    }
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("pencil-serial-lock-{}-{stamp}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn same_inode(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+
+    fn inheritable_fd(path: &Path) -> io::Result<Option<RawFd>> {
+        let expected = fs::metadata(path)?;
+        for entry in fs::read_dir("/proc/self/fd")? {
+            let entry = entry?;
+            let Ok(fd) = entry.file_name().to_string_lossy().parse::<RawFd>() else {
+                continue;
+            };
+            let Ok(actual) = fs::metadata(entry.path()) else {
+                continue;
+            };
+            if !same_inode(&expected, &actual) {
+                continue;
+            }
+            let flags = unsafe { fcntl(fd, F_GETFD) };
+            if flags >= 0 && flags & FD_CLOEXEC == 0 {
+                return Ok(Some(fd));
+            }
+        }
+        Ok(None)
+    }
+
+    fn has_target_fd(path: &Path) -> io::Result<bool> {
+        let expected = fs::metadata(path)?;
+        for entry in fs::read_dir("/proc/self/fd")? {
+            let Ok(entry) = entry else { continue };
+            if fs::metadata(entry.path()).is_ok_and(|actual| same_inode(&expected, &actual)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn exclusive_lock_held(path: &Path) -> io::Result<bool> {
+        let probe = fs::File::open(path)?;
+        let result = unsafe { flock(probe.as_raw_fd(), LOCK_SH | LOCK_NB) };
+        if result == 0 {
+            if unsafe { flock(probe.as_raw_fd(), LOCK_UN) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(false)
+        } else {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                Ok(true)
+            } else {
+                Err(error)
+            }
+        }
+    }
+
+    struct HeldChild {
+        child: Child,
+        stdout: Option<BufReader<std::process::ChildStdout>>,
+        finished: bool,
+    }
+
+    impl HeldChild {
+        fn release_and_wait(&mut self) -> io::Result<(ExitStatus, String)> {
+            if let Some(stdin) = self.child.stdin.as_mut() {
+                let _ = stdin.write_all(b"RELEASE\n");
+            }
+            let mut tail = String::new();
+            if let Some(stdout) = self.stdout.as_mut() {
+                stdout.read_to_string(&mut tail)?;
+            }
+            let status = self.child.wait()?;
+            self.finished = true;
+            Ok((status, tail))
+        }
+    }
+
+    impl Drop for HeldChild {
+        fn drop(&mut self) {
+            if !self.finished {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    fn child_command() -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "serial_lock_tests::child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .stderr(Stdio::inherit());
+        command
+    }
+
+    fn start_holder(fd: RawFd, path: &Path) -> Result<(HeldChild, String), String> {
+        let mut command = child_command();
+        let child = command
+            .env(CHILD_MODE, "hold")
+            .env(CHILD_FD, fd.to_string())
+            .env(CHILD_PATH, path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("spawn holder: {error}"))?;
+        let mut held = HeldChild {
+            child,
+            stdout: None,
+            finished: false,
+        };
+        held.stdout = held.child.stdout.take().map(BufReader::new);
+        let mut ready = String::new();
+        loop {
+            let mut line = String::new();
+            let read = held
+                .stdout
+                .as_mut()
+                .expect("piped child stdout")
+                .read_line(&mut line)
+                .map_err(|error| format!("read holder handshake: {error}"))?;
+            if read == 0 {
+                return Err(format!("holder exited before fd proof; output: {ready}"));
+            }
+            ready.push_str(&line);
+            if line.contains("PI_CHILD_READY ") {
+                return Ok((held, line.trim().to_owned()));
+            }
+        }
+    }
+
+    type HolderState = Arc<Mutex<Option<Result<(HeldChild, String), String>>>>;
+
+    struct HoldFdPath {
+        path: PathBuf,
+        state: HolderState,
+    }
+
+    impl AsRef<Path> for HoldFdPath {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for HoldFdPath {
+        fn drop(&mut self) {
+            let result = match inheritable_fd(&self.path) {
+                Ok(Some(fd)) => start_holder(fd, &self.path),
+                Ok(None) => Err("no inheritable descriptor for target inode".into()),
+                Err(error) => Err(format!("inspect target descriptor: {error}")),
+            };
+            *self.state.lock().unwrap() = Some(result);
+        }
+    }
+
+    #[test]
+    fn child() {
+        let Ok(mode) = std::env::var(CHILD_MODE) else {
+            return;
+        };
+        match mode.as_str() {
+            "hold" => {
+                let fd: RawFd = std::env::var(CHILD_FD).unwrap().parse().unwrap();
+                let path = PathBuf::from(std::env::var_os(CHILD_PATH).unwrap());
+                let actual = fs::metadata(format!("/proc/self/fd/{fd}")).unwrap();
+                let expected = fs::metadata(path).unwrap();
+                assert!(
+                    same_inode(&actual, &expected),
+                    "exec child did not retain target fd"
+                );
+                let flags = unsafe { fcntl(fd, F_GETFD) };
+                assert!(
+                    flags >= 0 && flags & FD_CLOEXEC == 0,
+                    "inherited fd flags={flags}"
+                );
+                println!(
+                    "PI_CHILD_READY fd={fd} dev={} ino={}",
+                    actual.dev(),
+                    actual.ino()
+                );
+                io::stdout().flush().unwrap();
+                let mut release = String::new();
+                io::stdin().lock().read_line(&mut release).unwrap();
+                assert_eq!(release.trim(), "RELEASE");
+            }
+            "lock-error" => {
+                assert_eq!(
+                    std::env::var("HDF5_USE_FILE_LOCKING").as_deref(),
+                    Ok("TRUE")
+                );
+                let path = PathBuf::from(std::env::var_os(CHILD_PATH).unwrap());
+                let error = read_hdf5_serial(&path, &[1], &[], &mut [0u64]).unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        IoError::Native {
+                            operation: "HDF5 serial file lock",
+                            ..
+                        }
+                    ),
+                    "native lock failure was not distinguished: {error:?}"
+                );
+            }
+            other => panic!("unknown child mode {other}"),
+        }
+    }
+
+    #[test]
+    fn inherited_writer_fd_does_not_leave_a_lock_or_block_read() {
+        let dir = TempDir::new();
+        let path = dir.0.join("writer.h5");
+        let state = Arc::new(Mutex::new(None));
+        write_hdf5_serial(
+            HoldFdPath {
+                path: path.clone(),
+                state: state.clone(),
+            },
+            &[1],
+            &[],
+            &[73u64],
+        )
+        .unwrap();
+        let Ok((mut child, proof)) = state.lock().unwrap().take().expect("path Drop handshake")
+        else {
+            eprintln!("SKIP writer-lock fixture: target fd was not inheritable");
+            return;
+        };
+        eprintln!("writer child proof: {proof}");
+        if has_target_fd(&path).unwrap_or(true) {
+            eprintln!("SKIP writer-lock fixture: parent still has a target fd after return");
+            let (status, output) = child.release_and_wait().unwrap();
+            assert!(status.success(), "holder child: {status}; {output}");
+            return;
+        }
+        let before = exclusive_lock_held(&path).expect("independent flock probe");
+        eprintln!("writer lock retained after return: {before}");
+        let mut actual = [0u64];
+        if let Err(error) = read_hdf5_serial(&path, &[1], &[], &mut actual) {
+            assert!(
+                matches!(
+                    error,
+                    IoError::Native {
+                        operation: "HDF5 serial open" | "HDF5 serial file lock",
+                        ..
+                    }
+                ),
+                "unexpected read failure with inherited target fd: {error:?}"
+            );
+            panic!("inherited writer descriptor blocked read: {error:?}");
+        }
+        assert_eq!(actual, [73]);
+        assert!(
+            !exclusive_lock_held(&path).expect("independent flock probe after read"),
+            "writer left an exclusive native lock after close/read"
+        );
+        let (status, output) = child.release_and_wait().unwrap();
+        assert!(status.success(), "holder child: {status}; {output}");
+    }
+
+    #[test]
+    fn reader_ignores_an_inherited_external_writer_lock() {
+        let dir = TempDir::new();
+        let path = dir.0.join("external-writer.h5");
+        write_hdf5_serial(&path, &[1], &[], &[91u64]).unwrap();
+        let writer = File::open_rw(&path).unwrap();
+        let fd = match inheritable_fd(&path) {
+            Ok(Some(fd)) => fd,
+            other => {
+                let _ = writer.close();
+                eprintln!("SKIP external-lock fixture: target fd unavailable: {other:?}");
+                return;
+            }
+        };
+        let (mut child, proof) = match start_holder(fd, &path) {
+            Ok(holder) => holder,
+            Err(reason) => {
+                let _ = writer.close();
+                eprintln!("SKIP external-lock fixture: {reason}");
+                return;
+            }
+        };
+        eprintln!("external writer child proof: {proof}");
+        writer.close().unwrap();
+        if has_target_fd(&path).unwrap_or(true) {
+            eprintln!("SKIP external-lock fixture: parent retained the HDF5 fd after close");
+            let (status, output) = child.release_and_wait().unwrap();
+            assert!(status.success(), "holder child: {status}; {output}");
+            return;
+        }
+        if !exclusive_lock_held(&path).expect("independent flock probe after close") {
+            eprintln!("SKIP external-lock fixture: child did not retain an exclusive lock");
+            let (status, output) = child.release_and_wait().unwrap();
+            assert!(status.success(), "holder child: {status}; {output}");
+            return;
+        }
+        let mut actual = [0u64];
+        if let Err(error) = read_hdf5_serial(&path, &[1], &[], &mut actual) {
+            assert!(
+                matches!(
+                    error,
+                    IoError::Native {
+                        operation: "HDF5 serial open" | "HDF5 serial file lock",
+                        ..
+                    }
+                ),
+                "unexpected read failure under a verified writer lock: {error:?}"
+            );
+            panic!("reader rejected a valid file while external writer lock remained: {error:?}");
+        }
+        assert_eq!(actual, [91]);
+        assert!(
+            exclusive_lock_held(&path).unwrap(),
+            "reader released another writer's lock"
+        );
+        let (status, output) = child.release_and_wait().unwrap();
+        assert!(status.success(), "holder child: {status}; {output}");
+    }
+
+    #[test]
+    fn native_lock_failure_has_a_distinct_operation() {
+        let dir = TempDir::new();
+        let path = dir.0.join("locked.h5");
+        write_hdf5_serial(&path, &[1], &[], &[17u64]).unwrap();
+        let writer = File::open_rw(&path).unwrap();
+        if !exclusive_lock_held(&path).expect("independent flock probe before child") {
+            eprintln!("SKIP lock-diagnostic fixture: HDF5 writer lock unavailable");
+            writer.close().unwrap();
+            return;
+        }
+        let output = child_command()
+            .env(CHILD_MODE, "lock-error")
+            .env(CHILD_PATH, &path)
+            .env("HDF5_USE_FILE_LOCKING", "TRUE")
+            .output()
+            .unwrap();
+        writer.close().unwrap();
+        assert!(
+            output.status.success(),
+            "lock-error child status {}; stdout: {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn non_lock_open_failure_keeps_the_generic_operation() {
+        let dir = TempDir::new();
+        let mut destination = [0u64];
+        let error =
+            read_hdf5_serial(dir.0.join("missing.h5"), &[1], &[], &mut destination).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                IoError::Native {
+                    operation: "HDF5 serial open",
+                    ..
+                }
+            ),
+            "non-lock open error was mislabeled: {error:?}"
+        );
+    }
+}
+
+#[path = "../src/serial_hdf5/global_id.rs"]
+mod global_id;
+
+#[test]
+fn resolves_static_and_dll_global_id_abis() {
+    use hdf5_metno_sys::h5i::hid_t;
+
+    let ids: [hid_t; 2] = [1, 0x1_0000_0001];
+    for expected in ids {
+        let static_binding: hid_t = expected;
+        // SAFETY: the hid_t implementation copies this initialized ID and dereferences no pointer.
+        assert_eq!(unsafe { global_id::resolve(&static_binding) }, expected);
+
+        let dll_storage: hid_t = expected;
+        let dll_binding: usize = std::ptr::from_ref(&dll_storage) as usize;
+        // SAFETY: dll_binding encodes a live, aligned hid_t pointer for this call, exactly as the
+        // DLL-import ABI requires; dll_storage remains alive and unchanged through the dereference.
+        assert_eq!(unsafe { global_id::resolve(&dll_binding) }, expected);
+    }
+}
+
 const DATA: &str = "/pencil_io_v1/data";
 const COMMIT: u64 = 0x434f_4d4d_4954_5445;
 

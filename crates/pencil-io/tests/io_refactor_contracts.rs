@@ -7,11 +7,10 @@
 //! rules). Mismatch rejection and destination preservation stay covered by the
 //! existing MPI/HDF5 suites.
 //!
-//! Error variants are behavioral, not source-level: the same MPI-initialized
-//! test below also pins the #110 conversion boundary of the shared named
-//! payload helper. A failed session payload read must stay
-//! `MpiSessionError::Io(..)`; re-wrapping it as
-//! `MpiSessionError::Named(NamedIoError::Io(..))` changes the public API.
+//! The #110 MPI-session read regression is portable: MPI may ignore its large
+//! buffer hint, so success must publish correct values; if a real `Io` error
+//! occurs, it must remain `MpiSessionError::Io(..)` and leave the destination
+//! unchanged rather than being wrapped as `MpiSessionError::Named(..)`.
 //!
 //! The HDF5 regression below runs under `parallel-hdf5` and reproduces the two
 //! #111 metadata defects with real files: (1) a shape whose final product is
@@ -249,8 +248,8 @@ mod hdf5_metadata_regressions {
     use mpi::traits::*;
     use pencil_array::{ExtraShape, MpiTopology, Pencil, PencilArray};
     use pencil_io::{
-        Hdf5FileSession, IoError, MpiFileSession, MpiIoOptions, MpiSessionError, ScalarType,
-        read_hdf5, read_hdf5_catalog, read_hdf5_serial,
+        Hdf5FileSession, MpiFileSession, MpiIoOptions, MpiSessionError, ScalarType, read_hdf5,
+        read_hdf5_catalog, read_hdf5_serial,
     };
 
     const COMMIT_MARKER: u64 = 0x434f_4d4d_4954_5445;
@@ -522,16 +521,10 @@ mod hdf5_metadata_regressions {
         }
     }
 
-    /// #110: the shared payload/record helper must keep the traditional public
-    /// error variant. `MpiFileSession::read_named` reports a failed payload
-    /// transfer as `MpiSessionError::Io(..)`; wrapping the same failure in
-    /// `MpiSessionError::Named(NamedIoError::Io(..))` is a public API change.
-    ///
-    /// A `cb_buffer_size` hint no allocator can satisfy makes the native
-    /// collective payload read fail on every rank, so the conversion is
-    /// observed through the public read API instead of a source string or a
-    /// test-only hook.
-    fn session_read_failure_keeps_the_io_variant<C>(
+    /// #110: an MPI hint is advisory and may be ignored. A successful read
+    /// must publish the file values; an actual `MpiSessionError::Io` must keep
+    /// the destination unchanged and must not be wrapped as `Named(..)`.
+    fn session_read_keeps_the_io_variant_or_publishes_values<C>(
         world: &C,
         directory: &Path,
         failures: &mut Vec<String>,
@@ -563,8 +556,9 @@ mod hdf5_metadata_regressions {
             return;
         }
 
-        let unallocatable = MpiIoOptions::default().hint("cb_buffer_size", "1000000000000000000");
-        let mut reader = match MpiFileSession::open_read(comm, &path, &unallocatable) {
+        let large_buffer_hint =
+            MpiIoOptions::default().hint("cb_buffer_size", "1000000000000000000");
+        let mut reader = match MpiFileSession::open_read(comm, &path, &large_buffer_hint) {
             Ok(session) => session,
             Err(error) => {
                 failures.push(format!("session open for read: {error:?}"));
@@ -573,25 +567,28 @@ mod hdf5_metadata_regressions {
         };
         let mut target = PencilArray::from_elem(pencil(), ExtraShape::scalar(), -1i32)
             .expect("destination array");
+        let before = target.as_slice().to_vec();
         let read = reader.read_named("data", target.view_mut());
         let closed = reader.close();
         match read {
-            Err(MpiSessionError::Io(IoError::CollectivePrecondition {
-                phase: "session payload read",
-            })) => {}
+            Ok(()) => {
+                if target.as_slice().iter().any(|&value| value != 11) {
+                    failures.push("successful session read published incorrect values".to_owned());
+                }
+            }
+            Err(MpiSessionError::Io(error)) => {
+                if target.as_slice() != before.as_slice() {
+                    failures.push(format!(
+                        "failed session read ({error:?}) modified its destination"
+                    ));
+                }
+            }
             Err(error) => failures.push(format!(
-                "failed session payload read must keep the MpiSessionError::Io variant: {error:?}"
+                "session read error must retain the MpiSessionError::Io variant: {error:?}"
             )),
-            Ok(()) => failures.push(
-                "the unallocatable collective buffer did not fail the session payload read"
-                    .to_owned(),
-            ),
         }
         if let Err(error) = closed {
             failures.push(format!("session close after read: {error:?}"));
-        }
-        if target.as_slice().iter().any(|&value| value != -1) {
-            failures.push("failed session read modified its destination".to_owned());
         }
     }
 
@@ -604,10 +601,10 @@ mod hdf5_metadata_regressions {
         let directory = owned_temp_dir(&world, "pencil-io-metadata-regressions");
         let mut failures = Vec::new();
 
-        // Runs first: the #110 error-variant check shares this process's single
-        // MPI initialization, and collecting the failure keeps the HDF5
+        // Runs first: the #110 portable result contract shares this process's
+        // single MPI initialization, and collecting failures keeps the HDF5
         // metadata regressions below executing.
-        session_read_failure_keeps_the_io_variant(&world, &directory, &mut failures);
+        session_read_keeps_the_io_variant_or_publishes_values(&world, &directory, &mut failures);
 
         let topology = MpiTopology::<1>::new(&world, [size]).expect("1-D process grid");
         let comm = topology.communicator();

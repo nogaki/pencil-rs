@@ -6,7 +6,8 @@ use mpi::datatype::Equivalence;
 use pencil_array::{ExtraShape, MpiTopology, Pencil, PencilArray};
 
 use super::{
-    AxisSelection, BackendChoice, DistributedLayout, FftError, R2cPlan, R2cWorkspace, StageGeometry,
+    AxisSelection, BackendChoice, DistributedLayout, FftError, R2cPlan, R2cWorkspace,
+    StageGeometry, r2c::RealOrientation,
 };
 #[cfg(feature = "fftw")]
 use crate::PlanOptions;
@@ -205,7 +206,7 @@ where
             selection,
             layout,
             BackendChoice::RustFft,
-            Some(real_len),
+            RealOrientation::C2r { real_len },
         )
         .map(|inner| Self { inner })
         .map_err(|error| match error {

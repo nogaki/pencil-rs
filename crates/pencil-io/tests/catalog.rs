@@ -4,7 +4,9 @@ use mpi::collective::CommunicatorCollectives;
 use mpi::traits::Communicator;
 use num_complex::{Complex32, Complex64};
 use pencil_array::{ExtraShape, MpiTopology, Pencil, PencilArray};
-use pencil_io::{CatalogError, read_mpi_catalog, read_mpi_named, read_mpi_named_catalog};
+use pencil_io::{
+    CatalogError, IoError, read_mpi, read_mpi_catalog, read_mpi_named, read_mpi_named_catalog,
+};
 use pencil_io::{
     MpiFileSession, MpiIoOptions, ScalarType, append_mpi_named, write_mpi, write_mpi_collection,
     write_mpi_named,
@@ -87,6 +89,36 @@ fn native_fixture_grid(grid: &[u64], code: u64, width: usize) -> Vec<u8> {
     }
     h.extend(vec![0; payload]);
     h
+}
+
+fn native_rank_fixture(n: usize, er: usize) -> Vec<u8> {
+    let grid = [1u64];
+    let header_len = 96 + (n + er + grid.len() + n) * 8;
+    let mut bytes = vec![0u8; 96];
+    bytes[..8].copy_from_slice(b"PENCILIO");
+    for (offset, value) in [
+        (8, 1),
+        (16, header_len as u64),
+        (24, COMMIT_WORD),
+        (32, n as u64),
+        (40, ScalarType::F32.code()),
+        (48, 4),
+        (56, er as u64),
+        (64, header_len as u64),
+        (72, 4),
+        (80, grid.len() as u64),
+        (88, 0),
+    ] {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    for value in std::iter::repeat_n(1u64, n + er)
+        .chain(grid)
+        .chain(0..n as u64)
+    {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.extend_from_slice(&[0; 4]);
+    bytes
 }
 
 fn named_fixture(code: u64, width: usize) -> Vec<u8> {
@@ -204,6 +236,75 @@ fn catalog_integration() {
     assert_eq!(v[0].global_shape(), &[4, 5]);
     assert_eq!(v[0].extra_shape(), &[3]);
     assert_eq!(v[0].provenance().len(), 32);
+
+    // Catalog paths use the descriptor bound, not the larger metadata/header bound.
+    let long_catalog_path = dir.join(format!("{}.pio", "p".repeat(65_536)));
+    assert!(long_catalog_path.to_string_lossy().len() > 64 * 1024);
+    let long_mpi_catalog = read_mpi_catalog(&long_catalog_path, comm);
+    let long_named_catalog = read_mpi_named_catalog(&long_catalog_path, comm);
+    #[cfg(feature = "parallel-hdf5")]
+    let long_hdf5_catalog = pencil_io::read_hdf5_catalog(&long_catalog_path, comm);
+    assert!(
+        matches!(
+            &long_mpi_catalog,
+            Err(CatalogError::Io(IoError::InvalidPath))
+        ),
+        "read_mpi_catalog: {long_mpi_catalog:?}"
+    );
+    assert!(
+        matches!(
+            &long_named_catalog,
+            Err(CatalogError::Io(IoError::InvalidPath))
+        ),
+        "read_mpi_named_catalog: {long_named_catalog:?}"
+    );
+    #[cfg(feature = "parallel-hdf5")]
+    assert!(
+        matches!(
+            &long_hdf5_catalog,
+            Err(CatalogError::Io(IoError::InvalidPath))
+        ),
+        "read_hdf5_catalog: {long_hdf5_catalog:?}"
+    );
+
+    // Combined spatial and extra rank is capped consistently by Header and catalog,
+    // independently of the 1 MiB header-byte ceiling.
+    let mut rank_target = array_f32(&world, [1, 1], [1]);
+    for (n, er, accepted) in [
+        (1, 1_022, true),
+        (1, 1_023, true),
+        (1, 1_024, false),
+        (1_000, 1_000, false),
+    ] {
+        let path = dir.join(format!("rank-{n}-{er}.pio"));
+        let fixture = native_rank_fixture(n, er);
+        assert!(fixture.len() < 1024 * 1024);
+        barrier_file(comm, &path, &fixture);
+        let result = read_mpi_catalog(&path, comm);
+        assert_eq!(result.is_ok(), accepted, "n={n}, extra={er}");
+        if accepted {
+            let info = result.unwrap();
+            assert_eq!(info[0].global_shape().len(), n);
+            assert_eq!(info[0].extra_shape().len(), er);
+            assert!(matches!(
+                read_mpi(&path, rank_target.view_mut()),
+                Err(IoError::MetadataMismatch {
+                    field: "type or rank"
+                })
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Err(CatalogError::Malformed("header bounds"))
+            ));
+            assert!(matches!(
+                read_mpi(&path, rank_target.view_mut()),
+                Err(IoError::InvalidFile {
+                    reason: "rank bound"
+                })
+            ));
+        }
+    }
 
     #[cfg(unix)]
     {
