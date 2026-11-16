@@ -2937,6 +2937,22 @@ fn validate_strided_line_buffer(actual: usize, required: usize) -> Result<(), Ff
     Ok(())
 }
 
+fn prepare_strided_complex_lines<const N: usize, const M: usize>(
+    pencil: &Pencil<N, M>,
+    axis: usize,
+    data_len: usize,
+    line_len: usize,
+    line_buffer_len: usize,
+) -> Result<Option<(usize, usize)>, FftError> {
+    let stride = memory_stride(pencil, axis)?;
+    if stride <= 1 {
+        return Ok(None);
+    }
+    validate_strided_line_buffer(line_buffer_len, line_len)?;
+    let count = strided_line_count(data_len, line_len, stride)?;
+    Ok(Some((stride, count)))
+}
+
 fn execute_strided_complex_forward<R: FftReal, const N: usize, const M: usize>(
     plan: &LocalC2cPlan<R>,
     pencil: &Pencil<N, M>,
@@ -2946,14 +2962,18 @@ fn execute_strided_complex_forward<R: FftReal, const N: usize, const M: usize>(
     scratch: &mut [Complex<R>],
     line_buffer: &mut [Complex<R>],
 ) -> Result<(), FftError> {
-    let stride = memory_stride(pencil, axis)?;
-    if stride <= 1 {
+    let Some((stride, count)) = prepare_strided_complex_lines(
+        pencil,
+        axis,
+        source.len(),
+        plan.line_len(),
+        line_buffer.len(),
+    )?
+    else {
         return plan
             .forward(source, destination, scratch)
             .map_err(FftError::LocalC2c);
-    }
-    validate_strided_line_buffer(line_buffer.len(), plan.line_len())?;
-    let count = strided_line_count(source.len(), plan.line_len(), stride)?;
+    };
     if destination.len() != source.len() {
         return Err(FftError::LocalC2c(LocalC2cError::BufferLengthMismatch));
     }
@@ -2984,14 +3004,18 @@ fn execute_strided_complex_forward_in_place<R: FftReal, const N: usize, const M:
     scratch: &mut [Complex<R>],
     line_buffer: &mut [Complex<R>],
 ) -> Result<(), FftError> {
-    let stride = memory_stride(pencil, axis)?;
-    if stride <= 1 {
+    let Some((stride, count)) = prepare_strided_complex_lines(
+        pencil,
+        axis,
+        data.len(),
+        plan.line_len(),
+        line_buffer.len(),
+    )?
+    else {
         return plan
             .forward_in_place(data, scratch)
             .map_err(FftError::LocalC2c);
-    }
-    validate_strided_line_buffer(line_buffer.len(), plan.line_len())?;
-    let count = strided_line_count(data.len(), plan.line_len(), stride)?;
+    };
     if data.is_empty() {
         return plan
             .forward_in_place(data, scratch)
@@ -3013,17 +3037,21 @@ fn execute_strided_complex_reverse<R: FftReal, const N: usize, const M: usize>(
     line_buffer: &mut [Complex<R>],
     normalize: bool,
 ) -> Result<(), FftError> {
-    let stride = memory_stride(pencil, axis)?;
-    if stride <= 1 {
+    let Some((stride, count)) = prepare_strided_complex_lines(
+        pencil,
+        axis,
+        source.len(),
+        plan.line_len(),
+        line_buffer.len(),
+    )?
+    else {
         return if normalize {
             plan.inverse(source, destination, scratch)
         } else {
             plan.backward(source, destination, scratch)
         }
         .map_err(FftError::LocalC2c);
-    }
-    validate_strided_line_buffer(line_buffer.len(), plan.line_len())?;
-    let count = strided_line_count(source.len(), plan.line_len(), stride)?;
+    };
     if destination.len() != source.len() {
         return Err(FftError::LocalC2c(LocalC2cError::BufferLengthMismatch));
     }
@@ -3062,17 +3090,21 @@ fn execute_strided_complex_reverse_in_place<R: FftReal, const N: usize, const M:
     line_buffer: &mut [Complex<R>],
     normalize: bool,
 ) -> Result<(), FftError> {
-    let stride = memory_stride(pencil, axis)?;
-    if stride <= 1 {
+    let Some((stride, count)) = prepare_strided_complex_lines(
+        pencil,
+        axis,
+        data.len(),
+        plan.line_len(),
+        line_buffer.len(),
+    )?
+    else {
         return if normalize {
             plan.inverse_in_place(data, scratch)
         } else {
             plan.backward_in_place(data, scratch)
         }
         .map_err(FftError::LocalC2c);
-    }
-    validate_strided_line_buffer(line_buffer.len(), plan.line_len())?;
-    let count = strided_line_count(data.len(), plan.line_len(), stride)?;
+    };
     if data.is_empty() {
         return if normalize {
             plan.inverse_in_place(data, scratch)

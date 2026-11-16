@@ -754,12 +754,7 @@ where
             self.core.stages[boundary].input.as_ref(),
             self.core.stages[boundary].axis,
         )?;
-        let real_source_line = if boundary_stride > 1 {
-            Some(initialized_vec(real_len, R::zero())?)
-        } else {
-            None
-        };
-        let real_line = initialized_vec(real_len, R::zero())?;
+        let (real_source_line, real_line) = r2c_real_line_buffers(real_len, boundary_stride)?;
         let complex_line = initialized_vec(complex_len, zero_complex::<R>())?;
         Ok(R2cWorkspace {
             core: Arc::clone(&self.core),
@@ -841,19 +836,18 @@ where
             self.core.fft_scratch_len,
             self.core.strided_line_len,
         )?;
+        let (real_source_line, real_line) = r2c_real_line_buffers(real_len, boundary_stride)?;
+        let complex_source_line = initialized_vec(complex_len, zero_complex::<R>())?;
+        let complex_line = initialized_vec(complex_len, zero_complex::<R>())?;
         Ok(R2cInPlaceWorkspace {
             core: Arc::clone(&self.core),
             transpose: complex_buffers.transpose,
             real_transpose,
             fft_scratch: complex_buffers.fft_scratch,
-            real_source_line: if boundary_stride > 1 {
-                Some(initialized_vec(real_len, R::zero())?)
-            } else {
-                None
-            },
-            real_line: initialized_vec(real_len, R::zero())?,
-            complex_source_line: initialized_vec(complex_len, zero_complex::<R>())?,
-            complex_line: initialized_vec(complex_len, zero_complex::<R>())?,
+            real_source_line,
+            real_line,
+            complex_source_line,
+            complex_line,
             complex_strided_line: complex_buffers.line_buffer,
         })
     }
@@ -1836,19 +1830,27 @@ fn registered_real_stage_pencils<R: FftReal, const N: usize, const M: usize>(
     if count > stages.len() {
         return Err(FftError::PreparationFailed);
     }
-    let mut pencils = Vec::new();
-    pencils
-        .try_reserve_exact(count)
-        .map_err(|_| FftError::AllocationFailed { required: count })?;
-    for stage in &stages[..count] {
-        if !pencils
-            .iter()
-            .any(|registered: &Arc<Pencil<N, M>>| registered.same_layout(stage.input.as_ref()))
-        {
-            pencils.push(Arc::clone(&stage.input));
-        }
+    registered_pencils(stages[..count].iter().map(|stage| &stage.input))
+}
+
+fn in_place_complex_capacity(
+    real_len: usize,
+    complex_len: usize,
+    real_bytes: usize,
+    complex_size: usize,
+    boundary_stride: usize,
+) -> Result<usize, FftError> {
+    if boundary_stride > 1 {
+        return Ok(real_len.max(complex_len));
     }
-    Ok(pencils.into_boxed_slice())
+    let rounded_real_bytes = real_bytes
+        .checked_add(
+            complex_size
+                .checked_sub(1)
+                .ok_or(FftError::PreparationFailed)?,
+        )
+        .ok_or(FftError::PreparationFailed)?;
+    Ok((rounded_real_bytes / complex_size).max(complex_len))
 }
 
 /// Capacity rule shared by every single-allocation in-place R2C layout.
@@ -1902,14 +1904,13 @@ where
     if storage_bytes > isize::MAX as usize {
         return Err(FftError::PreparationFailed);
     }
-    let rounded = storage_bytes
-        .checked_add(
-            complex_size
-                .checked_sub(1)
-                .ok_or(FftError::PreparationFailed)?,
-        )
-        .ok_or(FftError::PreparationFailed)?;
-    let complex_capacity = rounded / complex_size;
+    let complex_capacity = in_place_complex_capacity(
+        real_len,
+        complex_len,
+        real_bytes,
+        complex_size,
+        boundary_stride,
+    )?;
     Ok((real_len, complex_len, storage_bytes, complex_capacity))
 }
 
@@ -1966,23 +1967,20 @@ fn promoted_complex_len<R: FftReal, const N: usize, const M: usize>(
         core.stages[boundary].input.as_ref(),
         core.stages[boundary].axis,
     )?;
-    if stride > 1 {
-        Ok(real_len.max(complex_len))
+    let real_bytes = if stride > 1 {
+        0
     } else {
-        let real_bytes = real_len
+        real_len
             .checked_mul(size_of::<R>())
-            .ok_or(FftError::PreparationFailed)?;
-        let complex_size = size_of::<Complex<R>>();
-        let rounded = real_bytes
-            .checked_add(
-                complex_size
-                    .checked_sub(1)
-                    .ok_or(FftError::PreparationFailed)?,
-            )
             .ok_or(FftError::PreparationFailed)?
-            / complex_size;
-        Ok(rounded.max(complex_len))
-    }
+    };
+    in_place_complex_capacity(
+        real_len,
+        complex_len,
+        real_bytes,
+        size_of::<Complex<R>>(),
+        stride,
+    )
 }
 
 fn strided_phase_shape<R: FftReal, const N: usize, const M: usize>(
@@ -4525,6 +4523,19 @@ pub(super) fn storage_capacity_bytes_for_test<R: FftReal, const N: usize, const 
     array: &R2cInPlaceArray<R, N, M>,
 ) -> Option<usize> {
     array.storage_capacity_bytes()
+}
+
+fn r2c_real_line_buffers<R: FftReal>(
+    real_len: usize,
+    boundary_stride: usize,
+) -> Result<(Option<Vec<R>>, Vec<R>), FftError> {
+    let real_source_line = if boundary_stride > 1 {
+        Some(initialized_vec(real_len, R::zero())?)
+    } else {
+        None
+    };
+    let real_line = initialized_vec(real_len, R::zero())?;
+    Ok((real_source_line, real_line))
 }
 
 fn r2c_lengths<R: FftReal, const N: usize, const M: usize>(

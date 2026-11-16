@@ -419,6 +419,42 @@ fn new_options_and_raw_contracts() {
         }
     }
 
+    let complex_raw = directory.join("complex-independent-big.raw");
+    let mut complex_bytes = vec![0xa5; 5];
+    for value in 0..n * n {
+        let value = value as f64;
+        complex_bytes.extend_from_slice(&(value + 0.25).to_be_bytes());
+        complex_bytes.extend_from_slice(&(-value - 0.5).to_be_bytes());
+    }
+    root_write(&world, &complex_raw, &complex_bytes);
+    let topology = MpiTopology::<2>::new(&world, [1, n]).unwrap();
+    let pencil = Pencil::<2, 2>::new(topology, [n, n], [0, 1]).unwrap();
+    let mut complex_destination = PencilArray::from_elem(
+        pencil,
+        ExtraShape::scalar(),
+        num_complex::Complex::new(-1.0, -1.0),
+    )
+    .unwrap();
+    read_mpi_raw(
+        &complex_raw,
+        complex_destination.view_mut(),
+        RawReadOptions::default()
+            .byte_offset(5)
+            .byte_order(RawByteOrder::Big)
+            .mode(MpiIoMode::Independent)
+            .hint("access", "sequential"),
+    )
+    .unwrap();
+    let view = complex_destination.view();
+    let ranges = view.pencil().local_ranges();
+    for x in 0..ranges[0].len() {
+        for y in 0..ranges[1].len() {
+            let value = (ranges[0].start + x) * n + ranges[1].start + y;
+            let expected = num_complex::Complex::new(value as f64 + 0.25, -(value as f64) - 0.5);
+            assert_eq!(view.get_local(&[], [x, y]), Some(&expected));
+        }
+    }
+
     if world.size() > 1 {
         let axes = if world.rank() == 0 { [0, 1] } else { [1, 0] };
         let pencil =
