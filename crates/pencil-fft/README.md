@@ -7,7 +7,7 @@ backend is MPI-free and needs neither native FFTW nor Julia.
 - Default features: local transforms using RustFFT/RealFFT.
 - `distributed`: adds MPI and `pencil-array`. Requires native MPI headers,
   `mpicc`, and libclang by default; use the same MPI implementation to build and run.
-  Experimental [rsmpi-rt support](https://github.com/nogaki/pencil-rs#experimental-runtime-mpi-rsmpi-rt)
+  Experimental [rsmpi-rt support](https://github.com/tensor4all/pencil-rs#experimental-runtime-mpi-rsmpi-rt)
   instead loads MPIwrapper at runtime without native MPI build tools.
 - `fftw`: exposes explicit native FFTW constructors through `pencil-fftw`.
   Enabling it does not switch the default provider. Explicit FFTW construction

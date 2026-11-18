@@ -95,7 +95,7 @@ Open MPI 4.1.6 can lose collective-write payloads; update to 4.1.7 or later
 (5.0.6 or later also works) or launch with
 `mpiexec --mca fs_ufs_lock_algorithm 3`. That lock algorithm setting targets
 local filesystems; on NFS, prefer updating. See
-[the known-issue notes](https://github.com/nogaki/pencil-rs#open-mpi-416-collective-write-data-loss).
+[the known-issue notes](https://github.com/tensor4all/pencil-rs#open-mpi-416-collective-write-data-loss).
 
 No Julia, FFTW, or GPU is required. If transforms are also needed, `pencil-fft`
 uses MPI-free RustFFT/RealFFT by default, with distributed and native FFTW paths
