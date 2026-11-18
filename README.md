@@ -1,6 +1,6 @@
 # Pencil Arrays for Rust
 
-A row-major, MPI-distributed multidimensional array foundation inspired by
+A column-major, MPI-distributed multidimensional array foundation inspired by
 PencilArrays.jl, with a separately layered FFT implementation.
 
 The workspace contains the `pencil-array` core crate, the local FFT
@@ -32,14 +32,23 @@ exposing the legacy R2R axis-kind constructors.
 
 `Pencil` describes spatial distribution. `PencilArray` owns one layout and
 one local buffer. `ManyPencilArray` owns a buffer large enough for several
-registered layouts and exposes only its active layout. Array shapes use
-logical order `[extra..., spatial...]`; their row-major buffers use memory
-order `[extra..., permuted spatial...]`. `get_global` is a noncollective,
-local-only lookup: remotely owned or out-of-range coordinates return `None`.
-`Pencil::local_grid` borrows one complete global coordinate slice per spatial
-axis and iterates this rank's spatial coordinates in physical memory order;
-extra batches repeat that spatial grid. `LocalTransposePlan` provides
-process-local memory-axis permutations. `AllToAllvTransposePlan` and
+registered layouts and exposes only its active layout. `get_global` is a
+noncollective, local-only lookup: remotely owned or out-of-range coordinates
+return `None`. `Pencil::local_grid` borrows one complete global coordinate
+slice per spatial axis and iterates this rank's spatial coordinates in physical
+memory order; each extra batch repeats that spatial grid.
+
+**Column-major layout migration (in progress).** The approved contract is logical `[spatial..., extra...]`, physical
+`[permuted spatial..., extra...]`, with column-major prefix strides and the
+first axis fastest. Extra axes remain outside spatial permutation and MPI
+partitioning. The array crate's default decomposition is the trailing `M`
+spatial axes; Cartesian grid, rank/coordinate enumeration, and floor partition
+rules are unchanged. Stage 1 (`pencil-array`) is complete. `pencil-fft` and
+`pencil-io` layout paths are subsequent migration stages, not claimed complete
+here. There is no row-major compatibility mode or persisted-data backward-
+compatibility promise.
+
+`LocalTransposePlan` provides process-local memory-axis permutations. `AllToAllvTransposePlan` and
 `PointToPointTransposePlan` provide checked distributed redistribution through
 out-of-place views and shared-storage in-place execution. `SpatialRemapPlan`
 provides reusable affine per-axis sign/offset remapping across arbitrary pencil
@@ -89,8 +98,9 @@ an unfinished request scope may abort.
 `PencilArrayViewMut::from_slice_mut(&pencil, &extra_shape, &mut buffer)` attach
 checked pencil metadata to caller-owned storage without allocation, copying or
 ownership transfer. The slice must contain exactly the full local buffer in
-physical row-major `[extra..., permuted spatial...]` order. Metadata and storage
-remain borrowed for the view's lifetime; mutable views retain Rust's exclusive
+compact column-major `[permuted spatial..., extra...]` order, with the first axis
+varying fastest. Metadata and storage remain borrowed for the view's lifetime;
+mutable views retain Rust's exclusive
 borrow rules. Zero-length layouts are valid, and elements need not implement
 `Clone`. Existing view-based pointwise, reduction, transpose and I/O operations
 accept these views. This does not introduce arbitrary-stride views or an
@@ -107,7 +117,7 @@ infinity results follow the documented IEEE policy. Methods are available on
 functions take a validated view. `ManyPencilArray` intentionally has no direct
 collective methods: coordinate `active_view()` validity across ranks first,
 then call the corresponding view method or free function. Gather returns
-logical `[extra..., spatial...]` row-major order on the root and `None`
+logical `[spatial..., extra...]` column-major order on the root and `None`
 elsewhere; all ranks validate descriptors, counts, and root allocation before
 payload communication.
 

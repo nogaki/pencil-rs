@@ -4,7 +4,7 @@ use crate::{
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-/// Validation errors for checked pointwise operations.
+/// Validation errors for checked column-major pointwise operations.
 pub enum PointwiseError {
     /// Spatial layouts differ.
     #[error("pointwise arrays must have identical spatial layouts")]
@@ -140,10 +140,10 @@ fn strides(dims: &[usize]) -> Result<Vec<usize>, PointwiseError> {
         })?;
     out.resize(dims.len(), 1);
     let mut stride = 1usize;
-    for i in (0..dims.len()).rev() {
-        out[i] = stride;
+    for (axis, &extent) in dims.iter().enumerate() {
+        out[axis] = stride;
         stride = stride
-            .checked_mul(dims[i])
+            .checked_mul(extent)
             .ok_or(ArrayError::AllocationFailed {
                 required: usize::MAX,
             })?;

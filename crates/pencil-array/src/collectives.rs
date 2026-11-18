@@ -37,7 +37,8 @@ use crate::{
     view::LocalArrayLayout,
 };
 
-const DESCRIPTOR_SCHEMA: u64 = 3;
+const DESCRIPTOR_SCHEMA: u64 = 4;
+const LAYOUT_COLUMN_MAJOR: u64 = 0x434d_0001;
 const OPERATION_NAMESPACE: u64 = 0x4152_0000;
 const OP_GLOBAL_SUM: u64 = OPERATION_NAMESPACE + 1;
 const OP_GLOBAL_MIN: u64 = OPERATION_NAMESPACE + 2;
@@ -586,7 +587,7 @@ where
 /// Computes global any after applying `predicate` once to every local value.
 ///
 /// `predicate` must not panic, call MPI, or depend on callback invocation
-/// order beyond the local row-major storage order.
+/// order beyond the local column-major storage order.
 pub fn any_by<T, F, const N: usize, const M: usize>(
     view: &PencilArrayView<'_, T, N, M>,
     mut predicate: F,
@@ -608,7 +609,7 @@ where
 /// Computes global all after applying `predicate` once to every local value.
 ///
 /// `predicate` must not panic, call MPI, or depend on callback invocation
-/// order beyond the local row-major storage order.
+/// order beyond the local column-major storage order.
 pub fn all_by<T, F, const N: usize, const M: usize>(
     view: &PencilArrayView<'_, T, N, M>,
     mut predicate: F,
@@ -683,7 +684,7 @@ where
 
 /// Computes a checked global sum of mapped pairs.
 ///
-/// Traversal follows local row-major memory order (with broadcast dimensions
+/// Traversal follows local column-major memory order (with broadcast dimensions
 /// revisited). Metadata costs O(extra-rank); mapped values are accumulated as
 /// they are produced and are not stored. Captured callback state cannot be
 /// verified collectively; the callback must not panic or call MPI.
@@ -709,7 +710,7 @@ where
 
 /// Computes a scaled global L2 norm of mapped pairs.
 ///
-/// Traversal follows local row-major memory order (with broadcast dimensions
+/// Traversal follows local column-major memory order (with broadcast dimensions
 /// revisited). Metadata costs O(extra-rank); mapped values are accumulated as
 /// they are produced and are not stored. Captured callback state cannot be
 /// verified collectively; the callback must not panic or call MPI.
@@ -951,7 +952,7 @@ where
 }
 
 /// Maps two locally aligned inputs and folds their mapped pairs in rank order.
-/// Traversal follows local row-major memory order (with broadcast dimensions
+/// Traversal follows local column-major memory order (with broadcast dimensions
 /// revisited). Shape/stride metadata costs O(extra-rank); one partial per rank
 /// makes the extra storage and communication cost O(P). Captured callback state
 /// cannot be verified collectively; callbacks must be associative,
@@ -990,7 +991,7 @@ where
     Ok(partials.into_iter().fold(neutral, reduce))
 }
 
-/// Gathers a view to `root` in global logical row-major order.
+/// Gathers a view to `root` in global logical column-major order.
 ///
 /// The root is a rank in the view's topology Cartesian communicator and may be
 /// supplied as any integer type convertible to `usize`. Non-root ranks return
@@ -1454,13 +1455,12 @@ fn strides_for_dims(dims: &[usize]) -> Result<Vec<usize>, CollectiveError> {
             elements: dims.len(),
         })?;
     let mut stride: usize = 1;
-    for &dim in dims.iter().rev() {
+    for &dim in dims {
         out.push(stride);
         stride = stride
             .checked_mul(dim)
             .ok_or(CollectiveError::CountOverflow)?;
     }
-    out.reverse();
     Ok(out)
 }
 
@@ -2305,7 +2305,7 @@ fn descriptor_len<T, U, const N: usize, const M: usize>(
         *length = length.checked_add(value).ok_or(())?;
         Ok(())
     };
-    add(&mut length, 4)?; // schema, operation, spatial rank, topology rank
+    add(&mut length, 5)?; // schema, layout, operation, spatial rank, topology rank
     add(&mut length, N)?; // global spatial shape
     add(&mut length, M)?; // ordered decomposition
     add(&mut length, N)?; // memory permutation
@@ -2333,6 +2333,7 @@ where
     let mut descriptor = Vec::new();
     descriptor.try_reserve_exact(length).map_err(|_| ())?;
     append_word(&mut descriptor, DESCRIPTOR_SCHEMA);
+    append_word(&mut descriptor, LAYOUT_COLUMN_MAJOR);
     append_word(&mut descriptor, operation);
     append_word(&mut descriptor, u64::try_from(N).map_err(|_| ())?);
     append_word(&mut descriptor, u64::try_from(M).map_err(|_| ())?);
@@ -2891,7 +2892,7 @@ fn unpack_block<T, const N: usize, const M: usize>(
         let extra_offset = physical_offset / block.spatial_count;
         let mut remainder = physical_offset % block.spatial_count;
         let mut memory_coordinates = [0usize; N];
-        for (axis, coordinate) in memory_coordinates.iter_mut().enumerate().rev() {
+        for (axis, coordinate) in memory_coordinates.iter_mut().enumerate() {
             let extent = block.local_shape_memory[axis];
             *coordinate = remainder % extent;
             remainder /= extent;
@@ -2902,11 +2903,12 @@ fn unpack_block<T, const N: usize, const M: usize>(
             global_coordinates[logical_axis] = block.ranges[logical_axis].start + local_coordinate;
         }
         let mut global_spatial_offset = 0usize;
+        let mut global_stride = 1usize;
         for (logical_axis, &coordinate) in global_coordinates.iter().enumerate() {
-            global_spatial_offset =
-                global_spatial_offset * global_spatial_shape[logical_axis] + coordinate;
+            global_spatial_offset += coordinate * global_stride;
+            global_stride *= global_spatial_shape[logical_axis];
         }
-        let global_offset = extra_offset * global_spatial_count + global_spatial_offset;
+        let global_offset = global_spatial_offset + extra_offset * global_spatial_count;
         debug_assert!(extra_offset < extra_count);
         destination[global_offset] = physical_value;
     }

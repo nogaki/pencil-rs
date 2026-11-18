@@ -23,7 +23,7 @@ fn external_views() {
         assert_eq!(view.as_slice().as_ptr(), ptr);
         assert!(std::ptr::eq(view.pencil(), pencil.as_ref()));
         assert!(std::ptr::eq(view.extra_shape(), &extra));
-        assert_eq!(view.memory_shape(), [2, 3, 2]);
+        assert_eq!(view.memory_shape(), [3, 2, 2]);
         for e in 0..2 {
             for y in 0..3 {
                 for x in 0..2 {
@@ -45,7 +45,7 @@ fn external_views() {
             for x in 0..2 {
                 let gx = pencil.local_ranges()[0].start + x;
                 let value = (100 * e + 10 * gx + y) as i64;
-                assert_eq!(stack[e * 6 + y * 2 + x], value);
+                assert_eq!(stack[e * 6 + y + 3 * x], value);
                 assert_eq!(view.get_global(&[e], [gx, y]), Some(&value));
             }
         }

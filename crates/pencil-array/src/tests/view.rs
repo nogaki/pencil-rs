@@ -58,14 +58,14 @@ fn views_validate_storage_and_expose_permuted_local_layout() {
     assert_eq!(view.extra_shape(), &extra_shape);
     assert_eq!(view.local_spatial_shape(), [2, 3]);
     assert_eq!(view.local_spatial_memory_shape(), [3, 2]);
-    assert_eq!(view.logical_shape(), [2, 2, 3]);
-    assert_eq!(view.memory_shape(), [2, 3, 2]);
+    assert_eq!(view.logical_shape(), [2, 3, 2]);
+    assert_eq!(view.memory_shape(), [3, 2, 2]);
     assert_eq!(view.len(), 12);
     assert!(!view.is_empty());
     assert_eq!(view.as_slice(), storage.as_slice());
     assert_eq!(view.get_local(&[1], [1, 2]), Some(&11));
-    assert_eq!(view.get_local(&[0], [1, 0]), Some(&1));
-    assert_eq!(view.get_local(&[0], [0, 1]), Some(&2));
+    assert_eq!(view.get_local(&[0], [1, 0]), Some(&3));
+    assert_eq!(view.get_local(&[0], [0, 1]), Some(&1));
     assert_eq!(view.get_local(&[], [1, 2]), None);
     assert_eq!(view.get_local(&[2], [1, 2]), None);
     assert_eq!(view.get_local(&[0], [2, 0]), None);
@@ -74,11 +74,11 @@ fn views_validate_storage_and_expose_permuted_local_layout() {
     let mut storage: Vec<_> = (0..12).collect();
     {
         let mut view = PencilArrayViewMut::new(&pencil, &extra_shape, &mut storage).unwrap();
-        assert_eq!(view.logical_shape(), [2, 2, 3]);
-        assert_eq!(view.memory_shape(), [2, 3, 2]);
+        assert_eq!(view.logical_shape(), [2, 3, 2]);
+        assert_eq!(view.memory_shape(), [3, 2, 2]);
         assert_eq!(view.get_local(&[0], [1, 2]), Some(&5));
-        assert_eq!(view.get_local(&[0], [1, 0]), Some(&1));
-        assert_eq!(view.get_local(&[0], [0, 1]), Some(&2));
+        assert_eq!(view.get_local(&[0], [1, 0]), Some(&3));
+        assert_eq!(view.get_local(&[0], [0, 1]), Some(&1));
         *view.get_local_mut(&[0], [1, 2]).unwrap() = 99;
         view.as_mut_slice()[0] = 77;
     }

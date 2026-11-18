@@ -1,7 +1,7 @@
 use crate::{ShapeError, checked::checked_product};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-/// The ordered, undistributed dimensions preceding an array's spatial dimensions.
+/// Ordered, undistributed array dimensions following spatial dimensions in the logical and physical shapes.
 pub struct ExtraShape {
     dimensions: Box<[usize]>,
     element_count: usize,
@@ -28,7 +28,7 @@ impl ExtraShape {
         }
     }
 
-    /// Returns the extra dimensions in logical and memory order.
+    /// Returns the extra dimensions in logical and memory order; the first extra axis varies fastest.
     pub fn dimensions(&self) -> &[usize] {
         &self.dimensions
     }

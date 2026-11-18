@@ -27,7 +27,7 @@ impl SpatialAxis {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-/// A bijection from row-major memory positions to logical spatial axes.
+/// A bijection from physical memory positions to logical spatial axes.
 pub struct AxisPermutation<const N: usize> {
     axes_in_memory_order: [SpatialAxis; N],
     logical_to_memory: [usize; N],

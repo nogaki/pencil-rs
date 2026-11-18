@@ -286,7 +286,7 @@ fn local_global<const N: usize, const M: usize>(
     let memory_shape = pencil.local_shape_memory();
     let mut remainder = spatial_linear;
     let mut memory = [0usize; N];
-    for axis in (0..N).rev() {
+    for axis in 0..N {
         memory[axis] = remainder % memory_shape[axis];
         remainder /= memory_shape[axis];
     }

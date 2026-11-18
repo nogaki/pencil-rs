@@ -17,6 +17,21 @@ the same order with compatible descriptors. Coordinate local allocation or
 validation failures before entering the next collective. Drop MPI-owned objects
 before MPI finalization. See the API documentation for individual contracts.
 
+## Column-major storage contract
+
+Array logical shapes are `[spatial..., extra...]`; physical memory shapes are
+`[permuted spatial..., extra...]`, with the first physical axis varying fastest.
+For each extra index, its spatial block is contiguous; extra indices themselves
+use column-major order and are not permuted or distributed. `pencil.permutation()`
+only permutes spatial axes. `Pencil::new_default` distributes the trailing `M`
+spatial axes while preserving the topology grid and rank order.
+
+`from_vec`, `as_slice`, external views, `ManyPencilArray`, transpose payloads,
+and `gather` use this compact column-major contract. This is a breaking layout
+change; arbitrary-stride views and a row-major compatibility mode are not
+provided. The workspace migration is staged: this contract is implemented in
+`pencil-array` first; FFT and I/O layout paths follow in later stages.
+
 ## Affine spatial remapping
 
 `SpatialRemapPlan<T, N, M>` maps each destination coordinate `d` to source

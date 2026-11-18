@@ -20,7 +20,7 @@ fn expected_memory_points<const N: usize, const M: usize>(
     for linear in 0..pencil.local_len() {
         let mut remainder = linear;
         let mut memory_indices = [0; N];
-        for position in (0..N).rev() {
+        for position in 0..N {
             memory_indices[position] = remainder % memory_shape[position];
             remainder /= memory_shape[position];
         }
@@ -64,8 +64,10 @@ fn physical_offset<const N: usize>(
     logical_indices: [usize; N],
 ) -> usize {
     let mut offset = 0;
+    let mut stride = 1;
     for position in 0..N {
-        offset = offset * memory_shape[position] + logical_indices[axes_in_memory_order[position]];
+        offset += logical_indices[axes_in_memory_order[position]] * stride;
+        stride *= memory_shape[position];
     }
     offset
 }

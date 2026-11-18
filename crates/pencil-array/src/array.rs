@@ -44,7 +44,7 @@ impl<T, const N: usize, const M: usize> PencilArray<T, N, M> {
         Self::from_vec(pencil, extra_shape, storage)
     }
 
-    /// Allocates the local buffer and initializes its elements in row-major order.
+    /// Allocates the local buffer and initializes its elements in column-major physical order.
     pub fn from_fn(
         pencil: Arc<Pencil<N, M>>,
         extra_shape: ExtraShape,
@@ -55,7 +55,7 @@ impl<T, const N: usize, const M: usize> PencilArray<T, N, M> {
         Self::from_vec(pencil, extra_shape, storage)
     }
 
-    /// Returns the complete local row-major buffer.
+    /// Returns the complete local column-major buffer.
     pub fn as_slice(&self) -> &[T] {
         LocalArrayLayout::as_slice(self)
     }
@@ -65,7 +65,7 @@ impl<T, const N: usize, const M: usize> PencilArray<T, N, M> {
         &self.pencil
     }
 
-    /// Returns the undistributed dimensions preceding the spatial dimensions.
+    /// Returns the undistributed extra dimensions following the spatial dimensions.
     pub fn extra_shape(&self) -> &ExtraShape {
         LocalArrayLayout::extra_shape(self)
     }
@@ -80,12 +80,12 @@ impl<T, const N: usize, const M: usize> PencilArray<T, N, M> {
         LocalArrayLayout::local_spatial_memory_shape(self)
     }
 
-    /// Returns `[extra..., spatial...]` in logical-axis order.
+    /// Returns `[spatial..., extra...]` in logical-axis order.
     pub fn logical_shape(&self) -> Vec<usize> {
         LocalArrayLayout::logical_shape(self)
     }
 
-    /// Returns `[extra..., permuted spatial...]` in row-major memory order.
+    /// Returns `[permuted spatial..., extra...]` in column-major memory order.
     pub fn memory_shape(&self) -> Vec<usize> {
         LocalArrayLayout::memory_shape(self)
     }
@@ -100,7 +100,7 @@ impl<T, const N: usize, const M: usize> PencilArray<T, N, M> {
         self.storage.is_empty()
     }
 
-    /// Returns the complete mutable local row-major buffer.
+    /// Returns the complete mutable local column-major buffer.
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         &mut self.storage
     }

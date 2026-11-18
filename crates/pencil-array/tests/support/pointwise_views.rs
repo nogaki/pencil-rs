@@ -81,7 +81,7 @@ pub fn run<C: Communicator>(world: &C) {
     )
     .unwrap();
     for e in 0..6 {
-        let expected = 10 + (e % 3) as i64 + 100 + (e / 3) as i64 + 1_000;
+        let expected = 10 + (e / 2) as i64 + 100 + (e % 2) as i64 + 1_000;
         for k in 0..spatial {
             assert_eq!(
                 typed_out.as_slice()[e * spatial + k],
@@ -90,8 +90,8 @@ pub fn run<C: Communicator>(world: &C) {
             assert_eq!(
                 seen[e * spatial + k],
                 (
-                    10 + (e % 3) as i64 + k as i64,
-                    100 + (e / 3) as i64 + k as i64,
+                    10 + (e / 2) as i64 + k as i64,
+                    100 + (e % 2) as i64 + k as i64,
                     1000 + k as i64
                 )
             );
@@ -120,7 +120,7 @@ pub fn run<C: Communicator>(world: &C) {
         for k in 0..spatial {
             assert_eq!(
                 typed_ip.as_slice()[e * spatial + k],
-                1107 + (e / 3) as i64 + 2 * k as i64
+                1107 + (e % 2) as i64 + 2 * k as i64
             );
         }
     }
@@ -140,7 +140,7 @@ pub fn run<C: Communicator>(world: &C) {
         for k in 0..spatial {
             assert_eq!(
                 many_ip.as_slice()[e * spatial + k],
-                7 + 100 + (e / 3) as i64 + k as i64 + 1_000 + k as i64
+                7 + 100 + (e % 2) as i64 + k as i64 + 1_000 + k as i64
             );
         }
     }

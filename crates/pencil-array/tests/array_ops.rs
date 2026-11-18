@@ -28,16 +28,17 @@ fn pointwise(p: &Arc<Pencil<2, 1>>) {
     .unwrap();
     assert_eq!(calls, out.len());
     let n = p.local_len();
-    for i in 0..2 {
-        for j in 0..3 {
+    for e1 in 0..3 {
+        for e0 in 0..2 {
+            let batch = e0 + 2 * e1;
             for k in 0..n {
                 assert_eq!(
-                    seen[(i * 3 + j) * n + k],
-                    (a.as_slice()[j * n + k], b.as_slice()[i * n + k])
+                    seen[batch * n + k],
+                    (a.as_slice()[e1 * n + k], b.as_slice()[e0 * n + k])
                 );
                 assert_eq!(
-                    out.as_slice()[(i * 3 + j) * n + k],
-                    a.as_slice()[j * n + k] + b.as_slice()[i * n + k] + scalar
+                    out.as_slice()[batch * n + k],
+                    a.as_slice()[e1 * n + k] + b.as_slice()[e0 * n + k] + scalar
                 );
             }
         }

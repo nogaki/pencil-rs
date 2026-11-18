@@ -22,11 +22,12 @@ use crate::{
     checked_partition::{
         CheckedPartition, CheckedPartitionMut, DatatypePartition, DatatypePartitionMut,
     },
-    geometry::{partition_range, row_major_offset},
+    geometry::{column_major_offset, partition_range},
     preflight::{WORD_CHUNK, agree_header, agree_preflight, agree_words},
 };
 
-const DESCRIPTOR_SCHEMA: u64 = 1;
+const DESCRIPTOR_SCHEMA: u64 = 2;
+const LAYOUT_COLUMN_MAJOR: u64 = 0x434d_0001;
 const OP_PREPARE: u64 = 0x3601;
 const OP_APPLY: u64 = 0x3602;
 
@@ -88,7 +89,7 @@ pub enum SpatialRemapError {
     WrongOwner {
         /// The rank that received the invalid request.
         rank: i32,
-        /// The requested row-major global spatial index.
+        /// The requested column-major global spatial index.
         global_index: u64,
     },
 
@@ -503,7 +504,7 @@ where
 fn descriptor_length<T: Equivalence, const N: usize, const M: usize>(
     extra_shape: &ExtraShape,
 ) -> Result<usize, SpatialRemapError> {
-    let mut length = 4usize;
+    let mut length = 5usize;
     for amount in [
         1usize
             .checked_add(M)
@@ -589,6 +590,7 @@ where
         })?;
     descriptor.extend([
         DESCRIPTOR_SCHEMA,
+        LAYOUT_COLUMN_MAJOR,
         OP_PREPARE,
         dimension_word(N),
         dimension_word(M),
@@ -684,8 +686,8 @@ fn build_owner_routes<const N: usize, const M: usize>(
             elements: destination.local_len(),
         })?;
 
-    for destination_offset in 0..destination.local_len() {
-        let local = local_coordinate(destination, destination_offset)?;
+    for logical_linear in 0..destination.local_len() {
+        let local = local_logical_coordinate(destination, logical_linear)?;
         let mut destination_global = [0usize; N];
         for axis in 0..N {
             destination_global[axis] = destination.local_ranges()[axis]
@@ -696,8 +698,10 @@ fn build_owner_routes<const N: usize, const M: usize>(
         let source_global =
             affine_coordinate(destination_global, *source.global_shape(), signs, offsets)?;
         let owner = owner_rank(source, source_global)?;
-        let global_linear = row_major_offset(&source.global_shape()[..], &source_global[..])
+        let global_linear = column_major_offset(&source.global_shape()[..], &source_global[..])
             .map_err(|_| SpatialRemapError::StructuralInconsistency)?;
+        let destination_offset = local_source_offset(destination, destination_global)
+            .ok_or(SpatialRemapError::StructuralInconsistency)?;
         entries.push(RequestRoute {
             owner,
             global_index: u64::try_from(global_linear)
@@ -705,7 +709,16 @@ fn build_owner_routes<const N: usize, const M: usize>(
             destination_offset,
         });
     }
-    entries.sort_unstable_by_key(|entry| entry.owner);
+    entries.sort_unstable_by(|left, right| {
+        left.owner.cmp(&right.owner).then_with(|| {
+            local_logical_order(destination, left.destination_offset)
+                .expect("validated destination offset")
+                .cmp(
+                    &local_logical_order(destination, right.destination_offset)
+                        .expect("validated destination offset"),
+                )
+        })
+    });
 
     let mut owner_counts = filled_vec(rank_count, 0usize, "owner request counts")?;
     for entry in &entries {
@@ -739,6 +752,15 @@ fn build_owner_routes<const N: usize, const M: usize>(
     })
 }
 
+fn local_logical_order<const N: usize, const M: usize>(
+    pencil: &Pencil<N, M>,
+    memory_linear: usize,
+) -> Result<usize, SpatialRemapError> {
+    let local = local_coordinate(pencil, memory_linear)?;
+    column_major_offset(&pencil.local_shape_logical(), &local)
+        .map_err(|_| SpatialRemapError::StructuralInconsistency)
+}
+
 fn local_coordinate<const N: usize, const M: usize>(
     pencil: &Pencil<N, M>,
     memory_linear: usize,
@@ -749,7 +771,7 @@ fn local_coordinate<const N: usize, const M: usize>(
     let memory_shape = pencil.local_shape_memory();
     let mut remainder = memory_linear;
     let mut memory_coordinate = [0usize; N];
-    for axis in (0..N).rev() {
+    for axis in 0..N {
         if memory_shape[axis] == 0 {
             return Err(SpatialRemapError::StructuralInconsistency);
         }
@@ -764,6 +786,29 @@ fn local_coordinate<const N: usize, const M: usize>(
         logical[axis.index()] = memory_coordinate[memory_axis];
     }
     Ok(logical)
+}
+
+fn local_logical_coordinate<const N: usize, const M: usize>(
+    pencil: &Pencil<N, M>,
+    logical_linear: usize,
+) -> Result<[usize; N], SpatialRemapError> {
+    if logical_linear >= pencil.local_len() {
+        return Err(SpatialRemapError::StructuralInconsistency);
+    }
+    let shape = pencil.local_shape_logical();
+    let mut remainder = logical_linear;
+    let mut local = [0usize; N];
+    for axis in 0..N {
+        if shape[axis] == 0 {
+            return Err(SpatialRemapError::StructuralInconsistency);
+        }
+        local[axis] = remainder % shape[axis];
+        remainder /= shape[axis];
+    }
+    if remainder != 0 {
+        return Err(SpatialRemapError::StructuralInconsistency);
+    }
+    Ok(local)
 }
 
 fn affine_coordinate<const N: usize>(
@@ -915,12 +960,11 @@ fn global_coordinate<const N: usize, const M: usize>(
         return None;
     }
     let mut global = [0usize; N];
-    for axis in (0..N).rev() {
-        let extent = pencil.global_shape()[axis];
+    for (coordinate, &extent) in global.iter_mut().zip(pencil.global_shape()) {
         if extent == 0 {
             return None;
         }
-        global[axis] = remainder % extent;
+        *coordinate = remainder % extent;
         remainder /= extent;
     }
     (remainder == 0).then_some(global)
@@ -943,7 +987,7 @@ fn local_source_offset<const N: usize, const M: usize>(
         memory[position] = local[axis.index()];
     }
     let shape = pencil.local_shape_memory();
-    row_major_offset(&shape[..], &memory[..]).ok()
+    column_major_offset(&shape[..], &memory[..]).ok()
 }
 
 fn payload_layout<T>(

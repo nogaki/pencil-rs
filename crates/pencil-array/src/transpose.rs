@@ -18,13 +18,14 @@ use crate::{
     ArrayError, AxisPermutation, ExtraShape, ManyPencilArray, Pencil, PencilArrayView,
     PencilArrayViewMut,
     checked::{checked_product, local_storage_len},
-    geometry::row_major_offset,
+    geometry::column_major_offset,
     preflight::{agree_header, expand_for_max},
 };
 
 pub(crate) use crate::preflight::agree_preflight;
 
-const DESCRIPTOR_SCHEMA: u64 = 1;
+const DESCRIPTOR_SCHEMA: u64 = 2;
+const LAYOUT_COLUMN_MAJOR: u64 = 0x434d_0001;
 // The operation word combines transport and operation; keep these values
 // stable because they are part of the collective preflight protocol.
 const OPERATION_ALLTOALLV_NEW: u64 = 1;
@@ -869,8 +870,11 @@ fn validate_region_offsets<const N: usize>(
     }
 
     let last_memory = permutation.permute(last_local);
-    let max_spatial = row_major_offset(local_shape_memory, &last_memory)
+    let max_spatial = column_major_offset(local_shape_memory, &last_memory)
         .map_err(|_| TransposeError::PreparationFailed)?;
+    if max_spatial >= local_len {
+        return Err(TransposeError::PreparationFailed);
+    }
     let max_offset = (extra_count - 1)
         .checked_mul(local_len)
         .and_then(|extra_offset| extra_offset.checked_add(max_spatial))
@@ -881,9 +885,10 @@ fn validate_region_offsets<const N: usize>(
     Ok(())
 }
 
-// The pack and unpack walks no longer map elements individually; only the
-// test-only elementwise references below use this linear index mapping.
+// The pack and unpack walks no longer map elements individually; this unused
+// test-only row-major helper is retained for its original isolated contract.
 #[cfg(test)]
+#[allow(dead_code)]
 fn region_index<const N: usize>(
     region: &[Range<usize>; N],
     mut linear: usize,
@@ -929,9 +934,8 @@ impl<'a, const N: usize> LocalLayout<'a, N> {
 
 /// Precomputed memory walk for one peer region.
 ///
-/// The payload order is the global row-major order of the region, so the walk
-/// carries an odometer over the outer global axes and copies the last global
-/// axis as a single run.
+/// The payload order is logical column-major order within the region, so the walk
+/// carries an odometer over axes 1..N and copies logical axis 0 as a run.
 struct RegionWalk<const N: usize> {
     /// Memory offset of the region's start corner inside one extra block.
     start: usize,
@@ -939,11 +943,11 @@ struct RegionWalk<const N: usize> {
     stride: [usize; N],
     /// Region extent along each global axis.
     extent: [usize; N],
-    /// Number of odometer positions over all axes but the last one.
+    /// Number of odometer positions over logical axes 1..N.
     outer_len: usize,
-    /// Number of elements along the last global axis.
+    /// Number of elements along logical axis 0.
     run_len: usize,
-    /// Memory stride of the last global axis.
+    /// Memory stride of logical axis 0.
     run_stride: usize,
     /// Largest memory offset the walk reaches inside one extra block.
     max_offset: usize,
@@ -957,7 +961,7 @@ fn region_walk<const N: usize>(
     // memory shape, so these partial products cannot overflow.
     let mut stride = [0usize; N];
     let mut running = 1usize;
-    for position in (0..N).rev() {
+    for position in 0..N {
         let axis = layout.permutation.axes()[position].index();
         stride[axis] = running;
         running *= layout.shape_memory[position];
@@ -998,13 +1002,13 @@ fn region_walk<const N: usize>(
                     .ok_or(TransposeError::PreparationFailed)?,
             )
             .ok_or(TransposeError::PreparationFailed)?;
-        if axis + 1 < N {
+        if axis == 0 {
+            run_len = length;
+            run_stride = stride[axis];
+        } else {
             outer_len = outer_len
                 .checked_mul(length)
                 .ok_or(TransposeError::PreparationFailed)?;
-        } else {
-            run_len = length;
-            run_stride = stride[axis];
         }
     }
 
@@ -1022,8 +1026,8 @@ fn region_walk<const N: usize>(
 }
 
 /// Advances the odometer over the outer global axes to the next payload
-/// position. The payload order is global row-major, so only the storage offset
-/// needs carrying.
+/// position. The payload order is logical column-major, so only the storage
+/// offset needs carrying.
 ///
 /// A wrapping axis first gives back the advance it already accumulated
 /// (`counter * stride`) rather than adding its stride and subtracting the whole
@@ -1036,18 +1040,23 @@ fn advance_region<const N: usize>(
     counter: &mut [usize; N],
     offset: &mut usize,
 ) {
-    for axis in (0..N.saturating_sub(1)).rev() {
-        if counter[axis] + 1 < walk.extent[axis] {
-            counter[axis] += 1;
-            *offset += walk.stride[axis];
+    for ((counter, extent), stride) in counter
+        .iter_mut()
+        .skip(1)
+        .zip(walk.extent.iter().skip(1))
+        .zip(walk.stride.iter().skip(1))
+    {
+        if *counter + 1 < *extent {
+            *counter += 1;
+            *offset += *stride;
             return;
         }
-        *offset -= counter[axis] * walk.stride[axis];
-        counter[axis] = 0;
+        *offset -= *counter * *stride;
+        *counter = 0;
     }
 }
 
-/// Visits every region run in global row-major payload order, passing the
+/// Visits every region run in logical column-major payload order, passing the
 /// storage offset and payload offset of each run to `visit`.
 fn walk_region<const N: usize>(walk: &RegionWalk<N>, mut visit: impl FnMut(usize, usize)) {
     if walk.run_len == 0 {
@@ -1314,7 +1323,7 @@ pub(crate) fn unpack_destination_except_self<T: Copy, const N: usize, const M: u
     );
 }
 
-/// Copies one region between two pencil layouts in global row-major order.
+/// Copies one region between two pencil layouts in logical column-major order.
 fn copy_region_between<T: Copy, const N: usize>(
     source_walk: &RegionWalk<N>,
     destination_walk: &RegionWalk<N>,
@@ -1418,7 +1427,7 @@ pub(crate) fn copy_self_region<T: Copy, const N: usize, const M: usize>(
 fn plan_descriptor_len<const N: usize, const M: usize>() -> Result<usize, ()> {
     let topology_words = M.checked_mul(4).ok_or(())?;
     let spatial_words = N.checked_mul(4).ok_or(())?;
-    5usize
+    6usize
         .checked_add(topology_words)
         .and_then(|value| value.checked_add(spatial_words))
         .ok_or(())
@@ -1433,6 +1442,7 @@ fn build_plan_descriptor<const N: usize, const M: usize>(
     let mut descriptor = Vec::new();
     descriptor.try_reserve_exact(len).map_err(|_| ())?;
     descriptor.push(DESCRIPTOR_SCHEMA);
+    descriptor.push(LAYOUT_COLUMN_MAJOR);
     descriptor.push(operation);
     descriptor.push(N as u64);
     descriptor.push(M as u64);

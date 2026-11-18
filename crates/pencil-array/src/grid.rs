@@ -100,7 +100,7 @@ impl<'a, C, const N: usize> LocalGrid<'a, C, N> {
     /// Iterates local global-coordinate tuples in physical spatial memory order.
     ///
     /// The tuple itself remains in logical-axis order. The order matches the
-    /// spatial suffix of the array's row-major [`crate::PencilArray::as_slice`]
+    /// spatial block of the array's column-major [`crate::PencilArray::as_slice`]
     /// buffer, so one grid iteration can be paired with one extra batch of
     /// spatial values. The iterator performs no allocation and requires no MPI
     /// operation.
@@ -158,7 +158,7 @@ impl<C, const N: usize> FusedIterator for LocalGridIter<'_, C, N> {}
 
 impl<'a, C, const N: usize> LocalGridIter<'a, C, N> {
     fn advance_memory_indices(&mut self) {
-        for position in (0..N).rev() {
+        for position in 0..N {
             if self.memory_indices[position] < self.memory_shape[position] - 1 {
                 self.memory_indices[position] += 1;
                 return;

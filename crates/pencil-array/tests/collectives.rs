@@ -61,11 +61,11 @@ fn regular_array(pencil: Arc<Pencil<2, 2>>, extra: ExtraShape) -> PencilArray<i6
 }
 
 fn regular_expected() -> Vec<i64> {
-    (0..2)
-        .flat_map(|e0| {
-            (0..3).flat_map(move |e1| {
-                (0..5).flat_map(move |x| {
-                    (0..7).map(move |y| (e0 * 100_000 + e1 * 10_000 + x * 100 + y) as i64)
+    (0..3)
+        .flat_map(|e1| {
+            (0..2).flat_map(move |e0| {
+                (0..7).flat_map(move |y| {
+                    (0..5).map(move |x| (e0 * 100_000 + e1 * 10_000 + x * 100 + y) as i64)
                 })
             })
         })

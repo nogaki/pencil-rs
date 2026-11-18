@@ -5,7 +5,7 @@ use thiserror::Error;
 use crate::{
     ArrayError, ManyPencilArray, Pencil, PencilArrayView, PencilArrayViewMut,
     checked::{check_storage_len, local_storage_len, storage_length_mismatch},
-    geometry::row_major_offset,
+    geometry::column_major_offset,
     transpose::TransposeWorkspace,
 };
 
@@ -288,7 +288,7 @@ fn logical_offsets<const N: usize, const M: usize>(
     let mut remainder = spatial_linear;
     let logical_shape = source.local_shape_logical();
 
-    for axis in (0..N).rev() {
+    for axis in 0..N {
         let extent = logical_shape[axis];
         spatial_indices[axis] = remainder % extent;
         remainder /= extent;
@@ -297,9 +297,9 @@ fn logical_offsets<const N: usize, const M: usize>(
     let source_memory_indices = source.permutation().permute(spatial_indices);
     let destination_memory_indices = destination.permutation().permute(spatial_indices);
     let source_spatial_offset =
-        row_major_offset(&source.local_shape_memory(), &source_memory_indices)
+        column_major_offset(&source.local_shape_memory(), &source_memory_indices)
             .map_err(ArrayError::from)?;
-    let destination_spatial_offset = row_major_offset(
+    let destination_spatial_offset = column_major_offset(
         &destination.local_shape_memory(),
         &destination_memory_indices,
     )

@@ -511,8 +511,8 @@ fn run_point_to_point_large_payload(topology: &Arc<MpiTopology<1>>) {
     let shape = source_pencil.local_shape_logical();
     let ranges = source_pencil.local_ranges();
     let mut storage = Vec::with_capacity(source_pencil.local_len());
-    for x in 0..shape[0] {
-        for y in 0..shape[1] {
+    for y in 0..shape[1] {
+        for x in 0..shape[0] {
             let global_x = ranges[0].start + x;
             let global_y = ranges[1].start + y;
             storage.push((global_x * global_shape[1] + global_y) as u64);
@@ -1381,11 +1381,11 @@ fn fill_3d_physical<T: Copy>(
     let shape = pencil.local_shape_logical();
     let ranges = pencil.local_ranges();
     let mut physical = Vec::with_capacity(pencil.local_len());
-    // The source permutation is [z, x, y], so construct the physical buffer
-    // in that order rather than through the library's index helper.
-    for z in 0..shape[2] {
+    // p=[2, 0, 1] means CM fastest-to-slowest [z, x, y]; nest
+    // slowest-to-fastest so the independently supplied buffer matches it.
+    for y in 0..shape[1] {
         for x in 0..shape[0] {
-            for y in 0..shape[1] {
+            for z in 0..shape[2] {
                 physical.push(value([
                     ranges[0].start + x,
                     ranges[1].start + y,
@@ -1401,11 +1401,11 @@ fn expected_3d_physical<T: Copy>(pencil: &Pencil<3, 2>, value: fn([usize; 3]) ->
     let shape = pencil.local_shape_logical();
     let ranges = pencil.local_ranges();
     let mut expected = Vec::with_capacity(pencil.local_len());
-    // The destination permutation is [y, z, x], independently spelling out
-    // the physical destination order for comparison with as_slice().
-    for y in 0..shape[1] {
+    // p=[1, 2, 0] means CM fastest-to-slowest [y, z, x]; nest
+    // slowest-to-fastest to independently spell out as_slice() order.
+    for x in 0..shape[0] {
         for z in 0..shape[2] {
-            for x in 0..shape[0] {
+            for y in 0..shape[1] {
                 expected.push(value([
                     ranges[0].start + x,
                     ranges[1].start + y,

@@ -63,8 +63,8 @@ fn owning_array_contracts() {
     assert_eq!(indexed.extra_shape(), &extra_shape);
     assert_eq!(indexed.local_spatial_shape(), [2, 3, 4]);
     assert_eq!(indexed.local_spatial_memory_shape(), [2, 4, 3]);
-    assert_eq!(indexed.logical_shape(), [2, 2, 3, 4]);
-    assert_eq!(indexed.memory_shape(), [2, 2, 4, 3]);
+    assert_eq!(indexed.logical_shape(), [2, 3, 4, 2]);
+    assert_eq!(indexed.memory_shape(), [2, 4, 3, 2]);
     assert_eq!(indexed.len(), 48);
     assert!(!indexed.is_empty());
 
@@ -72,7 +72,7 @@ fn owning_array_contracts() {
         for x in 0..2 {
             for y in 0..3 {
                 for z in 0..4 {
-                    let expected = extra * 24 + x * 12 + z * 3 + y;
+                    let expected = x + 2 * (z + 4 * y) + extra * 24;
                     assert_eq!(indexed.get_local(&[extra], [x, y, z]), Some(&expected));
                 }
             }
@@ -87,8 +87,8 @@ fn owning_array_contracts() {
 
     {
         let view = indexed.view();
-        assert_eq!(view.memory_shape(), [2, 2, 4, 3]);
-        assert_eq!(view.get_local(&[1], [0, 2, 1]), Some(&29));
+        assert_eq!(view.memory_shape(), [2, 4, 3, 2]);
+        assert_eq!(view.get_local(&[1], [0, 2, 1]), Some(&42));
     }
     {
         let mut view = indexed.view_mut();
@@ -98,7 +98,7 @@ fn owning_array_contracts() {
     assert_eq!(indexed.get_local(&[0], [1, 1, 2]), Some(&99));
     assert_eq!(indexed.as_slice()[0], 77);
     *indexed.get_local_mut(&[1], [0, 2, 1]).unwrap() = 88;
-    assert_eq!(indexed.as_slice()[29], 88);
+    assert_eq!(indexed.as_slice()[42], 88);
     indexed.as_mut_slice()[1] = 66;
     assert_eq!(indexed.as_slice()[1], 66);
 
@@ -111,8 +111,8 @@ fn owning_array_contracts() {
     .unwrap();
     assert_eq!(empty_calls.get(), 0);
     assert!(empty.is_empty());
-    assert_eq!(empty.logical_shape(), [2, 0, usize::MAX, 2, 3, 4]);
-    assert_eq!(empty.memory_shape(), [2, 0, usize::MAX, 2, 4, 3]);
+    assert_eq!(empty.logical_shape(), [2, 3, 4, 2, 0, usize::MAX]);
+    assert_eq!(empty.memory_shape(), [2, 4, 3, 2, 0, usize::MAX]);
     assert!(
         PencilArray::from_elem(pencil, empty_extra, 5_u8)
             .unwrap()

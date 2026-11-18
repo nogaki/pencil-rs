@@ -25,7 +25,7 @@ fn immutable_pencils_define_and_derive_row_major_layouts() {
     let default = Pencil::<3, 2>::new_default(Arc::clone(&topology), global_shape).unwrap();
     assert!(Arc::ptr_eq(default.topology(), &topology));
     assert_eq!(default.global_shape(), &global_shape);
-    assert_eq!(default.decomposition().map(SpatialAxis::index), [0, 1]);
+    assert_eq!(default.decomposition().map(SpatialAxis::index), [1, 2]);
     assert_eq!(
         default.permutation().axes().map(SpatialAxis::index),
         [0, 1, 2]
@@ -33,15 +33,15 @@ fn immutable_pencils_define_and_derive_row_major_layouts() {
     assert_eq!(
         default.local_ranges(),
         &[
-            expected_range(10, c0, grid[0]),
-            expected_range(14, c1, grid[1]),
-            0..6,
+            0..10,
+            expected_range(14, c0, grid[0]),
+            expected_range(6, c1, grid[1]),
         ]
     );
     let logical_shape = [
-        expected_range(10, c0, grid[0]).len(),
-        expected_range(14, c1, grid[1]).len(),
-        6,
+        10,
+        expected_range(14, c0, grid[0]).len(),
+        expected_range(6, c1, grid[1]).len(),
     ];
     assert_eq!(default.local_shape_logical(), logical_shape);
     assert_eq!(default.local_shape_memory(), logical_shape);
@@ -50,9 +50,9 @@ fn immutable_pencils_define_and_derive_row_major_layouts() {
     assert_eq!(
         default.ranges_at([grid[0] - 1, 0]).unwrap(),
         [
-            expected_range(10, grid[0] - 1, grid[0]),
-            expected_range(14, 0, grid[1]),
-            0..6,
+            0..10,
+            expected_range(14, grid[0] - 1, grid[0]),
+            expected_range(6, 0, grid[1]),
         ]
     );
 
@@ -91,7 +91,7 @@ fn immutable_pencils_define_and_derive_row_major_layouts() {
     let reshaped = default.with_global_shape([12, 16, 8]).unwrap();
     assert!(default.same_topology(&reshaped));
     assert_eq!(reshaped.global_shape(), &[12, 16, 8]);
-    assert_eq!(reshaped.decomposition().map(SpatialAxis::index), [0, 1]);
+    assert_eq!(reshaped.decomposition().map(SpatialAxis::index), [1, 2]);
     assert_eq!(
         reshaped.permutation().axes().map(SpatialAxis::index),
         [0, 1, 2]
@@ -99,7 +99,7 @@ fn immutable_pencils_define_and_derive_row_major_layouts() {
 
     let copied_config = PencilConfig::from(default.as_ref());
     assert_eq!(copied_config.global_shape, global_shape);
-    assert_eq!(copied_config.decomposition, [0, 1]);
+    assert_eq!(copied_config.decomposition, [1, 2]);
     assert_eq!(
         copied_config.permutation.axes().map(SpatialAxis::index),
         [0, 1, 2]

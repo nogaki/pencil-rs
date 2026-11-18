@@ -2,7 +2,7 @@
 #![deny(missing_debug_implementations)]
 #![warn(missing_docs)]
 
-//! MPI-distributed, row-major multidimensional array foundations.
+//! MPI-distributed, column-major multidimensional array foundations.
 //!
 //! A [`Pencil`] describes spatial distribution only. A [`PencilArray`] owns
 //! one pencil layout and one local buffer. A [`ManyPencilArray`] owns one
@@ -10,9 +10,9 @@
 //! its active layout.
 //!
 //! Array dimensions are interpreted in logical order as
-//! `[extra..., spatial...]`. The row-major buffer uses memory order
-//! `[extra..., permuted spatial...]`; [`AxisPermutation`] changes only the
-//! spatial suffix. [`ExtraShape::scalar`] represents zero extra dimensions
+//! `[spatial..., extra...]`. The column-major buffer uses memory order
+//! `[permuted spatial..., extra...]`; the first physical axis varies fastest,
+//! and [`AxisPermutation`] changes only spatial axes. [`ExtraShape::scalar`] represents zero extra dimensions
 //! and contributes one element per local spatial point. Global accessors are
 //! local-only: a valid global spatial index owned by another rank returns
 //! `None`. [`LocalGrid`] borrows caller-provided global coordinate axes and
@@ -80,7 +80,7 @@
 //! Global reductions (`global_sum`, `global_min`, `global_max`, `l2_norm`,
 //! `any`, `all`, `sum_by`, and `norm_by`) and root `gather` apply the same
 //! collective descriptor and count preflight. Gather returns logical global
-//! row-major order on the root; non-root ranks receive `None`.
+//! column-major order on the root; non-root ranks receive `None`.
 //!
 //! # MPI-owning types are not transferable between threads
 //!

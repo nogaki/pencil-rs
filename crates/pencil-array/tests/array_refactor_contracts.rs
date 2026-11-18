@@ -282,7 +282,7 @@ fn array_refactor_contracts() {
     for e in 0..2usize {
         for x in 0..2usize {
             for y in 0..3usize {
-                storage[e * 6 + y * 2 + x] = (100 * e + 10 * (local_x.start + x) + y) as i64;
+                storage[e * 6 + y + 3 * x] = (100 * e + 10 * (local_x.start + x) + y) as i64;
             }
         }
     }
@@ -480,15 +480,15 @@ fn array_refactor_contracts() {
 
     // #117 behaviour: broadcast values must be unchanged by the hoist.
     let fill = |dims: [usize; 2]| -> Vec<i64> {
-        let mut values = Vec::new();
+        let mut values = vec![0; dims[0] * dims[1] * 6];
         for e0 in 0..dims[0] {
             for e1 in 0..dims[1] {
-                // Memory order is [extra..., y, x], with x fastest.
-                for y in 0..3usize {
-                    for x in 0..2usize {
-                        values.push(
-                            (e0 * 1_000_000 + e1 * 10_000 + (local_x.start + x) * 100 + y) as i64,
-                        );
+                let extra_linear = e0 + dims[0] * e1;
+                // Memory order is [y, x, e0, e1], with y fastest.
+                for x in 0..2usize {
+                    for y in 0..3usize {
+                        values[extra_linear * 6 + y + 3 * x] =
+                            (e0 * 1_000_000 + e1 * 10_000 + (local_x.start + x) * 100 + y) as i64;
                     }
                 }
             }

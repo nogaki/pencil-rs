@@ -1,5 +1,34 @@
 use super::*;
 
+fn column_major_offset<const N: usize>(shape: &[usize; N], indices: &[usize; N]) -> Option<usize> {
+    let mut offset = 0usize;
+    let mut stride = 1usize;
+    for axis in 0..N {
+        if indices[axis] >= shape[axis] {
+            return None;
+        }
+        offset = offset.checked_add(indices[axis].checked_mul(stride)?)?;
+        if axis + 1 < N {
+            stride = stride.checked_mul(shape[axis])?;
+        }
+    }
+    Some(offset)
+}
+
+fn column_major_region_index<const N: usize>(
+    region: &[Range<usize>; N],
+    mut linear: usize,
+) -> [usize; N] {
+    let mut index = [0; N];
+    for axis in 0..N {
+        let extent = region[axis].end - region[axis].start;
+        assert_ne!(extent, 0, "reference index requires a nonempty region");
+        index[axis] = region[axis].start + linear % extent;
+        linear /= extent;
+    }
+    index
+}
+
 /// Local pencil metadata that the offset validator needs.
 struct RegionMetadata<const N: usize> {
     local_ranges: [Range<usize>; N],
@@ -32,7 +61,7 @@ fn validate_region_offsets_reference<const N: usize>(
             .checked_mul(local_len)
             .ok_or(TransposeError::PreparationFailed)?;
         for linear in 0..spatial_len {
-            let global = region_index(region, linear)?;
+            let global = column_major_region_index(region, linear);
             let mut local = [0usize; N];
             for axis in 0..N {
                 let range = &local_ranges[axis];
@@ -42,8 +71,8 @@ fn validate_region_offsets_reference<const N: usize>(
                 local[axis] = global[axis] - range.start;
             }
             let memory = permutation.permute(local);
-            let spatial_offset = row_major_offset(local_shape_memory, &memory)
-                .map_err(|_| TransposeError::PreparationFailed)?;
+            let spatial_offset = column_major_offset(local_shape_memory, &memory)
+                .ok_or(TransposeError::PreparationFailed)?;
             let offset = extra_offset
                 .checked_add(spatial_offset)
                 .ok_or(TransposeError::PreparationFailed)?;
@@ -242,25 +271,26 @@ fn region_offsets_check_storage_and_usize_boundaries() {
         Err(TransposeError::PreparationFailed),
     );
 
-    let row_multiplication = RegionMetadata {
-        local_ranges: [0..3, 0..maximum],
-        local_shape_memory: [3, maximum],
+    let half = maximum / 2;
+    let column_major_multiplication = RegionMetadata {
+        local_ranges: [0..half + 1, 0..3],
+        local_shape_memory: [half + 1, 3],
         permutation: AxisPermutation::identity(),
-        local_len: 1,
+        local_len: maximum,
     };
     assert_eq!(
-        checked_offsets(&row_multiplication, &[2..3, 0..1], 1, maximum),
+        checked_offsets(&column_major_multiplication, &[0..1, 2..3], 1, maximum),
         Err(TransposeError::PreparationFailed),
     );
 
-    let row_addition = RegionMetadata {
-        local_ranges: [0..2, 0..maximum],
-        local_shape_memory: [2, maximum],
+    let column_major_addition = RegionMetadata {
+        local_ranges: [0..half, 0..3],
+        local_shape_memory: [half, 3],
         permutation: AxisPermutation::identity(),
-        local_len: 1,
+        local_len: maximum,
     };
     assert_eq!(
-        checked_offsets(&row_addition, &[1..2, 1..2], 1, maximum),
+        checked_offsets(&column_major_addition, &[2..3, 2..3], 1, maximum),
         Err(TransposeError::PreparationFailed),
     );
 
@@ -343,7 +373,7 @@ fn reference_region_offsets<const N: usize>(
     let spatial_len = region_spatial_len(region).expect("valid region");
     (0..spatial_len)
         .map(|linear| {
-            let global = region_index(region, linear).expect("valid region index");
+            let global = column_major_region_index(region, linear);
             let mut local = [0usize; N];
             for axis in 0..N {
                 let range = &local_ranges[axis];
@@ -351,7 +381,7 @@ fn reference_region_offsets<const N: usize>(
                 local[axis] = global[axis] - range.start;
             }
             let memory = permutation.permute(local);
-            row_major_offset(shape_memory, &memory).expect("valid memory index")
+            column_major_offset(shape_memory, &memory).expect("valid memory index")
         })
         .collect()
 }

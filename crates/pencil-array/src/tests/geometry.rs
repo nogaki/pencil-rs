@@ -88,6 +88,9 @@ fn local_ranges_report_the_failing_topology_axis() {
 fn row_major_offsets_validate_rank_bounds_and_overflow() {
     assert_eq!(row_major_offset(&[], &[]), Ok(0));
     assert_eq!(row_major_offset(&[2, 3, 4], &[1, 2, 3]), Ok(23));
+    assert_eq!(row_major_offset(&[2, 3, 4], &[1, 0, 0]), Ok(1));
+    assert_eq!(row_major_offset(&[2, 3, 4], &[0, 1, 0]), Ok(2));
+    assert_eq!(row_major_offset(&[2, 3, 4], &[0, 0, 1]), Ok(6));
     assert_eq!(
         row_major_offset(&[2, 3], &[1]),
         Err(GeometryError::RankMismatch {
@@ -143,9 +146,9 @@ proptest! {
     #[test]
     fn row_major_offsets_follow_nested_loop_order(shape in proptest::array::uniform3(1usize..8)) {
         let mut expected = 0;
-        for i in 0..shape[0] {
+        for k in 0..shape[2] {
             for j in 0..shape[1] {
-                for k in 0..shape[2] {
+                for i in 0..shape[0] {
                     prop_assert_eq!(row_major_offset(&shape, &[i, j, k]).unwrap(), expected);
                     expected += 1;
                 }

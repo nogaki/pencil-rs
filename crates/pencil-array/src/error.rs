@@ -32,7 +32,7 @@ pub enum AxisError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-/// Errors computing local geometry and row-major offsets.
+/// Errors computing local geometry and checked array offsets.
 pub enum GeometryError {
     /// A shape, length, or offset did not fit `usize`.
     #[error("shape or offset calculation overflowed usize")]
@@ -336,7 +336,7 @@ pub enum PencilError {
     #[error("invalid decomposition: {0}")]
     InvalidDecomposition(AxisError),
 
-    /// The row-major memory-axis permutation was invalid.
+    /// The physical memory-axis permutation was invalid.
     #[error("invalid memory-axis permutation: {0}")]
     InvalidPermutation(AxisError),
 

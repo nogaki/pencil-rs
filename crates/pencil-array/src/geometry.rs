@@ -62,7 +62,16 @@ pub(crate) fn shape_from_ranges<const N: usize>(ranges: &[Range<usize>; N]) -> [
     std::array::from_fn(|axis| ranges[axis].len())
 }
 
-pub(crate) fn row_major_offset(shape: &[usize], indices: &[usize]) -> Result<usize, GeometryError> {
+// Keep the private unit-test symbol; its old name is not a runtime layout mode.
+#[cfg(test)]
+fn row_major_offset(shape: &[usize], indices: &[usize]) -> Result<usize, GeometryError> {
+    column_major_offset(shape, indices)
+}
+
+pub(crate) fn column_major_offset(
+    shape: &[usize],
+    indices: &[usize],
+) -> Result<usize, GeometryError> {
     if shape.len() != indices.len() {
         return Err(GeometryError::RankMismatch {
             shape_rank: shape.len(),
@@ -70,6 +79,7 @@ pub(crate) fn row_major_offset(shape: &[usize], indices: &[usize]) -> Result<usi
         });
     }
     let mut offset = 0usize;
+    let mut stride = 1usize;
     for (axis, (&extent, &index)) in shape.iter().zip(indices).enumerate() {
         if index >= extent {
             return Err(GeometryError::LocalIndexOutOfBounds {
@@ -79,9 +89,17 @@ pub(crate) fn row_major_offset(shape: &[usize], indices: &[usize]) -> Result<usi
             });
         }
         offset = offset
-            .checked_mul(extent)
-            .and_then(|base| base.checked_add(index))
+            .checked_add(
+                index
+                    .checked_mul(stride)
+                    .ok_or(GeometryError::SizeOverflow)?,
+            )
             .ok_or(GeometryError::SizeOverflow)?;
+        if axis + 1 < shape.len() {
+            stride = stride
+                .checked_mul(extent)
+                .ok_or(GeometryError::SizeOverflow)?;
+        }
     }
     Ok(offset)
 }

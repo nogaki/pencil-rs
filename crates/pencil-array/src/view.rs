@@ -1,6 +1,7 @@
 use crate::{
     ArrayError, ExtraShape, GeometryError, LocalGrid, LocalGridError, Pencil,
     checked::{check_storage_len, local_storage_len},
+    geometry::column_major_offset,
 };
 
 pub(crate) trait LocalArrayLayout<T, const N: usize, const M: usize> {
@@ -18,15 +19,15 @@ pub(crate) trait LocalArrayLayout<T, const N: usize, const M: usize> {
 
     fn logical_shape(&self) -> Vec<usize> {
         let mut shape = Vec::with_capacity(self.extra_shape().dimensions().len() + N);
-        shape.extend_from_slice(self.extra_shape().dimensions());
         shape.extend_from_slice(&self.local_spatial_shape());
+        shape.extend_from_slice(self.extra_shape().dimensions());
         shape
     }
 
     fn memory_shape(&self) -> Vec<usize> {
         let mut shape = Vec::with_capacity(self.extra_shape().dimensions().len() + N);
-        shape.extend_from_slice(self.extra_shape().dimensions());
         shape.extend_from_slice(&self.local_spatial_memory_shape());
+        shape.extend_from_slice(self.extra_shape().dimensions());
         shape
     }
 
@@ -43,45 +44,14 @@ pub(crate) trait LocalArrayLayout<T, const N: usize, const M: usize> {
             });
         }
 
-        let mut offset = 0usize;
-        for (axis, (&extent, &index)) in self
-            .extra_shape()
-            .dimensions()
-            .iter()
-            .zip(extra_indices)
-            .enumerate()
-        {
-            if index >= extent {
-                return Err(GeometryError::LocalIndexOutOfBounds {
-                    axis,
-                    index,
-                    extent,
-                }
-                .into());
-            }
-            offset = offset
-                .checked_mul(extent)
-                .and_then(|base| base.checked_add(index))
-                .ok_or(GeometryError::SizeOverflow)?;
-        }
+        let extra_offset = column_major_offset(self.extra_shape().dimensions(), extra_indices)?;
         let memory_shape = self.pencil().local_shape_memory();
-        for (memory_position, axis) in self.pencil().permutation().axes().iter().enumerate() {
-            let extent = memory_shape[memory_position];
-            let index = spatial_indices[axis.index()];
-            if index >= extent {
-                return Err(GeometryError::LocalIndexOutOfBounds {
-                    axis: extra_rank + memory_position,
-                    index,
-                    extent,
-                }
-                .into());
-            }
-            offset = offset
-                .checked_mul(extent)
-                .and_then(|base| base.checked_add(index))
-                .ok_or(GeometryError::SizeOverflow)?;
-        }
-        Ok(offset)
+        let memory_indices = self.pencil().permutation().permute(spatial_indices);
+        let spatial_offset = column_major_offset(&memory_shape, &memory_indices)?;
+        extra_offset
+            .checked_mul(self.pencil().local_len())
+            .and_then(|base| base.checked_add(spatial_offset))
+            .ok_or_else(|| GeometryError::SizeOverflow.into())
     }
 
     fn global_offset(
@@ -119,9 +89,9 @@ pub struct PencilArrayView<'a, T, const N: usize, const M: usize> {
 impl<'a, T, const N: usize, const M: usize> PencilArrayView<'a, T, N, M> {
     /// Borrows external contiguous storage without copying or allocating.
     ///
-    /// Storage must be in row-major physical order: `[extra..., permuted
-    /// spatial...]`, with the last axis varying fastest. Extra axes follow
-    /// `extra_shape.dimensions()`; spatial axes follow `pencil.permutation()`.
+    /// Storage must be compact column-major physical order: `[permuted
+    /// spatial..., extra...]`, with the first axis varying fastest. Spatial axes
+    /// follow `pencil.permutation()`; extra axes follow `extra_shape.dimensions()`.
     /// The slice must contain the full local buffer, exactly
     /// `extra_shape.element_count() * pencil.local_len()` elements, not an
     /// arbitrary subset. A wrong length returns `ArrayError::StorageLengthMismatch`;
@@ -170,12 +140,12 @@ impl<'a, T, const N: usize, const M: usize> PencilArrayView<'a, T, N, M> {
         LocalArrayLayout::local_spatial_memory_shape(self)
     }
 
-    /// Returns `[extra..., spatial...]` in logical-axis order.
+    /// Returns `[spatial..., extra...]` in logical-axis order.
     pub fn logical_shape(&self) -> Vec<usize> {
         LocalArrayLayout::logical_shape(self)
     }
 
-    /// Returns `[extra..., permuted spatial...]` in row-major memory order.
+    /// Returns `[permuted spatial..., extra...]` in column-major memory order.
     pub fn memory_shape(&self) -> Vec<usize> {
         LocalArrayLayout::memory_shape(self)
     }
@@ -190,7 +160,7 @@ impl<'a, T, const N: usize, const M: usize> PencilArrayView<'a, T, N, M> {
         self.storage.is_empty()
     }
 
-    /// Returns the borrowed row-major buffer.
+    /// Returns the borrowed column-major buffer.
     pub fn as_slice(&self) -> &[T] {
         LocalArrayLayout::as_slice(self)
     }
@@ -249,9 +219,9 @@ pub struct PencilArrayViewMut<'a, T, const N: usize, const M: usize> {
 impl<'a, T, const N: usize, const M: usize> PencilArrayViewMut<'a, T, N, M> {
     /// Exclusively borrows external contiguous storage without copying or allocating.
     ///
-    /// Storage must be in row-major physical order: `[extra..., permuted
-    /// spatial...]`, with the last axis varying fastest. Extra axes follow
-    /// `extra_shape.dimensions()`; spatial axes follow `pencil.permutation()`.
+    /// Storage must be compact column-major physical order: `[permuted
+    /// spatial..., extra...]`, with the first axis varying fastest. Spatial axes
+    /// follow `pencil.permutation()`; extra axes follow `extra_shape.dimensions()`.
     /// The slice must contain the full local buffer, exactly
     /// `extra_shape.element_count() * pencil.local_len()` elements, not an
     /// arbitrary subset. A wrong length returns `ArrayError::StorageLengthMismatch`;
@@ -301,12 +271,12 @@ impl<'a, T, const N: usize, const M: usize> PencilArrayViewMut<'a, T, N, M> {
         LocalArrayLayout::local_spatial_memory_shape(self)
     }
 
-    /// Returns `[extra..., spatial...]` in logical-axis order.
+    /// Returns `[spatial..., extra...]` in logical-axis order.
     pub fn logical_shape(&self) -> Vec<usize> {
         LocalArrayLayout::logical_shape(self)
     }
 
-    /// Returns `[extra..., permuted spatial...]` in row-major memory order.
+    /// Returns `[permuted spatial..., extra...]` in column-major memory order.
     pub fn memory_shape(&self) -> Vec<usize> {
         LocalArrayLayout::memory_shape(self)
     }
@@ -321,7 +291,7 @@ impl<'a, T, const N: usize, const M: usize> PencilArrayViewMut<'a, T, N, M> {
         self.storage.is_empty()
     }
 
-    /// Returns a shared borrow of the row-major buffer.
+    /// Returns a shared borrow of the column-major buffer.
     pub fn as_slice(&self) -> &[T] {
         LocalArrayLayout::as_slice(self)
     }
@@ -335,7 +305,7 @@ impl<'a, T, const N: usize, const M: usize> PencilArrayViewMut<'a, T, N, M> {
         }
     }
 
-    /// Returns an exclusive borrow of the row-major buffer.
+    /// Returns an exclusive borrow of the column-major buffer.
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         self.storage
     }

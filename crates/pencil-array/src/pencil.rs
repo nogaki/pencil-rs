@@ -14,7 +14,7 @@ pub struct PencilConfig<const N: usize, const M: usize> {
     pub global_shape: [usize; N],
     /// The distributed spatial axes in topology-axis order.
     pub decomposition: [usize; M],
-    /// The spatial axes in row-major memory order.
+    /// The logical spatial axes in physical memory order, fastest first.
     pub permutation: AxisPermutation<N>,
 }
 
@@ -28,7 +28,7 @@ impl<const N: usize, const M: usize> From<&Pencil<N, M>> for PencilConfig<N, M> 
     }
 }
 
-/// An immutable MPI distribution and row-major memory layout for an N-dimensional array.
+/// An immutable MPI distribution and column-major memory layout for an N-dimensional array.
 #[derive(Debug)]
 pub struct Pencil<const N: usize, const M: usize> {
     topology: Arc<MpiTopology<M>>,
@@ -57,12 +57,17 @@ impl<const N: usize, const M: usize> Pencil<N, M> {
         )
     }
 
-    /// Creates an unpermuted row-major pencil decomposed over the leading M axes.
+    /// Creates an unpermuted pencil decomposed over the trailing M spatial axes.
     pub fn new_default(
         topology: Arc<MpiTopology<M>>,
         global_shape: [usize; N],
     ) -> Result<Arc<Self>, PencilError> {
-        Self::new(topology, global_shape, std::array::from_fn(|axis| axis))
+        let first_decomposed_axis = N.saturating_sub(M);
+        Self::new(
+            topology,
+            global_shape,
+            std::array::from_fn(|axis| first_decomposed_axis + axis),
+        )
     }
 
     /// Creates a pencil with explicit distribution and memory-axis permutation.
