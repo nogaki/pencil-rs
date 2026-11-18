@@ -6,7 +6,7 @@ resolver = "3"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
-repository = "https://github.com/nogaki/pencil-rs"
+repository = "https://github.com/tensor4all/pencil-rs"
 
 [workspace.dependencies]
 mpi = { version = "=0.8.2", default-features = false }
