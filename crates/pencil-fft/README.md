@@ -21,6 +21,11 @@ negative-sign R2C, and inverse is normalized R2C. It supports selected axes,
 batches, both transports and FFTW, but currently only out-of-place execution
 (no timing, collections or overlap variants).
 
+**Column-major migration status:** `pencil-array` migration and the distributed
+C2C selected-axis route are complete. Runtime migration and independent reference
+fixtures for other distributed FFT families, as well as `pencil-io`, remain
+follow-up work; the full FFT/I/O migration is not complete.
+
 FFTW-backed DCT/DST-I-IV and DHT use dedicated native real-to-real kernels,
 including componentwise complex transforms, rather than complex FFT embeddings.
 The portable RustFFT algorithms remain unchanged.

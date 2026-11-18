@@ -1423,6 +1423,10 @@ where
         }
         let core = TransformPlanCore {
             stages: stages.stages,
+            initial_transition: super::C2cStageTransition {
+                forward: C2cTransition::Identity,
+                backward: C2cTransition::Identity,
+            },
             transitions: transitions.into_boxed_slice(),
             extra_shape,
             selection,

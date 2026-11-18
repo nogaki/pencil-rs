@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use mpi::traits::{Communicator, CommunicatorCollectives};
-use pencil_array::{ExtraShape, MpiTopology, PencilArray};
+use pencil_array::{ArrayError, ExtraShape, MpiTopology, PencilArray};
 use pencil_fft::{
     AxisR2rKind, AxisTransform, C2cPlan, CollectionError, Complex, DhtPlan, DistributedLayout,
-    FourierDirection, FourierDirections, MixedC2cPlan, MixedR2cPlan, R2cPlan, R2rKind, R2rPlan,
-    TransposeMethod,
+    FftError, FourierDirection, FourierDirections, MixedC2cPlan, MixedR2cPlan, R2cPlan, R2rKind,
+    R2rPlan, TransposeMethod,
 };
 
 pub(super) fn indexed<E: std::fmt::Debug>(result: Result<(), CollectionError<E>>, expected: usize) {
@@ -214,7 +214,7 @@ fn c2c_oop_ip(topology: &Arc<MpiTopology<1>>) {
     }
 }
 
-fn cross_headers(topology: &Arc<MpiTopology<1>>) {
+fn cross_family_headers(topology: &Arc<MpiTopology<1>>) {
     let comm = topology.communicator();
     if comm.size() == 1 {
         return;
@@ -222,29 +222,151 @@ fn cross_headers(topology: &Arc<MpiTopology<1>>) {
     let rank = comm.rank();
     let c = c2c(topology, SHAPE);
     let r = r2c(topology, SHAPE);
-    let cs = vec![c.allocate_input().unwrap()];
+    let mut cs = vec![c.allocate_input().unwrap()];
+    fill_c(&mut cs[0], 2.0);
+    let c_before = cs[0].as_slice().to_vec();
     let mut cd = vec![c.allocate_output().unwrap()];
     let mut cw = c.allocate_out_of_place_workspace().unwrap();
-    let rs = vec![r.allocate_input().unwrap()];
+    let mut rs = vec![r.allocate_input().unwrap()];
+    fill_r(&mut rs[0], 3.0);
+    let r_before = rs[0].as_slice().to_vec();
     let mut rd = vec![r.allocate_output().unwrap()];
     let mut rw = r.allocate_workspace().unwrap();
-    if rank == 0 {
-        assert!(c.forward_many(&cs, &mut cd, &mut cw).is_err());
-    } else {
-        assert!(r.forward_many(&rs, &mut rd, &mut rw).is_err());
-    }
 
-    let f32_plan = c2c32(topology);
-    let f32s = vec![f32_plan.allocate_input().unwrap()];
-    let mut f32d = vec![f32_plan.allocate_output().unwrap()];
-    let mut f32w = f32_plan.allocate_out_of_place_workspace().unwrap();
-    let f64s = vec![c.allocate_input().unwrap()];
-    let mut f64d = vec![c.allocate_output().unwrap()];
+    // Valid controls prove both family-specific layouts before mixing headers.
+    c.forward_many(&cs, &mut cd, &mut cw).unwrap();
+    r.forward_many(&rs, &mut rd, &mut rw).unwrap();
+    assert_eq!(cs[0].as_slice(), c_before);
+    assert_eq!(rs[0].as_slice(), r_before);
+    cd[0].as_mut_slice().fill(Complex::new(23.0, -11.0));
+    rd[0].as_mut_slice().fill(Complex::new(17.0, 5.0));
+    let c_output_before = cd[0].as_slice().to_vec();
+    let r_output_before = rd[0].as_slice().to_vec();
+    let c_workspace_before = format!("{cw:?}");
+    let r_workspace_before = format!("{rw:?}");
     if rank == 0 {
-        assert!(f32_plan.forward_many(&f32s, &mut f32d, &mut f32w).is_err());
+        assert!(matches!(
+            c.forward_many(&cs, &mut cd, &mut cw),
+            Err(CollectionError::HeaderMismatch)
+        ));
     } else {
-        assert!(c.forward_many(&f64s, &mut f64d, &mut cw).is_err());
+        assert!(matches!(
+            r.forward_many(&rs, &mut rd, &mut rw),
+            Err(CollectionError::HeaderMismatch)
+        ));
     }
+    assert_eq!(cs[0].as_slice(), c_before);
+    assert_eq!(rs[0].as_slice(), r_before);
+    assert_eq!(cd[0].as_slice(), c_output_before);
+    assert_eq!(rd[0].as_slice(), r_output_before);
+    assert_eq!(format!("{cw:?}"), c_workspace_before);
+    assert_eq!(format!("{rw:?}"), r_workspace_before);
+}
+
+fn empty_c2c_collection(topology: &Arc<MpiTopology<1>>) {
+    let plan = c2c(topology, SHAPE);
+    let mut control_source = vec![plan.allocate_input().unwrap()];
+    fill_c(&mut control_source[0], 4.0);
+    let control_before = control_source[0].as_slice().to_vec();
+    let mut control_destination = vec![plan.allocate_output().unwrap()];
+    let mut control_workspace = plan.allocate_out_of_place_workspace().unwrap();
+    plan.forward_many(
+        &control_source,
+        &mut control_destination,
+        &mut control_workspace,
+    )
+    .unwrap();
+    assert_eq!(control_source[0].as_slice(), control_before);
+
+    let empty_source: Vec<PencilArray<Complex<f64>, 2, 1>> = Vec::new();
+    let mut empty_destination: Vec<PencilArray<Complex<f64>, 2, 1>> = Vec::new();
+    let mut workspace = plan.allocate_out_of_place_workspace().unwrap();
+    let workspace_before = format!("{workspace:?}");
+    assert!(matches!(
+        plan.forward_many(&empty_source, &mut empty_destination, &mut workspace),
+        Err(CollectionError::Empty)
+    ));
+    assert!(empty_source.is_empty());
+    assert!(empty_destination.is_empty());
+    assert_eq!(format!("{workspace:?}"), workspace_before);
+
+    let mut empty_arrays = Vec::new();
+    let mut in_place_workspace = plan.allocate_in_place_workspace().unwrap();
+    let in_place_workspace_before = format!("{in_place_workspace:?}");
+    assert!(matches!(
+        plan.forward_many_in_place(&mut empty_arrays, &mut in_place_workspace),
+        Err(CollectionError::Empty)
+    ));
+    assert!(empty_arrays.is_empty());
+    assert_eq!(format!("{in_place_workspace:?}"), in_place_workspace_before);
+    println!(
+        "\nC2C_PREFLIGHT_CASE=empty_collection rank={} size={}",
+        topology.communicator().rank(),
+        topology.communicator().size()
+    );
+}
+
+fn precision_header_mismatch(topology: &Arc<MpiTopology<1>>) {
+    let comm = topology.communicator();
+    if comm.size() == 1 {
+        return;
+    }
+    let rank = comm.rank();
+    let f32_plan = c2c32(topology);
+    let f64_plan = c2c(topology, SHAPE);
+    let mut f32_source = vec![f32_plan.allocate_input().unwrap()];
+    f32_source[0]
+        .as_mut_slice()
+        .fill(Complex::new(2.0_f32, -3.0_f32));
+    let f32_source_before = f32_source[0].as_slice().to_vec();
+    let mut f32_destination = vec![f32_plan.allocate_output().unwrap()];
+    let mut f32_workspace = f32_plan.allocate_out_of_place_workspace().unwrap();
+    let mut f64_source = vec![f64_plan.allocate_input().unwrap()];
+    fill_c(&mut f64_source[0], 5.0);
+    let f64_source_before = f64_source[0].as_slice().to_vec();
+    let mut f64_destination = vec![f64_plan.allocate_output().unwrap()];
+    let mut f64_workspace = f64_plan.allocate_out_of_place_workspace().unwrap();
+
+    // Each precision succeeds with valid canonical input before its headers diverge.
+    f32_plan
+        .forward_many(&f32_source, &mut f32_destination, &mut f32_workspace)
+        .unwrap();
+    f64_plan
+        .forward_many(&f64_source, &mut f64_destination, &mut f64_workspace)
+        .unwrap();
+    assert_eq!(f32_source[0].as_slice(), f32_source_before);
+    assert_eq!(f64_source[0].as_slice(), f64_source_before);
+
+    f32_destination[0]
+        .as_mut_slice()
+        .fill(Complex::new(19.0_f32, -7.0_f32));
+    f64_destination[0]
+        .as_mut_slice()
+        .fill(Complex::new(29.0, -13.0));
+    let f32_destination_before = f32_destination[0].as_slice().to_vec();
+    let f64_destination_before = f64_destination[0].as_slice().to_vec();
+    let f32_workspace_before = format!("{f32_workspace:?}");
+    let f64_workspace_before = format!("{f64_workspace:?}");
+    let result = if rank == 0 {
+        f32_plan.forward_many(&f32_source, &mut f32_destination, &mut f32_workspace)
+    } else {
+        f64_plan.forward_many(&f64_source, &mut f64_destination, &mut f64_workspace)
+    };
+    assert!(
+        matches!(result, Err(CollectionError::HeaderMismatch)),
+        "expected f32/f64 C2C header mismatch on rank {rank}"
+    );
+    assert_eq!(f32_source[0].as_slice(), f32_source_before);
+    assert_eq!(f64_source[0].as_slice(), f64_source_before);
+    assert_eq!(f32_destination[0].as_slice(), f32_destination_before);
+    assert_eq!(f64_destination[0].as_slice(), f64_destination_before);
+    assert_eq!(format!("{f32_workspace:?}"), f32_workspace_before);
+    assert_eq!(format!("{f64_workspace:?}"), f64_workspace_before);
+    println!(
+        "C2C_PREFLIGHT_CASE=precision_header_mismatch rank={} size={}",
+        rank,
+        comm.size()
+    );
 }
 
 fn r2c_oop_ip(topology: &Arc<MpiTopology<1>>) {
@@ -792,20 +914,244 @@ fn peer_preflight_families(topology: &Arc<MpiTopology<1>>) {
     );
 }
 
-pub fn run(topology: &Arc<MpiTopology<1>>) {
+fn run_c2c_preflight(topology: &Arc<MpiTopology<1>>) {
     operation_mismatch(topology);
     descriptor_mismatch(topology);
-    peer_preflight_families(topology);
+    peer_preflight_c2c(topology);
     c2c_oop_ip(topology);
+    empty_c2c_collection(topology);
+    precision_header_mismatch(topology);
+}
+
+pub fn run(topology: &Arc<MpiTopology<1>>) {
+    run_c2c_preflight(topology);
+    peer_preflight_families(topology);
     r2c_oop_ip(topology);
-    let plan = c2c(topology, SHAPE);
-    let empty_s = Vec::new();
-    let mut empty_d = Vec::new();
-    let mut empty_w = plan.allocate_out_of_place_workspace().unwrap();
-    assert!(
-        plan.forward_many(&empty_s, &mut empty_d, &mut empty_w)
-            .is_err()
-    );
-    cross_headers(topology);
+    cross_family_headers(topology);
     topology.communicator().barrier();
+}
+
+pub fn run_c2c(topology: &Arc<MpiTopology<1>>) {
+    run_c2c_preflight(topology);
+    topology.communicator().barrier();
+}
+
+fn expect_rank_preflight(
+    result: Result<(), CollectionError<FftError>>,
+    expected_index: usize,
+    rank: i32,
+    expected_error: impl FnOnce(&FftError) -> bool,
+) {
+    match (result.unwrap_err(), rank == 0) {
+        (CollectionError::Member { index, error }, true) => {
+            assert_eq!(index, expected_index);
+            assert!(
+                expected_error(&error),
+                "unexpected rank-0 C2C error: {error:?}"
+            );
+        }
+        (CollectionError::PeerPreflight { index }, false) => assert_eq!(index, expected_index),
+        (error, origin) => {
+            panic!("unexpected C2C preflight result on rank {rank} (origin={origin}): {error:?}")
+        }
+    }
+}
+
+fn peer_preflight_c2c(topology: &Arc<MpiTopology<1>>) {
+    let comm = topology.communicator();
+    if comm.size() == 1 {
+        return;
+    }
+    let rank = comm.rank();
+    let good = c2c(topology, SHAPE);
+    let foreign = c2c(topology, [3, 4]);
+
+    let mut source = vec![
+        good.allocate_input().unwrap(),
+        good.allocate_input().unwrap(),
+    ];
+    for (index, array) in source.iter_mut().enumerate() {
+        fill_c(array, index as f64 + 2.0);
+    }
+    let source_before = source
+        .iter()
+        .map(|array| array.as_slice().to_vec())
+        .collect::<Vec<_>>();
+    let mut destination = vec![
+        good.allocate_output().unwrap(),
+        good.allocate_output().unwrap(),
+    ];
+    for array in &mut destination {
+        array.as_mut_slice().fill(Complex::new(31.0, -7.0));
+    }
+    let old = if rank == 0 {
+        Some(std::mem::replace(
+            &mut destination[1],
+            foreign.allocate_output().unwrap(),
+        ))
+    } else {
+        None
+    };
+    let destination_before = destination
+        .iter()
+        .map(|array| array.as_slice().to_vec())
+        .collect::<Vec<_>>();
+    let mut workspace = good.allocate_out_of_place_workspace().unwrap();
+    let workspace_before = format!("{workspace:?}");
+    expect_rank_preflight(
+        good.forward_many(&source, &mut destination, &mut workspace),
+        1,
+        rank,
+        |error| matches!(error, FftError::OutputLayoutMismatch),
+    );
+    assert_eq!(
+        source
+            .iter()
+            .map(|array| array.as_slice().to_vec())
+            .collect::<Vec<_>>(),
+        source_before
+    );
+    assert_eq!(
+        destination
+            .iter()
+            .map(|array| array.as_slice().to_vec())
+            .collect::<Vec<_>>(),
+        destination_before
+    );
+    assert_eq!(format!("{workspace:?}"), workspace_before);
+    if let Some(old) = old {
+        destination[1] = old;
+    }
+
+    let mut good_destination = vec![
+        good.allocate_output().unwrap(),
+        good.allocate_output().unwrap(),
+    ];
+    good_destination[0]
+        .as_mut_slice()
+        .fill(Complex::new(23.0, -11.0));
+    let good_destination_before = good_destination
+        .iter()
+        .map(|array| array.as_slice().to_vec())
+        .collect::<Vec<_>>();
+    let mut bad_workspace = if rank == 0 {
+        foreign.allocate_out_of_place_workspace().unwrap()
+    } else {
+        good.allocate_out_of_place_workspace().unwrap()
+    };
+    let bad_workspace_before = format!("{bad_workspace:?}");
+    expect_rank_preflight(
+        good.forward_many(&source, &mut good_destination, &mut bad_workspace),
+        0,
+        rank,
+        |error| matches!(error, FftError::WorkspaceMismatch),
+    );
+    assert_eq!(
+        good_destination
+            .iter()
+            .map(|array| array.as_slice().to_vec())
+            .collect::<Vec<_>>(),
+        good_destination_before
+    );
+    assert_eq!(format!("{bad_workspace:?}"), bad_workspace_before);
+    good.forward_many(&source, &mut good_destination, &mut workspace)
+        .unwrap();
+
+    let mut arrays = vec![
+        good.allocate_in_place().unwrap(),
+        good.allocate_in_place().unwrap(),
+    ];
+    for (index, array) in arrays.iter_mut().enumerate() {
+        array
+            .view_mut()
+            .unwrap()
+            .as_mut_slice()
+            .fill(Complex::new(index as f64 + 5.0, -3.0));
+    }
+    let old = if rank == 0 {
+        Some(std::mem::replace(
+            &mut arrays[1],
+            foreign.allocate_in_place().unwrap(),
+        ))
+    } else {
+        None
+    };
+    if rank == 0 {
+        arrays[1]
+            .view_mut()
+            .unwrap()
+            .as_mut_slice()
+            .fill(Complex::new(6.0, -4.0));
+    }
+    let arrays_before = arrays
+        .iter()
+        .map(|array| array.view().unwrap().as_slice().to_vec())
+        .collect::<Vec<_>>();
+    let mut in_place_workspace = good.allocate_in_place_workspace().unwrap();
+    let in_place_workspace_before = format!("{in_place_workspace:?}");
+    expect_rank_preflight(
+        good.forward_many_in_place(&mut arrays, &mut in_place_workspace),
+        1,
+        rank,
+        |error| matches!(error, FftError::Array(ArrayError::IncompatiblePencils)),
+    );
+    assert_eq!(
+        arrays
+            .iter()
+            .map(|array| array.view().unwrap().as_slice().to_vec())
+            .collect::<Vec<_>>(),
+        arrays_before
+    );
+    assert!(
+        arrays
+            .iter()
+            .all(|array| array.state() == pencil_fft::C2cState::Input)
+    );
+    assert_eq!(format!("{in_place_workspace:?}"), in_place_workspace_before);
+    if let Some(old) = old {
+        arrays[1] = old;
+    }
+
+    let mut good_arrays = vec![
+        good.allocate_in_place().unwrap(),
+        good.allocate_in_place().unwrap(),
+    ];
+    for array in &mut good_arrays {
+        array
+            .view_mut()
+            .unwrap()
+            .as_mut_slice()
+            .fill(Complex::new(8.0, 1.0));
+    }
+    let good_arrays_before = good_arrays
+        .iter()
+        .map(|array| array.view().unwrap().as_slice().to_vec())
+        .collect::<Vec<_>>();
+    let mut bad_in_place_workspace = if rank == 0 {
+        foreign.allocate_in_place_workspace().unwrap()
+    } else {
+        good.allocate_in_place_workspace().unwrap()
+    };
+    let bad_in_place_workspace_before = format!("{bad_in_place_workspace:?}");
+    expect_rank_preflight(
+        good.forward_many_in_place(&mut good_arrays, &mut bad_in_place_workspace),
+        0,
+        rank,
+        |error| matches!(error, FftError::WorkspaceMismatch),
+    );
+    assert_eq!(
+        good_arrays
+            .iter()
+            .map(|array| array.view().unwrap().as_slice().to_vec())
+            .collect::<Vec<_>>(),
+        good_arrays_before
+    );
+    assert_eq!(
+        format!("{bad_in_place_workspace:?}"),
+        bad_in_place_workspace_before
+    );
+    good.forward_many_in_place(&mut good_arrays, &mut in_place_workspace)
+        .unwrap();
+    good.inverse_many_in_place(&mut good_arrays, &mut in_place_workspace)
+        .unwrap();
 }

@@ -297,7 +297,20 @@ fn strided_c2c_wrappers_and_r2c_registry_preserve_contracts() {
     // and the equivalent pencil below checks pointer-identity deduplication.
     #[allow(clippy::arc_with_non_send_sync)]
     let topology = Arc::new(MpiTopology::<1>::new(&world, [1]).unwrap());
-    let pencil = Pencil::<2, 1>::new(Arc::clone(&topology), [2, 3], [0]).unwrap();
+    let contiguous = Pencil::<2, 1>::new_default(Arc::clone(&topology), [2, 3]).unwrap();
+    let strided = contiguous
+        .with_permutation(AxisPermutation::new([1, 0]).unwrap())
+        .unwrap();
+    let axis0_memory_position = strided
+        .permutation()
+        .axes()
+        .iter()
+        .position(|axis| axis.index() == 0)
+        .unwrap();
+    let expected_axis0_stride: usize = strided.local_shape_memory()[..axis0_memory_position]
+        .iter()
+        .product();
+    assert_eq!(expected_axis0_stride, 3);
     let plan = LocalC2cPlan::<f64>::new(2).unwrap();
     let scratch_len = plan.scratch_len();
     let zero = Complex::new(0.0, 0.0);
@@ -309,7 +322,7 @@ fn strided_c2c_wrappers_and_r2c_registry_preserve_contracts() {
     for result in [
         execute_strided_complex_forward(
             &plan,
-            &pencil,
+            &strided,
             0,
             &source,
             &mut destination,
@@ -318,7 +331,7 @@ fn strided_c2c_wrappers_and_r2c_registry_preserve_contracts() {
         ),
         execute_strided_complex_forward_in_place(
             &plan,
-            &pencil,
+            &strided,
             0,
             &mut source.clone(),
             &mut scratch,
@@ -326,7 +339,7 @@ fn strided_c2c_wrappers_and_r2c_registry_preserve_contracts() {
         ),
         execute_strided_complex_reverse(
             &plan,
-            &pencil,
+            &strided,
             0,
             &source,
             &mut destination,
@@ -336,7 +349,7 @@ fn strided_c2c_wrappers_and_r2c_registry_preserve_contracts() {
         ),
         execute_strided_complex_reverse_in_place(
             &plan,
-            &pencil,
+            &strided,
             0,
             &mut source.clone(),
             &mut scratch,
@@ -358,7 +371,7 @@ fn strided_c2c_wrappers_and_r2c_registry_preserve_contracts() {
     assert!(matches!(
         execute_strided_complex_forward(
             &plan,
-            &pencil,
+            &strided,
             0,
             &source,
             &mut destination,
@@ -372,7 +385,7 @@ fn strided_c2c_wrappers_and_r2c_registry_preserve_contracts() {
     assert!(matches!(
         execute_strided_complex_forward(
             &plan,
-            &pencil,
+            &strided,
             0,
             &source,
             &mut short_destination,
@@ -384,7 +397,7 @@ fn strided_c2c_wrappers_and_r2c_registry_preserve_contracts() {
     assert!(matches!(
         execute_strided_complex_reverse(
             &plan,
-            &pencil,
+            &strided,
             0,
             &source,
             &mut short_destination,
@@ -395,9 +408,6 @@ fn strided_c2c_wrappers_and_r2c_registry_preserve_contracts() {
         Err(FftError::LocalC2c(LocalC2cError::BufferLengthMismatch))
     ));
 
-    let contiguous = pencil
-        .with_permutation(AxisPermutation::new([1, 0]).unwrap())
-        .unwrap();
     let source = [Complex::new(1.0, 0.5), Complex::new(-0.25, 0.75)];
     let mut destination = [zero; 2];
     let mut no_line = [];
@@ -451,12 +461,11 @@ fn strided_c2c_wrappers_and_r2c_registry_preserve_contracts() {
         .is_ok()
     );
 
-    let equivalent = Pencil::<2, 1>::new(Arc::clone(&topology), [2, 3], [0]).unwrap();
-    let alternate = pencil
-        .with_permutation(AxisPermutation::new([1, 0]).unwrap())
-        .unwrap();
-    let registered = registered_pencils([&pencil, &equivalent, &alternate].into_iter()).unwrap();
+    let equivalent = Pencil::<2, 1>::new_default(Arc::clone(&topology), [2, 3]).unwrap();
+    let alternate = strided;
+    let registered =
+        registered_pencils([&contiguous, &equivalent, &alternate].into_iter()).unwrap();
     assert_eq!(registered.len(), 2);
-    assert!(Arc::ptr_eq(&registered[0], &pencil));
+    assert!(Arc::ptr_eq(&registered[0], &contiguous));
     assert!(Arc::ptr_eq(&registered[1], &alternate));
 }

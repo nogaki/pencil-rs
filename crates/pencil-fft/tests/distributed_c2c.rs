@@ -129,16 +129,6 @@ fn distributed_c2c_one_mpi_binary() {
     assert_eq!(maximum, world.size() - 1);
     topology_1d.communicator().barrier();
 
-    run_case::<f64, 2, 1>(&topology_1d, [3, 4], ExtraShape::scalar(), 0.0, true);
-    run_case::<f64, 3, 1>(
-        &topology_1d,
-        [3, 2, 4],
-        ExtraShape::new([2, 3]).unwrap(),
-        1.0,
-        false,
-    );
-    run_case::<f64, 4, 1>(&topology_1d, [3, 2, 3, 4], ExtraShape::scalar(), 2.0, false);
-
     let grid_2d = match size {
         1 => [1, 1],
         4 => [2, 2],
@@ -146,26 +136,6 @@ fn distributed_c2c_one_mpi_binary() {
         _ => unreachable!(),
     };
     let topology_2d = MpiTopology::<2>::new(&world, grid_2d).unwrap();
-    run_case::<f64, 3, 2>(&topology_2d, [3, 1, 4], ExtraShape::scalar(), 3.0, false);
-    run_case::<f64, 4, 2>(
-        &topology_2d,
-        [3, 1, 3, 4],
-        ExtraShape::new([0]).unwrap(),
-        4.0,
-        false,
-    );
-
-    run_case::<f32, 2, 1>(&topology_1d, [3, 4], ExtraShape::scalar(), 5.0, false);
-    run_case::<f32, 3, 1>(&topology_1d, [3, 2, 4], ExtraShape::scalar(), 6.0, false);
-    run_case::<f32, 4, 1>(&topology_1d, [3, 2, 3, 4], ExtraShape::scalar(), 7.0, false);
-    run_case::<f32, 3, 2>(
-        &topology_2d,
-        [3, 1, 4],
-        ExtraShape::new([2, 3]).unwrap(),
-        8.0,
-        false,
-    );
-    run_case::<f32, 4, 2>(&topology_2d, [3, 1, 3, 4], ExtraShape::scalar(), 9.0, false);
 
     // A reversed rank-order communicator exercises the same route on a
     // different Cartesian context without changing the public API.
@@ -175,17 +145,11 @@ fn distributed_c2c_one_mpi_binary() {
     );
     let reversed = reversed.expect("all ranks join the reversed communicator");
     let reversed_topology = MpiTopology::<1>::new(&reversed, [size]).unwrap();
-    run_case::<f64, 3, 1>(
-        &reversed_topology,
-        [3, 2, 4],
-        ExtraShape::scalar(),
-        10.0,
-        false,
-    );
+    run_c2c_cases(&topology_1d, &topology_2d, &reversed_topology);
 
     run_r2c_cases(&topology_1d, &topology_2d);
     run_r2c_in_place_cases(&topology_1d, &topology_2d);
-    run_partial_subset_cases(&topology_1d, &topology_2d);
+    run_partial_r2c_cases(&topology_1d, &topology_2d);
     assert_r2c_method_parity::<f64, 3, 1>(
         &reversed_topology,
         [3, 2, 5],
@@ -195,6 +159,81 @@ fn distributed_c2c_one_mpi_binary() {
     negative_collective_cases(&world, &topology_1d, &topology_2d);
     negative_r2c_collective_cases(&world, &topology_1d, &topology_2d);
     negative_dht_collective_cases(&world, &topology_1d);
+}
+
+#[test]
+fn distributed_c2c_contract_one_mpi_binary() {
+    let universe = mpi::initialize().expect("MPI initialization failed");
+    let world = universe.world();
+    let size = usize::try_from(world.size()).unwrap();
+    assert!(matches!(size, 1 | 4 | 6), "run with 1, 4, or 6 ranks");
+
+    let topology_1d = MpiTopology::<1>::new(&world, [size]).unwrap();
+    let grid_2d = match size {
+        1 => [1, 1],
+        4 => [2, 2],
+        6 => [2, 3],
+        _ => unreachable!(),
+    };
+    let topology_2d = MpiTopology::<2>::new(&world, grid_2d).unwrap();
+    let reversed = world.split_by_color_with_key(
+        Color::with_value(0),
+        Key::try_from(world.size() - world.rank()).unwrap(),
+    );
+    let reversed = reversed.expect("all ranks join the reversed communicator");
+    let reversed_topology = MpiTopology::<1>::new(&reversed, [size]).unwrap();
+
+    run_c2c_cases(&topology_1d, &topology_2d, &reversed_topology);
+    negative_c2c_validation_cases(&world, &topology_1d, &topology_2d);
+    negative_c2c_selection_mask_cases(&world, &topology_1d);
+    negative_transport_cases(&world, &topology_1d, &topology_2d);
+    for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
+        negative_in_place_cases(&world, &topology_1d, &topology_2d, method);
+    }
+}
+
+fn run_c2c_cases(
+    topology_1d: &Arc<MpiTopology<1>>,
+    topology_2d: &Arc<MpiTopology<2>>,
+    reversed_topology: &Arc<MpiTopology<1>>,
+) {
+    run_case::<f64, 2, 1>(topology_1d, [3, 4], ExtraShape::scalar(), 0.0, true);
+    run_case::<f64, 3, 1>(
+        topology_1d,
+        [3, 2, 4],
+        ExtraShape::new([2, 3]).unwrap(),
+        1.0,
+        false,
+    );
+    run_case::<f64, 4, 1>(topology_1d, [3, 2, 3, 4], ExtraShape::scalar(), 2.0, false);
+    run_case::<f64, 3, 2>(topology_2d, [3, 1, 4], ExtraShape::scalar(), 3.0, false);
+    run_case::<f64, 4, 2>(
+        topology_2d,
+        [3, 1, 3, 4],
+        ExtraShape::new([0]).unwrap(),
+        4.0,
+        false,
+    );
+
+    run_case::<f32, 2, 1>(topology_1d, [3, 4], ExtraShape::scalar(), 5.0, false);
+    run_case::<f32, 3, 1>(topology_1d, [3, 2, 4], ExtraShape::scalar(), 6.0, false);
+    run_case::<f32, 4, 1>(topology_1d, [3, 2, 3, 4], ExtraShape::scalar(), 7.0, false);
+    run_case::<f32, 3, 2>(
+        topology_2d,
+        [3, 1, 4],
+        ExtraShape::new([2, 3]).unwrap(),
+        8.0,
+        false,
+    );
+    run_case::<f32, 4, 2>(topology_2d, [3, 1, 3, 4], ExtraShape::scalar(), 9.0, false);
+    run_case::<f64, 3, 1>(
+        reversed_topology,
+        [3, 2, 4],
+        ExtraShape::scalar(),
+        10.0,
+        false,
+    );
+    run_partial_c2c_cases(topology_2d);
 }
 
 fn run_case<R: TestReal, const N: usize, const M: usize>(
@@ -548,21 +587,24 @@ where
     snapshots
 }
 
-fn run_partial_subset_cases(topology_1d: &Arc<MpiTopology<1>>, topology_2d: &Arc<MpiTopology<2>>) {
+fn run_partial_c2c_cases(topology: &Arc<MpiTopology<2>>) {
     let shape = [2, 3, 2, 4];
-    let selections = [
+    for selection in [
         AxisSelection::from_indices([2, 0]).unwrap(),
         AxisSelection::empty(),
         AxisSelection::all(),
-    ];
-    for selection in selections {
+    ] {
         for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
-            run_partial_c2c_delta::<4, 2>(topology_2d, shape, selection, method);
+            run_partial_c2c_delta::<4, 2>(topology, shape, selection, method);
         }
     }
     for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
-        run_empty_c2c_in_place::<4, 2>(topology_2d, shape, method);
+        run_empty_c2c_in_place::<4, 2>(topology, shape, method);
     }
+}
+
+fn run_partial_r2c_cases(topology_1d: &Arc<MpiTopology<1>>, topology_2d: &Arc<MpiTopology<2>>) {
+    let shape = [2, 3, 2, 4];
     for selection in [
         AxisSelection::from_indices([0]).unwrap(),
         AxisSelection::from_indices([2, 0]).unwrap(),
@@ -3600,7 +3642,7 @@ fn negative_transport_layout<const N: usize, const M: usize>(
     world.barrier();
 }
 
-fn negative_collective_cases(
+fn negative_c2c_validation_cases(
     world: &mpi::topology::SimpleCommunicator,
     topology_1d: &Arc<MpiTopology<1>>,
     topology_2d: &Arc<MpiTopology<2>>,
@@ -3623,11 +3665,11 @@ fn negative_collective_cases(
     assert!(fully_distributed.is_err());
     world.barrier();
 
-    let canonical = Pencil::<2, 1>::new(Arc::clone(topology_1d), [3, 4], [0]).unwrap();
+    let canonical = Pencil::<2, 1>::new_default(Arc::clone(topology_1d), [3, 4]).unwrap();
     let noncanonical_permutation = canonical
         .with_permutation(AxisPermutation::new([1, 0]).unwrap())
         .unwrap();
-    let noncanonical_decomposition = canonical.with_decomposition([1]).unwrap();
+    let noncanonical_decomposition = canonical.with_decomposition([0]).unwrap();
     for noncanonical in [noncanonical_permutation, noncanonical_decomposition] {
         let input = if rank == 0 {
             Arc::clone(&noncanonical)
@@ -3684,9 +3726,9 @@ fn negative_collective_cases(
     // selected rank. The pointer identity is part of Pencil layout identity.
     let foreign_topology = MpiTopology::<1>::new(world, [world_size]).unwrap();
     let foreign_input_pencil =
-        Pencil::<2, 1>::new(Arc::clone(&foreign_topology), [3, 4], [0]).unwrap();
+        Pencil::<2, 1>::new_default(Arc::clone(&foreign_topology), [3, 4]).unwrap();
     let foreign_output_pencil = foreign_input_pencil
-        .with_decomposition([1])
+        .with_decomposition([0])
         .unwrap()
         .with_permutation(AxisPermutation::new([1, 0]).unwrap())
         .unwrap();
@@ -3791,7 +3833,7 @@ fn negative_collective_cases(
     reuse_backward(&valid_plan, &valid_output, &mut workspace);
     world.barrier();
 
-    let wrong_global_pencil = Pencil::<2, 1>::new(Arc::clone(topology_1d), [2, 6], [0]).unwrap();
+    let wrong_global_pencil = Pencil::<2, 1>::new_default(Arc::clone(topology_1d), [2, 6]).unwrap();
     let wrong_global_source = PencilArray::from_elem(
         wrong_global_pencil,
         ExtraShape::scalar(),
@@ -4243,7 +4285,107 @@ fn negative_collective_cases(
         reuse_forward(&plan_2d, &source_2d, &mut workspace_2d);
         world.barrier();
     }
+}
 
+fn negative_c2c_selection_mask_cases(
+    world: &mpi::topology::SimpleCommunicator,
+    topology: &Arc<MpiTopology<1>>,
+) {
+    if world.size() == 1 {
+        return;
+    }
+    let selection_a = AxisSelection::from_indices([0, 2]).unwrap();
+    let selection_b = AxisSelection::from_indices([1, 2]).unwrap();
+    for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
+        let constructor = if world.rank() == 0 {
+            C2cPlan::<f64, 3, 1>::from_shape_with_selection_and_method(
+                Arc::clone(topology),
+                [3, 2, 4],
+                ExtraShape::scalar(),
+                selection_a,
+                method,
+            )
+            .map(|_| ())
+        } else {
+            C2cPlan::<f64, 3, 1>::from_shape_with_selection_and_method(
+                Arc::clone(topology),
+                [3, 2, 4],
+                ExtraShape::scalar(),
+                selection_b,
+                method,
+            )
+            .map(|_| ())
+        };
+        assert!(matches!(
+            constructor,
+            Err(FftError::CollectiveDescriptorMismatch)
+        ));
+        world.barrier();
+
+        let plan_a = C2cPlan::<f64, 3, 1>::from_shape_with_selection_and_method(
+            Arc::clone(topology),
+            [3, 2, 4],
+            ExtraShape::scalar(),
+            selection_a,
+            method,
+        )
+        .unwrap();
+        let plan_b = C2cPlan::<f64, 3, 1>::from_shape_with_selection_and_method(
+            Arc::clone(topology),
+            [3, 2, 4],
+            ExtraShape::scalar(),
+            selection_b,
+            method,
+        )
+        .unwrap();
+        let mut source_a = plan_a.allocate_input().unwrap();
+        let mut source_b = plan_b.allocate_input().unwrap();
+        fill_input(&mut source_a, 101.0);
+        fill_input(&mut source_b, 101.0);
+        let mut output_a = plan_a.allocate_output().unwrap();
+        let mut output_b = plan_b.allocate_output().unwrap();
+        output_a.as_mut_slice().fill(Complex::new(17.0, -3.0));
+        output_b.as_mut_slice().fill(Complex::new(19.0, -5.0));
+        let mut workspace_a = plan_a.allocate_out_of_place_workspace().unwrap();
+        let mut workspace_b = plan_b.allocate_out_of_place_workspace().unwrap();
+        let before_source_a = complex_bits(source_a.as_slice());
+        let before_source_b = complex_bits(source_b.as_slice());
+        let before_output_a = complex_bits(output_a.as_slice());
+        let before_output_b = complex_bits(output_b.as_slice());
+        let before_workspace_a = format!("{workspace_a:?}");
+        let before_workspace_b = format!("{workspace_b:?}");
+        let result = if world.rank() == 0 {
+            plan_a.forward(&source_a, &mut output_a, &mut workspace_a)
+        } else {
+            plan_b.forward(&source_b, &mut output_b, &mut workspace_b)
+        };
+        assert!(matches!(
+            result,
+            Err(FftError::CollectiveDescriptorMismatch)
+        ));
+        assert_eq!(complex_bits(source_a.as_slice()), before_source_a);
+        assert_eq!(complex_bits(source_b.as_slice()), before_source_b);
+        assert_eq!(complex_bits(output_a.as_slice()), before_output_a);
+        assert_eq!(complex_bits(output_b.as_slice()), before_output_b);
+        assert_eq!(format!("{workspace_a:?}"), before_workspace_a);
+        assert_eq!(format!("{workspace_b:?}"), before_workspace_b);
+
+        plan_a
+            .forward(&source_a, &mut output_a, &mut workspace_a)
+            .unwrap();
+        plan_b
+            .forward(&source_b, &mut output_b, &mut workspace_b)
+            .unwrap();
+        world.barrier();
+    }
+}
+
+fn negative_collective_cases(
+    world: &mpi::topology::SimpleCommunicator,
+    topology_1d: &Arc<MpiTopology<1>>,
+    topology_2d: &Arc<MpiTopology<2>>,
+) {
+    negative_c2c_validation_cases(world, topology_1d, topology_2d);
     negative_selection_mask_cases(world, topology_1d);
     negative_transport_cases(world, topology_1d, topology_2d);
     for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {

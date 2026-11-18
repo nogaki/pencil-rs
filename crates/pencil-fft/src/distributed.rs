@@ -7,14 +7,17 @@
 //! local allocation failure before entering the next collective call. The
 //! legacy constructors select Alltoallv; the `_with_method` constructors can
 //! select the checked point-to-point transport as well. The out-of-place
-//! forward transform consumes the canonical input layout and produces the
-//! reversed output layout by default; [`DistributedLayout::permute_dims`] can
-//! keep every stage in identity memory order and use strided line kernels.
-//! [`C2cPlan::inverse`] and [`C2cPlan::backward`] consume the selected output
-//! layout in reverse, with `inverse` normalized and `backward` left unnormalized. `AxisSelection` chooses which local stages perform FFTs,
-//! but the canonical route still visits every axis in descending order so an
-//! unselected stage is an identity rather than a skipped transition. In-place
-//! execution uses the same route and state-checks its single buffer.
+//! forward transform consumes identity memory order with trailing-axis
+//! decomposition and produces the endpoint of the selected-axis route.
+//! Selected axes run in ascending logical order; when a selected axis is
+//! distributed, its grid slot moves to the preceding local transform axis (or
+//! the smallest local axis initially). By default the selected axis becomes
+//! the first physical memory axis; [`DistributedLayout::permute_dims`] can
+//! retain identity memory order and use column-major prefix-stride line kernels.
+//! Inverse and backward traverse only selected stages in reverse, with inverse
+//! normalized and backward left unnormalized. Unselected axes have no stage or
+//! transition; an empty selection is a validated no-op. In-place execution
+//! uses the same route and state-checks its single buffer.
 //!
 //! The fixed C2C descriptor includes the selected transport before native FFT,
 //! output, workspace, or in-place state changes. Descriptor and initial
@@ -287,30 +290,108 @@ const VALUE_KIND_C2C: u64 = 1;
 const VALUE_KIND_R2C: u64 = 2;
 const HEADER_WORDS: usize = 5;
 
-/// Timing for one fixed route stage.
+/// Timing aggregated into one fixed route-stage slot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StageTiming {
     /// Time spent in the local transform.
     pub fft: Duration,
-    /// Time spent in the following route transition.
+    /// Sum of wall-clock times for route transitions assigned to this slot.
+    /// The initial transition, when present, is assigned to slot 0.
     pub transpose: Duration,
     /// Number of local FFT phases included in `fft`.
     pub fft_calls: u64,
-    /// Number of route transitions included in `transpose`.
+    /// Number of route transitions included in this slot.
     pub transition_calls: u64,
-    /// Pack, unpack, and transport waits for this stage's transition.
+    /// Communication phases summed across this slot's route transitions.
     /// Unused phases (including phases of local-only transitions) are zero.
     pub communication: pencil_array::TransposeTiming,
-    /// Sum of this stage's measured work (`fft + transpose`).
+    /// Sum of this slot's measured work (`fft + transpose`).
     pub total: Duration,
 }
 
-/// Fixed-size timing returned by profiled distributed transforms.
+/// Timing entries for a distributed transform.
+///
+/// The active prefix is exposed through indexing, iteration, and `len`; the
+/// fixed-size `map` method retains array-style access to all `N` slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageTimings<const N: usize> {
+    entries: [StageTiming; N],
+    len: usize,
+}
+
+impl<const N: usize> StageTimings<N> {
+    /// Returns the number of executed route stages.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns whether no route stages were executed.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Maps all `N` storage slots, matching fixed-array `map` behavior.
+    pub fn map<T>(self, f: impl FnMut(StageTiming) -> T) -> [T; N] {
+        self.entries.map(f)
+    }
+
+    pub(crate) fn set_active_len(&mut self, len: usize) {
+        assert!(len <= N, "active timing stage count exceeds capacity");
+        self.len = len;
+    }
+}
+
+impl<const N: usize> Default for StageTimings<N> {
+    fn default() -> Self {
+        Self {
+            entries: [StageTiming::default(); N],
+            len: N,
+        }
+    }
+}
+
+impl<const N: usize> std::ops::Deref for StageTimings<N> {
+    type Target = [StageTiming];
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries[..self.len]
+    }
+}
+
+impl<const N: usize> std::ops::DerefMut for StageTimings<N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries[..self.len]
+    }
+}
+
+impl<const N: usize> IntoIterator for StageTimings<N> {
+    type Item = StageTiming;
+    type IntoIter = std::iter::Take<std::array::IntoIter<StageTiming, N>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter().take(self.len)
+    }
+}
+
+impl<'a, const N: usize> IntoIterator for &'a StageTimings<N> {
+    type Item = &'a StageTiming;
+    type IntoIter = std::slice::Iter<'a, StageTiming>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Timing returned by profiled distributed transforms.
+///
+/// For C2C, entries follow selected-axis order. A transition between route
+/// stages `i` and `i + 1` is assigned to slot `i`; the initial transition is
+/// also assigned to slot 0. Consequently a partial route can accumulate more
+/// than one transition in a slot, in both forward and inverse execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransformTiming<const N: usize> {
-    /// One entry for each logical stage index (`0..N`), in route order;
-    /// identity stages are included.
-    pub stages: [StageTiming; N],
+    /// One entry for each executed route stage, in route order.
+    pub stages: StageTimings<N>,
     /// Wall-clock duration of the complete call.
     pub total: Duration,
 }
@@ -318,7 +399,7 @@ pub struct TransformTiming<const N: usize> {
 impl<const N: usize> Default for TransformTiming<N> {
     fn default() -> Self {
         Self {
-            stages: [StageTiming::default(); N],
+            stages: StageTimings::default(),
             total: Duration::ZERO,
         }
     }
@@ -342,8 +423,8 @@ pub enum FftError {
     #[error("distributed FFT requires N >= 2 and 1 <= M < N")]
     InvalidDimensions,
 
-    /// The input pencil was not the canonical identity layout.
-    #[error("input pencil must use identity permutation and decomposition [0..M)")]
+    /// The input pencil was not the default identity/trailing-decomposition layout.
+    #[error("input pencil must use identity permutation and trailing decomposition [N-M..N)")]
     InvalidInputLayout,
 
     /// The supplied source array does not match the plan's input layout.
@@ -517,8 +598,8 @@ impl TransposeMethod {
 pub struct DistributedLayout {
     /// The checked MPI transport used for distributed transitions.
     pub transpose_method: TransposeMethod,
-    /// Whether each canonical route stage moves its transform axis to the
-    /// last memory dimension. `false` keeps every stage in identity memory
+    /// Whether each C2C route stage moves its transform axis to the
+    /// first memory dimension. `false` keeps every stage in identity memory
     /// order and uses strided local line kernels where required.
     pub permute_dims: bool,
 }
@@ -582,8 +663,8 @@ impl Default for DistributedLayout {
 /// A validated set of spatial axes to transform.
 ///
 /// The selection stores a private boolean mask. Indices supplied to
-/// [`Self::from_indices`] are only validation input; execution always uses the
-/// canonical descending route, not caller order.
+/// [`Self::from_indices`] are only validation input; C2C execution visits
+/// selected logical axes in ascending order, not caller order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AxisSelection<const N: usize> {
     mask: [bool; N],
@@ -690,14 +771,17 @@ impl<const N: usize> AxisSelection<N> {
 /// global recovery, and an unfinished request scope may abort. In-place
 /// array/workspace allocation and views are noncollective; callers must
 /// coordinate an allocation failure before the next collective call. The
-/// input must use the identity permutation and decomposition `[0, ..., M)`;
-/// this feature supports `N >= 2` and `1 <= M < N`. A validated
+/// input must use identity memory permutation and default trailing decomposition
+/// `[N-M, ..., N)`; this feature supports `N >= 2` and `1 <= M < N`. A validated
 /// [`AxisSelection`] controls which axes are transformed. The route always
-/// contains all `N` stages (`N - 1` transitions), from axis `N - 1` down to
-/// `0`; unselected stages are identities with no native FFT or scaling. The
-/// derived output uses decomposition `[1, ..., M]`; its spatial memory order
-/// is reversed when `layout.permute_dims` is true and identity otherwise,
-/// including for an empty selection. The [`Self::forward`],
+/// contains one stage per selected axis, in ascending logical-axis order;
+/// unselected axes have no transform stage or route transition. The default
+/// input uses identity memory order and trailing-axis decomposition. A
+/// selected distributed axis is localized by transferring its grid slot to
+/// the preceding local transform axis (or the smallest local axis initially).
+/// With `layout.permute_dims`, each selected axis becomes the first physical
+/// memory axis; otherwise all stages retain identity memory order. An empty
+/// selection is a validated no-op with unchanged endpoint layout. The [`Self::forward`],
 /// [`Self::inverse`], and [`Self::backward`] methods are
 /// out of place and input preserving; their source is respectively the
 /// canonical input and the selected output layout. `inverse` is normalized,
@@ -973,6 +1057,7 @@ struct C2cStageTransition<const N: usize, const M: usize> {
 #[derive(Debug)]
 struct TransformPlanCore<R: FftReal, const N: usize, const M: usize> {
     stages: Box<[TransformStage<R, N, M>]>,
+    initial_transition: C2cStageTransition<N, M>,
     transitions: Box<[C2cStageTransition<N, M>]>,
     extra_shape: ExtraShape,
     selection: AxisSelection<N>,
@@ -997,6 +1082,19 @@ struct TransformPlanCore<R: FftReal, const N: usize, const M: usize> {
 #[derive(Debug)]
 struct RouteCandidate<const N: usize, const M: usize> {
     stages: Box<[Arc<Pencil<N, M>>]>,
+    distributed: Box<[bool]>,
+}
+
+#[derive(Debug)]
+struct C2cRouteStage<const N: usize, const M: usize> {
+    axis: usize,
+    source: Arc<Pencil<N, M>>,
+    output: Arc<Pencil<N, M>>,
+}
+
+#[derive(Debug)]
+struct C2cRouteCandidate<const N: usize, const M: usize> {
+    stages: Box<[C2cRouteStage<N, M>]>,
     distributed: Box<[bool]>,
 }
 
@@ -1263,12 +1361,8 @@ where
         selection: AxisSelection<N>,
         layout: DistributedLayout,
     ) -> Result<Self, FftError> {
-        let input = Pencil::new(
-            Arc::clone(&topology),
-            global_shape,
-            std::array::from_fn(|axis| axis),
-        )
-        .map_err(FftError::Pencil);
+        let input =
+            Pencil::new_default(Arc::clone(&topology), global_shape).map_err(FftError::Pencil);
         Self::construct(
             topology,
             global_shape,
@@ -1324,7 +1418,7 @@ where
             .core
             .stages
             .last()
-            .expect("distributed C2C has at least two stages")
+            .expect("distributed C2C has an internal endpoint stage")
             .output
     }
 
@@ -1340,6 +1434,9 @@ where
 
     /// Returns the immutable checked geometry used by every route stage.
     pub fn stage_geometry(&self) -> Box<[StageGeometry<N, M>]> {
+        if self.core.selection.is_empty() {
+            return Box::new([]);
+        }
         self.core
             .stages
             .iter()
@@ -1377,7 +1474,10 @@ where
     /// must coordinate that failure before the next collective call.
     pub fn allocate_in_place(&self) -> Result<C2cInPlaceArray<R, N, M>, FftError> {
         let array = ManyPencilArray::from_elem(
-            registered_pencils(self.core.stages.iter().map(|stage| &stage.output))?,
+            registered_pencils(
+                std::iter::once(self.input_pencil())
+                    .chain(self.core.stages.iter().map(|stage| &stage.output)),
+            )?,
             0,
             self.core.extra_shape.clone(),
             zero_complex::<R>(),
@@ -1414,7 +1514,10 @@ where
         &self,
     ) -> Result<C2cOutOfPlaceWorkspace<R, N, M>, FftError> {
         let intermediate = ManyPencilArray::from_elem(
-            registered_pencils(self.core.stages.iter().map(|stage| &stage.output))?,
+            registered_pencils(
+                std::iter::once(self.input_pencil())
+                    .chain(self.core.stages.iter().map(|stage| &stage.output)),
+            )?,
             0,
             self.core.extra_shape.clone(),
             zero_complex::<R>(),
@@ -1541,7 +1644,7 @@ where
         self.execute_overlap(Direction::Backward, source, destination, workspace)
     }
 
-    /// Runs [`Self::forward`] and returns fixed-size route timing.
+    /// Runs [`Self::forward`] and returns timing for its executed route stages.
     pub fn forward_with_timing(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
@@ -1559,7 +1662,7 @@ where
         Ok(timing)
     }
 
-    /// Runs [`Self::inverse`] and returns fixed-size route timing.
+    /// Runs [`Self::inverse`] and returns timing for its executed route stages.
     pub fn inverse_with_timing(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
@@ -1577,7 +1680,7 @@ where
         Ok(timing)
     }
 
-    /// Runs [`Self::backward`] and returns fixed-size route timing.
+    /// Runs [`Self::backward`] and returns timing for its executed route stages.
     pub fn backward_with_timing(
         &self,
         source: &PencilArray<Complex<R>, N, M>,
@@ -1648,7 +1751,7 @@ where
         self.execute_in_place(Direction::Backward, array, workspace, None)
     }
 
-    /// Runs [`Self::forward_in_place`] and returns fixed-size route timing.
+    /// Runs [`Self::forward_in_place`] and returns timing for its executed route stages.
     pub fn forward_in_place_with_timing(
         &self,
         array: &mut C2cInPlaceArray<R, N, M>,
@@ -1659,7 +1762,7 @@ where
         Ok(timing)
     }
 
-    /// Runs [`Self::inverse_in_place`] and returns fixed-size route timing.
+    /// Runs [`Self::inverse_in_place`] and returns timing for its executed route stages.
     pub fn inverse_in_place_with_timing(
         &self,
         array: &mut C2cInPlaceArray<R, N, M>,
@@ -1670,7 +1773,7 @@ where
         Ok(timing)
     }
 
-    /// Runs [`Self::backward_in_place`] and returns fixed-size route timing.
+    /// Runs [`Self::backward_in_place`] and returns timing for its executed route stages.
     pub fn backward_in_place_with_timing(
         &self,
         array: &mut C2cInPlaceArray<R, N, M>,
@@ -1692,12 +1795,8 @@ where
         extra_shape: ExtraShape,
         directions: FourierDirections<N>,
     ) -> Result<Self, FftError> {
-        let input = Pencil::new(
-            Arc::clone(&topology),
-            global_shape,
-            std::array::from_fn(|axis| axis),
-        )
-        .map_err(FftError::Pencil);
+        let input =
+            Pencil::new_default(Arc::clone(&topology), global_shape).map_err(FftError::Pencil);
         Self::construct(
             topology,
             global_shape,
@@ -1720,12 +1819,7 @@ where
     pub fn with_fft_directions(&self, directions: FourierDirections<N>) -> Result<Self, FftError> {
         let topology = Arc::clone(self.input_pencil().topology());
         let shape = *self.input_pencil().global_shape();
-        let input = Pencil::new(
-            Arc::clone(&topology),
-            shape,
-            std::array::from_fn(|axis| axis),
-        )
-        .map_err(FftError::Pencil);
+        let input = Pencil::new_default(Arc::clone(&topology), shape).map_err(FftError::Pencil);
         let mut plan = Self::construct_with_backend(
             topology,
             shape,
@@ -1764,12 +1858,8 @@ where
         extra_shape: ExtraShape,
         options: PlanOptions,
     ) -> Result<Self, BackendInitError<FftError>> {
-        let input = Pencil::new(
-            Arc::clone(&topology),
-            global_shape,
-            std::array::from_fn(|axis| axis),
-        )
-        .map_err(FftError::Pencil);
+        let input =
+            Pencil::new_default(Arc::clone(&topology), global_shape).map_err(FftError::Pencil);
         Self::construct_with_backend(
             topology,
             global_shape,
@@ -1791,12 +1881,7 @@ where
     pub fn with_fftw(&self, options: PlanOptions) -> Result<Self, BackendInitError<FftError>> {
         let topology = Arc::clone(self.input_pencil().topology());
         let shape = *self.input_pencil().global_shape();
-        let input = Pencil::new(
-            Arc::clone(&topology),
-            shape,
-            std::array::from_fn(|axis| axis),
-        )
-        .map_err(FftError::Pencil);
+        let input = Pencil::new_default(Arc::clone(&topology), shape).map_err(FftError::Pencil);
         let mut plan = Self::construct_with_backend(
             topology,
             shape,
@@ -1902,7 +1987,13 @@ where
         let descriptor = collective_descriptor(communicator, descriptor, expected_len)?;
         let route = agree_result(
             communicator,
-            build_route(input, &topology, global_shape, layout.permute_dims),
+            build_c2c_route(
+                input,
+                &topology,
+                global_shape,
+                selection,
+                layout.permute_dims,
+            ),
         )?;
         agree_result(
             communicator,
@@ -1915,8 +2006,13 @@ where
                 Ok(())
             },
         )?;
-        let prepared =
-            prepare_stages_backend::<R, N, M>(&route, global_shape, selection, directions, backend);
+        let prepared = prepare_c2c_stages_backend::<R, N, M>(
+            &route,
+            global_shape,
+            selection,
+            directions,
+            backend,
+        );
         if !collective_valid(communicator, prepared.is_ok()) {
             return Err(match prepared {
                 Err(error) => error,
@@ -1925,11 +2021,33 @@ where
         }
         let stages = prepared.expect("collective backend preflight accepted");
 
-        let (transition_inputs, transition_outputs) = agree_result(
+        let first_layouts = [
+            Arc::clone(&route.stages[0].source),
+            Arc::clone(&route.stages[0].output),
+        ];
+        let (initial_inputs, initial_outputs) = agree_result(
+            communicator,
+            pencil_columns(first_layouts.iter(), first_layouts.iter()),
+        )?;
+        let (mut initial_transitions, initial_send, initial_receive, _, _) =
+            build_transitions::<N, M>(
+                communicator,
+                &initial_inputs,
+                &initial_outputs,
+                &[route.distributed[0]],
+                &extra_shape,
+                layout.transpose_method,
+                0,
+            )?;
+        let initial_transition = initial_transitions
+            .pop()
+            .ok_or(FftError::PreparationFailed)?;
+
+        let (transition_layouts, _) = agree_result(
             communicator,
             pencil_columns(
-                stages.stages.iter().map(|stage| &stage.input),
-                stages.stages.iter().map(|stage| &stage.output),
+                route.stages.iter().map(|stage| &stage.output),
+                route.stages.iter().map(|stage| &stage.output),
             ),
         )?;
         let (
@@ -1940,17 +2058,20 @@ where
             real_transpose_receive_len,
         ) = build_transitions::<N, M>(
             communicator,
-            &transition_inputs,
-            &transition_outputs,
-            &route.distributed,
+            &transition_layouts,
+            &transition_layouts,
+            &route.distributed[1..],
             &extra_shape,
             layout.transpose_method,
             0,
         )?;
+        let transpose_send_len = transpose_send_len.max(initial_send);
+        let transpose_receive_len = transpose_receive_len.max(initial_receive);
 
         let strided_line_len = strided_complex_line_len(&stages.stages)?;
         let core = TransformPlanCore {
             stages: stages.stages,
+            initial_transition,
             transitions: transitions.into_boxed_slice(),
             extra_shape,
             selection,
@@ -1981,6 +2102,9 @@ where
         mut report: Option<&mut TransformTiming<N>>,
     ) -> Result<(), FftError> {
         let started = Instant::now();
+        if let Some(timing) = report.as_deref_mut() {
+            timing.stages.set_active_len(self.core.selection.len());
+        }
         let communicator = self.input_pencil().topology().communicator();
         let operation = match direction {
             Direction::Forward => {
@@ -2014,6 +2138,16 @@ where
                 .unwrap_or(FftError::CollectivePreconditionFailed));
         }
         local_preflight.expect("collective distributed C2C preflight succeeded");
+
+        if self.core.selection.is_empty() {
+            destination
+                .as_mut_slice()
+                .copy_from_slice(source.as_slice());
+            if let Some(timing) = report {
+                timing.total = started.elapsed();
+            }
+            return Ok(());
+        }
 
         let normalize_inverse = matches!(direction, Direction::Inverse);
         let result = match direction {
@@ -2060,12 +2194,20 @@ where
                 .unwrap_or(FftError::CollectivePreconditionFailed)
                 .into());
         }
-        let overlap_supported = self.core.transitions.iter().all(|transition| {
-            transition.forward.supports_overlap() && transition.backward.supports_overlap()
-        });
+        let overlap_supported = self.core.initial_transition.forward.supports_overlap()
+            && self.core.initial_transition.backward.supports_overlap()
+            && self.core.transitions.iter().all(|transition| {
+                transition.forward.supports_overlap() && transition.backward.supports_overlap()
+            });
         // This agreement is deliberately before stage-zero writes or payload.
         if !collective_valid(communicator, overlap_supported) {
             return Err(FftOverlapError::UnsupportedTransport);
+        }
+        if self.core.selection.is_empty() {
+            destination
+                .as_mut_slice()
+                .copy_from_slice(source.as_slice());
+            return Ok(());
         }
         match direction {
             Direction::Forward => {
@@ -2111,6 +2253,9 @@ where
         mut report: Option<&mut TransformTiming<N>>,
     ) -> Result<(), FftError> {
         let started = Instant::now();
+        if let Some(timing) = report.as_deref_mut() {
+            timing.stages.set_active_len(self.core.selection.len());
+        }
         let communicator = self.input_pencil().topology().communicator();
         let operation = match direction {
             Direction::Forward => {
@@ -2145,11 +2290,19 @@ where
         }
         local_preflight.expect("collective distributed C2C in-place preflight succeeded");
 
-        let normalize_inverse = matches!(direction, Direction::Inverse);
         let target = match direction {
             Direction::Forward => C2cState::Output,
             Direction::Inverse | Direction::Backward => C2cState::Input,
         };
+        if self.core.selection.is_empty() {
+            array.state = target;
+            if let Some(timing) = report {
+                timing.total = started.elapsed();
+            }
+            return Ok(());
+        }
+
+        let normalize_inverse = matches!(direction, Direction::Inverse);
         let result = run_in_place_transaction(array, workspace, target, |array, workspace| {
             #[cfg(test)]
             collections::inject_in_place_failure()?;
@@ -2257,9 +2410,10 @@ impl<R: FftReal, const N: usize, const M: usize> C2cInPlaceArray<R, N, M> {
 }
 
 fn registered_pencils<'a, const N: usize, const M: usize>(
-    pencils: impl ExactSizeIterator<Item = &'a Arc<Pencil<N, M>>>,
+    pencils: impl Iterator<Item = &'a Arc<Pencil<N, M>>>,
 ) -> Result<Box<[Arc<Pencil<N, M>>]>, FftError> {
-    let required = pencils.len();
+    let (minimum, maximum) = pencils.size_hint();
+    let required = maximum.unwrap_or(minimum);
     let mut registered = Vec::new();
     registered
         .try_reserve_exact(required)
@@ -2301,6 +2455,126 @@ fn validate_input<const N: usize, const M: usize>(
         return Err(FftError::InvalidInputLayout);
     }
     Ok(input)
+}
+
+fn validate_c2c_input<const N: usize, const M: usize>(
+    input: Result<Arc<Pencil<N, M>>, FftError>,
+    topology: &Arc<MpiTopology<M>>,
+    global_shape: [usize; N],
+) -> Result<Arc<Pencil<N, M>>, FftError> {
+    if N < 2 || M == 0 || M >= N {
+        return Err(FftError::InvalidDimensions);
+    }
+    if let Some(axis) = global_shape.iter().position(|&extent| extent == 0) {
+        return Err(FftError::Pencil(PencilError::ZeroGlobalExtent { axis }));
+    }
+    let input = input?;
+    if !Arc::ptr_eq(input.topology(), topology) || input.global_shape() != &global_shape {
+        return Err(FftError::PreparationFailed);
+    }
+    let identity = std::array::from_fn(|axis| axis);
+    let default_decomposition = std::array::from_fn(|slot| N - M + slot);
+    if input.permutation().axes().map(SpatialAxis::index) != identity
+        || input.decomposition().map(SpatialAxis::index) != default_decomposition
+    {
+        return Err(FftError::InvalidInputLayout);
+    }
+    Ok(input)
+}
+
+fn build_c2c_route<const N: usize, const M: usize>(
+    input: Result<Arc<Pencil<N, M>>, FftError>,
+    topology: &Arc<MpiTopology<M>>,
+    global_shape: [usize; N],
+    selection: AxisSelection<N>,
+    permute_dims: bool,
+) -> Result<C2cRouteCandidate<N, M>, FftError> {
+    let input = validate_c2c_input(input, topology, global_shape)?;
+    let mut axes = Vec::new();
+    axes.try_reserve_exact(selection.len())
+        .map_err(|_| FftError::AllocationFailed {
+            required: selection.len(),
+        })?;
+    axes.extend((0..N).filter(|&axis| selection.contains(axis)));
+
+    let route_len = axes.len().max(1);
+    let mut stages = Vec::new();
+    stages
+        .try_reserve_exact(route_len)
+        .map_err(|_| FftError::AllocationFailed {
+            required: route_len,
+        })?;
+    let mut distributed = Vec::new();
+    distributed
+        .try_reserve_exact(route_len)
+        .map_err(|_| FftError::AllocationFailed {
+            required: route_len,
+        })?;
+
+    let mut current = input;
+    if axes.is_empty() {
+        stages.push(C2cRouteStage {
+            axis: 0,
+            source: Arc::clone(&current),
+            output: Arc::clone(&current),
+        });
+        distributed.push(false);
+    } else {
+        for (index, &axis) in axes.iter().enumerate() {
+            let source = Arc::clone(&current);
+            let mut decomposition = current.decomposition().map(SpatialAxis::index);
+            let is_distributed = if let Some(slot) = decomposition.iter().position(|&a| a == axis) {
+                let previous_local = if index == 0 {
+                    (0..N)
+                        .find(|candidate| !decomposition.contains(candidate))
+                        .ok_or(FftError::PreparationFailed)?
+                } else {
+                    axes[index - 1]
+                };
+                if decomposition.contains(&previous_local) {
+                    return Err(FftError::PreparationFailed);
+                }
+                decomposition[slot] = previous_local;
+                true
+            } else {
+                false
+            };
+            let permutation = if permute_dims {
+                let mut next_axes = [0; N];
+                next_axes[0] = axis;
+                let mut position = 1;
+                for old_axis in current.permutation().axes().map(SpatialAxis::index) {
+                    if old_axis != axis {
+                        next_axes[position] = old_axis;
+                        position += 1;
+                    }
+                }
+                AxisPermutation::new(next_axes)
+                    .map_err(PencilError::InvalidPermutation)
+                    .map_err(FftError::Pencil)?
+            } else {
+                AxisPermutation::identity()
+            };
+            let next = current
+                .reconfigured(PencilConfig {
+                    global_shape,
+                    decomposition,
+                    permutation,
+                })
+                .map_err(FftError::Pencil)?;
+            stages.push(C2cRouteStage {
+                axis,
+                source,
+                output: Arc::clone(&next),
+            });
+            distributed.push(is_distributed);
+            current = next;
+        }
+    }
+    Ok(C2cRouteCandidate {
+        stages: stages.into_boxed_slice(),
+        distributed: distributed.into_boxed_slice(),
+    })
 }
 
 fn build_route<const N: usize, const M: usize>(
@@ -2471,8 +2745,8 @@ fn prepare_complex_stage<R: FftReal, const N: usize, const M: usize>(
     })
 }
 
-fn prepare_stages_backend<R: FftReal, const N: usize, const M: usize>(
-    route: &RouteCandidate<N, M>,
+fn prepare_c2c_stages_backend<R: FftReal, const N: usize, const M: usize>(
+    route: &C2cRouteCandidate<N, M>,
     global_shape: [usize; N],
     selection: AxisSelection<N>,
     directions: FourierDirections<N>,
@@ -2484,16 +2758,17 @@ fn prepare_stages_backend<R: FftReal, const N: usize, const M: usize>(
         .try_reserve_exact(required)
         .map_err(|_| BackendInitError::Local(FftError::AllocationFailed { required }))?;
     let mut fft_scratch_len = 0;
-    for (index, pencil) in route.stages.iter().enumerate() {
-        let axis = N - 1 - index;
-        let stage = prepare_complex_stage_for_backend(
-            pencil,
+    for route_stage in route.stages.iter() {
+        let mut stage = prepare_complex_stage_for_backend(
+            &route_stage.output,
             global_shape,
-            axis,
-            selection.contains(axis),
+            route_stage.axis,
+            selection.contains(route_stage.axis),
             directions,
             backend,
         )?;
+        stage.input = Arc::clone(&route_stage.source);
+        stage.output = Arc::clone(&route_stage.output);
         fft_scratch_len = fft_scratch_len.max(stage.local.scratch_len());
         stages.push(stage);
     }
@@ -2697,7 +2972,7 @@ fn memory_stride<const N: usize, const M: usize>(
         .ok_or(FftError::PreparationFailed)?;
     let shape = pencil.local_shape_memory();
     let mut stride = 1usize;
-    for &extent in shape.iter().skip(position + 1) {
+    for &extent in &shape[..position] {
         stride = stride
             .checked_mul(extent)
             .ok_or(FftError::PreparationFailed)?;
@@ -3239,25 +3514,40 @@ where
     let source_view = source.view();
     {
         let stage = &core.stages[0];
-        let fft_scratch = &mut workspace.fft_scratch;
-        let line_buffer = &mut workspace.line_buffer;
-        let fft_started = Instant::now();
         workspace
             .intermediate
-            .overwrite_with(stage.output.as_ref(), |mut target| {
-                execute_complex_forward(
-                    &stage.local,
-                    stage.output.as_ref(),
-                    stage.axis,
-                    source_view.as_slice(),
-                    target.as_mut_slice(),
-                    fft_scratch,
-                    line_buffer,
-                )
-                .expect("distributed C2C forward preflight validated stage zero");
+            .overwrite_with(stage.input.as_ref(), |mut target| {
+                if target.as_mut_slice().len() != source_view.as_slice().len() {
+                    return Err(());
+                }
+                target
+                    .as_mut_slice()
+                    .copy_from_slice(source_view.as_slice());
                 Ok::<_, ()>(())
             })
-            .expect("distributed C2C stage-zero overwrite was preflighted");
+            .expect("distributed C2C input overwrite was preflighted");
+        if !matches!(&core.initial_transition.forward, C2cTransition::Identity) {
+            execute_transition_timed(
+                &core.initial_transition.forward,
+                &mut workspace.intermediate,
+                &mut workspace.transpose,
+                report.as_deref_mut(),
+                0,
+            )?;
+        }
+        let mut active = workspace
+            .intermediate
+            .active_view_mut()
+            .expect("initial C2C route layout was preflighted");
+        let fft_started = Instant::now();
+        execute_complex_forward_in_place(
+            &stage.local,
+            stage.output.as_ref(),
+            stage.axis,
+            active.as_mut_slice(),
+            &mut workspace.fft_scratch,
+            &mut workspace.line_buffer,
+        )?;
         record_fft_timing(&mut report, 0, fft_started);
     }
 
@@ -3286,18 +3576,58 @@ where
     let stage = &core.stages[0];
     workspace
         .intermediate
-        .overwrite_with(stage.output.as_ref(), |mut target| {
-            execute_complex_forward(
+        .overwrite_with(stage.input.as_ref(), |mut target| {
+            if target.as_mut_slice().len() != source_view.as_slice().len() {
+                return Err(FftError::PreparationFailed);
+            }
+            target
+                .as_mut_slice()
+                .copy_from_slice(source_view.as_slice());
+            Ok::<_, FftError>(())
+        })
+        .map_err(|error| map_overwrite(error, FftError::Array))?;
+    match &core.initial_transition.forward {
+        C2cTransition::PointToPoint(plan) => {
+            let callback = |data: &mut [Complex<R>]| {
+                #[cfg(test)]
+                consume_c2c_callback_injection()?;
+                execute_complex_forward_in_place(
+                    &stage.local,
+                    stage.output.as_ref(),
+                    stage.axis,
+                    data,
+                    &mut workspace.fft_scratch,
+                    &mut workspace.line_buffer,
+                )
+            };
+            plan.execute_in_place_with_callback(
+                &mut workspace.intermediate,
+                &mut workspace.transpose,
+                callback,
+            )
+            .map_err(map_overlap)?;
+        }
+        C2cTransition::Identity | C2cTransition::Local(_) => {
+            execute_transition(
+                &core.initial_transition.forward,
+                &mut workspace.intermediate,
+                &mut workspace.transpose,
+            )?;
+            let mut active = workspace
+                .intermediate
+                .active_view_mut()
+                .map_err(FftError::Array)?;
+            execute_complex_forward_in_place(
                 &stage.local,
                 stage.output.as_ref(),
                 stage.axis,
-                source_view.as_slice(),
-                target.as_mut_slice(),
+                active.as_mut_slice(),
                 &mut workspace.fft_scratch,
                 &mut workspace.line_buffer,
-            )
-        })
-        .map_err(|error| map_overwrite(error, FftError::Array))?;
+            )?;
+        }
+        C2cTransition::AllToAllv(_) => return Err(FftOverlapError::UnsupportedTransport),
+    }
     for (index, transition) in core.transitions.iter().enumerate() {
         let stage = &core.stages[index + 1];
         match &transition.forward {
@@ -3372,7 +3702,7 @@ where
         .overwrite_with(stage.output.as_ref(), |mut target| {
             execute_complex_reverse(
                 &stage.local,
-                stage.input.as_ref(),
+                stage.output.as_ref(),
                 stage.axis,
                 source_view.as_slice(),
                 target.as_mut_slice(),
@@ -3391,7 +3721,7 @@ where
                     consume_c2c_callback_injection()?;
                     execute_complex_reverse_in_place(
                         &stage.local,
-                        stage.input.as_ref(),
+                        stage.output.as_ref(),
                         stage.axis,
                         data,
                         &mut workspace.fft_scratch,
@@ -3418,7 +3748,7 @@ where
                     .map_err(FftError::Array)?;
                 execute_complex_reverse_in_place(
                     &stage.local,
-                    stage.input.as_ref(),
+                    stage.output.as_ref(),
                     stage.axis,
                     active.as_mut_slice(),
                     &mut workspace.fft_scratch,
@@ -3429,6 +3759,11 @@ where
             C2cTransition::AllToAllv(_) => return Err(FftOverlapError::UnsupportedTransport),
         }
     }
+    execute_transition(
+        &core.initial_transition.backward,
+        &mut workspace.intermediate,
+        &mut workspace.transpose,
+    )?;
     let active = workspace
         .intermediate
         .active_view()
@@ -3478,36 +3813,69 @@ fn execute_inverse<R: FftReal, const N: usize, const M: usize>(
 where
     Complex<R>: Equivalence,
 {
-    execute_inverse_complex_tail_timed(
-        &core.stages,
-        &core.transitions,
-        source,
-        &mut workspace.intermediate,
-        &mut workspace.transpose,
-        &mut workspace.fft_scratch,
-        &mut workspace.line_buffer,
-        normalize_inverse,
-        report.as_deref_mut(),
-    )?;
-    let stage = &core.stages[0];
+    let source_view = source.view();
+    let last = core.stages.len() - 1;
+    let last_stage = &core.stages[last];
+    let fft_started = Instant::now();
+    workspace
+        .intermediate
+        .overwrite_with(last_stage.output.as_ref(), |mut target| {
+            execute_complex_reverse(
+                &last_stage.local,
+                last_stage.output.as_ref(),
+                last_stage.axis,
+                source_view.as_slice(),
+                target.as_mut_slice(),
+                &mut workspace.fft_scratch,
+                &mut workspace.line_buffer,
+                normalize_inverse,
+            )
+        })
+        .expect("distributed C2C inverse output overwrite was preflighted");
+    record_fft_timing(&mut report, last, fft_started);
+
+    for index in (0..core.transitions.len()).rev() {
+        execute_transition_timed(
+            &core.transitions[index].backward,
+            &mut workspace.intermediate,
+            &mut workspace.transpose,
+            report.as_deref_mut(),
+            index,
+        )?;
+        let stage = &core.stages[index];
+        let mut active = workspace
+            .intermediate
+            .active_view_mut()
+            .expect("C2C reverse route layout was preflighted");
+        let fft_started = Instant::now();
+        execute_complex_reverse_in_place(
+            &stage.local,
+            stage.output.as_ref(),
+            stage.axis,
+            active.as_mut_slice(),
+            &mut workspace.fft_scratch,
+            &mut workspace.line_buffer,
+            normalize_inverse,
+        )?;
+        record_fft_timing(&mut report, index, fft_started);
+    }
+    if !matches!(&core.initial_transition.backward, C2cTransition::Identity) {
+        execute_transition_timed(
+            &core.initial_transition.backward,
+            &mut workspace.intermediate,
+            &mut workspace.transpose,
+            report,
+            0,
+        )?;
+    }
     let active = workspace
         .intermediate
         .active_view()
-        .expect("distributed C2C inverse final active layout was preflighted");
-    let mut destination_view = destination.view_mut();
-    let fft_started = Instant::now();
-    execute_complex_reverse(
-        &stage.local,
-        stage.input.as_ref(),
-        stage.axis,
-        active.as_slice(),
-        destination_view.as_mut_slice(),
-        &mut workspace.fft_scratch,
-        &mut workspace.line_buffer,
-        normalize_inverse,
-    )
-    .expect("distributed C2C final inverse stage was preflighted");
-    record_fft_timing(&mut report, 0, fft_started);
+        .expect("distributed C2C inverse input layout was preflighted");
+    destination
+        .view_mut()
+        .as_mut_slice()
+        .copy_from_slice(active.as_slice());
     Ok(())
 }
 
@@ -3680,6 +4048,15 @@ fn execute_forward_in_place<R: FftReal, const N: usize, const M: usize>(
 where
     Complex<R>: Equivalence,
 {
+    if !matches!(&core.initial_transition.forward, C2cTransition::Identity) {
+        execute_transition_timed(
+            &core.initial_transition.forward,
+            array,
+            transpose,
+            report.as_deref_mut(),
+            0,
+        )?;
+    }
     {
         let stage = &core.stages[0];
         let mut active = array.active_view_mut().map_err(FftError::Array)?;
@@ -3738,7 +4115,7 @@ where
         let fft_started = Instant::now();
         execute_complex_reverse_in_place(
             &stage.local,
-            stage.input.as_ref(),
+            stage.output.as_ref(),
             stage.axis,
             active.as_mut_slice(),
             fft_scratch,
@@ -3761,7 +4138,7 @@ where
         let fft_started = Instant::now();
         execute_complex_reverse_in_place(
             &stage.local,
-            stage.input.as_ref(),
+            stage.output.as_ref(),
             stage.axis,
             active.as_mut_slice(),
             fft_scratch,
@@ -3769,6 +4146,15 @@ where
             normalize_inverse,
         )?;
         record_fft_timing(&mut report, index, fft_started);
+    }
+    if !matches!(&core.initial_transition.backward, C2cTransition::Identity) {
+        execute_transition_timed(
+            &core.initial_transition.backward,
+            array,
+            transpose,
+            report,
+            0,
+        )?;
     }
     Ok(())
 }
@@ -3822,43 +4208,47 @@ fn execute_transition_timed<T: Equivalence + Copy + Clone, const N: usize, const
 ) -> Result<(), FftError> {
     let started = Instant::now();
     let result = match transition {
-        C2cTransition::Identity => Ok(()),
+        C2cTransition::Identity => Ok(None),
         C2cTransition::Local(plan) => {
             plan.execute_in_place_with_transpose_workspace(intermediate, workspace)
                 .expect("distributed C2C local transition was preflighted");
-            Ok(())
+            Ok(None)
         }
         C2cTransition::AllToAllv(plan) => {
             if report.is_some() {
                 plan.execute_in_place_with_timing(intermediate, workspace)
-                    .map(|phases| {
-                        report.as_deref_mut().expect("timed transition").stages[stage_index]
-                            .communication = phases;
-                    })
+                    .map(Some)
                     .map_err(FftError::Transpose)
             } else {
                 plan.execute_in_place(intermediate, workspace)
-                    .map(|_| ())
+                    .map(|_| None)
                     .map_err(FftError::Transpose)
             }
         }
         C2cTransition::PointToPoint(plan) => {
             if report.is_some() {
                 plan.execute_in_place_with_timing(intermediate, workspace)
-                    .map(|phases| {
-                        report.as_deref_mut().expect("timed transition").stages[stage_index]
-                            .communication = phases;
-                    })
+                    .map(Some)
                     .map_err(FftError::Transpose)
             } else {
                 plan.execute_in_place(intermediate, workspace)
-                    .map(|_| ())
+                    .map(|_| None)
                     .map_err(FftError::Transpose)
             }
         }
     };
+    if let (Some(timing), Ok(Some(phases))) = (report.as_deref_mut(), result.as_ref()) {
+        timing.stages[stage_index].communication.pack += phases.pack;
+        timing.stages[stage_index].communication.post_receive += phases.post_receive;
+        timing.stages[stage_index].communication.receive_wait += phases.receive_wait;
+        timing.stages[stage_index].communication.collective_wait += phases.collective_wait;
+        timing.stages[stage_index].communication.unpack += phases.unpack;
+        timing.stages[stage_index].communication.send_wait += phases.send_wait;
+        timing.stages[stage_index].communication.total += phases.total;
+    }
+    let result = result.map(|_| ());
     if let Some(timing) = report {
-        timing.stages[stage_index].transpose = started.elapsed();
+        timing.stages[stage_index].transpose += started.elapsed();
         timing.stages[stage_index].transition_calls += 1;
         timing.stages[stage_index].total =
             timing.stages[stage_index].fft + timing.stages[stage_index].transpose;
@@ -4053,11 +4443,9 @@ fn validate_out_of_place<R: FftReal, T, U, V, const N: usize, const M: usize>(
         return Err(FftError::WorkspaceMismatch);
     }
     let active = intermediate.active_pencil()?;
-    if !core
-        .stages
-        .iter()
-        .any(|stage| active.same_layout(stage.output.as_ref()))
-    {
+    if !core.stages.iter().any(|stage| {
+        active.same_layout(stage.input.as_ref()) || active.same_layout(stage.output.as_ref())
+    }) {
         return Err(FftError::WorkspaceMismatch);
     }
     Ok(())

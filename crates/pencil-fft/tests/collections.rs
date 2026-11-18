@@ -292,14 +292,12 @@ macro_rules! exercise {
         }
     }};
 }
-macro_rules! families {
+macro_rules! c2c_family {
     ($r:ty, $topology:expr, $layout:expr) => {{
         let t = $topology;
-        let l = $layout;
         let extra = || ExtraShape::new(vec![2]).unwrap();
-        let dct = AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DctII));
         exercise!(
-            C2cPlan::<$r, 2, 1>::from_shape_with_layout(Arc::clone(t), SHAPE, extra(), l)
+            C2cPlan::<$r, 2, 1>::from_shape_with_layout(Arc::clone(t), SHAPE, extra(), $layout)
                 .unwrap()
                 .with_fft_directions(FourierDirections::new([
                     FourierDirection::Backward,
@@ -315,6 +313,15 @@ macro_rules! families {
             true,
             3
         );
+    }};
+}
+macro_rules! families {
+    ($r:ty, $topology:expr, $layout:expr) => {{
+        let t = $topology;
+        let l = $layout;
+        let extra = || ExtraShape::new(vec![2]).unwrap();
+        let dct = AxisTransform::R2r(AxisR2rKind::Fftw(R2rKind::DctII));
+        c2c_family!($r, t, l);
         exercise!(
             R2cPlan::<$r, 2, 1>::from_shape_with_layout(Arc::clone(t), SHAPE, extra(), l).unwrap(),
             allocate_workspace,
@@ -422,4 +429,27 @@ fn collections_one_mpi_binary() {
     }
     collections_preflight::run(&topology);
     println!("COLLECTIONS_OK rank={} size={}", world.rank(), world.size());
+}
+
+#[test]
+fn collections_c2c_one_mpi_binary() {
+    let universe = mpi::initialize().unwrap();
+    let world = universe.world();
+    let topology = MpiTopology::<1>::new(&world, [world.size() as usize]).unwrap();
+    for transpose_method in [TransposeMethod::PointToPoint, TransposeMethod::AllToAllv] {
+        for permute_dims in [false, true] {
+            let layout = DistributedLayout {
+                transpose_method,
+                permute_dims,
+            };
+            c2c_family!(f32, &topology, layout);
+            c2c_family!(f64, &topology, layout);
+        }
+    }
+    collections_preflight::run_c2c(&topology);
+    println!(
+        "COLLECTIONS_C2C_OK rank={} size={}",
+        world.rank(),
+        world.size()
+    );
 }

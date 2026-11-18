@@ -38,15 +38,16 @@ return `None`. `Pencil::local_grid` borrows one complete global coordinate
 slice per spatial axis and iterates this rank's spatial coordinates in physical
 memory order; each extra batch repeats that spatial grid.
 
-**Column-major layout migration (in progress).** The approved contract is logical `[spatial..., extra...]`, physical
+**Column-major layout migration (staged).** The approved contract is logical `[spatial..., extra...]`, physical
 `[permuted spatial..., extra...]`, with column-major prefix strides and the
 first axis fastest. Extra axes remain outside spatial permutation and MPI
 partitioning. The array crate's default decomposition is the trailing `M`
 spatial axes; Cartesian grid, rank/coordinate enumeration, and floor partition
-rules are unchanged. Stage 1 (`pencil-array`) is complete. `pencil-fft` and
-`pencil-io` layout paths are subsequent migration stages, not claimed complete
-here. There is no row-major compatibility mode or persisted-data backward-
-compatibility promise.
+rules are unchanged. `pencil-array` migration is complete, and distributed C2C
+now uses the selected-axis column-major route. Runtime migration and reference
+fixtures for the other distributed FFT families, plus `pencil-io`, remain
+follow-up work; the full FFT/I/O migration is not complete. There is no row-major
+compatibility mode or persisted-data backward-compatibility promise.
 
 `LocalTransposePlan` provides process-local memory-axis permutations. `AllToAllvTransposePlan` and
 `PointToPointTransposePlan` provide checked distributed redistribution through
@@ -289,20 +290,22 @@ variants. It does not add C2R stages to arbitrary mixed-axis plans.
 
 ## Distributed C2C FFT
 
-A C2C plan also accepts `AxisSelection<N>`. It always follows the canonical
-full route from axis `N-1` through `0`, with `N` stages and `N-1`
-transitions. A selected stage performs its local FFT; an unselected stage is an
-identity with no native plan or scaling. Thus an empty selection is a valid
-identity transform whose selected-layout transposes still run. The output
-pencil uses decomposition `[1..=M]` and the reversed permutation by default;
-`DistributedLayout::permute_dims = false` keeps identity memory order and uses
-strided line kernels. Inverse/raw-backward normalization includes only
-selected axes. `AxisSelection::all()` preserves the legacy transform exactly.
+A C2C plan accepts `AxisSelection<N>` and builds one stage per selected axis,
+in ascending logical-axis order; the input list order is ignored. Unselected
+axes have no FFT stage or transition. The input is identity memory order with
+the default trailing-axis decomposition `[N-M..N)`. When a selected axis is
+distributed, its grid slot moves to the preceding local transform axis (or the
+smallest local axis for the first stage). By default, each selected axis moves
+to the first physical memory position; `DistributedLayout::permute_dims =
+false` keeps every stage in identity memory order and uses column-major prefix
+strides. An empty selection is a validated no-op with unchanged layout and
+values. In-place calls retain the public Input/Output state transition. Inverse
+and raw-backward normalization includes only selected axes.
 
 Enable the feature in this workspace with
 `cargo check -p pencil-fft --features distributed --locked`. The public
-`C2cPlan` supports `N >= 2` and `1 <= M < N`, canonical identity input
-pencils, exact extra shapes, reusable plan-bound
+`C2cPlan` supports `N >= 2` and `1 <= M < N`, default identity/trailing-
+decomposition input pencils, exact extra shapes, reusable plan-bound
 `C2cOutOfPlaceWorkspace`, and input-preserving forward, normalized inverse,
 and raw positive-sign backward execution. Forward consumes the canonical input
 layout and produces the selected output layout; both inverse and raw backward

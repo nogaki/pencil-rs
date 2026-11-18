@@ -173,6 +173,44 @@ fn overlap_and_overwrite_mappings_are_single_generic_helpers() {
     );
 }
 
+#[test]
+fn repeated_c2c_transitions_accumulate_every_timing_field() {
+    let production = production(DISTRIBUTED_RS);
+    let transition = functions(production)
+        .into_iter()
+        .find(|function| function.name == "execute_transition_timed")
+        .expect("the C2C transition timing recorder exists");
+
+    assert!(
+        transition
+            .body
+            .contains("timing.stages[stage_index].transpose += started.elapsed()"),
+        "C2C transitions sharing a timing slot must add elapsed time instead of replacing it"
+    );
+    assert!(
+        transition
+            .body
+            .contains("timing.stages[stage_index].transition_calls += 1"),
+        "every actual C2C route transition is counted in its assigned slot"
+    );
+    for phase in [
+        "pack",
+        "post_receive",
+        "receive_wait",
+        "collective_wait",
+        "unpack",
+        "send_wait",
+        "total",
+    ] {
+        let accumulation =
+            format!("timing.stages[stage_index].communication.{phase} += phases.{phase}");
+        assert!(
+            transition.body.contains(&accumulation),
+            "repeated C2C transitions must accumulate the {phase} timing field"
+        );
+    }
+}
+
 /// #103: mixed R2R/DHT stages reuse the single strided wrapper in `r2r.rs`
 /// instead of re-implementing `MixedR2rLocal` and the line loops.
 #[test]

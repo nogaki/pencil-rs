@@ -20,7 +20,7 @@ use crate::{
     AxisR2rKind, AxisSelection, AxisTransform, MixedC2cPlan, MixedError, MixedR2cPlan, R2cState,
 };
 use mpi::{collective::CommunicatorCollectives, topology::Communicator};
-use pencil_array::{ArrayError, MpiTopology, TransposeWorkspace};
+use pencil_array::{ArrayError, MpiTopology, Pencil, TransposeWorkspace};
 
 #[test]
 fn endpoint_chunks_bound_batch_statistics() {
@@ -137,6 +137,16 @@ fn in_place_operation_words_are_reserved_after_out_of_place_words() {
 
 #[test]
 fn in_place_transaction_poison_survives_error_and_panic() {
+    run_in_place_transaction_cases(false);
+}
+
+#[test]
+#[ignore = "MPI can be initialized only once per unit-test process; run this test explicitly"]
+fn c2c_in_place_transaction_poison_survives_error_and_panic() {
+    run_in_place_transaction_cases(true);
+}
+
+fn run_in_place_transaction_cases(c2c_only: bool) {
     let _mpi_test_lock = super::MPI_TEST_LOCK
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
@@ -236,7 +246,9 @@ fn in_place_transaction_poison_survives_error_and_panic() {
         }
     }
     if world.size() != 1 {
-        super::r2c::run_rank_specific_conversion_failure(&world);
+        if !c2c_only {
+            super::r2c::run_rank_specific_conversion_failure(&world);
+        }
         return;
     }
     let result = {
@@ -436,6 +448,10 @@ fn in_place_transaction_poison_survives_error_and_panic() {
                 &mut backward_array,
                 &mut backward_workspace,
             );
+        }
+
+        if c2c_only {
+            return;
         }
 
         let capacity_plan = R2cPlan::<f64, 2, 1>::from_shape_with_method(
@@ -1032,19 +1048,241 @@ fn assert_poisoned_views_and_retries(
 }
 
 #[test]
-fn canonical_routes_have_exact_local_and_distributed_transition_counts() {
-    assert_eq!(route_counts::<2, 1>(), (1, 0));
-    assert_eq!(route_counts::<3, 1>(), (1, 1));
-    assert_eq!(route_counts::<4, 1>(), (1, 2));
-    assert_eq!(route_counts::<3, 2>(), (2, 0));
-    assert_eq!(route_counts::<4, 2>(), (2, 1));
+#[ignore = "MPI route construction must run in its own multi-rank process"]
+fn column_major_routes_match_production_stage_geometry_and_transitions() {
+    let _mpi_test_lock = super::MPI_TEST_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let universe = mpi::initialize().expect("MPI initialization failed");
+    let world = universe.world();
+    assert!(matches!(world.size(), 4 | 6), "run with 4 or 6 MPI ranks");
+    let topology = MpiTopology::<2>::new(&world, [2, world.size() as usize / 2]).unwrap();
+    let layout = DistributedLayout::default();
+
+    let full = C2cPlan::<f64, 3, 2>::from_shape_with_selection_and_layout(
+        Arc::clone(&topology),
+        [4, 5, 7],
+        ExtraShape::scalar(),
+        AxisSelection::all(),
+        layout,
+    )
+    .unwrap();
+    assert_c2c_route(
+        &full,
+        &[
+            (0, [0, 1, 2], [1, 2], [0, 1, 2], [1, 2]),
+            (1, [0, 1, 2], [1, 2], [1, 0, 2], [0, 2]),
+            (2, [1, 0, 2], [0, 2], [2, 1, 0], [0, 1]),
+        ],
+        &[false, true, true],
+        2,
+        TransposeMethod::AllToAllv,
+    );
+
+    let partial_12 = C2cPlan::<f64, 3, 2>::from_shape_with_selection_and_layout(
+        Arc::clone(&topology),
+        [4, 5, 7],
+        ExtraShape::scalar(),
+        AxisSelection::from_indices([1, 2]).unwrap(),
+        layout,
+    )
+    .unwrap();
+    assert_c2c_route(
+        &partial_12,
+        &[
+            (1, [0, 1, 2], [1, 2], [1, 0, 2], [0, 2]),
+            (2, [1, 0, 2], [0, 2], [2, 1, 0], [0, 1]),
+        ],
+        &[true, true],
+        2,
+        TransposeMethod::AllToAllv,
+    );
+
+    let partial_02 = C2cPlan::<f64, 3, 2>::from_shape_with_selection_and_layout(
+        Arc::clone(&topology),
+        [4, 5, 7],
+        ExtraShape::scalar(),
+        AxisSelection::from_indices([0, 2]).unwrap(),
+        layout,
+    )
+    .unwrap();
+    assert_c2c_route(
+        &partial_02,
+        &[
+            (0, [0, 1, 2], [1, 2], [0, 1, 2], [1, 2]),
+            (2, [0, 1, 2], [1, 2], [2, 0, 1], [1, 0]),
+        ],
+        &[false, true],
+        1,
+        TransposeMethod::AllToAllv,
+    );
+
+    let single = C2cPlan::<f64, 3, 2>::from_shape_with_selection_and_layout(
+        Arc::clone(&topology),
+        [4, 5, 7],
+        ExtraShape::scalar(),
+        AxisSelection::from_indices([2]).unwrap(),
+        layout,
+    )
+    .unwrap();
+    assert_c2c_route(
+        &single,
+        &[(2, [0, 1, 2], [1, 2], [2, 0, 1], [1, 0])],
+        &[true],
+        1,
+        TransposeMethod::AllToAllv,
+    );
+
+    let empty = C2cPlan::<f64, 3, 2>::from_shape_with_selection_and_layout(
+        Arc::clone(&topology),
+        [4, 5, 7],
+        ExtraShape::scalar(),
+        AxisSelection::empty(),
+        layout,
+    )
+    .unwrap();
+    assert_c2c_route(&empty, &[], &[], 0, TransposeMethod::AllToAllv);
+    assert!(empty.input_pencil().same_layout(empty.output_pencil()));
+
+    let n4_subset = C2cPlan::<f64, 4, 2>::from_shape_with_selection_and_layout(
+        Arc::clone(&topology),
+        [4, 5, 6, 7],
+        ExtraShape::scalar(),
+        AxisSelection::from_indices([0, 2]).unwrap(),
+        layout,
+    )
+    .unwrap();
+    assert_c2c_route(
+        &n4_subset,
+        &[
+            (0, [0, 1, 2, 3], [2, 3], [0, 1, 2, 3], [2, 3]),
+            (2, [0, 1, 2, 3], [2, 3], [2, 0, 1, 3], [0, 3]),
+        ],
+        &[false, true],
+        1,
+        TransposeMethod::AllToAllv,
+    );
+
+    for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
+        let partial = C2cPlan::<f64, 3, 2>::from_shape_with_selection_and_layout(
+            Arc::clone(&topology),
+            [4, 5, 7],
+            ExtraShape::scalar(),
+            AxisSelection::from_indices([1, 2]).unwrap(),
+            DistributedLayout {
+                transpose_method: method,
+                ..layout
+            },
+        )
+        .unwrap();
+        assert_c2c_route(
+            &partial,
+            &[
+                (1, [0, 1, 2], [1, 2], [1, 0, 2], [0, 2]),
+                (2, [1, 0, 2], [0, 2], [2, 1, 0], [0, 1]),
+            ],
+            &[true, true],
+            2,
+            method,
+        );
+    }
 }
 
-fn route_counts<const N: usize, const M: usize>() -> (usize, usize) {
-    let mut decomposition: [usize; M] = std::array::from_fn(|axis| axis);
-    let mut distributed = 0;
-    for axis in (0..N - 1).rev() {
-        distributed += usize::from(super::advance_decomposition(&mut decomposition, axis));
+type ExpectedC2cStage<const N: usize, const M: usize> =
+    (usize, [usize; N], [usize; M], [usize; N], [usize; M]);
+
+fn assert_c2c_route<const N: usize, const M: usize>(
+    plan: &C2cPlan<f64, N, M>,
+    expected_stages: &[ExpectedC2cStage<N, M>],
+    expected_distributed_stages: &[bool],
+    expected_distributed_count: usize,
+    method: TransposeMethod,
+) where
+    Complex<f64>: mpi::datatype::Equivalence,
+{
+    let actual_stages = plan.stage_geometry();
+    assert_eq!(actual_stages.len(), expected_stages.len());
+    assert_eq!(actual_stages.len(), expected_distributed_stages.len());
+    for (index, ((stage, expected), &distributed)) in actual_stages
+        .iter()
+        .zip(expected_stages)
+        .zip(expected_distributed_stages)
+        .enumerate()
+    {
+        assert_eq!(stage.axis, expected.0, "route stage {index} axis");
+        assert_pencil_layout(&stage.source, expected.1, expected.2, "source", index);
+        assert_pencil_layout(&stage.output, expected.3, expected.4, "output", index);
+        assert_eq!(
+            !stage.source.same_distribution(&stage.output),
+            distributed,
+            "route stage {index} actual distribution transition"
+        );
     }
-    (distributed, (N - 1) - distributed)
+
+    assert_eq!(
+        expected_distributed_stages
+            .iter()
+            .filter(|&&distributed| distributed)
+            .count(),
+        expected_distributed_count,
+        "independent hand-count for the expected route"
+    );
+    let actual_distributed_count = actual_stages
+        .iter()
+        .filter(|stage| !stage.source.same_distribution(&stage.output))
+        .count();
+    assert_eq!(actual_distributed_count, expected_distributed_count);
+
+    let transitions = plan
+        .core
+        .transitions
+        .iter()
+        .map(|transition| &transition.forward);
+    assert_eq!(
+        plan.core.transitions.len(),
+        actual_stages.len().saturating_sub(1),
+        "one production transition connects each adjacent pair of stages"
+    );
+    for (index, (transition, &distributed)) in transitions
+        .zip(expected_distributed_stages.iter().skip(1))
+        .enumerate()
+    {
+        if distributed {
+            match method {
+                TransposeMethod::AllToAllv => assert!(
+                    matches!(transition, C2cTransition::AllToAllv(_)),
+                    "inter-stage transition {index}"
+                ),
+                TransposeMethod::PointToPoint => assert!(
+                    matches!(transition, C2cTransition::PointToPoint(_)),
+                    "inter-stage transition {index}"
+                ),
+            }
+        } else {
+            assert!(
+                matches!(transition, C2cTransition::Identity),
+                "inter-stage transition {index}"
+            );
+        }
+    }
+}
+
+fn assert_pencil_layout<const N: usize, const M: usize>(
+    pencil: &Pencil<N, M>,
+    expected_axes: [usize; N],
+    expected_decomposition: [usize; M],
+    endpoint: &str,
+    stage: usize,
+) {
+    assert_eq!(
+        pencil.permutation().axes().map(|axis| axis.index()),
+        expected_axes,
+        "stage {stage} {endpoint} memory-axis order"
+    );
+    assert_eq!(
+        pencil.decomposition().map(|axis| axis.index()),
+        expected_decomposition,
+        "stage {stage} {endpoint} decomposition slots"
+    );
 }

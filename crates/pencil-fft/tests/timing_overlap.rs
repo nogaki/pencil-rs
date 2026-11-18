@@ -5,9 +5,9 @@ use std::sync::Arc;
 use mpi::traits::*;
 use pencil_array::{ExtraShape, MpiTopology, PencilArray};
 use pencil_fft::{
-    AxisR2rKind, AxisTransform, C2cPlan, Complex, DistributedLayout, FftError, FftOverlapError,
-    FftReal, FourierDirection, FourierDirections, MixedC2cPlan, MixedR2cPlan, R2cPlan, R2rKind,
-    R2rPlan, TransposeMethod,
+    AxisR2rKind, AxisSelection, AxisTransform, C2cPlan, Complex, DistributedLayout, FftError,
+    FftOverlapError, FftReal, FourierDirection, FourierDirections, MixedC2cPlan, MixedR2cPlan,
+    R2cPlan, R2rKind, R2rPlan, TransposeMethod,
 };
 
 trait TestReal: FftReal + mpi::datatype::Equivalence + std::fmt::Debug {
@@ -39,23 +39,131 @@ fn distributed_timing_overlap_one_mpi_binary() {
     assert!(matches!(size, 1 | 4 | 6), "run with 1, 4, or 6 ranks");
     let topology = MpiTopology::<1>::new(&world, [size]).unwrap();
 
+    run_c2c_timing_cases(&topology);
+    run_baselines(&topology);
+    run_empty_c2c_timing_case(&topology);
+}
+
+#[test]
+fn distributed_c2c_timing_overlap_one_mpi_binary() {
+    let universe = mpi::initialize().expect("MPI initialization failed");
+    let world = universe.world();
+    let size = usize::try_from(world.size()).unwrap();
+    assert!(matches!(size, 1 | 4 | 6), "run with 1, 4, or 6 ranks");
+    let topology = MpiTopology::<1>::new(&world, [size]).unwrap();
+
+    run_c2c_timing_cases(&topology);
+    run_empty_c2c_timing_case(&topology);
+}
+
+#[test]
+fn distributed_c2c_partial_route_timing_one_mpi_binary() {
+    let universe = mpi::initialize().expect("MPI initialization failed");
+    let world = universe.world();
+    let size = usize::try_from(world.size()).unwrap();
+    assert!(
+        matches!(size, 4 | 6),
+        "run with 4 or 6 ranks for actual transposes"
+    );
+    let topology = MpiTopology::<2>::new(&world, [2, size / 2]).unwrap();
+
+    for method in [TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
+        for permute_dims in [false, true] {
+            run_partial_route_timing(&topology, method, permute_dims);
+        }
+    }
+}
+
+fn run_partial_route_timing(
+    topology: &Arc<MpiTopology<2>>,
+    method: TransposeMethod,
+    permute_dims: bool,
+) {
+    let plan = C2cPlan::<f64, 3, 2>::from_shape_with_selection_and_layout(
+        Arc::clone(topology),
+        [4, 5, 7],
+        ExtraShape::scalar(),
+        AxisSelection::from_indices([1, 2]).unwrap(),
+        DistributedLayout {
+            transpose_method: method,
+            permute_dims,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        plan.stage_geometry()
+            .iter()
+            .map(|stage| stage.axis)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    let source = plan.allocate_input().unwrap();
+    let mut spectrum = plan.allocate_output().unwrap();
+    let mut workspace = plan.allocate_out_of_place_workspace().unwrap();
+
+    let forward = plan
+        .forward_with_timing(&source, &mut spectrum, &mut workspace)
+        .unwrap();
+    assert_partial_route_timing(&forward);
+    let mut recovered = plan.allocate_input().unwrap();
+    let inverse = plan
+        .inverse_with_timing(&spectrum, &mut recovered, &mut workspace)
+        .unwrap();
+    assert_partial_route_timing(&inverse);
+
+    let mut array = plan.allocate_in_place().unwrap();
+    let mut in_place_workspace = plan.allocate_in_place_workspace().unwrap();
+    let forward = plan
+        .forward_in_place_with_timing(&mut array, &mut in_place_workspace)
+        .unwrap();
+    assert_partial_route_timing(&forward);
+    let inverse = plan
+        .inverse_in_place_with_timing(&mut array, &mut in_place_workspace)
+        .unwrap();
+    assert_partial_route_timing(&inverse);
+}
+
+fn assert_partial_route_timing<const N: usize>(timing: &pencil_fft::TransformTiming<N>) {
+    assert_eq!(timing.stages[0].fft_calls, 1);
+    assert_eq!(timing.stages[1].fft_calls, 1);
+    assert_eq!(
+        timing.stages[0].transition_calls, 2,
+        "the nonlocal first selected axis has an initial transpose and a later transpose"
+    );
+    assert_eq!(
+        timing.stages[1].transition_calls, 0,
+        "the final selected stage has no following transition"
+    );
+    assert_eq!(
+        timing.stages[0].total,
+        timing.stages[0].fft + timing.stages[0].transpose,
+        "the stage total includes its accumulated transpose timing"
+    );
+    assert_eq!(
+        timing.stages[1].total,
+        timing.stages[1].fft + timing.stages[1].transpose
+    );
+    assert!(timing.total >= timing.stages.iter().map(|stage| stage.total).sum());
+}
+
+fn run_c2c_timing_cases(topology: &Arc<MpiTopology<1>>) {
     for &method in &[TransposeMethod::AllToAllv, TransposeMethod::PointToPoint] {
         for &permute_dims in &[false, true] {
             for directions in [
                 FourierDirections::forward(),
                 FourierDirections::new([FourierDirection::Forward, FourierDirection::Backward]),
             ] {
-                run_case::<f64>(&topology, method, permute_dims, directions, false);
-                run_case::<f32>(&topology, method, permute_dims, directions, false);
+                run_case::<f64>(topology, method, permute_dims, directions, false);
+                run_case::<f32>(topology, method, permute_dims, directions, false);
             }
         }
     }
-    run_baselines(&topology);
+}
 
-    // A zero-sized extra dimension is a real empty local array, including on
-    // otherwise nonempty ranks. It must still pass construction and timing.
+fn run_empty_c2c_timing_case(topology: &Arc<MpiTopology<1>>) {
+    // Zero-sized extras must still pass construction and timing.
     run_case::<f64>(
-        &topology,
+        topology,
         TransposeMethod::PointToPoint,
         false,
         FourierDirections::forward(),
@@ -99,11 +207,12 @@ fn run_case<R: TestReal>(
     };
     let mut output = plan.allocate_output().unwrap();
     let mut workspace = plan.allocate_out_of_place_workspace().unwrap();
+    let stage_count = plan.stage_geometry().len();
 
     let timing = plan
         .forward_with_timing(&source, &mut output, &mut workspace)
         .unwrap();
-    assert_c2c_timing(&timing);
+    assert_c2c_timing(&timing, stage_count);
     if !empty {
         assert_dft(&output, [5, 7], directions);
     }
@@ -114,7 +223,7 @@ fn run_case<R: TestReal>(
     let inverse_timing = plan
         .inverse_with_timing(&output, &mut inverse, &mut workspace)
         .unwrap();
-    assert_c2c_timing(&inverse_timing);
+    assert_c2c_timing(&inverse_timing, stage_count);
     assert_close(
         inverse.as_slice(),
         &source_before,
@@ -124,7 +233,7 @@ fn run_case<R: TestReal>(
     let backward_timing = plan
         .backward_with_timing(&output, &mut backward, &mut workspace)
         .unwrap();
-    assert_c2c_timing(&backward_timing);
+    assert_c2c_timing(&backward_timing, stage_count);
     for (actual, expected) in backward.as_slice().iter().zip(source_before.iter()) {
         assert!((R::to_f64(actual.re) - R::to_f64(expected.re) * 35.0).abs() < tolerance);
     }
@@ -146,7 +255,7 @@ fn run_case<R: TestReal>(
             _ => plan.backward_in_place_with_timing(&mut in_place, &mut ws),
         }
         .unwrap();
-        assert_c2c_timing(&timing);
+        assert_c2c_timing(&timing, stage_count);
         let view = in_place.view().unwrap();
         let expected = match direction {
             0 => output.as_slice(),
@@ -330,21 +439,27 @@ fn run_baselines(topology: &Arc<MpiTopology<1>>) {
     );
 }
 
-fn assert_c2c_timing<const N: usize>(timing: &pencil_fft::TransformTiming<N>) {
+fn assert_c2c_timing<const N: usize>(timing: &pencil_fft::TransformTiming<N>, stage_count: usize) {
     assert_timing(timing);
-    for (index, stage) in timing.stages.iter().enumerate() {
+    assert!(stage_count <= timing.stages.len());
+    for (index, stage) in timing.stages.iter().take(stage_count).enumerate() {
         assert_eq!(stage.fft_calls, 1, "C2C stage {index}");
         assert_eq!(
             stage.transition_calls,
-            if index + 1 < N { 1 } else { 0 },
+            u64::from(index + 1 < stage_count),
             "C2C transition {index}"
         );
     }
+    assert!(
+        timing.stages[stage_count..]
+            .iter()
+            .all(|stage| { stage.fft_calls == 0 && stage.transition_calls == 0 })
+    );
 }
 
 fn assert_timing<const N: usize>(timing: &pencil_fft::TransformTiming<N>) {
     assert!(timing.total >= timing.stages.iter().map(|stage| stage.total).sum());
-    for stage in timing.stages {
+    for stage in timing.stages.iter() {
         assert!(stage.total >= stage.fft);
         assert!(stage.total >= stage.transpose);
         assert!(stage.communication.pack <= stage.transpose);

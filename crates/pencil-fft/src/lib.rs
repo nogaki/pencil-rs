@@ -331,7 +331,7 @@ pub use distributed::{
     DhtPlan, DistributedLayout, FftError, FftOverlapError, FourierDirection, FourierDirections,
     R2cError, R2cInPlaceArray, R2cInPlaceWorkspace, R2cPlan, R2cWorkspace, R2rError,
     R2rInPlaceArray, R2rInPlaceWorkspace, R2rPlan, R2rState, R2rWorkspace, StageGeometry,
-    StageTiming, TransformTiming, TransposeMethod,
+    StageTiming, StageTimings, TransformTiming, TransposeMethod,
 };
 
 /// Errors returned by local C2C plan construction and execution.
